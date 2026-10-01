@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/refine-core",
+    "crates/refine-store",
+    "crates/refine-http",
+    "crates/refine-llm",
+    "crates/refine-tools",
+    "crates/refine-mcp",
+    "crates/refine-plugin",
+    "crates/refine-importer",
+    "crates/refine-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+rust-version = "1.98"
+
+[workspace.dependencies]
+# internal
+refine-core = { path = "crates/refine-core" }
+refine-store = { path = "crates/refine-store" }
+refine-http = { path = "crates/refine-http" }
+refine-llm = { path = "crates/refine-llm" }
+refine-tools = { path = "crates/refine-tools" }
+refine-mcp = { path = "crates/refine-mcp" }
+refine-plugin = { path = "crates/refine-plugin" }
+refine-importer = { path = "crates/refine-importer" }
+
+# runtime / web
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs", "io-util", "net"] }
+axum = { version = "0.8", features = ["json"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+hyper = "1"
+bytes = "1"
+
+# storage
+rusqlite = { version = "0.40", features = ["bundled", "blob", "column_decltype"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.35"
+zstd = "0.13"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "0.9"
+
+# misc
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+hex = "0.4"
+parking_lot = "0.12"
+rustc-hash = "2"
+
+# metrics
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+debug = 1

@@ -1,0 +1,16 @@
+[package]
+name = "refine-importer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Streaming read-only 20-session importer"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+refine-store.workspace = true

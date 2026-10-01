@@ -1,0 +1,281 @@
+//! Schema: STRICT tables, fixed-size metadata only, user_version gate.
+//! Payloads never live here — they live in the blob store (STORAGE.md §4).
+
+use anyhow::{Result, bail};
+use rusqlite::Connection;
+
+/// Bump when the schema changes; refuse to open mismatches with an actionable error
+/// (reliary8/stria pattern: schema.rs user_version gate).
+pub const SCHEMA_VERSION: i64 = 1;
+
+const DDL: &str = "
+-- session metadata (no payloads)
+CREATE TABLE session (
+    id            TEXT PRIMARY KEY,
+    project_id    TEXT NOT NULL DEFAULT 'global',
+    slug          TEXT NOT NULL DEFAULT '',
+    directory     TEXT NOT NULL DEFAULT '',
+    parent_id     TEXT,
+    title         TEXT NOT NULL DEFAULT '',
+    version       TEXT NOT NULL DEFAULT '1',
+    time_created  INTEGER NOT NULL,
+    time_updated  INTEGER NOT NULL,
+    version_dirt  INTEGER NOT NULL DEFAULT 0
+) STRICT;
+
+CREATE INDEX idx_session_updated ON session(time_updated DESC);
+CREATE INDEX idx_session_parent ON session(parent_id) WHERE parent_id IS NOT NULL;
+
+-- message metadata; payload refs the blob store
+CREATE TABLE message (
+    id          TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+    role        TEXT NOT NULL,
+    time_created INTEGER NOT NULL,
+    model       TEXT,
+    provider_id TEXT,
+    tokens_in   INTEGER,
+    tokens_out  INTEGER,
+    blob_sha    TEXT NOT NULL
+) STRICT;
+
+CREATE INDEX idx_message_session ON message(session_id, time_created, id);
+
+-- part metadata; large payloads out-of-DB
+CREATE TABLE part (
+    id          TEXT PRIMARY KEY,
+    message_id  TEXT NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+    session_id  TEXT NOT NULL,
+    type        TEXT NOT NULL,
+    time_created INTEGER NOT NULL,
+    byte_len    INTEGER NOT NULL,
+    blob_sha    TEXT
+) STRICT;
+
+CREATE INDEX idx_part_message ON part(message_id, time_created);
+CREATE INDEX idx_part_session ON part(session_id);
+
+-- bounded event ring (never RAM; never unbounded: PLAN §5)
+CREATE TABLE event (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT,
+    project_id  TEXT NOT NULL DEFAULT 'global',
+    type        TEXT NOT NULL,
+    payload     TEXT NOT NULL,
+    time_created INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX idx_event_session ON event(session_id, seq);
+
+-- permission decisions (per project+action+resource, S8)
+CREATE TABLE permission (
+    project_id  TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    resource    TEXT NOT NULL,
+    decision    TEXT NOT NULL,
+    time_created INTEGER NOT NULL,
+    PRIMARY KEY (project_id, action, resource)
+) STRICT;
+
+-- todos
+CREATE TABLE todo (
+    id          TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+    content     TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    priority    TEXT,
+    time_created INTEGER NOT NULL,
+    time_updated INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX idx_todo_session ON todo(session_id);
+
+-- FTS5 external-content projection, MAIN DB only (STORAGE.md §1 — ATTACH impossible)
+CREATE TABLE search_doc (
+    id      INTEGER PRIMARY KEY,
+    title   TEXT NOT NULL DEFAULT '',
+    excerpt TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL DEFAULT 0
+) STRICT;
+
+CREATE VIRTUAL TABLE search_fts USING fts5(
+    title, excerpt, content='search_doc', content_rowid='id', tokenize='unicode61'
+);
+
+-- blob chunk index: content-addressed, fixed-size rows (STORAGE.md §4)
+CREATE TABLE blob_chunk (
+    sha       TEXT NOT NULL,
+    ord       INTEGER NOT NULL,
+    byte_len  INTEGER NOT NULL,
+    PRIMARY KEY (sha, ord)
+) STRICT, WITHOUT ROWID;
+
+-- blob objects: total length + codec, GC bookkeeping
+CREATE TABLE blob_object (
+    sha        TEXT PRIMARY KEY,
+    byte_len   INTEGER NOT NULL,
+    chunk_cnt  INTEGER NOT NULL,
+    codec      TEXT NOT NULL DEFAULT 'zstd',
+    created_at INTEGER NOT NULL,
+    deleted_at INTEGER
+) STRICT;
+
+CREATE TABLE import_manifest (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) STRICT;
+";
+
+/// Apply schema to a fresh DB and stamp user_version. Idempotent: skips if stamped.
+pub fn migrate(conn: &Connection) -> Result<()> {
+    let ver: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .expect("user_version readable");
+    if ver == SCHEMA_VERSION {
+        return Ok(());
+    }
+    if ver != 0 {
+        bail!(
+            "database schema version {ver} != expected {SCHEMA_VERSION}; \
+             refuse to touch it (upgrade path runs through `refine import`/migrations)"
+        );
+    }
+    conn.execute_batch(DDL)?;
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pragma;
+
+    #[test]
+    fn migrate_is_idempotent_and_strict() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.db");
+        let conn = pragma::create_new(&p).unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap(); // second run: no-op
+        // STRICT: wrong-typed write must fail
+        let err = conn.execute(
+            "INSERT INTO session (id, time_created, time_updated) VALUES (?, ?, ?)",
+            rusqlite::params!["s1", "not-an-int", 1],
+        );
+        assert!(err.is_err(), "STRICT table must reject text in INTEGER");
+        // index presence for the hot list query
+        let plans: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT * FROM session ORDER BY time_updated DESC",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plans.contains("idx_session_updated"), "got plan: {plans}");
+    }
+
+    #[test]
+    fn version_mismatch_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.db");
+        let conn = pragma::create_new(&p).unwrap();
+        migrate(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 99).unwrap();
+        let err = migrate(&conn).unwrap_err();
+        assert!(
+            err.to_string().contains("99"),
+            "message must name the version"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fts_m0 {
+    use super::*;
+    use crate::pragma;
+
+    /// M0 decisive experiment (PLAN §13): FTS5 external-content LOCAL lifecycle
+    /// must work on the bundled build; ATTACH-based designs are already falsified
+    /// on-box (content-name qualification + trigger restrictions) — we assert the
+    /// local design we chose actually functions.
+    #[test]
+    fn external_content_lifecycle_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.db");
+        let conn = pragma::create_new(&p).unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO search_doc (id, title, excerpt, updated_at) VALUES (1, 'hello world', 'some body', 1)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO search_fts(rowid, title, excerpt) SELECT id, title, excerpt FROM search_doc",
+            [],
+        ).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM search_fts WHERE search_fts MATCH 'hello'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        // update path: edit doc then rebuild its row
+        conn.execute("UPDATE search_doc SET title='goodbye moon' WHERE id=1", [])
+            .unwrap();
+        conn.execute("DELETE FROM search_fts WHERE rowid=1", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO search_fts(rowid, title, excerpt) SELECT id, title, excerpt FROM search_doc WHERE id=1",
+            [],
+        ).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM search_fts WHERE search_fts MATCH 'moon'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// M0 experiment: contentless FTS5 (`content=''`) behavior on the BUNDLED build.
+    /// The system sqlite 3.53.0 on this box fails to even construct it (vtable
+    /// constructor failed). If bundled behaves the same, any contentless design
+    /// is off the table; if it works, it's still only usable inside the main DB
+    /// (ATTACH separately falsified). The test records which world we're in.
+    #[test]
+    fn contentless_fts_status_recorded() {
+        let conn = Connection::open_in_memory().unwrap();
+        let attempt = conn.execute_batch(
+            "CREATE VIRTUAL TABLE cl USING fts5(content='', tokenize='unicode61');
+             INSERT INTO cl(rowid, cl) VALUES(1, 'hello world');
+             SELECT count(*) FROM cl WHERE cl MATCH 'hello';",
+        );
+        match &attempt {
+            Ok(()) => {
+                tracing::info!("contentless FTS5 works on bundled {}", rusqlite::version());
+            }
+            Err(e) => {
+                // Not a failure of refine: our schema never uses contentless.
+                // Recorded so STORAGE.md §1 stays honest about the build.
+                tracing::warn!(
+                    "contentless FTS5 unavailable on bundled {}: {e} (design does not rely on it)",
+                    rusqlite::version()
+                );
+            }
+        }
+        // The design we DO use (external-content over a local projection) must
+        // always construct, regardless of contentless availability:
+        conn.execute_batch(
+            "CREATE TABLE doc(id INTEGER PRIMARY KEY, t TEXT);
+             CREATE VIRTUAL TABLE ft USING fts5(content='doc', content_rowid='id', t);",
+        )
+        .expect("external-content local must construct on bundled build");
+        // If contentless works, its full lifecycle must too — otherwise record it:
+        if attempt.is_ok() {
+            conn.execute_batch("SELECT count(*) FROM cl WHERE cl MATCH 'hello';")
+                .expect("contentless roundtrip");
+        }
+    }
+}
