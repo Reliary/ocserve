@@ -1,0 +1,11 @@
+HTTP/1.1 200 OK
+Cache-Control: no-cache, no-transform
+X-Content-Type-Options: nosniff
+Content-Type: text/event-stream
+Vary: Origin
+x-accel-buffering: no
+Date: Thu, 01 Oct 2026 22:05:07 GMT
+Transfer-Encoding: chunked
+
+data: {"payload":{"id":"evt_0f97ff8ab0017PVK23XpJUTuiH","type":"server.connected","properties":{}}}
+
