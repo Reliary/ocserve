@@ -17,9 +17,9 @@ by direct execution — not from documentation.
 
 | Experiment | Result |
 |---|---|
-| External-content FTS5 in **attached** file, `content='main.m'` | ✗ constructor fails: content name is qualified with the FTS table's schema (`b.main.m`) |
+| External-content FTS5 in **attached** file, `content='main.m'` | ✗ create may succeed, but `rebuild`/`MATCH` fail: content name is qualified with the FTS table's schema (`b.main.m`) — **[M0-VERIFIED]** by full lifecycle test |
 | Trigger on main table writing attached FTS | ✗ `qualified table names are not allowed ... within triggers` |
-| Contentless FTS5 (`content=''`) local, `:memory:` and file | ✗ `vtable constructor failed` on this build (contentless is broken here — must re-test against rusqlite bundled at M0) |
+| Contentless FTS5 (`content=''`) local, `:memory:` and file | ✗ `vtable constructor failed` on system sqlite 3.53.0 **and** rusqlite bundled 3.53.2 (**[M0-VERIFIED]**, `contentless_fts_status_recorded`) — broken across 3.53.x builds, not a distro quirk; contentless designs are off the table |
 | Plain FTS5 local + in attached file | ✓ works |
 | External-content FTS5 **local** (same file): create → insert → rebuild → match | ✓ works |
 

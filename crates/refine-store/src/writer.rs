@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Debug)]
 /// A unit of work executed inside the writer transaction.
 /// Handlers capture plain data — no Connection escapes this enum's scope.
 pub enum WriteOp {

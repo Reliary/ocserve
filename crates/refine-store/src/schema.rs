@@ -254,13 +254,17 @@ mod fts_m0 {
         );
         match &attempt {
             Ok(()) => {
-                tracing::info!("contentless FTS5 works on bundled {}", rusqlite::version());
+                // println (not tracing): test binary has no subscriber
+                println!(
+                    "M0-FTS-CONTENTLESS: works on bundled {}",
+                    rusqlite::version()
+                );
             }
             Err(e) => {
                 // Not a failure of refine: our schema never uses contentless.
                 // Recorded so STORAGE.md §1 stays honest about the build.
-                tracing::warn!(
-                    "contentless FTS5 unavailable on bundled {}: {e} (design does not rely on it)",
+                println!(
+                    "M0-FTS-CONTENTLESS: unavailable on bundled {}: {e} (design does not rely on it)",
                     rusqlite::version()
                 );
             }
