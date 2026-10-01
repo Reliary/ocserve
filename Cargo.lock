@@ -975,6 +975,7 @@ dependencies = [
  "refine-http",
  "refine-importer",
  "refine-store",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

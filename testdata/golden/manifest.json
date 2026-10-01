@@ -1,1 +1,130 @@
-{}
+{
+ "agent": {
+  "keys": [
+   "$[].description",
+   "$[].mode",
+   "$[].name",
+   "$[].native",
+   "$[].options",
+   "$[].permission",
+   "$[].permission[].action",
+   "$[].permission[].pattern",
+   "$[].permission[].permission"
+  ],
+  "mode": "keys",
+  "ms": 50,
+  "path": "/agent",
+  "status": 200
+ },
+ "command": {
+  "keys": [
+   "$[].description",
+   "$[].hints",
+   "$[].name",
+   "$[].source",
+   "$[].template"
+  ],
+  "mode": "keys",
+  "ms": 33,
+  "path": "/command",
+  "status": 200
+ },
+ "error_notfound": {
+  "len": 80,
+  "mode": "bytes",
+  "path": "/session/ses_nonexistent",
+  "status": 404
+ },
+ "global_health": {
+  "len": 36,
+  "mode": "bytes",
+  "path": "/global/health",
+  "status": 200
+ },
+ "path": {
+  "keys": [
+   "$.config",
+   "$.directory",
+   "$.home",
+   "$.state",
+   "$.worktree"
+  ],
+  "mode": "keys",
+  "ms": 27,
+  "path": "/path",
+  "status": 200
+ },
+ "project": {
+  "keys": [
+   "$[].id",
+   "$[].sandboxes",
+   "$[].sandboxes[]",
+   "$[].time",
+   "$[].time.created",
+   "$[].time.initialized",
+   "$[].time.updated",
+   "$[].worktree"
+  ],
+  "mode": "keys",
+  "ms": 12,
+  "path": "/project",
+  "status": 200
+ },
+ "project_current": {
+  "keys": [
+   "$.id",
+   "$.sandboxes",
+   "$.sandboxes[]",
+   "$.time",
+   "$.time.created",
+   "$.time.initialized",
+   "$.time.updated",
+   "$.worktree"
+  ],
+  "mode": "keys",
+  "ms": 28,
+  "path": "/project/current",
+  "status": 200
+ },
+ "session_list": {
+  "keys": [
+   "$[].agent",
+   "$[].cost",
+   "$[].directory",
+   "$[].id",
+   "$[].model",
+   "$[].model.id",
+   "$[].model.providerID",
+   "$[].model.variant",
+   "$[].path",
+   "$[].projectID",
+   "$[].slug",
+   "$[].summary",
+   "$[].summary.additions",
+   "$[].summary.deletions",
+   "$[].summary.files",
+   "$[].time",
+   "$[].time.created",
+   "$[].time.updated",
+   "$[].title",
+   "$[].tokens",
+   "$[].tokens.cache",
+   "$[].tokens.cache.read",
+   "$[].tokens.cache.write",
+   "$[].tokens.input",
+   "$[].tokens.output",
+   "$[].tokens.reasoning",
+   "$[].version"
+  ],
+  "mode": "keys",
+  "ms": 53,
+  "path": "/session",
+  "status": 200
+ },
+ "session_status": {
+  "len": 2,
+  "mode": "bytes",
+  "path": "/session/status",
+  "status": 200
+ }
+}

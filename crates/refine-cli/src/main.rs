@@ -39,6 +39,17 @@ enum Cmd {
         #[arg(long)]
         data_dir: Option<std::path::PathBuf>,
     },
+    /// Differential replay of the recorded corpus against a target base URL
+    /// (PLAN §6): --self-test runs against upstream (harness validity),
+    /// otherwise point at refine to check wire compat.
+    Replay {
+        /// e.g. http://127.0.0.1:4901 (upstream) or http://127.0.0.1:4911 (refine)
+        #[arg(long)]
+        target: String,
+        /// tolerate routes the target doesn't implement yet (refine during M1-M3)
+        #[arg(long)]
+        allow_missing: bool,
+    },
 }
 
 fn default_data_dir() -> std::path::PathBuf {
@@ -51,6 +62,8 @@ fn default_data_dir() -> std::path::PathBuf {
             p
         })
 }
+
+mod replay;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -77,6 +90,20 @@ fn main() -> Result<()> {
             limit,
             data_dir,
         } => import(source, limit, data_dir.unwrap_or_else(default_data_dir)),
+        Cmd::Replay {
+            target,
+            allow_missing,
+        } => rt::block_on(async move {
+            let (pass, fail, failures) = replay::replay_all(&target, allow_missing).await?;
+            println!("replay {target}: {pass} passed, {fail} failed");
+            if fail > 0 {
+                for f in &failures {
+                    eprintln!("  {f}");
+                }
+                anyhow::bail!("differential replay failed: {fail} routes");
+            }
+            Ok(())
+        }),
     }
 }
 
