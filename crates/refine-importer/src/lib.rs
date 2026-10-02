@@ -94,6 +94,12 @@ pub fn import_last_n(source: &Path, data_dir: &Path, limit: u32) -> Result<()> {
 
     // M3 payload phase: messages/parts/events + search_doc (streamed)
     let stats = payload::import_payloads(source, &db, &ids)?;
+    {
+        // imported events enter the bounded ring (STORAGE §4)
+        let c = refine_store::pragma::open_writer(&db)?;
+        let pruned = refine_store::enforce_event_retention(&c)?;
+        tracing::info!("event retention enforced at import: {pruned} pruned");
+    }
     println!(
         "payloads: {} messages, {} parts ({} blobbed), {} events, {} search_docs in {}ms; peak RSS {} MB",
         stats.messages,

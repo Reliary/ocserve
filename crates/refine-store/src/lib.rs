@@ -193,7 +193,49 @@ pub fn next_event_seq(db: &std::path::Path, session_id: &str) -> anyhow::Result<
     Ok(seq)
 }
 
-/// Persist a durable event (bounded ring — STORAGE §4 retention applies later).
+/// Ring bound (STORAGE §4): per-session event cap + age window — declared
+/// at the call site (AGENTS §2.3: bounded by construction).
+pub const EVENT_MAX_PER_SESSION: i64 = 200_000;
+pub const EVENT_MAX_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// Enforce the ring bound: keep the newest `max_per_session` rows per
+/// session and drop rows older than `max_age_ms` (explicit `now_ms` for
+/// deterministic tests). Returns rows deleted.
+pub fn prune_events(
+    conn: &rusqlite::Connection,
+    now_ms: i64,
+    max_per_session: i64,
+    max_age_ms: i64,
+) -> anyhow::Result<usize> {
+    let cutoff = now_ms - max_age_ms;
+    conn.execute(
+        "DELETE FROM event WHERE time_created < ?1 AND time_created <> 0",
+        [cutoff],
+    )?;
+    let aged = conn.changes() as usize;
+    let capped = conn.execute(
+        "DELETE FROM event WHERE rowid IN (
+            SELECT rowid FROM (
+                SELECT rowid, ROW_NUMBER() OVER (
+                    PARTITION BY session_id ORDER BY seq DESC
+                ) AS rn FROM event
+            ) WHERE rn > ?1
+        )",
+        [max_per_session],
+    )?;
+    Ok(aged + capped)
+}
+
+/// Retention with the production bounds (boot + import + throttled append).
+pub fn enforce_event_retention(conn: &rusqlite::Connection) -> anyhow::Result<usize> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    prune_events(conn, now, EVENT_MAX_PER_SESSION, EVENT_MAX_AGE_MS)
+}
+
+/// Persist a durable event (ring bound enforced at boot/import/append).
 pub fn append_event(
     writer: &Writer,
     session_id: Option<&str>,
@@ -215,6 +257,29 @@ pub fn append_event(
             now.into(),
         ],
     }])?;
+    // Throttled ring enforcement (STORAGE §4): every 1024th durable write
+    // enqueues the retention deletes — an in-band bound, not a cron hope.
+    static EVENT_PRUNE_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    use std::sync::atomic::Ordering;
+    if EVENT_PRUNE_TICK.fetch_add(1, Ordering::Relaxed) % 1024 == 1023 {
+        writer.write(vec![
+            WriteOp::Sql {
+                sql: "DELETE FROM event WHERE time_created < ?1 AND time_created <> 0".into(),
+                params: vec![(now - EVENT_MAX_AGE_MS).into()],
+            },
+            WriteOp::Sql {
+                sql: "DELETE FROM event WHERE rowid IN (
+                        SELECT rowid FROM (
+                            SELECT rowid, ROW_NUMBER() OVER (
+                                PARTITION BY session_id ORDER BY seq DESC
+                            ) AS rn FROM event
+                        ) WHERE rn > ?1
+                    )"
+                .into(),
+                params: vec![EVENT_MAX_PER_SESSION.into()],
+            },
+        ])?;
+    }
     Ok(())
 }
 
@@ -290,4 +355,15 @@ pub fn load_session_wire(
         }))
     })?;
     Ok(rows.filter_map(|r| r.ok()).next())
+}
+
+/// Online backup (STORAGE §5): `VACUUM INTO` — consistent snapshot, source
+/// untouched; restore = copy back + `PRAGMA integrity_check`.
+pub fn backup_to(conn: &rusqlite::Connection, dest: &std::path::Path) -> anyhow::Result<()> {
+    if dest.exists() {
+        anyhow::bail!("backup destination exists: {}", dest.display());
+    }
+    let sql = format!("VACUUM INTO '{}'", dest.display());
+    conn.execute_batch(&sql)?;
+    Ok(())
 }

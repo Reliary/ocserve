@@ -23,6 +23,11 @@ pub fn boot_checks(data_dir: &std::path::Path) -> Result<()> {
     let db = refine_store::writer::db_path(data_dir);
     let conn = pragma::open_writer(&db).context("open/create database")?;
     refine_store::schema::migrate(&conn).context("schema migrate")?;
+    // 4.5 ring bound enforced at boot (STORAGE §4; AGENTS §2.3)
+    let pruned = refine_store::enforce_event_retention(&conn).context("event retention")?;
+    if pruned > 0 {
+        tracing::info!("event retention at boot: {pruned} rows pruned");
+    }
     // 5. FTS roundtrip on the real DB (catches broken builds — M0 finding)
     conn.execute_batch(
         "INSERT INTO search_doc (id, title, excerpt, updated_at) VALUES (-1, 'boot fts probe', '', 0);
