@@ -943,11 +943,15 @@ async fn post_summarize(
     };
 
     // agent = last user message's agent (v1: findLast user ?? defaultAgent)
-    let history = refine_store::load_messages(&st.db, &sid, None).map_err(|e| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        name: "InternalError",
-        message: format!("{e:#}"),
-    })?;
+    // Compaction reads the FULL history by design (upstream summarize does
+    // the same via session.messages()); bounded by session size, identical
+    // to upstream. The rule stays armed for routes serving lists/pages.
+    let history = refine_store::load_messages(&st.db, &sid, None) // allow:load_messages (summarize compaction)
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("{e:#}"),
+        })?;
     let agent = history
         .iter()
         .rev()

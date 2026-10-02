@@ -1,0 +1,57 @@
+# Parity harness: upstream opencode 1.18.31 vs refine, identical workloads.
+# Ports published on loopback only; live services (:4901/:4912) untouched.
+# Round data lives under ./.runs/$ROUND (fresh per round, wiped by run.sh).
+name: parity
+
+x-shared: &shared
+  restart: "no"
+  networks: [parity]
+  # identical fixtures for both arms — dummy key, no plugins/mcp, stub default
+  volumes:
+    - ./config/opencode.json:/root/.config/opencode/opencode.json:ro
+    - ./config/auth.json:/root/.local/share/opencode/auth.json:ro
+    - ./config/model.json:/root/.local/state/opencode/model.json:ro
+
+services:
+  stub:
+    build:
+      context: .
+      dockerfile: Dockerfile.stub
+    environment:
+      STUB_TOK_PER_SEC: ${STUB_TOK_PER_SEC:-120}
+    ports:
+      - "127.0.0.1:18090:8080"   # /_stats + raw-framing probes from host
+    networks: [parity]
+    restart: "no"
+
+  upstream:
+    build:
+      context: .
+      dockerfile: Dockerfile.upstream
+    <<: *shared
+    ports:
+      - "127.0.0.1:4921:4921"
+    volumes:
+      - ./config/opencode.json:/root/.config/opencode/opencode.json:ro
+      - ./config/auth.json:/root/.local/share/opencode/auth.json:ro
+      - ./config/model.json:/root/.local/state/opencode/model.json:ro
+      - ./.runs/${ROUND:?round required}/upstream:/root/.local/share/opencode
+
+  refine:
+    build:
+      context: ../..
+      dockerfile: bench/parity/Dockerfile.refine
+    <<: *shared
+    environment:
+      REFINE_LEGACY_SYNC: "0"
+    ports:
+      - "127.0.0.1:4922:4922"
+    volumes:
+      - ./config/opencode.json:/root/.config/opencode/opencode.json:ro
+      - ./config/auth.json:/root/.local/share/opencode/auth.json:ro
+      - ./config/model.json:/root/.local/state/opencode/model.json:ro
+      - ./.runs/${ROUND:?round required}/refine:/data
+
+networks:
+  parity:
+    driver: bridge

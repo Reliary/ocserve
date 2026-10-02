@@ -29,7 +29,9 @@ else
 fi
 
 echo "== guard: HTTP must stream messages (no load_messages) =="
-if out=$(grep -rn --include='*.rs' 'load_messages(' crates/refine-http/src 2>/dev/null); then
+# Named exceptions: lines carrying the marker 'allow:load_messages' are
+# documented full-reads (post_summarize compaction — upstream does the same)
+if out=$(grep -rn --include='*.rs' 'load_messages(' crates/refine-http/src 2>/dev/null | grep -v 'allow:load_messages'); then
   echo "$out"; echo "FAIL: load_messages in HTTP materializes whole sessions (OOM class) — use for_each_message_json"; fail=1
 else
   echo "ok"
