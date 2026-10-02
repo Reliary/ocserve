@@ -13,9 +13,9 @@ milestone).
 
 | Req | Requirement | Tests | Status |
 |---|---|---|---|
-| F1 | Drop-in: both frozen clients work unchanged (PLAN §3) | `golden::*` (byte-compat), `replay` self-test vs upstream | partial — TUI attach + oc-remote flows land M1/M2 (TESTING §8) |
+| F1 | Drop-in: both frozen clients work unchanged (PLAN §3) | `golden::*`, `replay` 24/24 with 7 declared deferrals (M2/M4), live TUI attach 12 s zero-error run, `auth_metrics::*` | partial — oc-remote device run pending (wire contract validated by replay) |
 | F2 | Plugin + MCP compatibility (3+3) | — | planned — M4 (TESTING §8) |
-| F3 | Import 20 sessions, original untouched (PLAN §9) | — | planned — M3 |
+| F3 | Import 20 sessions, original untouched (PLAN §9) | metadata pass live-tested (20 rows, ro+query_only, original untouched); payload streaming + hash equality — M3 | partial |
 | F4 | Pure Rust request path (PLAN §2) | (architecture; no runtime Node/Bun in workspace deps — `cargo tree` audit planned M2) | partial |
 | F5 | Low maintenance vs upstream drift (PLAN §8) | `replay::replay_all` self-test (9/9 vs upstream 1.18.31) | partial — drift watch nightly is M5 |
 | F6 | v1 wire compatibility only (PLAN §11) | `golden::sse_first_frame_matches_upstream`, `golden::notfound_envelope_matches_upstream` | green |
@@ -36,7 +36,7 @@ milestone).
 
 | ID | Kill criterion | Tests | Status |
 |---|---|---|---|
-| K-SSE-BYTES | raw SSE frames+headers byte-golden; no `id:`/`retry:`; 10 s heartbeat | `golden::sse_headers_match_freeze`, `golden::sse_first_frame_matches_upstream` | green (first frame; heartbeat cadence M1 — needs 10 s wait test) |
+| K-SSE-BYTES | raw SSE frames+headers byte-golden; no `id:`/`retry:`; 10 s heartbeat | `golden::sse_headers_match_freeze`, `golden::sse_first_frame_matches_upstream` | green (headers, first frame, 10 s heartbeat cadence via paused-time `heartbeat_cadence_and_shape`) |
 | K-ENVELOPE | P0 route schema/status identical to upstream | `golden::health_bytes_match_upstream`, `golden::notfound_envelope_matches_upstream`, `golden::session_status_bytes_match_upstream`, `refine replay --allow-missing` (3 pass/4 skip/2 data-gap) | partial — grows per M1-M3 route work |
 | K-CRASH | SIGKILL blob/DB protocol: quick_check, zero dangling refs | `crash_fuzz::sigkill_fuzz_blob_db_protocol` (25 iters CI; 1000 nightly per SRE §5) | green |
 | K-CACHE | aggregate page cache ≤32 MB declared+enforced | `cache_fixture` (budget arithmetic, profile asserts) | green |
