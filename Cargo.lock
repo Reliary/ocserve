@@ -1083,6 +1083,7 @@ dependencies = [
  "refine-http",
  "refine-importer",
  "refine-mcp",
+ "refine-plugin",
  "refine-store",
  "reqwest",
  "rusqlite",
@@ -1106,6 +1107,7 @@ dependencies = [
  "parking_lot",
  "refine-llm",
  "refine-mcp",
+ "refine-plugin",
  "refine-store",
  "refine-tools",
  "serde",
@@ -1132,6 +1134,7 @@ dependencies = [
  "refine-core",
  "refine-llm",
  "refine-mcp",
+ "refine-plugin",
  "refine-store",
  "refine-tools",
  "reqwest",
@@ -1195,9 +1198,12 @@ name = "refine-plugin"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "parking_lot",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 

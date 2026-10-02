@@ -45,6 +45,8 @@ pub struct PromptContext {
     pub gate: Arc<PermissionGate>,
     /// MCP hub (M4a): namespaced tools merged into the provider tool list.
     pub mcp: Option<Arc<refine_mcp::McpHub>>,
+    /// Plugin sidecar (M4b): hook dispatch (v1 names, e.g. tool.execute.after).
+    pub plugins: Option<Arc<tokio::sync::Mutex<refine_plugin::Sidecar>>>,
 }
 
 fn now_ms() -> i64 {
@@ -494,6 +496,29 @@ pub async fn run_prompt(
                 });
                 // metadata.output mirrors output (capture fact)
                 running["state"]["metadata"]["output"] = running["state"]["output"].clone();
+                // v1 hook: tool.execute.after (sequential in-host; failures are
+                // logged host-side, never block the tool result — M4b)
+                if let Some(plug) = &ctx.plugins {
+                    let hook_in = json!({
+                        "sessionID": session_id,
+                        "messageID": assistant_id,
+                        "callID": call.id,
+                        "tool": call.name,
+                        "agent": agent,
+                        "modelID": model,
+                        "args": serde_json::from_str::<Value>(&call.arguments)
+                            .unwrap_or_else(|_| json!({})),
+                        "session": {"id": session_id},
+                    });
+                    let mut guard = plug.lock().await;
+                    match guard
+                        .trigger("tool.execute.after", hook_in, json!({"output": output}))
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("plugin tool.execute.after: {e:#}"),
+                    }
+                }
                 emit_durable(
                     ctx,
                     writer,

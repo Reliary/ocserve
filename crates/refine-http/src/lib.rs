@@ -125,6 +125,8 @@ pub struct AppState {
     pub gate: std::sync::Arc<refine_core::PermissionGate>,
     /// MCP hub probed at serve boot (OnceLock: tests run without probing).
     pub mcp: std::sync::OnceLock<std::sync::Arc<refine_mcp::McpHub>>,
+    /// Plugin sidecar (M4b): async mutex — trigger() takes &mut across await.
+    pub plugins: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<refine_plugin::Sidecar>>>,
 }
 
 /// LLM endpoint resolution for the prompt runner (assembled by Runtime).
@@ -218,6 +220,7 @@ impl AppState {
             bus: refine_core::EventBus::new(),
             gate: refine_core::PermissionGate::new(),
             mcp: std::sync::OnceLock::new(),
+            plugins: std::sync::OnceLock::new(),
             db: w.db,
             blobs: w.blobs,
             writer: w.writer,
@@ -720,6 +723,7 @@ async fn post_message(
         rules,
         gate: st.gate.clone(),
         mcp: st.mcp.get().cloned(),
+        plugins: st.plugins.get().cloned(),
     };
     let writer = st.writer.clone();
     let result = refine_core::prompt::run_prompt(&ctx, &writer, &id, &payload)

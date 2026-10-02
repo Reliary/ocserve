@@ -136,6 +136,16 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     // M4a: probe MCP servers before serving (statuses captured, never fatal)
     let mcp_cfgs =
         refine_mcp::parse_config(rt.config.get("mcp").unwrap_or(&serde_json::Value::Null));
+    let plugin_specs: Vec<String> = rt
+        .config
+        .get("plugin")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
     let llm = rt.llm_registry();
     let payloads = refine_http::Payloads {
         config: rt.config,
@@ -167,7 +177,47 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     let hub = refine_mcp::McpHub::probe_all(&mcp_cfgs).await;
     tracing::info!("mcp probe: {}", hub.statuses());
     let _ = state.mcp.set(std::sync::Arc::new(hub));
-    let app = refine_http::router(state);
+
+    // M4b: plugin sidecar — materialize host, spawn Node, load configured
+    // plugins (statuses logged like /mcp; load failures never block serving)
+    let mut plugin_sidecar: Option<refine_plugin::Sidecar> = None;
+    if !plugin_specs.is_empty() {
+        let host = refine_plugin::materialize_host(&data_dir.join("plugin-host"))
+            .context("materialize plugin host")?;
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()));
+        let server_url = format!("http://{hostname}:{port}");
+        let directory = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "/".into());
+        match refine_plugin::Sidecar::spawn(&host, &server_url, &directory).await {
+            Ok(mut sc) => {
+                let input = serde_json::json!({
+                    "directory": directory,
+                    "projectID": "global",
+                    "worktree": "/",
+                    "serverUrl": server_url,
+                });
+                for spec in &plugin_specs {
+                    match refine_plugin::resolve_entry(spec, &home) {
+                        Ok(entry) => match sc.load(spec, &entry, &input).await {
+                            Ok(hooks) => tracing::info!("plugin {spec} loaded: {hooks:?}"),
+                            Err(e) => tracing::warn!("plugin {spec} load failed: {e:#}"),
+                        },
+                        Err(e) => tracing::warn!("plugin {spec} resolve failed: {e:#}"),
+                    }
+                }
+                tracing::info!("plugin statuses: {}", sc.statuses());
+                plugin_sidecar = Some(sc);
+            }
+            Err(e) => tracing::error!("plugin sidecar spawn failed: {e:#}"),
+        }
+    }
+    if let Some(sc) = plugin_sidecar {
+        let _ = state
+            .plugins
+            .set(std::sync::Arc::new(tokio::sync::Mutex::new(sc)));
+    }
+    let app = refine_http::router(state.clone());
 
     let addr = format!("{hostname}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -178,6 +228,10 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    if let Some(plug) = state.plugins.get() {
+        plug.lock().await.shutdown().await;
+        tracing::info!("plugin sidecar disposed");
+    }
     Ok(())
 }
 
