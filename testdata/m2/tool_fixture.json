@@ -1,0 +1,217 @@
+{
+ "session": {
+  "id": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+  "slug": "mighty-river",
+  "projectID": "global",
+  "directory": "<HOMEPATH>",
+  "path": "home/user",
+  "cost": 0,
+  "tokens": {
+   "input": 0,
+   "output": 0,
+   "reasoning": 0,
+   "cache": {
+    "read": 0,
+    "write": 0
+   }
+  },
+  "title": "tool-shape-probe",
+  "version": "1.18.31",
+  "time": {
+   "created": 1790905356953,
+   "updated": 1790905356953
+  }
+ },
+ "messages": [
+  {
+   "info": {
+    "id": "msg_0fa4712af001cfaoPgl4FbqQsX",
+    "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+    "role": "user",
+    "time": {
+     "created": 1790905356975
+    },
+    "summary": {
+     "diffs": []
+    },
+    "agent": "plan",
+    "model": {
+     "providerID": "opencode-go",
+     "modelID": "deepseek-v4-flash"
+    }
+   },
+   "parts": [
+    {
+     "id": "prt_0fa4712b7001pQLJxGJmZ7vjVh",
+     "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+     "messageID": "msg_0fa4712af001cfaoPgl4FbqQsX",
+     "type": "text",
+     "text": "Run `echo TOOL_OK` with the bash tool, then reply with the output you saw. You must use the bash tool."
+    }
+   ]
+  },
+  {
+   "info": {
+    "id": "msg_0fa471325001oGI2F5v1qfV2Bs",
+    "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+    "role": "assistant",
+    "time": {
+     "created": 1790905357093,
+     "completed": 1790905359513
+    },
+    "parentID": "msg_0fa4712af001cfaoPgl4FbqQsX",
+    "modelID": "deepseek-v4-flash",
+    "providerID": "opencode-go",
+    "mode": "plan",
+    "agent": "plan",
+    "path": {
+     "cwd": "<HOMEPATH>",
+     "root": "/"
+    },
+    "cost": 0.004047876,
+    "tokens": {
+     "total": 28286,
+     "input": 26342,
+     "output": 152,
+     "reasoning": 0,
+     "cache": {
+      "read": 1792,
+      "write": 0
+     }
+    },
+    "finish": "tool-calls"
+   },
+   "parts": [
+    {
+     "id": "prt_0fa471a6c001rJ5mf5JeHxQntp",
+     "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+     "messageID": "msg_0fa471325001oGI2F5v1qfV2Bs",
+     "type": "step-start"
+    },
+    {
+     "id": "prt_0fa471a82001l4z0kQBD5jMoID",
+     "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+     "messageID": "msg_0fa471325001oGI2F5v1qfV2Bs",
+     "type": "reasoning",
+     "text": "The user asked me to run `echo TOOL_OK` with the bash tool. But there's a plan mode system reminder that says I'm in read-only phase and cannot modify files. However, running `echo TOOL_OK` is a read-only operation - it just prints text, it doesn't modify anything. The plan mode says commands may ONLY read/inspect. `echo TOOL_OK` doesn't modify anything, it's just printing to stdout.\n\nThis is a simple verification request. Let me run it.",
+     "time": {
+      "start": 1790905358978,
+      "end": 1790905359255
+     }
+    },
+    {
+     "id": "prt_0fa471b9f001whGT6tORio5xxN",
+     "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+     "messageID": "msg_0fa471325001oGI2F5v1qfV2Bs",
+     "type": "tool",
+     "callID": "call_e6995cbecb9745e290f8518d",
+     "tool": "bash",
+     "state": {
+      "status": "completed",
+      "input": {
+       "command": "echo TOOL_OK"
+      },
+      "output": "TOOL_OK\n",
+      "title": "echo TOOL_OK",
+      "metadata": {
+       "output": "TOOL_OK\n",
+       "exit": 0,
+       "truncated": false
+      },
+      "time": {
+       "start": 1790905359283,
+       "end": 1790905359414
+      }
+     }
+    },
+    {
+     "id": "prt_0fa471c3c001UE5kM5sV2Axxxn",
+     "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+     "messageID": "msg_0fa471325001oGI2F5v1qfV2Bs",
+     "type": "step-finish",
+     "reason": "tool-calls",
+     "cost": 0.004047876,
+     "tokens": {
+      "total": 28286,
+      "input": 26342,
+      "output": 152,
+      "reasoning": 0,
+      "cache": {
+       "read": 1792,
+       "write": 0
+      }
+     }
+    }
+   ]
+  },
+  {
+   "info": {
+    "id": "msg_0fa471ce9002WfpWXTmlP2T5Zt",
+    "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+    "role": "assistant",
+    "time": {
+     "created": 1790905359594,
+     "completed": 1790905360912
+    },
+    "parentID": "msg_0fa4712af001cfaoPgl4FbqQsX",
+    "modelID": "deepseek-v4-flash",
+    "providerID": "opencode-go",
+    "mode": "plan",
+    "agent": "plan",
+    "path": {
+     "cwd": "<HOMEPATH>",
+     "root": "/"
+    },
+    "cost": 0.00010908,
+    "tokens": {
+     "total": 28309,
+     "input": 144,
+     "output": 5,
+     "reasoning": 0,
+     "cache": {
+      "read": 28160,
+      "write": 0
+     }
+    },
+    "finish": "stop"
+   },
+   "parts": [
+    {
+     "id": "prt_0fa4721b20017QuFJiU5HdHZvg",
+     "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+     "messageID": "msg_0fa471ce9002WfpWXTmlP2T5Zt",
+     "type": "step-start"
+    },
+    {
+     "id": "prt_0fa4721c0001GYM40tNWAV4fSi",
+     "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+     "messageID": "msg_0fa471ce9002WfpWXTmlP2T5Zt",
+     "type": "text",
+     "text": "TOOL_OK",
+     "time": {
+      "start": 1790905360832,
+      "end": 1790905360838
+     }
+    },
+    {
+     "id": "prt_0fa4721cb001n9Z3OnzeamZ4yK",
+     "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+     "messageID": "msg_0fa471ce9002WfpWXTmlP2T5Zt",
+     "type": "step-finish",
+     "reason": "stop",
+     "cost": 0.00010908,
+     "tokens": {
+      "total": 28309,
+      "input": 144,
+      "output": 5,
+      "reasoning": 0,
+      "cache": {
+       "read": 28160,
+       "write": 0
+      }
+     }
+    }
+   ]
+  }
+ ]
+}
