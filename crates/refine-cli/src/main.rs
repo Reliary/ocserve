@@ -151,6 +151,29 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     // Assemble config-derived payloads (fail fast if config unreadable)
     let rt = runtime::Runtime::load_for(&data_dir)
         .context("load runtime config (opencode.json/auth/models cache)")?;
+    // W6: dead default model = the ox-alpha lesson automated — warn when a
+    // configured default isn't in its provider's model catalog (the prompt
+    // would fail with ProviderModelNotFoundError at send time)
+    if let Some(defaults) = rt
+        .config_providers
+        .get("default")
+        .and_then(|d| d.as_object())
+    {
+        for (pid, model) in defaults {
+            let mid = model.as_str().unwrap_or_default();
+            let known = rt
+                .config_providers
+                .pointer(&format!("/providers/{pid}/models"))
+                .and_then(|m| m.as_object())
+                .map(|m| m.contains_key(mid))
+                .unwrap_or(false);
+            if !mid.is_empty() && !known {
+                tracing::warn!(
+                    "default model {pid}/{mid} is NOT in the provider catalog — prompts will fail at send time (update the default or the cache)"
+                );
+            }
+        }
+    }
     // M4a: probe MCP servers before serving (statuses captured, never fatal)
     let mcp_cfgs =
         refine_mcp::parse_config(rt.config.get("mcp").unwrap_or(&serde_json::Value::Null));
@@ -185,6 +208,22 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
         }
         Err(e) => {
             tracing::warn!("search backfill failed (search incomplete until next boot): {e:#}")
+        }
+    }
+    // W6: search parity gauge (part rows vs projection) — mismatch after
+    // backfill = indexed drift worth seeing on /metrics
+    if let Ok(conn) = refine_store::pragma::open_reader(&db_path) {
+        let parts: i64 = conn
+            .query_row("SELECT count(*) FROM msg_part", [], |r| r.get(0))
+            .unwrap_or(-1);
+        let indexed: i64 = conn
+            .query_row("SELECT count(*) FROM part_search", [], |r| r.get(0))
+            .unwrap_or(-1);
+        refine_metrics::gauge("refine_search_indexed_rows", indexed.max(0));
+        if parts >= 0 && indexed >= 0 && indexed != parts {
+            tracing::warn!(
+                "search index parity drift: {indexed}/{parts} parts indexed (backfill next boot)"
+            );
         }
     }
     let state = AppState::with_wiring(
@@ -462,6 +501,26 @@ fn doctor(data_dir: std::path::PathBuf) -> Result<()> {
                     Ok(r) if r == "ok" => println!("  quick_check:     ok"),
                     Ok(r) => println!("  quick_check:     {r}"),
                     Err(e) => println!("  quick_check:     FAIL: {e}"),
+                }
+                // W6: search index parity + trigram smoke
+                let sp: i64 = conn
+                    .query_row("SELECT count(*) FROM msg_part", [], |r| r.get(0))
+                    .unwrap_or(-1);
+                let si: i64 = conn
+                    .query_row("SELECT count(*) FROM part_search", [], |r| r.get(0))
+                    .unwrap_or(-1);
+                if sp == si {
+                    println!("  search parity:   ok ({si} rows)");
+                } else {
+                    println!("  search parity:   DRIFT {si}/{sp} (boot backfill repairs)");
+                }
+                match conn.query_row(
+                    "SELECT count(*) FROM part_search_fts WHERE part_search_fts MATCH '\"idx\"'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                ) {
+                    Ok(n) => println!("  trigram MATCH:   ok ({n} rows contain 'idx')"),
+                    Err(e) => println!("  trigram MATCH:   FAIL: {e}"),
                 }
             }
             Err(e) => println!("  open:            FAIL: {e:#}"),
