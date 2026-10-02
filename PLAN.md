@@ -210,11 +210,27 @@ magic-context (`chat.message`, `tool.execute.after`, `experimental.chat.messages
 `experimental.chat.system.transform`, `experimental.text.complete`), reliary8 (`tool.execute.after`).
 Auth plugins: out (user decision). Dispatcher nevertheless carries the full upstream name table (§3).
 
-1. Install time: esbuild bundle per plugin (cached; never in request path).
-2. Runtime: rquickjs isolate per plugin, `set_memory_limit(8 MB)`, 30 s hook deadline,
-   shims for `node:fs`/`node:sqlite`→host functions; hook overrun kills hook, not process.
+1. ~~Install time: esbuild bundle per plugin~~ — **superseded by gate result below**.
+2. ~~rquickjs isolate per plugin~~ — **quickjs rejected at the gate on measured evidence**
+   (import audit of the frozen artifacts: `bun:sqlite`, `child_process`, `node:fs/crypto/url`,
+   better-sqlite3/bun-branch detection, TTY UI modules → a dozen shims plus a *synchronous*
+   SQLite bridge = deadlock-prone). Rejected before any rquickjs code was written.
 3. State under `~/.local/share/refine/plugin/{name}/`.
-4. **Falsifiable gate**: three plugins behave identically on recorded transcripts, restart
+4. **Gate result (M4b, 2026-10)**: Node v25 sidecar (bun is not installed on this host;
+   Node is, with `node:sqlite`) — NDJSON JSON-RPC over stdio, host files materialized next
+   to the data dir, plugin chatter forced to stderr so framing cannot corrupt, RPC deadline
+   30 s, declared *outside* refine's 300 MB budget with child RSS scraped into metrics
+   (≤80 MB target). Extraction chain ported from `readV1Plugin`+`getLegacyPlugins`
+   (PluginModule.server → default object.server → default fn → named fn exports); hook
+   semantics = v1 sequential `fn(input, output)` mutation; `bun:sqlite` satisfied by a
+   node:sqlite shim on both the ESM import path (module.register resolver) and the CJS
+   require path (`Module._resolveFilename`), with a truthy `globalThis.Bun` marker so
+   plugins take their bun branches. Falsifiable acceptance: synthetic-plugin roundtrip
+   tests + live: 4/5 configured plugins load (gemini-auth ships a raw `.ts` entry —
+   Bun-only, user-declared unused, fails with a clear error), and
+   `trigger tool.execute.after: 3 hook(s)` proven in the server log on a real write prompt.
+   Remaining gate items: recorded-transcript behavioral parity + restart-state preservation
+   (M5 soak).
    preserves state; else Bun sidecar fallback (JSON-RPC over unix socket, ≤80 MB, declared
    outside the 300 MB budget but scraped into metrics).
 5. MCP: stdio + StreamableHTTP + legacy SSE; tools/resources/prompts; change notifications;

@@ -1,7 +1,7 @@
 # refine — memory management spec ("so lightweight")
 
 Companion to `PLAN.md`. Hard contract: **RSS < 300 MB steady-state (refine process only;
-+80 MB if the Bun plugin sidecar fallback is active — declared boundary, both measured),
++80 MB if the Node plugin sidecar is active — declared boundary, both measured),
 zero swap growth over 24 h**.
 
 ## 1. Reconciled budget (fixes the fatal cache×pool arithmetic)
@@ -16,14 +16,15 @@ that alone exceeds the entire budget. Corrected line items:
 | tokio: 8 workers × 1 MB stacks + blocking pool 8 × 1 MB | 16 MB | `thread_stack_size(1MB)`, `max_blocking_threads(8)` |
 | hyper/reqwest/rustls: ≤16 pooled conns | 12 MB | `pool_max_idle_per_host(4)`, `pool_idle_timeout`, global conn semaphore |
 | SSE fanout: bounded per-subscriber ring (4096 events × ~300 B avg) + disk spill pointer | 2 MB | `broadcast` capacity bound; overflow policy below |
-| rquickjs: 3 isolates × 8 MB heap cap + stack caps | 30 MB | `set_memory_limit(8MB)`, `set_max_stack_size`; hook overruns kill the hook, not the process |
+| ~~rquickjs isolates~~ → **rejected at gate** (PLAN §10 gate result); Node sidecar lives *outside* this budget | 0 MB | child RSS scraped via `rss_bytes{component="sidecar"}` (≤80 MB target) |
 | zstd/sha256/import chunk buffers (≤1 MB × 2 concurrent) | 12 MB | fixed-size buffer pool, `BytesMut` reuse |
 | Allocator retention headroom (mimalloc purge) | 25 MB | `MIMALLOC_PURGE_DELAY=500` |
 | **Unallocated headroom** | **~146 MB** | absorbs spikes; soak asserts the *slope*, not the peak |
 | **Total** | **300 MB** | |
 
-Bun sidecar (if fallback engages): declared *outside* refine's 300 MB (system total ~380 MB);
-`rss_bytes{component="sidecar"}` scraped from the child so the combined number is still visible.
+Node plugin sidecar (PLAN §10 gate result — quickjs rejected on import audit): declared
+*outside* refine's 300 MB (system total target ≤380 MB); `rss_bytes{component="sidecar"}`
+scraped from the child so the combined number is still visible.
 
 ## 2. Global allocator
 
