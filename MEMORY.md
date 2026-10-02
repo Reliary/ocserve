@@ -30,6 +30,11 @@ interval so the combined number is always visible.
 baseline 40 MB (`--max-old-space-size=64 --max-semi-space-size=2`, isolated probes:
 context-mode 59 MB, reliary8 54 MB alone) → **146 MB combined sidecar steady-state**,
 uncapped same configuration was 148 MB (the heap cap contains growth, not baseline).
+Live cgroup series under load (release build, systemd unit): **steady 341-347 MB**
+(refine + sidecar together). A first-run long generation burst tripped a 480M cap →
+systemd oom-kill → clean restart; the unit cap was raised to **600M** with the
+margin documented in `deploy/refine.service` (fail-fast worked; the cap was tight
+for allocator page retention during delta bursts).
 The original ≤80 MB target is **not achievable with these artifacts** on any single
 node process; boundary set to measured + headroom: sidecar **hard cap 160 MB** (systemd
 `MemoryMax` in the unit), combined refine+sidecar budget **460 MB**. Any future plugin
