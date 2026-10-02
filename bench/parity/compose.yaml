@@ -19,6 +19,7 @@ services:
       dockerfile: Dockerfile.stub
     environment:
       STUB_TOK_PER_SEC: ${STUB_TOK_PER_SEC:-120}
+      STUB_FORCE_WORDS: ${STUB_FORCE_WORDS:-}
     ports:
       - "127.0.0.1:18090:8080"   # /_stats + raw-framing probes from host
     networks: [parity]
@@ -44,6 +45,9 @@ services:
     <<: *shared
     environment:
       REFINE_LEGACY_SYNC: "0"
+      # S5 storm: byte budget tunable so reachable event volumes can force
+      # eviction/lag (default stays32MB — see refine-core event.rs)
+      REFINE_EVENT_RING_MB: ${REFINE_EVENT_RING_MB:-32}
     ports:
       - "127.0.0.1:4922:4922"
     volumes:

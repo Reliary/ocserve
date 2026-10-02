@@ -2523,10 +2523,7 @@ async fn global_event(State(st): State<Arc<AppState>>) -> Response {
                     match tokio::time::timeout(dur.max(Duration::from_millis(1)), rx.recv()).await {
                         Ok(Ok(frame)) => {
                             refine_metrics::counter("refine_sse_events_total", 1);
-                            Some((
-                                Ok(Event::default().data(frame.to_string())),
-                                (rx, next_hb, bus, guard),
-                            ))
+                            Some((Ok(Event::default().data(&frame)), (rx, next_hb, bus, guard)))
                         }
                         Ok(Err(_lagged_or_closed)) => {
                             refine_metrics::labeled_counter(

@@ -56,7 +56,11 @@ def main():
         print("no results under .runs/", file=sys.stderr)
         sys.exit(1)
     rounds = sorted({r for r, _ in runs})
-    measured = [r for r in rounds if not r.startswith("warm")]
+    # storm rounds (s5*) carry STUB_FORCE_WORDS/REFINE_EVENT_RING_MB env —
+    # they must NOT contaminate the perf medians (S1 latencies there are
+    # artificially big by design); they feed the S5 section only
+    measured = [r for r in rounds
+                if not r.startswith("warm") and not r.startswith("s5")]
     warmups = [r for r in rounds if r.startswith("warm")]
     arms = ["upstream", "refine"]
 
@@ -186,6 +190,64 @@ def main():
     lines.append("")
 
     # errors + resource samples
+    # ---- S5 connection storm ----
+    storm_runs = [(r, arm) for (r, arm), d in sorted(runs.items())
+                  if "S5" in d.get("scenarios", {})]
+    if storm_runs:
+        lines.append("## S5 connection storm (stalled + slow + live SSE readers, big frames)\n")
+        lines.append("Factual booleans (no thresholds): lag/evicted fired, sockets "
+                     "returned to baseline, handshakes all landed, healthy readers "
+                     "received frames. Curve = anon bytes at phase marks.\n")
+        lines.append("| metric | " + " | ".join(f"{r}/{arm}" for r, arm in storm_runs) + " |")
+        lines.append("|---" * (1 + len(storm_runs)) + "|")
+
+        def s5get(d, path):
+            cur = d.get("scenarios", {}).get("S5", {})
+            for k in path:
+                if not isinstance(cur, dict):
+                    return None
+                cur = cur.get(k)
+            return cur
+
+        def b2s(v):
+            return "✅" if v else ("❌" if v is False else "—")
+
+        rows = [
+            ("sockets before→after",
+             lambda d: f"{s5get(d, ['sockets_before'])}→{s5get(d, ['sockets_after'])} "
+                       f"{b2s(s5get(d, ['assert_sockets_clean']))}"),
+            ("ring lag Δ (slow readers)",
+             lambda d: s5get(d, ["ring_lag_delta"])),
+            ("ring evicted Δ",
+             lambda d: s5get(d, ["ring_evicted_delta"])),
+            ("evict|lag fired",
+             lambda d: b2s(s5get(d, ["assert_lag_or_evict_fired"]))),
+            ("handshakes (L/S/X)",
+             lambda d: str(s5get(d, ["handshakes"]))),
+            ("frames seen by readers",
+             lambda d: s5get(d, ["frames_seen_by_readers"])),
+            ("storm writes / p95 (s)",
+             lambda d: f"{s5get(d, ['storm_writes'])} / {s5get(d, ['storm_latency', 'p95'])}"),
+            ("ring bytes A→B→C",
+             lambda d: "→".join(str(s5get(d, [k, "refine_event_ring_bytes"]))
+                                for k in ("metrics_phase_a", "metrics_phase_b", "metrics_phase_c"))),
+            ("anon curve start→A→B→C (MB)",
+             lambda d: "→".join(
+                 str(round(v / 1e6, 1)) if (v := s5get(d, ["anon_curve", k])) else "—"
+                 for k in ("t_start", "t_phaseA_end", "t_phaseB_end", "t_phaseC_end"))),
+            ("reader errors",
+             lambda d: s5get(d, ["reader_errors"]) or "none"),
+        ]
+        for label, getter in rows:
+            vals = []
+            for r, arm in storm_runs:
+                try:
+                    vals.append(str(getter(runs[(r, arm)])))
+                except Exception:
+                    vals.append("—")
+            lines.append(f"| {label} | " + " | ".join(vals) + " |")
+        lines.append("")
+
     lines.append("## Errors & resource samples\n")
     for (r, arm), d in sorted(runs.items()):
         errs = d.get("errors", [])

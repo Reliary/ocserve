@@ -59,7 +59,8 @@ def user_text(messages):
 
 def derive(text):
     digest = hashlib.sha256(text.encode("utf-8", "replace")).digest()
-    n_words = 90 + digest[0]  # 90..145 words, same for both arms
+    force = os.environ.get("STUB_FORCE_WORDS", "")
+    n_words = int(force) if force.isdigit() else 90 + digest[0]  # 90..145 words
     words = [POOL[digest[i % len(digest)] % len(POOL)] for i in range(n_words)]
     # embed the short hash so logs/smoke can cross-check both arms
     words[0] = digest.hex()[:8]

@@ -54,6 +54,28 @@ is the recorded fallback. `resources.source` says which was used — never
 silently mixed. `anon` is the true footprint (file-backed cache is counted
 in `current` but is reclaimable).
 
+## S5: connection storm (`STORM=1 ./run.sh`)
+
+Models the multi-connection OOM shape (several oc-remote clients + TUI):
+`S5_LIVE=4` readers that drain, `S5_SLOW=2` reading one line/5s,
+`S5_STALLED=2` that complete the handshake and never read again (TCP
+backpressure parks the server's writer — the backgrounded-phone case).
+Phases:60s subscribers-only → sustained prompt writes (big stub frames via
+`STUB_FORCE_WORDS=20000`, `STUB_TOK_PER_SEC=6000`; ring budget forced to
+4MB via `REFINE_EVENT_RING_MB=4` so eviction/lag occur at reachable event
+volumes) →60s settle. Storm rounds are tagged `s5*` and **excluded from
+the perf medians** (their S1 latencies are artificially large by design).
+
+Report section records facts, not thresholds: ring lag/evicted deltas,
+sockets before→after, handshakes, frames healthy readers saw, anon curve
+at phase marks, storm write p95, ring-bytes A→B→C.
+
+Mechanism note: upstream gives every `/event` subscriber an **unbounded
+queue** (`event.ts:25` `Queue.unbounded` + `offerUnsafe`) — a stalled
+client grows memory forever. refine's bus is one shared ring bounded by
+**count and bytes** (worst = max(32MB, largest frame)); lagging receivers
+get `Lagged` → disconnect; publishers never block.
+
 ## Methodology rules
 
 - A metric that did not run is `null`/`—`, never `0` (decidability rule from

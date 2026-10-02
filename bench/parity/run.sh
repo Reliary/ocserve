@@ -46,13 +46,30 @@ fi
 
 docker compose -f compose.yaml down >/dev/null 2>&1 || true   # clear stale stacks
 
+# ---------- storm mode (S5): refine-first connection-storm rounds ----------
+# STORM=1 ./run.sh → rounds tagged s5* (excluded from perf medians): big stub
+# frames + small ring budget force eviction/lag at reachable event volumes.
+# arms = refine only unless STORM_UPSTREAM=1; warmup off by default.
+if [ "${STORM:-0}" = "1" ]; then
+    export S5_SECONDS="${S5_SECONDS:-300}"
+    export STUB_FORCE_WORDS="${STUB_FORCE_WORDS:-20000}"
+    export STUB_TOK_PER_SEC="${STUB_TOK_PER_SEC:-6000}"
+    export REFINE_EVENT_RING_MB="${REFINE_EVENT_RING_MB:-4}"
+    if [ "${STORM_UPSTREAM:-0}" = "1" ]; then ARMS="upstream refine"; else ARMS="refine"; fi
+    WARMUP="${WARMUP:-0}"
+else
+    ARMS="upstream refine"
+fi
+
 # ---------- runs ----------
 seq_pairs=()
+prefix="m"
+if [ "${STORM:-0}" = "1" ]; then prefix="s5m"; fi
 if [ "${WARMUP:-1}" = "1" ]; then seq_pairs+=(warm); fi
-for i in $(seq 1 "$ROUNDS"); do seq_pairs+=("m$i"); done
+for i in $(seq 1 "$ROUNDS"); do seq_pairs+=("${prefix}$i"); done
 
 for tag in "${seq_pairs[@]}"; do
-    for arm in upstream refine; do
+    for arm in $ARMS; do
         round="${tag}$( [ "$arm" = upstream ] && echo u || echo r )"
         if [ -f ".runs/$round/$arm/result.json" ]; then
             echo "== $round ($arm) already has result.json — skip (resume) =="
