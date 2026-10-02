@@ -241,17 +241,20 @@ fn expand_pattern(p: &str) -> String {
 }
 
 impl Runtime {
-    /// The config-derived route payloads (W4 PATCH reload path).
-    pub fn payloads(&self) -> refine_http::Payloads {
+    /// CONSUMING variant for the reload path: a live OOM was measured at
+    /// three reloads (clone-all payloads() + mimalloc retention ratcheted
+    /// 470→665→749MB then the cap killed dispose) — the reloader moves the
+    /// fields instead of duplicating the whole payload set every call.
+    pub fn into_payloads(self) -> refine_http::Payloads {
         refine_http::Payloads {
-            config: self.config.clone(),
-            agent: self.agent.clone(),
-            api_agent: self.api_agent.clone(),
-            command: self.command.clone(),
-            config_providers: self.config_providers.clone(),
-            provider: self.provider.clone(),
-            console: self.console.clone(),
-            capabilities: self.capabilities.clone(),
+            config: self.config,
+            agent: self.agent,
+            api_agent: self.api_agent,
+            command: self.command,
+            config_providers: self.config_providers,
+            provider: self.provider,
+            console: self.console,
+            capabilities: self.capabilities,
         }
     }
 

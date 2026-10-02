@@ -149,8 +149,13 @@ async fn hub_unavailable_is_503() {
 #[tokio::test]
 async fn auth_overlay_crud_and_provider_methods() {
     let dir = tempfile::tempdir().unwrap();
+    // LIVE shape: providers is a LIST of {id, ...} (caught by the W5 battery
+    // when the dict assumption returned {})
     let payloads = Payloads {
-        config_providers: serde_json::json!({"providers": {"deepseek": {}, "openrouter": {}}, "default": {}}),
+        config_providers: serde_json::json!({
+            "providers": [{"id": "deepseek"}, {"id": "openrouter"}],
+            "default": {}
+        }),
         ..Default::default()
     };
     let cp_seed = payloads.config_providers.clone();

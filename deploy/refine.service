@@ -25,7 +25,11 @@ RestartSec=5
 # cap → oom-kill → clean systemd restart (fail-fast worked; cap too tight
 # for allocator page retention during delta bursts). Children share this
 # cgroup, so MemoryMax must cover the sidecar or systemd OOM-kills plugins.
-MemoryMax=600M
+# 2026-10-02: raised 600M→750M — W5 battery (MCP reconnect ×2 + auth
+# PUT/DELETE reloads + search + sidecar + embedding model) hit the 600M
+# cap exactly (systemd: kernel OOM kill, peak 600M; steady post-restart
+# is ~412MB cgroup). Provenance: journal 19:20:09 oom-kill.
+MemoryMax=750M
 MemorySwapMax=0
 ProtectSystem=strict
 ReadWritePaths=%h/.local/share/refine %h/.local/share/opencode %h/.cache/opencode %h/.config/opencode %h/src/reliary8

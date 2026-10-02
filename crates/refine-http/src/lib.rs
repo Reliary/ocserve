@@ -1159,13 +1159,20 @@ async fn auth_delete(
 async fn provider_auth_methods(State(st): State<Arc<AppState>>) -> Json<Value> {
     let payloads = st.payloads.read();
     let mut out = serde_json::Map::new();
-    if let Some(providers) = payloads
+    // LIVE shape: config_providers.providers is a LIST of {id, ...} — the
+    // dict assumption returned {} (caught on the W5 live battery)
+    if let Some(list) = payloads
         .config_providers
         .get("providers")
-        .and_then(|p| p.as_object())
+        .and_then(|p| p.as_array())
     {
-        for pid in providers.keys() {
-            out.insert(pid.clone(), json!([{"type": "api", "label": "API Key"}]));
+        for e in list {
+            if let Some(pid) = e.get("id").and_then(|v| v.as_str()) {
+                out.insert(
+                    pid.to_string(),
+                    json!([{"type": "api", "label": "API Key"}]),
+                );
+            }
         }
     }
     Json(serde_json::Value::Object(out))

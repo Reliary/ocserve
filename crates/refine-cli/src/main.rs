@@ -199,7 +199,7 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
             );
         }
     }
-    let payloads = rt.payloads();
+    let payloads = rt.into_payloads(); // consumed after llm/mcp/plugins took their pieces
     let db_path = refine_store::writer::db_path(&data_dir);
     let writer = std::sync::Arc::new(
         refine_store::Writer::spawn(db_path.clone()).context("spawn store writer")?,
@@ -266,7 +266,7 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
             dyn Fn() -> anyhow::Result<refine_http::Payloads> + Send + Sync,
         > = std::sync::Arc::new(move || {
             let rt = crate::runtime::Runtime::load_for(&data_dir_for_reload)?;
-            Ok(rt.payloads())
+            Ok(rt.into_payloads()) // move, not clone (measured OOM: see runtime.rs)
         });
         *state.reloader.write() = Some(reloader);
     }
