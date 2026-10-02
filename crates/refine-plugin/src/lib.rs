@@ -148,6 +148,11 @@ pub struct Sidecar {
 impl Sidecar {
     pub async fn spawn(host_path: &Path, server_url: &str, directory: &str) -> Result<Self> {
         let mut child = Command::new("node")
+            // MEMORY.md sidecar boundary (≤80MB target): cap the V8 heap so
+            // the loaded plugin bundles cannot balloon RSS (measured 148MB
+            // uncapped on first boot — M5 finding).
+            .arg("--max-old-space-size=64")
+            .arg("--max-semi-space-size=2")
             .arg(host_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

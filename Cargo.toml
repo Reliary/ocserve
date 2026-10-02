@@ -9,6 +9,7 @@ members = [
     "crates/refine-mcp",
     "crates/refine-plugin",
     "crates/refine-importer",
+    "crates/refine-metrics",
     "crates/refine-cli",
 ]
 
@@ -27,6 +28,7 @@ refine-llm = { path = "crates/refine-llm" }
 refine-tools = { path = "crates/refine-tools" }
 refine-mcp = { path = "crates/refine-mcp" }
 refine-plugin = { path = "crates/refine-plugin" }
+refine-metrics = { path = "crates/refine-metrics" }
 refine-importer = { path = "crates/refine-importer" }
 
 # runtime / web

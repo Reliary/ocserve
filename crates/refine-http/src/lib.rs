@@ -514,18 +514,11 @@ async fn get_project_current(State(st): State<Arc<AppState>>) -> impl IntoRespon
 }
 
 /// Prometheus text format for the KPI series (SRE §2). Internal bind only.
-async fn metrics(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let rss = read_vm_rss_kb();
-    let body = format!(
-        "# HELP refine_requests_total HTTP requests handled\n\
-         # TYPE refine_requests_total counter\n\
-         refine_requests_total {}\n\
-         # HELP refine_rss_bytes resident set size\n\
-         # TYPE refine_rss_bytes gauge\n\
-         refine_rss_bytes {}\n",
-        st.requests.load(std::sync::atomic::Ordering::Relaxed),
-        rss * 1024,
-    );
+async fn metrics(State(_st): State<Arc<AppState>>) -> impl IntoResponse {
+    // registry counters are incremented by the timing middleware; rss sampled
+    // here (scrape-time) so gauges are fresh
+    refine_metrics::sample_rss();
+    let body = refine_metrics::render();
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -533,18 +526,6 @@ async fn metrics(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         )],
         body,
     )
-}
-
-fn read_vm_rss_kb() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("VmRSS:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|v| v.parse().ok())
-        })
-        .unwrap_or(0)
 }
 
 // ---- M2: session create + sync prompt + message list ----
@@ -773,9 +754,21 @@ async fn global_event(State(st): State<Arc<AppState>>) -> Response {
             .to_string(),
     );
     let rx = st.bus.subscribe();
+    refine_metrics::gauge(
+        "refine_sse_clients",
+        st.bus.subscriber_count().max(1) as i64,
+    );
     // The stream must own a bus clone: if the Router/state were dropped while
     // a subscriber still streams (oneshot tests), the Sender must survive.
     let bus_keepalive = st.bus.clone();
+    // Drop-guard: decrement the client gauge when the stream ends (any exit).
+    struct SseClientGuard;
+    impl Drop for SseClientGuard {
+        fn drop(&mut self) {
+            refine_metrics::gauge_delta("refine_sse_clients", -1);
+        }
+    }
+    let sse_guard = SseClientGuard;
     // Timeout-driven merge: heartbeat at exact 10s cadence regardless of
     // traffic; bus frames yielded as they arrive; Lagged/Closed ends the
     // stream (bounded-queue disconnect, PLAN §4).
@@ -785,16 +778,27 @@ async fn global_event(State(st): State<Arc<AppState>>) -> Response {
                 rx,
                 tokio::time::Instant::now() + Duration::from_secs(10),
                 bus_keepalive,
+                sse_guard,
             ),
-            |(mut rx, mut next_hb, bus)| async move {
+            |(mut rx, mut next_hb, bus, guard)| async move {
                 {
                     let dur = next_hb.saturating_duration_since(tokio::time::Instant::now());
                     match tokio::time::timeout(dur.max(Duration::from_millis(1)), rx.recv()).await {
-                        Ok(Ok(frame)) => Some((
-                            Ok(Event::default().data(frame.to_string())),
-                            (rx, next_hb, bus),
-                        )),
-                        Ok(Err(_lagged_or_closed)) => None,
+                        Ok(Ok(frame)) => {
+                            refine_metrics::counter("refine_sse_events_total", 1);
+                            Some((
+                                Ok(Event::default().data(frame.to_string())),
+                                (rx, next_hb, bus, guard),
+                            ))
+                        }
+                        Ok(Err(_lagged_or_closed)) => {
+                            refine_metrics::labeled_counter(
+                                "refine_event_ring_lag_total",
+                                "reason=\"lagged_or_closed\"",
+                                1,
+                            );
+                            None
+                        }
                         Err(_elapsed) => {
                             let hb = Event::default().data(
                                 json!({"payload":{"id":evt_id("heartbeat"),
@@ -802,7 +806,7 @@ async fn global_event(State(st): State<Arc<AppState>>) -> Response {
                                 .to_string(),
                             );
                             next_hb += Duration::from_secs(10);
-                            Some((Ok(hb), (rx, next_hb, bus)))
+                            Some((Ok(hb), (rx, next_hb, bus, guard)))
                         }
                     }
                 }
@@ -835,6 +839,21 @@ async fn auth_gate(
 ) -> Result<Response, ApiError> {
     st.requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SRE §2: request metrics (bounded route labels; measured at both exits)
+    refine_metrics::counter("refine_requests_total", 1);
+    let metric_t0 = std::time::Instant::now();
+    let metric_label = format!(
+        "route=\"{}\",method=\"{}\"",
+        refine_metrics::route_label(req.uri().path()),
+        req.method()
+    );
+    let record = move |t0: std::time::Instant| {
+        refine_metrics::observe(
+            "refine_http_request_duration_seconds",
+            &metric_label,
+            t0.elapsed().as_micros() as u64,
+        );
+    };
     // Hit-set capture (M1 §PLAN C4): every request path logged for the
     // differential route inventory.
     tracing::info!("req {} {}", req.method(), req.uri().path());
@@ -854,6 +873,7 @@ async fn auth_gate(
             })
             .unwrap_or(false);
         if !authorized {
+            record(metric_t0);
             return Err(ApiError {
                 status: StatusCode::UNAUTHORIZED,
                 name: "UnauthorizedError",
@@ -861,7 +881,9 @@ async fn auth_gate(
             });
         }
     }
-    Ok(next.run(req).await)
+    let resp = next.run(req).await;
+    record(metric_t0);
+    Ok(resp)
 }
 
 /// Router for the P0 surface. Auth is an AppState decision (freeze §3).

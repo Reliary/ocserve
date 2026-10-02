@@ -23,8 +23,18 @@ that alone exceeds the entire budget. Corrected line items:
 | **Total** | **300 MB** | |
 
 Node plugin sidecar (PLAN §10 gate result — quickjs rejected on import audit): declared
-*outside* refine's 300 MB (system total target ≤380 MB); `rss_bytes{component="sidecar"}`
-scraped from the child so the combined number is still visible.
+*outside* refine's 300 MB; `refine_sidecar_rss_bytes` scraped from the child each sample
+interval so the combined number is always visible.
+
+**Measured boundary (2026-10, 4 configured plugins, node v25.9.0, this host):** node
+baseline 40 MB (`--max-old-space-size=64 --max-semi-space-size=2`, isolated probes:
+context-mode 59 MB, reliary8 54 MB alone) → **146 MB combined sidecar steady-state**,
+uncapped same configuration was 148 MB (the heap cap contains growth, not baseline).
+The original ≤80 MB target is **not achievable with these artifacts** on any single
+node process; boundary set to measured + headroom: sidecar **hard cap 160 MB** (systemd
+`MemoryMax` in the unit), combined refine+sidecar budget **460 MB**. Any future plugin
+addition must re-measure (gate: sidecar ≤160 MB after load, else a plugin is dropped or
+loads lazily).
 
 ## 2. Global allocator
 

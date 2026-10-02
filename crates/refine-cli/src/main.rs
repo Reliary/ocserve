@@ -164,6 +164,30 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     let blobs = std::sync::Arc::new(
         refine_store::BlobStore::new(data_dir.join("blobs")).context("blob store")?,
     );
+    // SRE §2 sampler: rss/peak, wal bytes, writer queue depth (15s cadence)
+    {
+        let writer_for_metrics = writer.clone();
+        let wal_path = db_path.with_extension("db-wal");
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                refine_metrics::sample_rss();
+                refine_metrics::gauge(
+                    "refine_writer_queue_depth",
+                    writer_for_metrics.queue_depth(),
+                );
+                let wal = std::fs::metadata(&wal_path)
+                    .map(|m| m.len() as i64)
+                    .unwrap_or(0);
+                refine_metrics::gauge("refine_wal_bytes", wal);
+                if let Some(rss) = sidecar_rss(std::process::id()) {
+                    refine_metrics::gauge("refine_sidecar_rss_bytes", rss);
+                }
+            }
+        });
+    }
     let state = AppState::with_wiring(
         None,
         payloads,
@@ -176,6 +200,13 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     );
     let hub = refine_mcp::McpHub::probe_all(&mcp_cfgs).await;
     tracing::info!("mcp probe: {}", hub.statuses());
+    refine_metrics::gauge(
+        "refine_mcp_connected",
+        hub.statuses()
+            .as_object()
+            .map(|o| o.values().filter(|v| v["status"] == "connected").count())
+            .unwrap_or(0) as i64,
+    );
     let _ = state.mcp.set(std::sync::Arc::new(hub));
 
     // M4b: plugin sidecar — materialize host, spawn Node, load configured
@@ -233,6 +264,45 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
         tracing::info!("plugin sidecar disposed");
     }
     Ok(())
+}
+
+/// RSS of the node plugin sidecar child (first node process we spawned).
+fn sidecar_rss(ppid: u32) -> Option<i64> {
+    let mut found = None;
+    // NOTE: `?` must not appear here — /proc contains non-pid entries
+    // (cpuinfo, meminfo, …) and a single parse miss must not abort the scan.
+    for entry in std::fs::read_dir("/proc").ok()? {
+        let name = match entry {
+            Ok(e) => e.file_name(),
+            Err(_) => continue,
+        };
+        let Ok(pid) = name.to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        // comm can contain spaces/parens: split after the last ')'
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        if fields.len() > 1 && fields[1].parse::<u32>().ok() == Some(ppid) {
+            let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+            if comm.trim().starts_with("node") {
+                // comm shows node-MainThread
+                let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+                found = status
+                    .lines()
+                    .find(|l| l.starts_with("VmRSS:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .map(|kb| kb * 1024);
+                break;
+            }
+        }
+    }
+    found
 }
 
 async fn shutdown_signal() {

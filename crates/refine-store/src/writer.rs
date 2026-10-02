@@ -33,6 +33,8 @@ struct Batch {
 pub struct Writer {
     tx: Option<mpsc::Sender<Batch>>,
     handle: Option<std::thread::JoinHandle<()>>,
+    /// in-flight batches (send +1, ack -1) — writer_queue_depth metric source
+    inflight: std::sync::Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl Writer {
@@ -50,7 +52,13 @@ impl Writer {
         Ok(Self {
             tx: Some(tx),
             handle: Some(handle),
+            inflight: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         })
+    }
+
+    /// In-flight batch count (SRE writer_queue_depth gauge source).
+    pub fn queue_depth(&self) -> i64 {
+        self.inflight.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Submit ops; blocks until the batch commits. Returns rows affected (sum).
@@ -60,11 +68,16 @@ impl Writer {
             .tx
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("writer closed"))?;
+        self.inflight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tx.send(Batch { ops, ack: ack_tx })
             .map_err(|_| anyhow::anyhow!("writer thread gone"))?;
-        ack_rx
+        let res = ack_rx
             .recv()
-            .map_err(|_| anyhow::anyhow!("writer dropped ack"))?
+            .map_err(|_| anyhow::anyhow!("writer dropped ack"))?;
+        self.inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        res
     }
 }
 

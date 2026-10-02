@@ -22,6 +22,7 @@ refine-core.workspace = true
 refine-llm.workspace = true
 refine-tools.workspace = true
 refine-mcp.workspace = true
+refine-metrics.workspace = true
 refine-plugin.workspace = true
 futures-util.workspace = true
 metrics.workspace = true

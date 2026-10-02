@@ -1083,6 +1083,7 @@ dependencies = [
  "refine-http",
  "refine-importer",
  "refine-mcp",
+ "refine-metrics",
  "refine-plugin",
  "refine-store",
  "reqwest",
@@ -1107,6 +1108,7 @@ dependencies = [
  "parking_lot",
  "refine-llm",
  "refine-mcp",
+ "refine-metrics",
  "refine-plugin",
  "refine-store",
  "refine-tools",
@@ -1134,6 +1136,7 @@ dependencies = [
  "refine-core",
  "refine-llm",
  "refine-mcp",
+ "refine-metrics",
  "refine-plugin",
  "refine-store",
  "refine-tools",
@@ -1192,6 +1195,10 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "refine-metrics"
+version = "0.0.1"
 
 [[package]]
 name = "refine-plugin"

@@ -67,6 +67,11 @@ fn emit_durable(
     seq: &mut i64,
 ) -> Result<()> {
     refine_store::append_event(writer, Some(session_id), event_type, &properties)?;
+    refine_metrics::labeled_counter(
+        "refine_events_emitted_total",
+        &format!("type=\"{event_type}\""),
+        1,
+    );
     let this_seq = *seq;
     *seq += 1;
     ctx.bus
@@ -83,6 +88,11 @@ fn emit_durable(
 
 /// Emit a non-durable live event (delta/status/idle/diff — no sync twin, per capture).
 fn emit_live(ctx: &PromptContext, event_type: &str, properties: Value) {
+    refine_metrics::labeled_counter(
+        "refine_events_emitted_total",
+        &format!("type=\"{event_type}\""),
+        1,
+    );
     ctx.bus
         .publish(frame(&ctx.directory, event_type, properties));
 }
@@ -264,19 +274,33 @@ pub async fn run_prompt(
             anyhow::bail!("prompt exceeded {MAX_STEPS} steps (bounded loop, AGENTS §2.3)");
         }
         let started = Instant::now();
+        let mut llm_ttft: Option<std::time::Duration> = None;
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut finish: Option<String> = None;
         let mut usage: Option<Usage> = None;
         let mut assembler = ToolCallAssembler::default();
 
-        let mut stream = client
+        let mut stream = match client
             .chat_stream(&model, &messages, None, Some(&tools))
             .await
-            .context("provider stream open")?;
+        {
+            Ok(st) => st,
+            Err(e) => {
+                refine_metrics::labeled_counter(
+                    "refine_llm_stream_errors_total",
+                    &format!("provider=\"{}\",model=\"{model}\"", ctx.provider_id),
+                    1,
+                );
+                return Err(e).context("provider stream open");
+            }
+        };
         while let Some(ev) = stream.next().await {
             match ev.context("provider stream")? {
                 StreamEvent::TextDelta(t) => {
+                    if llm_ttft.is_none() {
+                        llm_ttft = Some(started.elapsed());
+                    }
                     emit_live(
                         ctx,
                         "message.part.delta",
@@ -321,6 +345,21 @@ pub async fn run_prompt(
         }
         let tool_calls = assembler.finish();
         let elapsed_ms = started.elapsed().as_millis() as i64;
+        {
+            let llm_label = format!("provider=\"{}\",model=\"{model}\"", ctx.provider_id);
+            refine_metrics::observe(
+                "refine_llm_request_duration_seconds",
+                &llm_label,
+                started.elapsed().as_micros() as u64,
+            );
+            if let Some(ttft) = llm_ttft {
+                refine_metrics::observe(
+                    "refine_llm_ttft_seconds",
+                    &llm_label,
+                    ttft.as_micros() as u64,
+                );
+            }
+        }
         let t_done = now_ms();
         let finish_reason = finish.unwrap_or_else(|| "stop".into());
         let u = usage.clone().unwrap_or_default();
@@ -511,12 +550,22 @@ pub async fn run_prompt(
                         "session": {"id": session_id},
                     });
                     let mut guard = plug.lock().await;
-                    match guard
+                    let hook_t0 = std::time::Instant::now();
+                    let hook_res = guard
                         .trigger("tool.execute.after", hook_in, json!({"output": output}))
-                        .await
-                    {
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!("plugin tool.execute.after: {e:#}"),
+                        .await;
+                    refine_metrics::observe(
+                        "refine_plugin_hook_duration_seconds",
+                        "hook=\"tool.execute.after\",result=\"ok\"",
+                        hook_t0.elapsed().as_micros() as u64,
+                    );
+                    if let Err(e) = &hook_res {
+                        refine_metrics::labeled_counter(
+                            "refine_plugin_hook_errors_total",
+                            "hook=\"tool.execute.after\"",
+                            1,
+                        );
+                        tracing::warn!("plugin tool.execute.after: {e:#}");
                     }
                 }
                 emit_durable(

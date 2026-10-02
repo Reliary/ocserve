@@ -31,6 +31,11 @@ impl EventBus {
     /// Publish a fully-encoded global-event frame (payload already wrapped).
     /// Lagged/disconnected receivers are dropped silently — the bus must
     /// never block publishers (event bus backpressure → disconnect, not stall).
+    /// Live subscriber count (SSE client gauge, SRE §2).
+    pub fn subscriber_count(&self) -> usize {
+        self.tx.receiver_count()
+    }
+
     pub fn publish(&self, frame: Value) {
         let _ = self.tx.send(frame);
     }
