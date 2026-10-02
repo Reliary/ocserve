@@ -2180,5 +2180,43 @@
   "mode": "keys",
   "path": "/vcs",
   "status": 200
+ },
+ "experimental_session": {
+  "mode": "keys",
+  "path": "/experimental/session?search=OpenCode&roots=true&limit=50",
+  "status": 200,
+  "keys": [
+   "$[].agent",
+   "$[].cost",
+   "$[].directory",
+   "$[].id",
+   "$[].model",
+   "$[].model.id",
+   "$[].model.providerID",
+   "$[].model.variant",
+   "$[].path",
+   "$[].project",
+   "$[].project.id",
+   "$[].project.worktree",
+   "$[].projectID",
+   "$[].slug",
+   "$[].summary",
+   "$[].summary.additions",
+   "$[].summary.deletions",
+   "$[].summary.files",
+   "$[].time",
+   "$[].time.created",
+   "$[].time.updated",
+   "$[].title",
+   "$[].tokens",
+   "$[].tokens.cache",
+   "$[].tokens.cache.read",
+   "$[].tokens.cache.write",
+   "$[].tokens.input",
+   "$[].tokens.output",
+   "$[].tokens.reasoning",
+   "$[].version"
+  ],
+  "ms": 50
  }
 }
