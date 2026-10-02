@@ -18,6 +18,44 @@ pub const FREEZE_VERSION: &str = "1.18.31";
 
 /// Pre-assembled payloads for config-derived routes (built by refine-cli's
 /// `Runtime::load()`; kept crate-local so http doesn't depend on cli).
+/// JSON deep merge: objects merge recursively, everything else (arrays,
+/// scalars) replaces. Used by overlay layering + PATCH /config (W4).
+pub fn deep_merge(base: &mut serde_json::Value, patch: serde_json::Value) {
+    match (base, patch) {
+        (serde_json::Value::Object(b), serde_json::Value::Object(p)) => {
+            for (k, v) in p {
+                match b.get_mut(&k) {
+                    Some(bv) => deep_merge(bv, v),
+                    None => {
+                        b.insert(k, v);
+                    }
+                }
+            }
+        }
+        (b, p) => *b = p,
+    }
+}
+
+/// W4 config-write target: default = the SHARED opencode.json (drop-in
+/// contract — both servers read it); `REFINE_CONFIG_WRITE=overlay` switches
+/// to a refine-owned file that layers over the base at load (never touches
+/// the other server's config).
+pub fn config_write_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+    if std::env::var("REFINE_CONFIG_WRITE")
+        .map(|v| v == "overlay")
+        .unwrap_or(false)
+    {
+        std::path::PathBuf::from(home).join(".config/refine/config.json")
+    } else {
+        std::path::PathBuf::from(home).join(".config/opencode/opencode.json")
+    }
+}
+
+/// Boot-injected config reloader (W4): Runtime::load lives in refine-cli —
+/// the closure avoids a crate cycle; None in tests.
+pub type ConfigReloader = std::sync::Arc<dyn Fn() -> anyhow::Result<Payloads> + Send + Sync>;
+
 #[derive(Default)]
 pub struct Payloads {
     pub config: serde_json::Value,
@@ -112,22 +150,13 @@ pub type PromptTask = (u64, tokio::task::JoinHandle<()>);
 
 /// App state shared by handlers.
 pub struct AppState {
-    /// Static config payload served at GET /config (recorded corpus).
-    pub config: serde_json::Value,
-    /// Agents payload for GET /agent (default-first order).
-    pub agent: Vec<serde_json::Value>,
-    /// Agents for GET /api/agent (declaration order, natives first).
-    pub api_agent: Vec<serde_json::Value>,
-    /// Commands payload for GET /command.
-    pub command: Vec<serde_json::Value>,
-    /// GET /config/providers payload (providers + default).
-    pub config_providers: serde_json::Value,
-    /// GET /provider payload (all + default + connected).
-    pub provider: serde_json::Value,
-    /// GET /experimental/console payload.
-    pub console: serde_json::Value,
-    /// GET /experimental/capabilities payload.
-    pub capabilities: serde_json::Value,
+    /// Config-derived route payloads (W4: swappable after PATCH /config —
+    /// upstream marks the instance for disposal and serves fresh config).
+    pub payloads: parking_lot::RwLock<Payloads>,
+    /// Boot-injected config reloader (Runtime lives in refine-cli; the
+    /// closure avoids a crate cycle). None in tests → PATCH still writes
+    /// the file, swap skipped (logged).
+    pub reloader: parking_lot::RwLock<Option<ConfigReloader>>,
     /// Known sessions (M1: served from store as it comes online).
     pub sessions: parking_lot::RwLock<HashMap<String, serde_json::Value>>,
     /// Runtime paths for GET /path (env-derived at boot; never stored in repo).
@@ -238,14 +267,8 @@ impl AppState {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "/".into());
         Arc::new(Self {
-            config: p.config,
-            agent: p.agent,
-            api_agent: p.api_agent,
-            command: p.command,
-            config_providers: p.config_providers,
-            provider: p.provider,
-            console: p.console,
-            capabilities: p.capabilities,
+            payloads: parking_lot::RwLock::new(p),
+            reloader: parking_lot::RwLock::new(None),
             sessions: parking_lot::RwLock::new(HashMap::new()),
             // upstream /path shape (keys golden: home/state/config/worktree/directory)
             paths: json!({
@@ -282,31 +305,31 @@ async fn health() -> impl IntoResponse {
 }
 
 async fn get_config(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(st.config.clone())
+    Json(st.payloads.read().config.clone())
 }
 
 async fn get_agent(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(st.agent.clone())
+    Json(st.payloads.read().agent.clone())
 }
 
 async fn get_command(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(st.command.clone())
+    Json(st.payloads.read().command.clone())
 }
 
 async fn get_config_providers(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(st.config_providers.clone())
+    Json(st.payloads.read().config_providers.clone())
 }
 
 async fn get_provider(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(st.provider.clone())
+    Json(st.payloads.read().provider.clone())
 }
 
 async fn get_console(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(st.console.clone())
+    Json(st.payloads.read().console.clone())
 }
 
 async fn get_capabilities(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(st.capabilities.clone())
+    Json(st.payloads.read().capabilities.clone())
 }
 
 /// v2-style location envelope shared by /api/* routes (captured live).
@@ -326,7 +349,8 @@ async fn get_api_location(State(st): State<Arc<AppState>>) -> impl IntoResponse 
 /// GET /api/agent — v2-shaped agent list (permission triple renamed to
 /// {action, resource, effect}; natives-first order; no plugin agents).
 async fn get_api_agent(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let data: Vec<Value> = st
+    let payloads = st.payloads.read();
+    let data: Vec<Value> = payloads
         .api_agent
         .iter()
         .map(|a| {
@@ -374,7 +398,8 @@ to the configured permissions.";
 
 /// GET /api/command — {location, data:[{description,name,template}]}.
 async fn get_api_command(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let data: Vec<Value> = st
+    let payloads = st.payloads.read();
+    let data: Vec<Value> = payloads
         .command
         .iter()
         .map(|c| {
@@ -784,6 +809,76 @@ async fn get_messages(
     Ok(resp)
 }
 
+/// PATCH /config + PATCH /global/config — W4 merge (v1 ConfigHttpApi.update:
+/// deep-merges the payload, marks the instance for disposal, returns the
+/// ECHOED payload — handlers/config.ts:18-21). Atomic file write (tmp in
+/// the same dir → rename, .bak kept), then the boot-injected reloader
+/// swaps derived payloads so the next GET serves fresh config. Divergence:
+/// refine treats global==user config (single file); runtime endpoint
+/// registries refresh on restart (TESTING §1.6).
+async fn patch_config(
+    State(st): State<Arc<AppState>>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let path = config_write_path();
+    let mut base: Value = if path.exists() {
+        let raw = std::fs::read_to_string(&path).map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("read {}: {e}", path.display()),
+        })?;
+        serde_json::from_str(&raw).map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("parse {}: {e}", path.display()),
+        })?
+    } else {
+        json!({})
+    };
+    deep_merge(&mut base, payload.clone());
+    let dir = path.parent().ok_or_else(|| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: "config path has no parent".into(),
+    })?;
+    std::fs::create_dir_all(dir).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("mkdir {}: {e}", dir.display()),
+    })?;
+    let tmp = dir.join(format!(".opencode.json.tmp-{}", std::process::id()));
+    let data = serde_json::to_vec_pretty(&base).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("serialize: {e}"),
+    })?;
+    std::fs::write(&tmp, &data).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("write {}: {e}", tmp.display()),
+    })?;
+    if path.exists() {
+        let _ = std::fs::copy(&path, dir.join(".opencode.json.bak"));
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("rename {}: {e}", path.display()),
+    })?;
+    // instance disposal analog: rebuild derived payloads (v1 marks for
+    // disposal and serves fresh config afterwards)
+    let reload = st.reloader.read().clone();
+    match &reload {
+        Some(f) => match f() {
+            Ok(p) => *st.payloads.write() = p,
+            Err(e) => tracing::warn!("config reload failed (restart to apply): {e:#}"),
+        },
+        None => tracing::warn!("config written; reloader unset (tests/boot) — restart to apply"),
+    }
+    tracing::info!("config patched: {}", path.display());
+    Ok(Json(payload))
+}
+
 /// POST /session/{id}/summarize — W3 compaction-lite (v1 handlers/session.ts
 /// summarize: payload {providerID, modelID, auto?} → true). Runs ONE
 /// transient text-only turn carrying buildPrompt's instruction + serialized
@@ -994,6 +1089,8 @@ fn build_prompt_context(
     let pricing = st.llm.pricing.get(&(pid.clone(), mid.clone())).copied();
     // agent permission rules (v1 wire shape → evaluator)
     let rules: Vec<refine_tools::Rule> = st
+        .payloads
+        .read()
         .agent
         .iter()
         .find(|a| a["name"].as_str() == Some(agent.as_str()))
@@ -1844,17 +1941,25 @@ async fn post_command(
         .get("arguments")
         .and_then(|a| a.as_str())
         .unwrap_or("");
-    let entry = st
-        .command
-        .iter()
-        .find(|c| c["name"].as_str() == Some(name))
-        .and_then(|c| c["template"].as_str());
-    let Some(template) = entry else {
-        let available: Vec<&str> = st
+    // scoped: parking_lot guards are !Send — never held across run_prompt's
+    // .await (Handler would stop accepting the future)
+    let (template, available_owned): (Option<String>, Vec<String>) = {
+        let payloads = st.payloads.read();
+        let t = payloads
             .command
             .iter()
-            .filter_map(|c| c["name"].as_str())
+            .find(|c| c["name"].as_str() == Some(name))
+            .and_then(|c| c["template"].as_str())
+            .map(str::to_string);
+        let names = payloads
+            .command
+            .iter()
+            .filter_map(|c| c["name"].as_str().map(str::to_string))
             .collect();
+        (t, names)
+    };
+    let available: Vec<&str> = available_owned.iter().map(String::as_str).collect();
+    let Some(template) = template.as_deref() else {
         let msg = format!(
             "Command not found: \"{name}\".{}",
             if available.is_empty() {
@@ -2295,6 +2400,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/session", get(get_sessions).post(post_session))
         .route("/session/status", get(session_status))
         .route("/session/search", axum::routing::post(search_messages))
+        .route("/config", axum::routing::patch(patch_config))
+        .route("/global/config", axum::routing::patch(patch_config))
         .route(
             "/session/{id}/summarize",
             axum::routing::post(post_summarize),

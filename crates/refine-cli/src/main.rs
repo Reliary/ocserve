@@ -165,16 +165,7 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
         })
         .unwrap_or_default();
     let llm = rt.llm_registry();
-    let payloads = refine_http::Payloads {
-        config: rt.config,
-        agent: rt.agent,
-        api_agent: rt.api_agent,
-        command: rt.command,
-        config_providers: rt.config_providers,
-        provider: rt.provider,
-        console: rt.console,
-        capabilities: rt.capabilities,
-    };
+    let payloads = rt.payloads();
     let db_path = refine_store::writer::db_path(&data_dir);
     let writer = std::sync::Arc::new(
         refine_store::Writer::spawn(db_path.clone()).context("spawn store writer")?,
@@ -216,6 +207,18 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
             .unwrap_or(0) as i64,
     );
     let _ = state.mcp.set(std::sync::Arc::new(hub));
+
+    // W4: PATCH /config rebuilds derived payloads through this closure
+    // (Runtime::load reads opencode.json + the refine overlay layer)
+    {
+        let reloader: std::sync::Arc<
+            dyn Fn() -> anyhow::Result<refine_http::Payloads> + Send + Sync,
+        > = std::sync::Arc::new(|| {
+            let rt = crate::runtime::Runtime::load()?;
+            Ok(rt.payloads())
+        });
+        *state.reloader.write() = Some(reloader);
+    }
 
     // Legacy→refine delta sync (development bridge; kill switch
     // REFINE_LEGACY_SYNC=0). 60s cadence after a 5s settle, fail-soft: any

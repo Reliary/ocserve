@@ -241,13 +241,35 @@ fn expand_pattern(p: &str) -> String {
 }
 
 impl Runtime {
+    /// The config-derived route payloads (W4 PATCH reload path).
+    pub fn payloads(&self) -> refine_http::Payloads {
+        refine_http::Payloads {
+            config: self.config.clone(),
+            agent: self.agent.clone(),
+            api_agent: self.api_agent.clone(),
+            command: self.command.clone(),
+            config_providers: self.config_providers.clone(),
+            provider: self.provider.clone(),
+            console: self.console.clone(),
+            capabilities: self.capabilities.clone(),
+        }
+    }
+
     pub fn load() -> Result<Self> {
         let home = std::env::var("HOME").unwrap_or_default();
         let config_path = Path::new(&home).join(".config/opencode/opencode.json");
         let auth_path = Path::new(&home).join(".local/share/opencode/auth.json");
         let cache_path = Path::new(&home).join(".cache/opencode/models.json");
 
-        let raw_config = read_json(&config_path)?;
+        let mut raw_config = read_json(&config_path)?;
+        // W4 overlay: a refine-owned patch file (REFINE_CONFIG_WRITE=overlay
+        // writes it) deep-merges OVER the shared opencode.json on every load —
+        // never mutates the user's other server's config unless told to.
+        let overlay_path = Path::new(&home).join(".config/refine/config.json");
+        if overlay_path.exists() {
+            let overlay = read_json(&overlay_path)?;
+            refine_http::deep_merge(&mut raw_config, overlay);
+        }
         let auth = if auth_path.exists() {
             read_json(&auth_path)?
         } else {

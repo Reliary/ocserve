@@ -34,6 +34,11 @@ traceable test, every test has a traceable requirement.
    | part written without its search projection (FTS silently misses rows) | `check-guards.sh` rule 4: `msg_part` INSERT/UPDATE only in `refine-store/src` (helpers carry the companion) | search suite: blob-hit, backfill idempotence, PATCH-reindex, cascade-delete |
    | literal backslash at EOL in any SQL string (shipped ONCE in W1 — stray `\` reached SQLite) | `check-guards.sh` rule 2 widened to any `\\$` EOL in `crates/*/src` (was `sql:`-prefixed only — the widening itself has a planted-violation negative control) | backfill/search suites execute every SQL path |
 
+   **Named divergences (K-CONFIG):** refine serves ONE config (global==user file;
+   `PATCH /config` and `PATCH /global/config` share a handler/target); live-swap covers
+   the derived route payloads only — provider endpoint registries (LLM routing) rebuild
+   on restart, not on PATCH (v1's instance disposal rebuilds everything).
+
    **Named divergences (K-SUMMARIZE):** refine's summarize does NOT create
    compaction-state/history filtering (upstream `filterCompacted` hides pre-compaction
    messages from later prompts — refine keeps full history and appends the summary as an
