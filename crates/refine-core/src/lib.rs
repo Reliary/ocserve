@@ -9,6 +9,7 @@ pub mod event;
 pub mod ids;
 pub mod permission;
 pub mod prompt;
+pub mod question;
 
 pub use event::EventBus;
 pub use permission::PermissionGate;

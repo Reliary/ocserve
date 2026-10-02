@@ -126,8 +126,23 @@ pub fn schemas() -> Vec<Value> {
         json!({"type":"function","function":{"name":"edit","description":"Replace exact text in a file.","parameters":{"type":"object","properties":{"filePath":{"type":"string","description":"The absolute path to the file to edit"},"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["filePath","oldText","newText"]}}}),
         json!({"type":"function","function":{"name":"glob","description":"Find files by glob pattern.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}}}),
         json!({"type":"function","function":{"name":"grep","description":"Regex search file contents.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"}},"required":["pattern"]}}}),
+        json!({"type":"function","function":{"name":"question","description":QUESTION_DESCRIPTION,"parameters":{"type":"object","properties":{"questions":{"type":"array","description":"Questions to ask","items":{"type":"object","properties":{"question":{"type":"string","description":"Complete question"},"header":{"type":"string","description":"Very short label (max 30 chars)"},"options":{"type":"array","description":"Available choices","items":{"type":"object","properties":{"label":{"type":"string","description":"Display text (1-5 words, concise)"},"description":{"type":"string","description":"Explanation of choice"}},"required":["label","description"]}},"multiple":{"type":"boolean","description":"Allow selecting multiple choices"}},"required":["question","header","options"]}}},"required":["questions"]}}}),
     ]
 }
+
+/// v1 tool/question.txt — model-facing contract for the question tool
+/// (verbatim: prompt_loop routes `question` to the QuestionGate, never to
+/// `execute()`).
+pub const QUESTION_DESCRIPTION: &str = "Use this tool when you need to ask the user questions during execution. This allows you to:
+1. Gather user preferences or requirements
+2. Clarify ambiguous instructions
+3. Get decisions on implementation choices as you work
+4. Offer choices to the user about what direction to take.
+
+Usage notes:
+- When `custom` is enabled (default), a \"Type your own answer\" option is added automatically; don't include \"Other\" or catch-all options
+- Answers are returned as arrays of labels; set `multiple: true` to allow selecting more than one
+- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label";
 
 fn truncate(mut output: String) -> (String, bool) {
     let mut truncated = false;
@@ -610,13 +625,36 @@ mod tests {
     }
 
     #[test]
-    fn schemas_cover_six_tools() {
+    fn schemas_cover_seven_tools_including_question() {
         let s = schemas();
-        assert_eq!(s.len(), 6);
+        assert_eq!(
+            s.len(),
+            7,
+            "six exec tools + question (gated, never executed)"
+        );
         for spec in &s {
             assert_eq!(spec["type"], "function");
             assert!(spec["function"]["name"].as_str().is_some());
             assert!(spec["function"]["parameters"]["type"] == "object");
         }
+        let q = &s[6];
+        assert_eq!(q["function"]["name"], "question");
+        let params = &q["function"]["parameters"];
+        assert_eq!(params["required"][0], "questions");
+        let item = &params["properties"]["questions"]["items"];
+        for f in ["question", "header", "options"] {
+            assert!(item["properties"].get(f).is_some(), "Prompt requires {f}");
+        }
+        assert_eq!(
+            item["required"],
+            serde_json::json!(["question", "header", "options"]),
+            "v1 Prompt required set (custom is Info-only, not in the tool schema)"
+        );
+        assert!(
+            q["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Type your own answer")
+        );
     }
 }

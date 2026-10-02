@@ -145,6 +145,8 @@ pub struct AppState {
         std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, PromptTask>>>,
     /// Monotonic generation source for prompt_tasks.
     pub prompt_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Question rendezvous (v1 Question service): pending asks + reply/reject.
+    pub question_gate: std::sync::Arc<refine_core::question::QuestionGate>,
 }
 
 /// LLM endpoint resolution for the prompt runner (assembled by Runtime).
@@ -246,6 +248,7 @@ impl AppState {
                 std::collections::HashMap::new(),
             )),
             prompt_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            question_gate: refine_core::question::QuestionGate::new(),
             db: w.db,
             blobs: w.blobs,
             writer: w.writer,
@@ -731,6 +734,7 @@ fn build_prompt_context(
         gate: st.gate.clone(),
         mcp: st.mcp.get().cloned(),
         plugins: st.plugins.get().cloned(),
+        questions: st.question_gate.clone(),
     };
     Ok(ctx)
 }
@@ -1237,16 +1241,56 @@ async fn find_text(
     Ok(Json(Value::Array(matches)))
 }
 
-/// GET /question — pending questions. refine has no question tool yet → []
-/// (ConnectionService polls this; empty list is the honest answer).
-async fn get_questions() -> Json<Value> {
-    Json(json!([]))
+/// GET /question — all pending question requests (v1 Question.Request list;
+/// oc-remote ConnectionService polls this while a dialog may be open).
+async fn get_questions(State(st): State<Arc<AppState>>) -> Json<Value> {
+    Json(Value::Array(st.question_gate.list()))
 }
 
-/// POST /question/{id}/reply|reject → true; no questions can be pending yet
-/// → 404 (freeze NotFound shape), never a silent success.
-async fn question_missing(id: axum::extract::Path<String>) -> Result<Json<Value>, ApiError> {
-    Err(ApiError::not_found(format!("Question not found: {}", id.0)))
+/// POST /question/{id}/reply — {answers: [[labels]]} (v1 Reply payload) → true.
+async fn post_question_reply(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let raw = body
+        .get("answers")
+        .and_then(|a| a.as_array())
+        .ok_or_else(|| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            name: "BadRequest",
+            message: "body must be {answers: [[String]]}".into(),
+        })?;
+    let mut answers: Vec<Vec<String>> = Vec::with_capacity(raw.len());
+    for a in raw {
+        let row = a.as_array().ok_or_else(|| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            name: "BadRequest",
+            message: "each answer must be an array of labels".into(),
+        })?;
+        answers.push(
+            row.iter()
+                .map(|l| l.as_str().unwrap_or_default().to_string())
+                .collect(),
+        );
+    }
+    if st.question_gate.reply(&id, answers) {
+        Ok(Json(json!(true)))
+    } else {
+        Err(ApiError::not_found(format!("Question not found: {id}")))
+    }
+}
+
+/// POST /question/{id}/reject — no body (oc-remote posts empty) → true.
+async fn post_question_reject(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if st.question_gate.reject(&id) {
+        Ok(Json(json!(true)))
+    } else {
+        Err(ApiError::not_found(format!("Question not found: {id}")))
+    }
 }
 
 /// Freeze-shaped event id: `evt_` + 26 hex chars (upstream ids are time+random
@@ -1461,11 +1505,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/question", get(get_questions))
         .route(
             "/question/{id}/reply",
-            axum::routing::post(question_missing),
+            axum::routing::post(post_question_reply),
         )
         .route(
             "/question/{id}/reject",
-            axum::routing::post(question_missing),
+            axum::routing::post(post_question_reject),
         )
         .route("/session/{id}/todo", get(get_todos))
         .route("/session/{id}/abort", axum::routing::post(post_abort))

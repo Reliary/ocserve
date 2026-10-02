@@ -49,6 +49,8 @@ pub struct PromptContext {
     pub mcp: Option<Arc<refine_mcp::McpHub>>,
     /// Plugin sidecar (M4b): hook dispatch (v1 names, e.g. tool.execute.after).
     pub plugins: Option<Arc<tokio::sync::Mutex<refine_plugin::Sidecar>>>,
+    /// Question rendezvous (v1 Question service): `question` tool gate.
+    pub questions: Arc<crate::question::QuestionGate>,
 }
 
 fn now_ms() -> i64 {
@@ -423,6 +425,64 @@ pub async fn run_prompt(
                     &mut seq,
                 )?;
 
+                // ---- question tool: own rendezvous, no permission gate
+                // (upstream QuestionTool never ctx.ask()s) ----
+                if call.name == "question" {
+                    let (output, state) = question_tool_state(
+                        ctx,
+                        writer,
+                        session_id,
+                        &assistant_id,
+                        &call.id,
+                        &call.arguments,
+                        &mut seq,
+                    )
+                    .await?;
+                    running["state"] = state;
+                    if let Some(plug) = &ctx.plugins {
+                        let hook_in = json!({
+                            "sessionID": session_id,
+                            "messageID": assistant_id,
+                            "callID": call.id,
+                            "tool": call.name,
+                            "agent": agent,
+                            "modelID": model,
+                            "args": serde_json::from_str::<Value>(&call.arguments)
+                                .unwrap_or_else(|_| json!({})),
+                            "session": {"id": session_id},
+                        });
+                        let mut guard = plug.lock().await;
+                        let hook_t0 = std::time::Instant::now();
+                        let hook_res = guard
+                            .trigger("tool.execute.after", hook_in, json!({"output": output}))
+                            .await;
+                        refine_metrics::observe(
+                            "refine_plugin_hook_duration_seconds",
+                            "hook=\"tool.execute.after\",result=\"ok\"",
+                            hook_t0.elapsed().as_micros() as u64,
+                        );
+                        if let Err(e) = &hook_res {
+                            refine_metrics::labeled_counter(
+                                "refine_plugin_hook_errors_total",
+                                "hook=\"tool.execute.after\"",
+                                1,
+                            );
+                            tracing::warn!("plugin tool.execute.after: {e:#}");
+                        }
+                    }
+                    emit_durable(
+                        ctx,
+                        writer,
+                        session_id,
+                        "message.part.updated",
+                        json!({"sessionID": session_id, "part": running}),
+                        &mut seq,
+                    )?;
+                    parts.push(running);
+                    provider_tool_results.push((call.id.clone(), output));
+                    continue;
+                }
+
                 // ---- permission gate ----
                 let key = format!("{}:{}", call.name, resource);
                 let effect = if ctx.gate.check_always(session_id, &key) {
@@ -777,6 +837,94 @@ pub async fn run_prompt(
 
         return Ok((assistant_info, parts));
     }
+}
+
+/// The `question` tool: register → `question.asked` → await bounded reply →
+/// `question.replied|rejected` → tool state + model-facing output (v1
+/// QuestionTool verbatim formatting; bypasses the permission gate — upstream
+/// QuestionTool never ctx.ask()s).
+async fn question_tool_state(
+    ctx: &PromptContext,
+    writer: &refine_store::Writer,
+    session_id: &str,
+    assistant_id: &str,
+    call_id: &str,
+    arguments: &str,
+    seq: &mut i64,
+) -> Result<(String, Value)> {
+    let input: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+    let questions = input.get("questions").cloned().unwrap_or(Value::Null);
+    let valid = questions.as_array().map(|a| !a.is_empty()).unwrap_or(false);
+    if !valid {
+        let msg = "Error: questions must be a non-empty array".to_string();
+        return Ok((
+            msg.clone(),
+            json!({
+                "status": "error",
+                "input": input,
+                "output": msg,
+                "title": "question",
+                "metadata": {},
+                "time": {"start": now_ms(), "end": now_ms()},
+            }),
+        ));
+    }
+    let ask_start = now_ms();
+    let qid = crate::ids::que_id();
+    let request = json!({
+        "id": qid,
+        "sessionID": session_id,
+        "questions": questions,
+        "tool": {"messageID": assistant_id, "callID": call_id},
+    });
+    let (rx, _guard) = ctx.questions.register(&qid, request.clone());
+    emit_durable(ctx, writer, session_id, "question.asked", request, seq)?;
+    let outcome = ctx.questions.wait(&qid, rx).await;
+    let (status, title, output, metadata) = match outcome {
+        crate::question::Outcome::Answers(answers) => {
+            emit_durable(
+                ctx,
+                writer,
+                session_id,
+                "question.replied",
+                json!({"sessionID": session_id, "requestID": qid, "answers": answers}),
+                seq,
+            )?;
+            (
+                "completed".to_string(),
+                crate::question::format_title(&questions),
+                crate::question::format_output(&questions, &answers),
+                json!({"answers": answers}),
+            )
+        }
+        crate::question::Outcome::Rejected => {
+            emit_durable(
+                ctx,
+                writer,
+                session_id,
+                "question.rejected",
+                json!({"sessionID": session_id, "requestID": qid}),
+                seq,
+            )?;
+            (
+                "error".to_string(),
+                "question".to_string(),
+                crate::question::REJECTED_MESSAGE.to_string(),
+                json!({}),
+            )
+        }
+    };
+    Ok((
+        output.clone(),
+        json!({
+            "status": status,
+            "input": input,
+            "output": output,
+            "title": title,
+            "metadata": metadata,
+            "time": {"start": ask_start, "end": now_ms()},
+        }),
+    ))
 }
 
 /// Permission resource per tool (v1: fs tools → path, bash → command).

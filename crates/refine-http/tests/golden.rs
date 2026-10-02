@@ -976,6 +976,20 @@ async fn file_find_question_routes() {
             Request::builder()
                 .method("POST")
                 .uri("/question/q1/reply")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"answers":[["yes"]]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "unknown request id");
+    // reject with NO body (oc-remote posts empty) → 404 for unknown id
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/question/q1/reject")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -984,4 +998,139 @@ async fn file_find_question_routes() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     std::fs::remove_dir_all(&seed).ok();
+}
+
+// ---- question tool rendezvous (v1 Question service port) ----
+
+#[tokio::test]
+async fn question_pending_reply_reject_flow() {
+    let st = refine_http::AppState::with_payloads(None, refine_http::Payloads::default());
+    refine_store::insert_session(
+        &st.writer,
+        &serde_json::json!({
+            "id": "ses_q",
+            "projectID": "global",
+            "directory": "/work",
+            "path": "ses_q",
+            "slug": "ses_q",
+            "title": "q",
+            "version": "1",
+            "time": {"created": 1, "updated": 2},
+        }),
+    )
+    .unwrap();
+    let app = refine_http::router(st.clone());
+
+    // pending via the same register path the runner uses
+    let request = serde_json::json!({
+        "id": "que_test01",
+        "sessionID": "ses_q",
+        "questions": [{
+            "question": "Ship it?", "header": "Ship",
+            "options": [{"label": "Yes", "description": "go"}, {"label": "No", "description": "stop"}],
+            "multiple": false, "custom": true
+        }],
+        "tool": {"messageID": "msg_x", "callID": "call_x"},
+    });
+    let (rx, _guard) = st.question_gate.register("que_test01", request.clone());
+
+    // GET /question shows the pending request (oc-remote poll)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/question")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    assert_eq!(v[0]["id"], "que_test01");
+    assert_eq!(v[0]["sessionID"], "ses_q");
+    assert_eq!(v[0]["questions"][0]["question"], "Ship it?");
+    assert_eq!(v[0]["tool"]["callID"], "call_x");
+
+    // bad answers shape → 400
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/question/que_test01/reply")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"answers":"nope"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // reply → true, resolves the runner's receiver with the answers
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/question/que_test01/reply")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"answers":[["Yes"]]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await, serde_json::json!(true));
+    match rx.await.unwrap() {
+        refine_core::question::Outcome::Answers(a) => {
+            assert_eq!(a, vec![vec!["Yes".to_string()]])
+        }
+        _ => panic!("expected answers"),
+    }
+    // list empty; double reply → 404
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/question")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await, serde_json::json!([]));
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/question/que_test01/reply")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"answers":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // reject flow: register → reject (empty body) → Outcome::Rejected
+    let (rx2, _g2) = st.question_gate.register(
+        "que_test02",
+        serde_json::json!({"id": "que_test02", "sessionID": "ses_q", "questions": []}),
+    );
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/question/que_test02/reject")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await, serde_json::json!(true));
+    assert!(matches!(
+        rx2.await.unwrap(),
+        refine_core::question::Outcome::Rejected
+    ));
 }

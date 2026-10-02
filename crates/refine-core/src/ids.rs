@@ -32,6 +32,13 @@ pub fn ses_id() -> String {
     format!("ses_{}", encode(ms, &nonce[..8]))
 }
 
+/// Question request id (v1 QuestionID: `que_` +26 chars, ascending).
+pub fn que_id() -> String {
+    let ms = now_ms();
+    let nonce: Vec<u8> = std::iter::repeat_with(rand_byte).take(8).collect();
+    format!("que_{}", encode(ms, &nonce[..8]))
+}
+
 pub fn evt_id() -> String {
     let ms = now_ms();
     let nonce: Vec<u8> = std::iter::repeat_with(rand_byte).take(8).collect();
