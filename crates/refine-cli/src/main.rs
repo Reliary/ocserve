@@ -151,29 +151,6 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     // Assemble config-derived payloads (fail fast if config unreadable)
     let rt = runtime::Runtime::load_for(&data_dir)
         .context("load runtime config (opencode.json/auth/models cache)")?;
-    // W6: dead default model = the ox-alpha lesson automated — warn when a
-    // configured default isn't in its provider's model catalog (the prompt
-    // would fail with ProviderModelNotFoundError at send time)
-    if let Some(defaults) = rt
-        .config_providers
-        .get("default")
-        .and_then(|d| d.as_object())
-    {
-        for (pid, model) in defaults {
-            let mid = model.as_str().unwrap_or_default();
-            let known = rt
-                .config_providers
-                .pointer(&format!("/providers/{pid}/models"))
-                .and_then(|m| m.as_object())
-                .map(|m| m.contains_key(mid))
-                .unwrap_or(false);
-            if !mid.is_empty() && !known {
-                tracing::warn!(
-                    "default model {pid}/{mid} is NOT in the provider catalog — prompts will fail at send time (update the default or the cache)"
-                );
-            }
-        }
-    }
     // M4a: probe MCP servers before serving (statuses captured, never fatal)
     let mcp_cfgs =
         refine_mcp::parse_config(rt.config.get("mcp").unwrap_or(&serde_json::Value::Null));
@@ -188,6 +165,40 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
         })
         .unwrap_or_default();
     let llm = rt.llm_registry();
+    // W6: warn only about the EFFECTIVE default (what an unset prompt
+    // actually resolves to — llm_registry's state→config precedence), not
+    // every per-provider default-map entry: the first version flagged three
+    // unused providers' defaults (user: "i don't use any of those 3 models")
+    {
+        let (dpid, dmid) = &llm.default_model;
+        // catalog shape (live-verified): config_providers.providers is a
+        // LIST of {id, models:{...}} — the earlier pointer("/providers/x/
+        // models") never matched it; config-file providers are a DICT under
+        // provider.<pid>.models. Both must be consulted.
+        let known = rt
+            .config_providers
+            .get("providers")
+            .and_then(|p| p.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(dpid.as_str()))
+            })
+            .and_then(|e| e.get("models"))
+            .and_then(|m| m.as_object())
+            .map(|m| m.contains_key(dmid.as_str()))
+            .unwrap_or(false)
+            || rt
+                .config
+                .pointer(&format!("/provider/{dpid}/models"))
+                .and_then(|m| m.as_object())
+                .map(|m| m.contains_key(dmid.as_str()))
+                .unwrap_or(false);
+        if !dmid.is_empty() && !known {
+            tracing::warn!(
+                "effective default model {dpid}/{dmid} is NOT in the provider catalog — prompts with no model selection will fail at send time (the dead-ox-alpha case)"
+            );
+        }
+    }
     let payloads = rt.payloads();
     let db_path = refine_store::writer::db_path(&data_dir);
     let writer = std::sync::Arc::new(
