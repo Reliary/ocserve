@@ -1,0 +1,84 @@
+{
+ "_source": "live probes against upstream 1.18.31 on 127.0.0.1:4901, 2026-10-02 (read-only GETs; busy probe used one throwaway prompt session, deleted)",
+ "route": "GET /session/{id}/message",
+ "page_headers": {
+  "X-Next-Cursor": "base64url(JSON {\"id\": <messageID>, \"time\": <time_created>}) \u2014 key order id,time; emitted ONLY when older messages exist beyond the page",
+  "Link": "<{origin}{path}?limit={n}&before={cursor}>; rel=\"next\" \u2014 origin echoes request Host (x-forwarded-proto honored)",
+  "Access-Control-Expose-Headers": "Link, X-Next-Cursor",
+  "Content-Length": "present upstream (buffered response); refine streams chunked (client-compatible divergence)"
+ },
+ "cursor_follow": "limit=5 \u2192 X-Next-Cursor \u2192 limit=5&before=<cursor> \u2192 200, page strictly older than cursor id, next cursor continues",
+ "rules": [
+  {
+   "req": "before without limit",
+   "status": 400,
+   "body": "{\"_tag\":\"BadRequest\"}"
+  },
+  {
+   "req": "before=garbage with limit",
+   "status": 400,
+   "body": "{\"_tag\":\"BadRequest\"}"
+  },
+  {
+   "req": "limit absent / limit= / limit=0",
+   "status": 200,
+   "behavior": "full history, no page headers"
+  },
+  {
+   "req": "limit=+5 / limit=1e3",
+   "status": 200,
+   "behavior": "5 / 1000 (JS Number semantics)"
+  },
+  {
+   "req": "limit=abc",
+   "status": 400,
+   "body": {
+    "name": "BadRequest",
+    "data": {
+     "message": "Expected an integer, got NaN\\n  at [\"limit\"]",
+     "kind": "Query"
+    }
+   }
+  },
+  {
+   "req": "limit=5.5 / limit=-0.5",
+   "status": 400,
+   "body": {
+    "name": "BadRequest",
+    "data": {
+     "message": "Expected an integer, got {5.5|-0.5}\\n  at [\"limit\"]",
+     "kind": "Query"
+    }
+   }
+  },
+  {
+   "req": "limit=-1",
+   "status": 400,
+   "body": {
+    "name": "BadRequest",
+    "data": {
+     "message": "Expected a value greater than or equal to 0, got -1\\n  at [\"limit\"]",
+     "kind": "Query"
+    }
+   }
+  },
+  {
+   "req": "limit=999999999999999999999",
+   "status": 400,
+   "body": {
+    "name": "BadRequest",
+    "data": {
+     "message": "Expected an integer, got 1e+21\\n  at [\"limit\"]",
+     "kind": "Query"
+    }
+   }
+  }
+ ],
+ "session_status_busy": {
+  "route": "GET /session/status",
+  "captured": "{\"<probe-session-id>\": {\"type\": \"busy\"}}",
+  "semantics": "map of NON-idle sessions only (idle entries deleted upstream session/status.ts); value = Info union {idle|busy|retry}; busy observed at +0.13s after prompt_async, drained to idle ~10s after completion",
+  "note": "upstream probe required an explicit working model (opencode-go/mimo-v2.6-flash); upstream's own deepseek-v4-flash id was rejected by the long-running server's stale catalog (ProviderModelNotFoundError)"
+ },
+ "stream_note": "upstream buffers (Content-Length); refine streams \u2014 oc-remote reads bodyAsChannel to temp file either way (verified usage)"
+}
