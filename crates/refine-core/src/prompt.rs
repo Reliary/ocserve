@@ -165,11 +165,50 @@ fn provider_stall() -> std::time::Duration {
     })
 }
 
+/// Execution knobs for `run_prompt_with`. Defaults = every existing caller's
+/// behavior (prompt/message/command/shell/abort paths unchanged).
+#[derive(Clone)]
+pub struct RunOpts {
+    /// persist the incoming payload's user message (false: summarize runs a
+    /// transient instruction — only the assistant reply lands in history)
+    pub persist_user: bool,
+    /// skip loading session history as provider messages (prelude carries it)
+    pub skip_history: bool,
+    /// extra user message for the MODEL when skip_history (summarize prompt)
+    pub prelude: Option<String>,
+    /// send tools to the provider (false: summarization is text-only)
+    pub tools_enabled: bool,
+}
+
+impl Default for RunOpts {
+    fn default() -> Self {
+        // NOTE: derive(Default) would make every bool false — persist_user /
+        // tools_enabled MUST default true or existing callers silently change
+        // (caught immediately: prompt_async/command persistence tests red).
+        Self {
+            persist_user: true,
+            skip_history: false,
+            prelude: None,
+            tools_enabled: true,
+        }
+    }
+}
+
 pub async fn run_prompt(
     ctx: &PromptContext,
     writer: &refine_store::Writer,
     session_id: &str,
     payload: &Value,
+) -> Result<(Value, Vec<Value>)> {
+    run_prompt_with(ctx, writer, session_id, payload, RunOpts::default()).await
+}
+
+pub async fn run_prompt_with(
+    ctx: &PromptContext,
+    writer: &refine_store::Writer,
+    session_id: &str,
+    payload: &Value,
+    opts: RunOpts,
 ) -> Result<(Value, Vec<Value>)> {
     if !refine_store::session_exists(&ctx.db, session_id)? {
         anyhow::bail!("Session not found: {session_id}");
@@ -222,14 +261,16 @@ pub async fn run_prompt(
         "agent": agent,
         "model": {"providerID": model, "modelID": model},
     });
-    insert_message(
-        writer,
-        Some(&*ctx.blobs),
-        session_id,
-        &user_info,
-        &user_parts,
-    )
-    .context("persist user message")?;
+    if opts.persist_user {
+        insert_message(
+            writer,
+            Some(&*ctx.blobs),
+            session_id,
+            &user_info,
+            &user_parts,
+        )
+        .context("persist user message")?;
+    }
 
     emit_durable(
         ctx,
@@ -246,23 +287,25 @@ pub async fn run_prompt(
         }),
         &mut seq,
     )?;
-    emit_durable(
-        ctx,
-        writer,
-        session_id,
-        "message.updated",
-        json!({"sessionID": session_id, "info": user_info}),
-        &mut seq,
-    )?;
-    for part in &user_parts {
+    if opts.persist_user {
         emit_durable(
             ctx,
             writer,
             session_id,
-            "message.part.updated",
-            json!({"sessionID": session_id, "part": part}),
+            "message.updated",
+            json!({"sessionID": session_id, "info": user_info}),
             &mut seq,
         )?;
+        for part in &user_parts {
+            emit_durable(
+                ctx,
+                writer,
+                session_id,
+                "message.part.updated",
+                json!({"sessionID": session_id, "part": part}),
+                &mut seq,
+            )?;
+        }
     }
     emit_live(
         ctx,
@@ -271,11 +314,25 @@ pub async fn run_prompt(
     );
 
     // ---- provider context ----
-    let history = refine_store::load_messages(&ctx.db, session_id, None)?;
     let mut messages = vec![ChatMessage::text("system", ctx.system.clone())];
-    messages.extend(to_provider_messages(&history));
-    let mut tools = refine_tools::schemas();
-    if let Some(hub) = &ctx.mcp {
+    if opts.skip_history {
+        // transient instruction carries the serialized history (summarize)
+        messages.push(ChatMessage::text(
+            "user",
+            opts.prelude.clone().unwrap_or_default(),
+        ));
+    } else {
+        let history = refine_store::load_messages(&ctx.db, session_id, None)?;
+        messages.extend(to_provider_messages(&history));
+    }
+    let mut tools = if opts.tools_enabled {
+        refine_tools::schemas()
+    } else {
+        Vec::new()
+    };
+    if opts.tools_enabled
+        && let Some(hub) = &ctx.mcp
+    {
         // cached after first prompt (listChanged=false servers); failures
         // degrade to builtin-only tools, never block the prompt
         let mcp_tools =
@@ -319,7 +376,17 @@ pub async fn run_prompt(
         // stage must fail, never hang busy (A3).
         let mut stream = match tokio::time::timeout(
             provider_stall(),
-            client.chat_stream(&model, &messages, None, Some(&tools), Some(session_id)),
+            client.chat_stream(
+                &model,
+                &messages,
+                None,
+                if opts.tools_enabled {
+                    Some(&tools)
+                } else {
+                    None
+                },
+                Some(session_id),
+            ),
         )
         .await
         {

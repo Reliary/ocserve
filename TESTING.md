@@ -34,6 +34,14 @@ traceable test, every test has a traceable requirement.
    | part written without its search projection (FTS silently misses rows) | `check-guards.sh` rule 4: `msg_part` INSERT/UPDATE only in `refine-store/src` (helpers carry the companion) | search suite: blob-hit, backfill idempotence, PATCH-reindex, cascade-delete |
    | literal backslash at EOL in any SQL string (shipped ONCE in W1 — stray `\` reached SQLite) | `check-guards.sh` rule 2 widened to any `\\$` EOL in `crates/*/src` (was `sql:`-prefixed only — the widening itself has a planted-violation negative control) | backfill/search suites execute every SQL path |
 
+   **Named divergences (K-SUMMARIZE):** refine's summarize does NOT create
+   compaction-state/history filtering (upstream `filterCompacted` hides pre-compaction
+   messages from later prompts — refine keeps full history and appends the summary as an
+   ordinary assistant message, per the live probe's 4-message shape minus the
+   `info.summary` marker); the agent system prompt stays attached (v1 compaction shapes
+   its own system); no overflow/prune machinery (full history serialized, tool outputs
+   truncated at 2000 chars like v1 serialize).
+
    **Named divergences (K-SYNC bridge):** legacy-delta sync is *additive-only* — upstream
    message/part **edits and deletes are not pulled** (rare in v1; a legacy edit after sync
    shows as the original in refine). Legacy **wins** title/time_updated for imported sessions

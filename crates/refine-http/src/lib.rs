@@ -784,6 +784,92 @@ async fn get_messages(
     Ok(resp)
 }
 
+/// POST /session/{id}/summarize — W3 compaction-lite (v1 handlers/session.ts
+/// summarize: payload {providerID, modelID, auto?} → true). Runs ONE
+/// transient text-only turn carrying buildPrompt's instruction + serialized
+/// history (refine-core::compact); the summary lands as an ordinary
+/// assistant message (divergence: no compaction-state/history filtering —
+/// TESTING §1.6). Synchronous like upstream (`yield* promptSvc.loop`).
+async fn post_summarize(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(sid): axum::extract::Path<String>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    if !refine_store::session_exists(&st.db, &sid).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })? {
+        return Err(ApiError::not_found(format!("Session not found: {sid}")));
+    }
+    let provider = payload
+        .get("providerID")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let model_id = payload
+        .get("modelID")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let (Some(provider), Some(model_id)) = (provider, model_id) else {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            name: "BadRequest",
+            message: "providerID and modelID are required".into(),
+        });
+    };
+
+    let release = lock_session(&st, &sid).await?;
+    let Ok(_guard) = release.arc().try_lock() else {
+        return Err(session_busy(&sid));
+    };
+
+    // agent = last user message's agent (v1: findLast user ?? defaultAgent)
+    let history = refine_store::load_messages(&st.db, &sid, None).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })?;
+    let agent = history
+        .iter()
+        .rev()
+        .find(|(info, _)| info["role"] == "user")
+        .and_then(|(info, _)| info["agent"].as_str())
+        .unwrap_or("build")
+        .to_string();
+    let entries: Vec<String> = history
+        .iter()
+        .map(|(info, parts)| refine_core::compact::serialize(info, parts))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let prelude = refine_core::compact::build_summary_prompt(&entries);
+
+    let prompt_payload = json!({
+        "model": {"providerID": provider, "modelID": model_id},
+        "agent": agent,
+        "parts": [],
+    });
+    let ctx = build_prompt_context(&st, &prompt_payload, &sid)?;
+    let writer = st.writer.clone();
+    refine_core::prompt::run_prompt_with(
+        &ctx,
+        &writer,
+        &sid,
+        &prompt_payload,
+        refine_core::prompt::RunOpts {
+            // upstream probe (2026-10-02): summarize persists an EMPTY user
+            // marker (parts=[]) + the assistant summary — 4-message shape
+            // [user, assistant, user, assistant] confirmed live on 1.18.31
+            persist_user: true,
+            skip_history: true,
+            prelude: Some(prelude),
+            tools_enabled: false,
+        },
+    )
+    .await
+    .map_err(prompt_err)?;
+    Ok(Json(json!(true)))
+}
+
 /// POST /session/search — W1 content search over part payloads (contract
 /// block PLAN §17). ≥3 chars → trigram FTS substring MATCH; shorter → LIKE
 /// fallback (same projection, one query either way). Inline AND blobbed
@@ -2209,6 +2295,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/session", get(get_sessions).post(post_session))
         .route("/session/status", get(session_status))
         .route("/session/search", axum::routing::post(search_messages))
+        .route(
+            "/session/{id}/summarize",
+            axum::routing::post(post_summarize),
+        )
         .route(
             "/session/{id}",
             get(get_session)

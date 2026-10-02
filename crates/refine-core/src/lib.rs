@@ -5,6 +5,7 @@
 //! (PLAN §11): durable event seq, bounded ring, crash-recoverable claims
 //! land with M3 milestones.
 
+pub mod compact;
 pub mod event;
 pub mod ids;
 pub mod permission;
