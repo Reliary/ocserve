@@ -367,3 +367,170 @@ pub fn backup_to(conn: &rusqlite::Connection, dest: &std::path::Path) -> anyhow:
     conn.execute_batch(&sql)?;
     Ok(())
 }
+
+// ---- oc-remote contract family (Batch 1: session/message/part mutations) ----
+
+/// PATCH /session/{id} — title update (oc-remote rename sends {title} only;
+/// metadata/permission/archived fields are not stored by refine — ignored).
+pub fn update_session_title(
+    writer: &Writer,
+    session_id: &str,
+    title: &str,
+) -> anyhow::Result<usize> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    writer.write(vec![WriteOp::Sql {
+        sql: "UPDATE session SET title = ?2, time_updated = ?3 WHERE id = ?1".into(),
+        params: vec![session_id.into(), title.into(), now.into()],
+    }])
+}
+
+/// DELETE /session/{id} — cascade messages/parts/todo (FKs), plus events
+/// (no FK) and the session row. Blob GC is a separate pass (orphans are
+/// expected until gc_orphans runs — STORAGE §3).
+pub fn delete_session(
+    writer: &Writer,
+    db: &std::path::Path,
+    session_id: &str,
+) -> anyhow::Result<bool> {
+    if !session_exists(db, session_id)? {
+        return Ok(false);
+    }
+    writer.write(vec![
+        WriteOp::Sql {
+            sql: "DELETE FROM event WHERE session_id = ?1".into(),
+            params: vec![session_id.into()],
+        },
+        WriteOp::Sql {
+            sql: "DELETE FROM session WHERE id = ?1".into(),
+            params: vec![session_id.into()],
+        },
+    ])?;
+    Ok(true)
+}
+
+/// GET /session/{id}/children — sessions whose parent_id is this id (refine
+/// never sets parent_id today → always []; shape-correct for the client).
+pub fn load_children(
+    db: &std::path::Path,
+    session_id: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let conn = pragma::open_reader(db)?;
+    let mut stmt =
+        conn.prepare("SELECT id FROM session WHERE parent_id = ?1 ORDER BY time_updated DESC")?;
+    let ids: Vec<String> = stmt
+        .query_map([session_id], |r| r.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    let mut out = Vec::new();
+    for id in ids {
+        if let Some(v) = load_session_wire(db, &id)? {
+            out.push(v);
+        }
+    }
+    Ok(out)
+}
+
+/// GET /session/{id}/todo — upstream Todo.Info subset oc-remote decodes:
+/// {content, status, priority} (SseEvent.TodoUpdated.Todo).
+pub fn load_todos(
+    db: &std::path::Path,
+    session_id: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let conn = pragma::open_reader(db)?;
+    let mut stmt = conn.prepare(
+        "SELECT content, status, priority FROM todo WHERE session_id = ?1 ORDER BY time_created",
+    )?;
+    let rows = stmt.query_map([session_id], |r| {
+        Ok(serde_json::json!({
+            "content": r.get::<_, String>(0)?,
+            "status": r.get::<_, String>(1)?,
+            "priority": r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+        }))
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// DELETE /session/{id}/message/{mid} (parts cascade via FK).
+pub fn delete_message(
+    writer: &Writer,
+    db: &std::path::Path,
+    session_id: &str,
+    message_id: &str,
+) -> anyhow::Result<bool> {
+    let exists: bool = {
+        let conn = pragma::open_reader(db)?;
+        conn.query_row(
+            "SELECT count(*) FROM msg WHERE id = ?1 AND session_id = ?2",
+            rusqlite::params![message_id, session_id],
+            |r| r.get::<_, i64>(0).map(|n| n > 0),
+        )?
+    };
+    if !exists {
+        return Ok(false);
+    }
+    writer.write(vec![WriteOp::Sql {
+        sql: "DELETE FROM msg WHERE id = ?1 AND session_id = ?2".into(),
+        params: vec![message_id.into(), session_id.into()],
+    }])?;
+    Ok(true)
+}
+
+/// DELETE /session/{id}/message/{mid}/part/{pid}
+pub fn delete_part(
+    writer: &Writer,
+    db: &std::path::Path,
+    message_id: &str,
+    part_id: &str,
+) -> anyhow::Result<bool> {
+    let exists: bool = {
+        let conn = pragma::open_reader(db)?;
+        conn.query_row(
+            "SELECT count(*) FROM msg_part WHERE id = ?1 AND message_id = ?2",
+            rusqlite::params![part_id, message_id],
+            |r| r.get::<_, i64>(0).map(|n| n > 0),
+        )?
+    };
+    if !exists {
+        return Ok(false);
+    }
+    writer.write(vec![WriteOp::Sql {
+        sql: "DELETE FROM msg_part WHERE id = ?1".into(),
+        params: vec![part_id.into()],
+    }])?;
+    Ok(true)
+}
+
+/// PATCH .../part/{pid} — replace the stored part JSON (inline ≤8KB, else
+/// blob). `data` is the client's full part object (native sessionID/messageID
+/// keys — verified in oc-remote Part @SerialName).
+pub fn update_part(
+    writer: &Writer,
+    blobs: &BlobStore,
+    message_id: &str,
+    part_id: &str,
+    data: &serde_json::Value,
+) -> anyhow::Result<bool> {
+    let text = data.to_string();
+    let byte_len = text.len() as i64;
+    let (inline, sha) = if text.len() > INLINE_PART_MAX {
+        let (sha, _, _) = blobs.put(text.as_bytes())?;
+        (None, Some(sha))
+    } else {
+        (Some(text), None)
+    };
+    let n = writer.write(vec![WriteOp::Sql {
+        sql: "UPDATE msg_part SET byte_len = ?3, inline = ?4, blob_sha = ?5 WHERE id = ?1 AND message_id = ?2"
+            .into(),
+        params: vec![
+            part_id.into(),
+            message_id.into(),
+            byte_len.into(),
+            inline.into(),
+            sha.into(),
+        ],
+    }])?;
+    Ok(n > 0)
+}

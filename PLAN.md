@@ -348,3 +348,26 @@ byte-golden capture of live `/global/event`; contentless-FTS retest under bundle
 
 Live 33 GB DB reclaim while refine is built: `VACUUM` (~21 GB back), rotate 577 MB logs, WAL
 checkpoint, raise `cache_size`, `swappiness` 150 → 10. Optional; not part of refine.
+
+## 17. oc-remote route coverage (exhaustive client audit)
+
+Source: static extraction of all58 route templates + call graph from
+`~/src/oc-remote` (`OpenCodeApi.kt` + callers), diffed against refine's router.
+Status codes: **live** = implemented + tested this session; **probe-by-design** =
+the client probes for MiMoCode extensions; vanilla opencode also 404s, so our
+404 *is* freeze behavior; **out** = explicitly out of MVP scope with reason;
+**batch N** = planned follow-up batches (not yet implemented).
+
+| Route (oc-remote) | Method | Status |
+|---|---|---|
+| `/global/health` `/global/event` `/path` `/project` `/project/current` `/project/{id}/directories` `/agent` `/command` `/config` `/config/providers` `/provider` `/session` `/session/{id}` `/session/{id}/message` `/session/{id}/prompt_async` `/session/status` `/experimental/session` `/experimental/workspace` `/mcp` `/permission` `/permission/{id}/reply` | GET/POST/… | **live** (M0–M5 core) |
+| `/session/{id}/children` `/session/{id}/todo` `/session/{id}/abort`, `DELETE /session/{id}`, `PATCH /session/{id}` | GET/POST/DELETE/PATCH | **live** (Batch 1) |
+| `DELETE/PATCH /session/{id}/message/{mid}`, `DELETE/PATCH …/part/{pid}` | DELETE/PATCH | **live** (Batch 1) |
+| `/file`, `/file/content`, `/find/file`, `/find`, `/question`, `/question/{id}/reply|reject` | GET/POST | **live** (Batch 2; question replies 404 until the question tool exists — honest, no silent success) |
+| `/session/{id}/task`, `/session/{id}/actors`, `/bash-interactive`, `/workflows` | GET | **probe-by-design** — no v1 route exists upstream either (verified in v1 httpapi groups); client tolerates the absence |
+| `/session/{id}/diff` `/session/{id}/command` `/session/{id}/shell` `/session/{id}/summarize` `/global/config` `PATCH /config` `PATCH /global/config` `/global/dispose` `/mcp/{name}/{action}` `/mcp/{name}/auth` `/provider/auth` `/auth/{id}` (PUT/DELETE) | mixed | **batch 3** (semantics-heavy: command expansion, config mutation, MCP control, provider keys) |
+| `/pty` `/pty/{id}` (POST/PUT/DELETE), `/provider/{id}/oauth/*` | mixed | **out** — PTY host and provider OAuth are separate features (never in MVP scope); UI probes tolerate 404 |
+| `/session/{id}/share` (POST/DELETE), `/revert` `/unrevert` `/fork` | POST | **out** — share/snapshot/git-revert infra explicitly out of MVP (PLAN §2); 404 tolerated by client |
+| `/api/session/{id}/agent|model|prompt` | POST | **out** — v2-only endpoints, unused by oc-remote against v1 servers (call graph: UNUSED) |
+| `/experimental/workspace` `/project/{id}/directories` | GET | live; call graph UNUSED by client but served (freeze) |
+| `/session/{id}/message` (collection DELETE) | — | not a route: the client's second `.delete` was temp-file cleanup (static call graph false positive) |

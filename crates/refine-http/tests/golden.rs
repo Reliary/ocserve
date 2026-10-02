@@ -548,3 +548,440 @@ async fn prompt_async_returns_204_persists_user_message_and_404s_unknown() {
     }
     assert!(saw_user, "background prompt persisted the user message");
 }
+
+// ---- oc-remote contract family, Batch 1 (TESTING §4) ----
+
+async fn batch1_state() -> (std::sync::Arc<refine_http::AppState>, axum::Router) {
+    let st = refine_http::AppState::with_payloads(None, refine_http::Payloads::default());
+    refine_store::insert_session(
+        &st.writer,
+        &serde_json::json!({
+            "id": "ses_b1",
+            "projectID": "global",
+            "directory": "/work",
+            "path": "ses_b1",
+            "slug": "ses_b1",
+            "title": "batch1",
+            "version": "1",
+            "time": {"created": 1, "updated": 2},
+        }),
+    )
+    .unwrap();
+    // one message + one text part
+    let info = serde_json::json!({
+        "id": "msg_b1",
+        "sessionID": "ses_b1",
+        "role": "user",
+        "time": {"created": 100},
+    });
+    let parts = vec![serde_json::json!({
+        "id": "prt_b1",
+        "sessionID": "ses_b1",
+        "messageID": "msg_b1",
+        "type": "text",
+        "text": "before-edit",
+    })];
+    refine_store::insert_message(&st.writer, Some(&*st.blobs), "ses_b1", &info, &parts).unwrap();
+    // a todo row
+    st.writer
+        .write(vec![refine_store::WriteOp::Sql {
+            sql: "INSERT INTO todo (id, session_id, content, status, priority, time_created, time_updated) \
+                  VALUES ('td1', 'ses_b1', 'ship it', 'in_progress', 'high', 1, 2)"
+                .into(),
+            params: vec![],
+        }])
+        .unwrap();
+    let app = refine_http::router(st.clone());
+    (st, app)
+}
+
+async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn session_rename_delete_children_todo_abort() {
+    let (_st, app) = batch1_state().await;
+
+    // PATCH rename → wire reflects new title
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/session/ses_b1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"title":"renamed"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v["title"], "renamed");
+
+    // unknown → 404 freeze envelope
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/session/ses_nope")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"title":"x"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // children → []
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/session/ses_b1/children")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await, serde_json::json!([]));
+
+    // todo → shape {content,status,priority}
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/session/ses_b1/todo")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let todos = body_json(resp).await;
+    assert_eq!(todos[0]["content"], "ship it");
+    assert_eq!(todos[0]["priority"], "high");
+
+    // abort with no active task → true (idempotent)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/session/ses_b1/abort")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await, serde_json::json!(true));
+
+    // DELETE session → true, then reads 404
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/session/ses_b1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await, serde_json::json!(true));
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/session/ses_b1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // deleted session → 404 on message list too
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/session/ses_b1/message")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn message_and_part_mutations_roundtrip() {
+    let (_st, app) = batch1_state().await;
+
+    // part PATCH (native keys, matching path) → stored data replaced
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/session/ses_b1/message/msg_b1/part/prt_b1")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"id":"prt_b1","sessionID":"ses_b1","messageID":"msg_b1",
+                        "type":"text","text":"after-edit"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let v = body_json(resp).await;
+    assert_eq!(status, 200, "patch part failed: {v}");
+    assert_eq!(v["text"], "after-edit");
+    // read back via GET messages
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/session/ses_b1/message")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let msgs = body_json(resp).await;
+    assert_eq!(msgs[0]["parts"][0]["text"], "after-edit", "PATCH persisted");
+
+    // mismatched ids → 400 (v1 rejects)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/session/ses_b1/message/msg_b1/part/prt_b1")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"id":"prt_b1","sessionID":"ses_OTHER","messageID":"msg_b1","type":"text"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // DELETE part → true; gone from read
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/session/ses_b1/message/msg_b1/part/prt_b1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await, serde_json::json!(true));
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/session/ses_b1/message")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let msgs = body_json(resp).await;
+    assert_eq!(msgs[0]["parts"].as_array().map(|p| p.len()).unwrap_or(0), 0);
+
+    // DELETE message → true; message gone
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/session/ses_b1/message/msg_b1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await, serde_json::json!(true));
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/session/ses_b1/message")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let msgs = body_json(resp).await;
+    assert_eq!(msgs.as_array().map(|m| m.len()).unwrap_or(99), 0);
+
+    // DELETE unknown part → 404 envelope
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/session/ses_b1/message/msg_gone/part/prt_gone")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ---- oc-remote contract family, Batch 2 (file/find/question) ----
+
+#[tokio::test]
+async fn file_find_question_routes() {
+    // base directory = AppState paths.directory = /work (with_payloads);
+    // scope_path canonicalizes — create a real dir the state can see? paths
+    // are env-derived: use HOME-based temp instead by building state normally
+    // and pointing requests at paths that exist under the canonical base.
+    let st = refine_http::AppState::with_payloads(None, refine_http::Payloads::default());
+    let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/"));
+    // with_payloads directory = current_dir (canonicalizable). Seed a file
+    // under a unique subdir we can safely write.
+    let seed = base.join(format!("refine-file-test-{}", std::process::id()));
+    std::fs::create_dir_all(&seed).unwrap();
+    std::fs::write(seed.join("hello.txt"), "hi there").unwrap();
+    std::fs::create_dir_all(seed.join("sub")).unwrap();
+    std::fs::write(seed.join("sub/nested.rs"), "fn deep() {}").unwrap();
+    let rel = format!("{}/", seed.file_name().unwrap().to_string_lossy());
+
+    let app = refine_http::router(st.clone());
+
+    // list directory
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/file?path={rel}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    let names: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"hello.txt"), "listing: {names:?}");
+    assert!(names.contains(&"sub"), "listing: {names:?}");
+    let node = v.as_array().unwrap()[0].clone();
+    for k in ["name", "path", "type", "absolute", "ignored"] {
+        assert!(node.get(k).is_some(), "FileNode missing {k}");
+    }
+
+    // file content
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/file/content?path={rel}hello.txt"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    assert_eq!(v["type"], "text");
+    assert_eq!(v["content"], "hi there");
+
+    // scope escape → 400
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/file/content?path=../../../etc/passwd")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // find/file substring
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/find/file?query={}&limit=100", "nested"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    let hits: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    assert!(
+        hits.iter().any(|h| h.ends_with("nested.rs")),
+        "find/file hits: {hits:?}"
+    );
+
+    // find text
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/find?pattern=hi%20there")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    let arr = v.as_array().unwrap();
+    assert!(!arr.is_empty(), "grep found our file");
+    assert!(
+        arr.iter()
+            .any(|m| m["path"].as_str().unwrap_or("").ends_with("hello.txt")),
+        "our file in matches: {arr:?}"
+    );
+    assert!(arr[0]["lineNumber"].as_i64().is_some());
+
+    // question polls → [], reply/reject → 404 (nothing pending, honest)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/question")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await, serde_json::json!([]));
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/question/q1/reply")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    std::fs::remove_dir_all(&seed).ok();
+}

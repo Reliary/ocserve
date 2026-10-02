@@ -87,6 +87,9 @@ impl IntoResponse for HttpError {
     }
 }
 
+/// session → (generation, background prompt task) for POST /abort.
+pub type PromptTask = (u64, tokio::task::JoinHandle<()>);
+
 /// App state shared by handlers.
 pub struct AppState {
     /// Static config payload served at GET /config (recorded corpus).
@@ -135,6 +138,13 @@ pub struct AppState {
             std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
         >,
     >,
+    /// Background prompt tasks per session: (generation, JoinHandle) —
+    /// POST /abort cancels the current generation (v1 session.abort).
+    /// Bound: one entry per in-flight async prompt, removed on completion.
+    pub prompt_tasks:
+        std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, PromptTask>>>,
+    /// Monotonic generation source for prompt_tasks.
+    pub prompt_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// LLM endpoint resolution for the prompt runner (assembled by Runtime).
@@ -232,6 +242,10 @@ impl AppState {
             prompt_locks: std::sync::Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            prompt_tasks: std::sync::Arc::new(parking_lot::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            prompt_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             db: w.db,
             blobs: w.blobs,
             writer: w.writer,
@@ -802,21 +816,437 @@ async fn post_prompt_async(
     let writer = st.writer.clone();
     let locks = st.prompt_locks.clone();
     let sid = id.clone();
-    tokio::spawn(async move {
+    let generation = st
+        .prompt_gen
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tasks = st.prompt_tasks.clone();
+    let tasks_insert = st.prompt_tasks.clone();
+    let handle = tokio::spawn(async move {
         let guard = lock.lock().await;
         match refine_core::prompt::run_prompt(&ctx, &writer, &sid, &payload).await {
             Ok(_) => {}
             Err(e) => tracing::error!("prompt_async failed session={sid}: {e:#}"),
         }
         drop(guard);
-        let mut map = locks.lock();
-        if let Some(arc) = map.get(&sid)
-            && std::sync::Arc::strong_count(arc) <= 2
         {
-            map.remove(&sid);
+            let mut map = locks.lock();
+            if let Some(arc) = map.get(&sid)
+                && std::sync::Arc::strong_count(arc) <= 2
+            {
+                map.remove(&sid);
+            }
+        }
+        let mut t = tasks.lock();
+        if let Some((g, _)) = t.get(&sid)
+            && *g == generation
+        {
+            t.remove(&sid);
         }
     });
+    tasks_insert.lock().insert(id.clone(), (generation, handle));
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- oc-remote contract family (Batch 1: session/message/part) ----
+
+async fn get_children(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    refine_store::load_children(&st.db, &id)
+        .map(|v| Json(Value::Array(v)))
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("{e:#}"),
+        })
+}
+
+async fn get_todos(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    refine_store::load_todos(&st.db, &id)
+        .map(|v| Json(Value::Array(v)))
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("{e:#}"),
+        })
+}
+
+/// PATCH /session/{id} — oc-remote rename sends {title} only. Other
+/// UpdatePayload fields (metadata/permission/time.archived) are not stored
+/// by refine — accepted and ignored (documented divergence).
+async fn patch_session(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(title) = payload.get("title").and_then(|t| t.as_str()) {
+        refine_store::update_session_title(&st.writer, &id, title).map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("{e:#}"),
+        })?;
+    }
+    refine_store::load_session_wire(&st.db, &id)
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("{e:#}"),
+        })?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))
+}
+
+/// DELETE /session/{id} → true (v1 Schema.Boolean). Aborts any in-flight
+/// async prompt first (it would write into a deleted session otherwise).
+async fn delete_session_route(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some((_, handle)) = st.prompt_tasks.lock().remove(&id) {
+        handle.abort();
+    }
+    refine_store::delete_session(&st.writer, &st.db, &id)
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("{e:#}"),
+        })?
+        .then_some(Json(json!(true)))
+        .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))
+}
+
+/// POST /session/{id}/abort → true (idempotent: no active task = still true).
+async fn post_abort(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some((_, handle)) = st.prompt_tasks.lock().remove(&id) {
+        handle.abort();
+        tracing::info!("abort: cancelled prompt task for {id}");
+    }
+    Ok(Json(json!(true)))
+}
+
+async fn delete_message_route(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path((sid, mid)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    refine_store::delete_message(&st.writer, &st.db, &sid, &mid)
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("{e:#}"),
+        })?
+        .then_some(Json(json!(true)))
+        .ok_or_else(|| ApiError::not_found(format!("Message not found: {mid}")))
+}
+
+async fn delete_part_route(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path((_sid, mid, pid)): axum::extract::Path<(String, String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    refine_store::delete_part(&st.writer, &st.db, &mid, &pid)
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("{e:#}"),
+        })?
+        .then_some(Json(json!(true)))
+        .ok_or_else(|| ApiError::not_found(format!("Part not found: {pid}")))
+}
+
+/// PATCH .../part/{pid} — replace part JSON (native sessionID/messageID keys;
+/// v1 verifies all three ids match the path — oc-remote pre-validates too).
+async fn patch_part_route(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path((sid, mid, pid)): axum::extract::Path<(String, String, String)>,
+    Json(part): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let body_sid = part.get("sessionID").and_then(|v| v.as_str()).unwrap_or("");
+    let body_mid = part.get("messageID").and_then(|v| v.as_str()).unwrap_or("");
+    let body_pid = part.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if body_sid != sid || body_mid != mid || body_pid != pid {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            name: "BadRequest",
+            message: "part id/sessionID/messageID must match the path".into(),
+        });
+    }
+    refine_store::update_part(&st.writer, &st.blobs, &mid, &pid, &part)
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("{e:#}"),
+        })?
+        .then_some(Json(part))
+        .ok_or_else(|| ApiError::not_found(format!("Part not found: {pid}")))
+}
+
+// ---- oc-remote contract family (Batch 2: file/find/question) ----
+
+fn scope_path(base: &std::path::Path, raw: &str) -> Result<std::path::PathBuf, ApiError> {
+    let joined = if raw.is_empty() || raw == "." {
+        base.to_path_buf()
+    } else {
+        let p = std::path::Path::new(raw);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            base.join(p)
+        }
+    };
+    let canon_base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    let canon = std::fs::canonicalize(&joined).unwrap_or(joined.clone());
+    if !canon.starts_with(&canon_base) {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            name: "BadRequest",
+            message: format!("path escapes the session directory: {raw}"),
+        });
+    }
+    Ok(canon)
+}
+
+/// GET /file?path= — directory listing (FileNode list, oc-remote file browser).
+async fn list_directory(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/"));
+    let raw = q.get("path").map(String::as_str).unwrap_or(".");
+    let dir = scope_path(base, raw)?;
+    let rd = std::fs::read_dir(&dir).map_err(|e| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        name: "BadRequest",
+        message: format!("list {}: {e}", dir.display()),
+    })?;
+    let mut nodes: Vec<Value> = Vec::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        let meta = entry.metadata().ok();
+        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let rel = if raw.is_empty() || raw == "." {
+            name.clone()
+        } else {
+            format!("{}/{}", raw.trim_end_matches('/'), name)
+        };
+        let ignored =
+            name.starts_with('.') || name == "node_modules" || name == "target" || name == ".git";
+        nodes.push(json!({
+            "name": name,
+            "path": rel,
+            "type": if is_dir { "directory" } else { "file" },
+            "absolute": path.to_string_lossy(),
+            "ignored": ignored,
+            "size": meta.as_ref().filter(|m| m.is_file()).map(|m| m.len()),
+            "modified": meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| {
+                t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_millis() as i64)
+            }),
+        }));
+    }
+    // directories first, then name (browser expectations), bounded
+    nodes.sort_by(|a, b| {
+        let da = a["type"] == "directory";
+        let db = b["type"] == "directory";
+        db.cmp(&da)
+            .then_with(|| a["name"].as_str().cmp(&b["name"].as_str()))
+    });
+    nodes.truncate(5000);
+    Ok(Json(Value::Array(nodes)))
+}
+
+/// GET /file/content?path= — {type: text|binary, content, encoding}.
+async fn read_file_content(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/"));
+    let raw = q.get("path").map(String::as_str).ok_or_else(|| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        name: "BadRequest",
+        message: "missing path".into(),
+    })?;
+    let path = scope_path(base, raw)?;
+    let bytes = std::fs::read(&path).map_err(|e| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        name: "BadRequest",
+        message: format!("read {}: {e}", path.display()),
+    })?;
+    // bound: MEMORY §6 parse cap — truncate at 1MB
+    let truncated = bytes.len() > 1024 * 1024;
+    let bytes = if truncated {
+        &bytes[..1024 * 1024]
+    } else {
+        &bytes[..]
+    };
+    let (kind, content) = match std::str::from_utf8(bytes) {
+        Ok(text) => ("text", text.to_string()),
+        Err(_) => ("binary", String::from_utf8_lossy(bytes).into_owned()),
+    };
+    Ok(Json(json!({
+        "type": kind,
+        "content": content,
+        "encoding": "utf-8",
+    })))
+}
+
+/// GET /find/file?query=&type=&limit= — file-name/path search → List<String>
+/// (bounded walk; case-insensitive substring, glob when the query has *).
+async fn find_files(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/"));
+    let query = q
+        .get("query")
+        .map(String::as_str)
+        .unwrap_or("")
+        .to_lowercase();
+    if query.is_empty() {
+        return Ok(Json(json!([])));
+    }
+    let want_type = q.get("type").map(String::as_str).unwrap_or("");
+    let limit: usize = q
+        .get("limit")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(50)
+        .clamp(1, 200);
+    let glob_mode = query.contains('*') || query.contains('?');
+    let mut out: Vec<String> = Vec::new();
+    let mut stack = vec![(base.to_path_buf(), String::new())];
+    let mut visited = 0usize;
+    while let Some((dir, rel)) = stack.pop() {
+        visited += 1;
+        if visited > 20_000 || out.len() >= limit * 4 {
+            break; // bounded (AGENTS §2.3)
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == ".git" || name == "node_modules" {
+                continue;
+            }
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let child_rel = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            let matched = if glob_mode {
+                refine_tools::wildcard_match(&name, &query)
+            } else {
+                child_rel.to_lowercase().contains(&query)
+            };
+            if matched
+                && (want_type.is_empty()
+                    || (want_type == "dir" && is_dir)
+                    || (want_type == "file" && !is_dir))
+            {
+                out.push(child_rel.clone());
+            }
+            if is_dir {
+                stack.push((entry.path(), child_rel));
+            }
+        }
+    }
+    // prefix matches first, then lexicographic; capped
+    out.sort_by(|a, b| {
+        let pa = a.to_lowercase().starts_with(&query);
+        let pb = b.to_lowercase().starts_with(&query);
+        pb.cmp(&pa).then_with(|| a.cmp(b))
+    });
+    out.truncate(limit);
+    Ok(Json(Value::Array(
+        out.into_iter().map(Value::String).collect(),
+    )))
+}
+
+/// GET /find?pattern= — text search → SearchMatch list. Single `grep -rnE`
+/// spawn (bounded output, 5s); absoluteOffset is not derivable from grep
+/// output and this route has no callers in oc-remote — recorded as 0
+/// (documented, not silently invented).
+async fn find_text(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/"));
+    let pattern = q.get("pattern").map(String::as_str).unwrap_or("");
+    if pattern.is_empty() {
+        return Ok(Json(json!([])));
+    }
+    let out = std::process::Command::new("grep")
+        .args([
+            "-rnE",
+            "--binary-files=without-match",
+            "-m",
+            "50",
+            "--",
+            pattern,
+        ])
+        .arg(base)
+        .env("LC_ALL", "C")
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => {
+            return Err(ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                name: "InternalError",
+                message: format!("grep spawn: {e}"),
+            });
+        }
+    };
+    // grep: 0=matches, 1=none, >1=error (e.g. bad pattern → 2 → 400)
+    if out.status.code().unwrap_or(0) > 1 {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            name: "BadRequest",
+            message: "invalid pattern".into(),
+        });
+    }
+    let mut matches: Vec<Value> = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines().take(200) {
+        // path:line:content
+        let (p1, rest) = match line.split_once(':') {
+            Some(x) => x,
+            None => continue,
+        };
+        let (ln, text) = match rest.split_once(':') {
+            Some(x) => x,
+            None => continue,
+        };
+        let ln: i64 = ln.parse().unwrap_or(0);
+        let rel = std::path::Path::new(p1)
+            .strip_prefix(base)
+            .map(|r| r.to_string_lossy().to_string())
+            .unwrap_or_else(|_| p1.to_string());
+        matches.push(json!({
+            "path": rel,
+            "lines": text,
+            "lineNumber": ln,
+            "absoluteOffset": 0,
+        }));
+    }
+    Ok(Json(Value::Array(matches)))
+}
+
+/// GET /question — pending questions. refine has no question tool yet → []
+/// (ConnectionService polls this; empty list is the honest answer).
+async fn get_questions() -> Json<Value> {
+    Json(json!([]))
+}
+
+/// POST /question/{id}/reply|reject → true; no questions can be pending yet
+/// → 404 (freeze NotFound shape), never a silent success.
+async fn question_missing(id: axum::extract::Path<String>) -> Result<Json<Value>, ApiError> {
+    Err(ApiError::not_found(format!("Question not found: {}", id.0)))
 }
 
 /// Freeze-shaped event id: `evt_` + 26 hex chars (upstream ids are time+random
@@ -996,7 +1426,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/project/current", get(get_project_current))
         .route("/session", get(get_sessions).post(post_session))
         .route("/session/status", get(session_status))
-        .route("/session/{id}", get(get_session))
+        .route(
+            "/session/{id}",
+            get(get_session)
+                .patch(patch_session)
+                .delete(delete_session_route),
+        )
         .route(
             "/session/{id}/message",
             get(get_messages).post(post_message),
@@ -1017,6 +1452,30 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/session/{id}/prompt_async",
             axum::routing::post(post_prompt_async),
+        )
+        .route("/session/{id}/children", get(get_children))
+        .route("/file", get(list_directory))
+        .route("/file/content", get(read_file_content))
+        .route("/find/file", get(find_files))
+        .route("/find", get(find_text))
+        .route("/question", get(get_questions))
+        .route(
+            "/question/{id}/reply",
+            axum::routing::post(question_missing),
+        )
+        .route(
+            "/question/{id}/reject",
+            axum::routing::post(question_missing),
+        )
+        .route("/session/{id}/todo", get(get_todos))
+        .route("/session/{id}/abort", axum::routing::post(post_abort))
+        .route(
+            "/session/{id}/message/{mid}",
+            axum::routing::delete(delete_message_route),
+        )
+        .route(
+            "/session/{id}/message/{mid}/part/{pid}",
+            axum::routing::delete(delete_part_route).patch(patch_part_route),
         )
         .route("/experimental/session", get(get_experimental_sessions))
         .route("/mcp", get(get_mcp))
