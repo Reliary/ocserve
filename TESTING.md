@@ -34,6 +34,13 @@ traceable test, every test has a traceable requirement.
    | part written without its search projection (FTS silently misses rows) | `check-guards.sh` rule 4: `msg_part` INSERT/UPDATE only in `refine-store/src` (helpers carry the companion) | search suite: blob-hit, backfill idempotence, PATCH-reindex, cascade-delete |
    | literal backslash at EOL in any SQL string (shipped ONCE in W1 — stray `\` reached SQLite) | `check-guards.sh` rule 2 widened to any `\\$` EOL in `crates/*/src` (was `sql:`-prefixed only — the widening itself has a planted-violation negative control) | backfill/search suites execute every SQL path |
 
+   **Named divergences (K-ADMIN):** GET /provider/auth derives methods from configured
+   providers (`api-key` only — v1 derives from auth hooks incl. OAuth we cannot run);
+   MCP auth start/callback/authenticate routes are ABSENT (no OAuth MCP servers
+   configured; GET falls to SPA HTML like other unknown routes); dispose has no instance
+   registry to tear down (event + reload only); `disconnected` is a refine-side status
+   value (v1 corpus captured connected/failed only).
+
    **Named divergences (K-CONFIG):** refine serves ONE config (global==user file;
    `PATCH /config` and `PATCH /global/config` share a handler/target); live-swap covers
    the derived route payloads only — provider endpoint registries (LLM routing) rebuild

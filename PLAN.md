@@ -401,7 +401,8 @@ the client probes for MiMoCode extensions; vanilla opencode also 404s, so our
 | `/session/{id}/command` `/session/{id}/shell` | POST | **live** — command = v1 template expansion ($N/$ARGUMENTS/append rules) + session.error SSE on unknown; shell = direct bash exec (no model), synthetic-user + assistant/bash messages, cost 0 |
 | `/session/{id}/summarize` | POST | **live (W3)** — probe bytes: 200 `true`; probe shape: empty user marker (parts=[]) with last-user agent + summarize model, assistant summary follows; port = one transient text-only turn (refine-core::compact = v1 buildPrompt+serialize verbatim), sync, try_lock→409; divergences: no compaction-state/history filter, no info.summary marker (TESTING §1.6) |
 | `PATCH /config` `PATCH /global/config` | PATCH | **live (W4)** — echo payload, shared-file default (overlay via env), reloader swap; see K-CONFIG |
-| `/global/dispose` `/mcp/{name}/{action}` `/mcp/{name}/auth` `/provider/auth` `/auth/{id}` (PUT/DELETE) `/session/{id}/diff` | mixed | **batch 5** (MCP control, provider keys, dispose needs unit Restart=always) |
+| `POST /mcp/{name}/connect\|disconnect` `DELETE /mcp/{name}/auth` `PUT/DELETE /auth/{providerID}` `GET /provider/auth` `POST /global/dispose` | mixed | **live (W5)** — see K-ADMIN; auth writes refine overlay; GET mcp auth/callback routes intentionally absent (no OAuth servers → SPA HTML, documented) |
+| `/session/{id}/diff` | GET | **batch 5** (git/worktree diff) |
 | `/pty` `/pty/{id}` (POST/PUT/DELETE), `/provider/{id}/oauth/*` | mixed | **out** — PTY host and provider OAuth are separate features (never in MVP scope); UI probes tolerate 404 |
 | `/session/{id}/share` (POST/DELETE), `/revert` `/unrevert` `/fork` | POST | **out** — share/snapshot/git-revert infra explicitly out of MVP (PLAN §2); 404 tolerated by client |
 | `/api/session/{id}/agent|model|prompt` | POST | **out** — v2-only endpoints, unused by oc-remote against v1 servers (call graph: UNUSED) |

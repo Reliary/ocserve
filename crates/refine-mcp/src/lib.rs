@@ -426,6 +426,8 @@ pub struct McpHub {
     statuses: parking_lot::Mutex<HashMap<String, (String, Option<String>)>>,
     /// lazy tool-schema cache (populated on first prompt; listChanged=false)
     tools_cache: parking_lot::Mutex<Option<Vec<Value>>>,
+    /// enabled configs retained so connect can respawn a disconnected server
+    cfgs: parking_lot::Mutex<Vec<ServerCfg>>,
 }
 
 impl McpHub {
@@ -433,6 +435,7 @@ impl McpHub {
     /// Failures are captured, never fatal (upstream: status map, §1146).
     pub async fn probe_all(cfgs: &[ServerCfg]) -> McpHub {
         let hub = McpHub::default();
+        *hub.cfgs.lock() = cfgs.iter().filter(|c| c.enabled).cloned().collect();
         for cfg in cfgs.iter().filter(|c| c.enabled) {
             match McpClient::connect(cfg).await {
                 Ok(mut client) => match client.initialize().await {
@@ -457,6 +460,71 @@ impl McpHub {
             }
         }
         hub
+    }
+
+    /// W5: is the server name configured (enabled)?
+    pub fn known(&self, name: &str) -> bool {
+        self.cfgs.lock().iter().any(|c| c.name == name)
+    }
+
+    /// W5: POST /mcp/{name}/disconnect — drop+kill the client, mark status.
+    pub async fn disconnect(&self, name: &str) -> anyhow::Result<()> {
+        let client = self.clients.lock().remove(name);
+        match client {
+            Some(mut c) => {
+                c.close().await;
+                self.statuses
+                    .lock()
+                    .insert(name.to_string(), ("disconnected".into(), None));
+                *self.tools_cache.lock() = None; // schemas refetch on next prompt
+                Ok(())
+            }
+            None => anyhow::bail!("MCP server not found: {name}"),
+        }
+    }
+
+    /// W5: POST /mcp/{name}/connect — (re)spawn + handshake.
+    pub async fn connect(&self, name: &str) -> anyhow::Result<()> {
+        let cfg = self
+            .cfgs
+            .lock()
+            .iter()
+            .find(|c| c.name == name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("MCP server not found: {name}"))?;
+        // bind BEFORE the await: if-let scrutinee temporaries (parking_lot
+        // guard) live through the body — held across .await = !Send future
+        let old = self.clients.lock().remove(name);
+        if let Some(mut old) = old {
+            old.close().await;
+        }
+        match McpClient::connect(&cfg).await {
+            Ok(mut client) => match client.initialize().await {
+                Ok(_) => {
+                    self.statuses
+                        .lock()
+                        .insert(name.to_string(), ("connected".into(), None));
+                    self.clients.lock().insert(name.to_string(), client);
+                    *self.tools_cache.lock() = None;
+                    Ok(())
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    client.close().await;
+                    self.statuses
+                        .lock()
+                        .insert(name.to_string(), ("failed".into(), Some(msg.clone())));
+                    anyhow::bail!(msg)
+                }
+            },
+            Err(e) => {
+                let msg = format!("{e:#}");
+                self.statuses
+                    .lock()
+                    .insert(name.to_string(), ("failed".into(), Some(msg.clone())));
+                Err(e)
+            }
+        }
     }
 
     /// Freeze route shape: {name: {status, error?}} (§1146).

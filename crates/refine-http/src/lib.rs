@@ -107,6 +107,13 @@ pub enum HttpError {
     Query {
         message: String,
     },
+    /// Effect TaggedErrorClass envelope with schema fields at top level
+    /// (errors.ts:143 McpServerNotFoundError → {"_tag":..., name, message}).
+    TaggedData {
+        status: StatusCode,
+        tag: &'static str,
+        fields: serde_json::Value,
+    },
 }
 
 impl From<ApiError> for HttpError {
@@ -125,6 +132,23 @@ impl IntoResponse for HttpError {
                     status,
                     [(axum::http::header::CONTENT_TYPE, "application/json")],
                     body,
+                )
+                    .into_response()
+            }
+            HttpError::TaggedData {
+                status,
+                tag,
+                fields,
+            } => {
+                let mut obj = serde_json::Map::new();
+                obj.insert("_tag".into(), serde_json::Value::String(tag.into()));
+                if let serde_json::Value::Object(f) = fields {
+                    obj.extend(f);
+                }
+                (
+                    status,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    serde_json::Value::Object(obj).to_string(),
                 )
                     .into_response()
             }
@@ -962,6 +986,211 @@ async fn post_summarize(
     )
     .await
     .map_err(prompt_err)?;
+    Ok(Json(json!(true)))
+}
+
+/// W5 admin bundle — POST /mcp/{name}/connect|disconnect (the client's
+/// generic `/$action` path is identical to v1 McpPaths.connect/disconnect),
+/// DELETE /mcp/{name}/auth, PUT/DELETE /auth/{providerID} (refine-OWN auth
+/// overlay — NEVER the legacy auth.json refine reads), GET /provider/auth,
+/// POST /global/dispose.
+fn mcp_not_found(name: &str) -> HttpError {
+    HttpError::TaggedData {
+        status: StatusCode::NOT_FOUND,
+        tag: "McpServerNotFoundError",
+        fields: json!({"name": name, "message": format!("MCP server not found: {name}")}),
+    }
+}
+
+async fn mcp_action(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path((name, action)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, HttpError> {
+    let hub = st.mcp.get().cloned().ok_or_else(|| HttpError::TaggedData {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        tag: "McpUnavailable",
+        fields: json!({"message": "MCP hub not initialized"}),
+    })?;
+    let res = match action.as_str() {
+        "connect" => hub.connect(&name).await,
+        "disconnect" => hub.disconnect(&name).await,
+        _ => Err(anyhow::anyhow!("unknown MCP action: {action}")),
+    };
+    res.map_err(|e| {
+        if e.to_string().contains("not found") {
+            mcp_not_found(&name)
+        } else {
+            HttpError::Api(ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                name: "InternalError",
+                message: format!("{e:#}"),
+            })
+        }
+    })?;
+    Ok(Json(json!(true)))
+}
+
+async fn mcp_auth_remove(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<Json<Value>, HttpError> {
+    // v1 authRemove: existence check first, then removeAuth → {success:true}
+    let known = st
+        .mcp
+        .get()
+        .map(|h| {
+            let m = h.statuses();
+            m.as_object()
+                .map(|o| o.contains_key(&name))
+                .unwrap_or(false)
+                || h.known(&name)
+        })
+        .unwrap_or(false);
+    if !known {
+        return Err(mcp_not_found(&name));
+    }
+    // no OAuth MCP servers are configured → removing stored auth is a no-op
+    // success (divergence TESTING §1.6)
+    Ok(Json(json!({"success": true})))
+}
+
+/// refine-owned auth overlay — the file refine WRITES; the legacy auth.json
+/// refine READS stays untouched (a bad write there would brick the TUI).
+fn auth_overlay_path(st: &AppState) -> std::path::PathBuf {
+    st.db
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("auth-overlay.json")
+}
+
+fn write_json_atomic(path: &std::path::Path, value: &Value) -> Result<(), ApiError> {
+    let dir = path.parent().ok_or_else(|| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: "path has no parent".into(),
+    })?;
+    std::fs::create_dir_all(dir).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("mkdir: {e}"),
+    })?;
+    let tmp = dir.join(format!(".tmp-{}-auth", std::process::id()));
+    let data = serde_json::to_vec_pretty(value).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("serialize: {e}"),
+    })?;
+    std::fs::write(&tmp, data).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("write: {e}"),
+    })?;
+    std::fs::rename(&tmp, path).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("rename: {e}"),
+    })?;
+    Ok(())
+}
+
+fn reload_payloads(st: &AppState) {
+    let reload = st.reloader.read().clone();
+    match &reload {
+        Some(f) => match f() {
+            Ok(p) => *st.payloads.write() = p,
+            Err(e) => tracing::warn!("payload reload failed: {e:#}"),
+        },
+        None => tracing::warn!("reloader unset — restart to apply"),
+    }
+}
+
+async fn auth_put(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(pid): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    if !body.is_object() {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            name: "BadRequest",
+            message: "auth payload must be an object".into(),
+        });
+    }
+    let path = auth_overlay_path(&st);
+    let mut overlay: Value = if path.exists() {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|r| serde_json::from_str(&r).ok())
+            .unwrap_or_else(|| json!({}))
+    } else {
+        json!({})
+    };
+    overlay[&pid] = body; // Auth.Info union stored verbatim (discriminator "type")
+    write_json_atomic(&path, &overlay)?;
+    reload_payloads(&st);
+    tracing::info!("auth overlay set provider={pid}");
+    Ok(Json(json!(true)))
+}
+
+async fn auth_delete(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(pid): axum::extract::Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let path = auth_overlay_path(&st);
+    if path.exists() {
+        let mut overlay: Value = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|r| serde_json::from_str(&r).ok())
+            .unwrap_or_else(|| json!({}));
+        if let Some(obj) = overlay.as_object_mut() {
+            obj.remove(&pid);
+        }
+        write_json_atomic(&path, &overlay)?;
+        reload_payloads(&st);
+    }
+    tracing::info!("auth overlay remove provider={pid}");
+    Ok(Json(json!(true)))
+}
+
+/// GET /provider/auth — {providerID: [{type,label}]}. v1 derives these from
+/// auth HOOKS (provider/auth.ts:131); refine serves what refine can do —
+/// api-key methods for every configured provider (divergence TESTING §1.6;
+/// matches the PUT /auth {type:"api"} client flow).
+async fn provider_auth_methods(State(st): State<Arc<AppState>>) -> Json<Value> {
+    let payloads = st.payloads.read();
+    let mut out = serde_json::Map::new();
+    if let Some(providers) = payloads
+        .config_providers
+        .get("providers")
+        .and_then(|p| p.as_object())
+    {
+        for pid in providers.keys() {
+            out.insert(pid.clone(), json!([{"type": "api", "label": "API Key"}]));
+        }
+    }
+    Json(serde_json::Value::Object(out))
+}
+
+/// POST /global/dispose — v1 (global.ts:84): dispose + emit + true. Refine
+/// analog: durable+live `server.instance.disposed` (EventReducer clears
+/// client state) + payload reload. Divergence: no instance registry
+/// (TESTING §1.6).
+async fn global_dispose(State(st): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    refine_store::append_event(&st.writer, None, "server.instance.disposed", &json!({})).map_err(
+        |e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("{e:#}"),
+        },
+    )?;
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    st.bus.publish(refine_core::event::frame(
+        &dir,
+        "server.instance.disposed",
+        json!({}),
+    ));
+    reload_payloads(&st);
+    tracing::info!("global dispose: emitted + payloads reloaded");
     Ok(Json(json!(true)))
 }
 
@@ -2400,6 +2629,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/session", get(get_sessions).post(post_session))
         .route("/session/status", get(session_status))
         .route("/session/search", axum::routing::post(search_messages))
+        .route("/mcp/{name}/{action}", axum::routing::post(mcp_action))
+        .route("/mcp/{name}/auth", axum::routing::delete(mcp_auth_remove))
+        .route(
+            "/auth/{providerID}",
+            axum::routing::put(auth_put).delete(auth_delete),
+        )
+        .route("/provider/auth", axum::routing::get(provider_auth_methods))
+        .route("/global/dispose", axum::routing::post(global_dispose))
         .route("/config", axum::routing::patch(patch_config))
         .route("/global/config", axum::routing::patch(patch_config))
         .route(

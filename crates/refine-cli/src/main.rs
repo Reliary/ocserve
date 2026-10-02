@@ -149,7 +149,7 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     refine_cli::boot_checks(&data_dir)?;
 
     // Assemble config-derived payloads (fail fast if config unreadable)
-    let rt = runtime::Runtime::load()
+    let rt = runtime::Runtime::load_for(&data_dir)
         .context("load runtime config (opencode.json/auth/models cache)")?;
     // M4a: probe MCP servers before serving (statuses captured, never fatal)
     let mcp_cfgs =
@@ -211,10 +211,11 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     // W4: PATCH /config rebuilds derived payloads through this closure
     // (Runtime::load reads opencode.json + the refine overlay layer)
     {
+        let data_dir_for_reload = data_dir.clone();
         let reloader: std::sync::Arc<
             dyn Fn() -> anyhow::Result<refine_http::Payloads> + Send + Sync,
-        > = std::sync::Arc::new(|| {
-            let rt = crate::runtime::Runtime::load()?;
+        > = std::sync::Arc::new(move || {
+            let rt = crate::runtime::Runtime::load_for(&data_dir_for_reload)?;
             Ok(rt.payloads())
         });
         *state.reloader.write() = Some(reloader);

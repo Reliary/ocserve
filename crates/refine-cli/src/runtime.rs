@@ -255,7 +255,10 @@ impl Runtime {
         }
     }
 
-    pub fn load() -> Result<Self> {
+    /// data_dir-aware load (W5): the auth OVERLAY refine writes lives there
+    /// and layers over the read-only legacy auth.json. (Boot + reloader both
+    /// call this — there is deliberately no env-default variant.)
+    pub fn load_for(data_dir: &std::path::Path) -> Result<Self> {
         let home = std::env::var("HOME").unwrap_or_default();
         let config_path = Path::new(&home).join(".config/opencode/opencode.json");
         let auth_path = Path::new(&home).join(".local/share/opencode/auth.json");
@@ -270,11 +273,18 @@ impl Runtime {
             let overlay = read_json(&overlay_path)?;
             refine_http::deep_merge(&mut raw_config, overlay);
         }
-        let auth = if auth_path.exists() {
+        let mut auth = if auth_path.exists() {
             read_json(&auth_path)?
         } else {
             json!({})
         };
+        // W5 auth overlay: refine-owned PUT /auth writes here; layers over
+        // the legacy auth refine never mutates.
+        let auth_overlay_path = data_dir.join("auth-overlay.json");
+        if auth_overlay_path.exists() {
+            let overlay = read_json(&auth_overlay_path)?;
+            refine_http::deep_merge(&mut auth, overlay);
+        }
         let cache = if cache_path.exists() {
             read_json(&cache_path)?
         } else {
