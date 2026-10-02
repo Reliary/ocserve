@@ -660,11 +660,45 @@ async fn get_messages(
 
 /// POST /session/{id}/message — sync prompt (blocks until stream completes,
 /// returns {info, parts}; captured in testdata/m2/prompt_response.json).
+/// v1 currentModel(sessionID): payload.model → session's stored model
+/// (updated at prompt time) → configured default.
+fn resolve_model(st: &Arc<AppState>, payload: &Value, session_id: &str) -> (String, String) {
+    if let (Some(p), Some(m)) = (
+        payload
+            .pointer("/model/providerID")
+            .and_then(|v| v.as_str()),
+        payload.pointer("/model/modelID").and_then(|v| v.as_str()),
+    ) {
+        return (p.to_string(), m.to_string());
+    }
+    if let Ok(conn) = refine_store::pragma::open_reader(&st.db) {
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT model FROM session WHERE id = ?1",
+                [session_id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        if let Some(raw) = stored
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+        {
+            let p = v.get("providerID").and_then(|x| x.as_str()).unwrap_or("");
+            let m = v.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            if !p.is_empty() && !m.is_empty() {
+                return (p.to_string(), m.to_string());
+            }
+        }
+    }
+    st.llm.default_model.clone()
+}
+
 /// Resolve agent/model/system/endpoint/rules into a runnable prompt context.
 /// Shared by POST /message (sync) and POST /prompt_async (backgrounded).
 fn build_prompt_context(
     st: &Arc<AppState>,
     payload: &Value,
+    session_id: &str,
 ) -> Result<refine_core::prompt::PromptContext, ApiError> {
     let agent = payload
         .get("agent")
@@ -678,15 +712,7 @@ fn build_prompt_context(
         .get(&agent)
         .cloned()
         .unwrap_or_else(|| crate::BUILD_SYSTEM_BLURB.to_string());
-    let (pid, mid) = match (
-        payload
-            .pointer("/model/providerID")
-            .and_then(|v| v.as_str()),
-        payload.pointer("/model/modelID").and_then(|v| v.as_str()),
-    ) {
-        (Some(p), Some(m)) => (p.to_string(), m.to_string()),
-        _ => st.llm.default_model.clone(),
-    };
+    let (pid, mid) = resolve_model(st, payload, session_id);
     let (base_url, api_key) = st
         .llm
         .endpoints
@@ -778,7 +804,7 @@ async fn post_message(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(payload): Json<Value>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let ctx = build_prompt_context(&st, &payload)?;
+    let ctx = build_prompt_context(&st, &payload, &id)?;
     let lock = lock_session(&st, &id).await?;
     let _guard = lock.lock().await;
     let writer = st.writer.clone();
@@ -815,7 +841,7 @@ async fn post_prompt_async(
     })? {
         return Err(ApiError::not_found(format!("Session not found: {id}")));
     }
-    let ctx = build_prompt_context(&st, &payload)?;
+    let ctx = build_prompt_context(&st, &payload, &id)?;
     let lock = lock_session(&st, &id).await?;
     let writer = st.writer.clone();
     let locks = st.prompt_locks.clone();
@@ -1293,6 +1319,467 @@ async fn post_question_reject(
     }
 }
 
+// ---- oc-remote contract family (Batch 4: command/shell) ----
+
+/// v1 argsRegex tokenizer: quoted strings or non-space runs, then
+/// quoteTrimRegex strips one leading/trailing quote per token.
+pub fn split_command_args(arguments: &str) -> Vec<String> {
+    let bytes = arguments.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let (tok, next) = if c == b'"' || c == b'\'' {
+            let quote = c;
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != quote {
+                j += 1;
+            }
+            let end = (j + 1).min(bytes.len());
+            (
+                std::str::from_utf8(&bytes[i..end])
+                    .unwrap_or("")
+                    .to_string(),
+                end,
+            )
+        } else {
+            let mut j = i;
+            while j < bytes.len() && !bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            (
+                std::str::from_utf8(&bytes[i..j]).unwrap_or("").to_string(),
+                j,
+            )
+        };
+        // quoteTrim: strip one leading then one trailing quote char
+        let mut t = tok.as_str();
+        if t.starts_with(['"', '\'']) {
+            t = &t[1..];
+        }
+        if t.ends_with(['"', '\'']) && !t.is_empty() {
+            t = &t[..t.len() - 1];
+        }
+        out.push(t.to_string());
+        i = next;
+    }
+    out
+}
+
+/// v1 command template expansion (prompt.ts command()): $N placeholders (last
+/// position swallows the remaining args), then $ARGUMENTS, then append rule.
+/// `!`…`` shell snippets (ConfigMarkdown.shell) are NOT evaluated — neither
+/// built-in template uses them (documented gap for exotic config commands).
+pub fn expand_command(template: &str, arguments: &str) -> String {
+    let args = split_command_args(arguments);
+    // max placeholder position
+    let mut last = 0usize;
+    let b = template.as_bytes();
+    let mut i = 0;
+    while i + 1 < b.len() {
+        if b[i] == b'$' && b[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if let Some(n) = std::str::from_utf8(&b[i + 1..j])
+                .ok()
+                .and_then(|d| d.parse::<usize>().ok())
+            {
+                last = last.max(n);
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    // replace $N
+    let mut with_args = String::new();
+    let mut i = 0;
+    let mut had_placeholder = false;
+    while i < b.len() {
+        if b[i] == b'$' && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            let n: usize = std::str::from_utf8(&b[i + 1..j])
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+            had_placeholder = true;
+            let arg_index = n.saturating_sub(1);
+            let value = if arg_index >= args.len() {
+                String::new()
+            } else if n == last {
+                args[arg_index..].join(" ")
+            } else {
+                args[arg_index].clone()
+            };
+            with_args.push_str(&value);
+            i = j;
+        } else {
+            // copy one utf-8 char
+            let ch_len = {
+                let ch = template[i..].chars().next().unwrap_or(' ');
+                ch.len_utf8()
+            };
+            with_args.push_str(&template[i..i + ch_len]);
+            i += ch_len;
+        }
+    }
+    let uses_arguments = template.contains("$ARGUMENTS");
+    let mut expanded = with_args.replace("$ARGUMENTS", arguments);
+    if !had_placeholder && !uses_arguments && !arguments.trim().is_empty() {
+        expanded = format!("{expanded}\n\n{arguments}");
+    }
+    expanded.trim().to_string()
+}
+
+/// v1 Session.Event.Error on unknown commands (oc-remote toast via
+/// session.error SSE) + durable+s twin.
+fn emit_session_error_event(st: &Arc<AppState>, sid: &str, message: &str) {
+    let props = json!({
+        "sessionID": sid,
+        "error": {"name": "UnknownError", "data": {"message": message}},
+    });
+    if let Err(e) = refine_store::append_event(&st.writer, Some(sid), "session.error", &props) {
+        tracing::warn!("session.error persist failed: {e:#}");
+    }
+    let seq = refine_store::next_event_seq(&st.db, sid).unwrap_or(0);
+    let dir = st.paths["directory"].as_str().unwrap_or("/");
+    st.bus.publish(refine_core::event::frame(
+        dir,
+        "session.error",
+        props.clone(),
+    ));
+    st.bus.publish(refine_core::event::sync_frame(
+        dir,
+        "session.error",
+        props,
+        seq as u64,
+        sid,
+    ));
+}
+
+/// Busy rejection (v1 mapBusy → SessionBusyError): command/shell never queue
+/// — they fail fast when the session is mid-prompt (upstream semantics).
+fn session_busy(id: &str) -> ApiError {
+    ApiError {
+        status: StatusCode::CONFLICT,
+        name: "SessionBusyError",
+        message: format!("Session is busy: {id}"),
+    }
+}
+
+/// POST /session/{id}/command — v1 promptSvc.command: look up the command
+/// (built-ins init/review + config), expand the template, run the prompt
+/// synchronously, return WithParts. Unknown → session.error SSE + 400.
+async fn post_command(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    if !refine_store::session_exists(&st.db, &id).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })? {
+        return Err(ApiError::not_found(format!("Session not found: {id}")));
+    }
+    let name = payload
+        .get("command")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    let arguments = payload
+        .get("arguments")
+        .and_then(|a| a.as_str())
+        .unwrap_or("");
+    let entry = st
+        .command
+        .iter()
+        .find(|c| c["name"].as_str() == Some(name))
+        .and_then(|c| c["template"].as_str());
+    let Some(template) = entry else {
+        let available: Vec<&str> = st
+            .command
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        let msg = format!(
+            "Command not found: \"{name}\".{}",
+            if available.is_empty() {
+                String::new()
+            } else {
+                format!(" Available commands: {}", available.join(", "))
+            }
+        );
+        emit_session_error_event(&st, &id, &msg);
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            name: "BadRequest",
+            message: msg,
+        });
+    };
+    let expanded = expand_command(template, arguments);
+    let mut cmd_payload = json!({
+        "parts": [{"type": "text", "text": expanded}],
+    });
+    if let Some(a) = payload.get("agent").and_then(|a| a.as_str()) {
+        cmd_payload["agent"] = json!(a);
+    }
+    if let Some(m) = payload.get("model") {
+        cmd_payload["model"] = m.clone();
+    }
+    if let Some(mid) = payload.get("messageID").and_then(|m| m.as_str()) {
+        cmd_payload["messageId"] = json!(mid);
+    }
+
+    let ctx = build_prompt_context(&st, &cmd_payload, &id)?;
+    let lock = lock_session(&st, &id).await?;
+    let Ok(_guard) = lock.try_lock() else {
+        return Err(session_busy(&id));
+    };
+    let writer = st.writer.clone();
+    let (info, parts) = refine_core::prompt::run_prompt(&ctx, &writer, &id, &cmd_payload)
+        .await
+        .map_err(prompt_err)?;
+    drop(_guard);
+    {
+        let mut map = st.prompt_locks.lock();
+        if let Some(arc) = map.get(&id)
+            && std::sync::Arc::strong_count(arc) <= 2
+        {
+            map.remove(&id);
+        }
+    }
+    Ok(Json(json!({"info": info, "parts": parts})))
+}
+
+/// POST /session/{id}/shell — v1 promptSvc.shell: NO model. Runs the command
+/// directly (bash), records synthetic-user + assistant/bash tool messages,
+/// returns WithParts. Port note: shell.env plugin hook skipped (no configured
+/// plugin subscribes); abort-of-running-shell not wired (documented).
+async fn post_shell(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    if !refine_store::session_exists(&st.db, &id).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })? {
+        return Err(ApiError::not_found(format!("Session not found: {id}")));
+    }
+    let command = payload
+        .get("command")
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            name: "BadRequest",
+            message: "command required".into(),
+        })?;
+    let agent = payload
+        .get("agent")
+        .and_then(|a| a.as_str())
+        .ok_or_else(|| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            name: "BadRequest",
+            message: "agent required".into(),
+        })?;
+    let (pid, mid) = resolve_model(&st, &payload, &id);
+
+    let lock = lock_session(&st, &id).await?;
+    let Ok(_guard) = lock.try_lock() else {
+        return Err(session_busy(&id));
+    };
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+
+    // busy → run → idle (client spinner parity)
+    let status_frame = |kind: &str| {
+        refine_core::event::frame(
+            &dir,
+            "session.status",
+            json!({"sessionID": id, "status": {"type": kind}}),
+        )
+    };
+    st.bus.publish(status_frame("busy"));
+
+    let started = now_ms_local();
+    let user_msg_id = refine_core::ids::msg_id();
+    let user_part = json!({
+        "type": "text", "id": refine_core::ids::prt_id(),
+        "sessionID": id, "messageID": user_msg_id,
+        "text": "The following tool was executed by the user",
+        "synthetic": true,
+    });
+    let user_info = json!({
+        "id": user_msg_id,
+        "sessionID": id,
+        "role": "user",
+        "agent": agent,
+        "model": {"providerID": pid, "modelID": mid},
+        "time": {"created": started},
+        "summary": {"diffs": []},
+    });
+    let assistant_id = refine_core::ids::msg_id();
+    let call_id = refine_core::ids::evt_id();
+    let mut tool_part = json!({
+        "type": "tool", "id": refine_core::ids::prt_id(),
+        "sessionID": id, "messageID": assistant_id,
+        "callID": call_id, "tool": "bash",
+        "state": {
+            "status": "running",
+            "input": {"command": command},
+            "time": {"start": started},
+        },
+    });
+
+    // persist user msg + assistant msg, emit running state (upstream order)
+    let writer = st.writer.clone();
+    insert_message_http(
+        &writer,
+        &st,
+        &id,
+        &user_info,
+        std::slice::from_ref(&user_part),
+    )?;
+    let assistant_info = json!({
+        "id": assistant_id,
+        "parentID": user_msg_id,
+        "role": "assistant",
+        "mode": agent,
+        "agent": agent,
+        "path": {"cwd": dir, "root": "/"},
+        "cost": 0.0,
+        "tokens": {"total": 0, "input": 0, "output": 0, "reasoning": 0,
+                   "cache": {"write": 0, "read": 0}},
+        "modelID": mid,
+        "providerID": pid,
+        "time": {"created": started, "completed": started},
+        "finish": "stop",
+        "id": assistant_id,
+        "sessionID": id,
+    });
+    insert_message_http(&writer, &st, &id, &assistant_info, &[])?;
+    emit_durable_http(
+        &st,
+        &id,
+        "message.updated",
+        json!({"sessionID": id, "info": user_info.clone()}),
+    )?;
+    emit_durable_http(
+        &st,
+        &id,
+        "message.updated",
+        json!({"sessionID": id, "info": assistant_info.clone()}),
+    )?;
+    emit_durable_http(
+        &st,
+        &id,
+        "message.part.updated",
+        json!({"sessionID": id, "part": user_part}),
+    )?;
+    emit_durable_http(
+        &st,
+        &id,
+        "message.part.updated",
+        json!({"sessionID": id, "part": tool_part.clone()}),
+    )?;
+
+    // execute directly (bash executor: stderr merged, output bounded,
+    // default 120s cap — ShellInput carries no timeout)
+    let exec = refine_tools::execute(
+        "bash",
+        &json!({"command": command}),
+        std::path::Path::new(&dir),
+    );
+    let (status, output) = match exec {
+        Ok(r) => ("completed", r.output),
+        Err(e) => ("error", format!("Error: {e:#}")),
+    };
+    let completed = now_ms_local();
+    // v1 finish() shape: completed always carries {title:"", output,
+    // metadata:{output}} — no exit field (capture-verified)
+    tool_part["state"] = json!({
+        "status": status,
+        "input": {"command": command},
+        "output": output,
+        "title": "",
+        "metadata": {"output": ""},
+        "time": {"start": started, "end": completed},
+    });
+    tool_part["state"]["metadata"]["output"] = tool_part["state"]["output"].clone();
+    insert_message_http(
+        &writer,
+        &st,
+        &id,
+        &assistant_info,
+        std::slice::from_ref(&tool_part),
+    )?;
+    emit_durable_http(
+        &st,
+        &id,
+        "message.part.updated",
+        json!({"sessionID": id, "part": tool_part.clone()}),
+    )?;
+    st.bus.publish(status_frame("idle"));
+
+    Ok(Json(json!({"info": assistant_info, "parts": [tool_part]})))
+}
+
+fn now_ms_local() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Persist a message via the store + emit its updated/part durable events.
+fn insert_message_http(
+    writer: &refine_store::Writer,
+    st: &Arc<AppState>,
+    sid: &str,
+    info: &Value,
+    parts: &[Value],
+) -> Result<(), ApiError> {
+    refine_store::insert_message(writer, Some(&*st.blobs), sid, info, parts).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })
+}
+
+/// Durable event from HTTP handlers (no PromptContext): persist + plain +
+/// sync twin (seq from next_event_seq — single-flight per handler call).
+fn emit_durable_http(
+    st: &Arc<AppState>,
+    sid: &str,
+    event_type: &str,
+    props: Value,
+) -> Result<(), ApiError> {
+    refine_store::append_event(&st.writer, Some(sid), event_type, &props).map_err(|e| {
+        ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("{e:#}"),
+        }
+    })?;
+    let seq = refine_store::next_event_seq(&st.db, sid).unwrap_or(0);
+    let dir = st.paths["directory"].as_str().unwrap_or("/");
+    st.bus
+        .publish(refine_core::event::frame(dir, event_type, props.clone()));
+    st.bus.publish(refine_core::event::sync_frame(
+        dir, event_type, props, seq as u64, sid,
+    ));
+    Ok(())
+}
+
 /// Freeze-shaped event id: `evt_` + 26 hex chars (upstream ids are time+random
 /// 26-char alphanumerics; ours hash a nanos counter — clients only require
 /// uniqueness, and byte-golden normalizes this span).
@@ -1513,6 +2000,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/session/{id}/todo", get(get_todos))
         .route("/session/{id}/abort", axum::routing::post(post_abort))
+        .route("/session/{id}/command", axum::routing::post(post_command))
+        .route("/session/{id}/shell", axum::routing::post(post_shell))
         .route(
             "/session/{id}/message/{mid}",
             axum::routing::delete(delete_message_route),

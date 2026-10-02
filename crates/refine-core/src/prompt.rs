@@ -271,6 +271,14 @@ pub async fn run_prompt(
                 });
         tools.extend(mcp_tools);
     }
+    // v1 visibleTools/disabled parity: deny'd tools are never sent to the
+    // model (ask/allow stay visible — ask flows at exec time instead).
+    tools.retain(|spec| {
+        spec.pointer("/function/name")
+            .and_then(|n| n.as_str())
+            .map(|n| refine_tools::evaluate(n, "*", &ctx.rules) != "deny")
+            .unwrap_or(true)
+    });
 
     let client = Client::new(ctx.endpoint.base_url.clone(), ctx.endpoint.api_key.clone());
     let mut total_usage = Usage::default();
@@ -553,6 +561,7 @@ pub async fn run_prompt(
                                 exit: None,
                                 title: call.name.clone(),
                                 error: false,
+                                metadata: None,
                             }),
                             Some(Err(e)) => Err(e),
                             None => refine_tools::execute(
@@ -571,16 +580,18 @@ pub async fn run_prompt(
                         )
                     };
                     match exec {
-                        Ok(r) => (
-                            r.output,
-                            json!({
-                                "output": "", // set below (avoid double-copy in state)
-                                "exit": r.exit,
-                                "truncated": r.truncated,
-                            }),
-                            r.title,
-                            r.error,
-                        ),
+                        Ok(r) => {
+                            // todowrite supplies {todos} metadata; everything
+                            // else keeps the bash-style template
+                            let meta = r.metadata.unwrap_or_else(|| {
+                                json!({
+                                    "output": "",
+                                    "exit": r.exit,
+                                    "truncated": r.truncated,
+                                })
+                            });
+                            (r.output, meta, r.title, r.error)
+                        }
                         Err(e) => (format!("Error: {e:#}"), json!({}), call.name.clone(), true),
                     }
                 } else {
@@ -597,11 +608,55 @@ pub async fn run_prompt(
                         .unwrap_or_else(|_| json!({"raw": call.arguments})),
                     "output": output,
                     "title": title,
-                    "metadata": {"output": "", "exit": meta["exit"], "truncated": meta["truncated"]},
+                    // meta = bash template {output:"",exit,truncated} OR the
+                    // tool's custom metadata (todowrite {todos}) — the old
+                    // destructure here DROPPED custom keys (field bug: todos
+                    // never reached state/persist — caught by live verify)
+                    "metadata": meta,
                     "time": {"start": exec_start, "end": now_ms()},
                 });
-                // metadata.output mirrors output (capture fact)
-                running["state"]["metadata"]["output"] = running["state"]["output"].clone();
+                // metadata.output mirrors output (capture fact) — except
+                // todowrite parts, whose metadata is {todos} (v1 Output)
+                if running["state"]["metadata"].get("todos").is_none() {
+                    running["state"]["metadata"]["output"] = running["state"]["output"].clone();
+                }
+                // todowrite: REPLACE the session todo list (v1
+                // SessionTodo.update) + emit todo.updated (durable+s twin) —
+                // oc-remote's todos panel reads GET /todo and this event
+                if call.name == "todowrite"
+                    && running["state"]["status"] == "completed"
+                    && let Some(todos) = running["state"]["metadata"]["todos"].as_array()
+                {
+                    let todos = todos.clone();
+                    let now = now_ms();
+                    let mut ops = vec![refine_store::WriteOp::Sql {
+                        sql: "DELETE FROM todo WHERE session_id = ?1".into(),
+                        params: vec![session_id.into()],
+                    }];
+                    for (i, t) in todos.iter().enumerate() {
+                        ops.push(refine_store::WriteOp::Sql {
+                                sql: "INSERT INTO todo (id, session_id, content, status, priority, time_created, time_updated)                                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)".into(),
+                                params: vec![
+                                    format!("{session_id}_t{i}").into(),
+                                    session_id.into(),
+                                    t["content"].as_str().unwrap_or_default().into(),
+                                    t["status"].as_str().unwrap_or("pending").into(),
+                                    t["priority"].as_str().unwrap_or("").into(),
+                                    now.into(),
+                                ],
+                            });
+                    }
+                    writer.write(ops)?;
+                    emit_durable(
+                        ctx,
+                        writer,
+                        session_id,
+                        "todo.updated",
+                        json!({"sessionID": session_id, "todos": todos}),
+                        &mut seq,
+                    )?;
+                }
+
                 // v1 hook: tool.execute.after (sequential in-host; failures are
                 // logged host-side, never block the tool result — M4b)
                 if let Some(plug) = &ctx.plugins {
@@ -817,23 +872,25 @@ pub async fn run_prompt(
         );
         emit_live(ctx, "session.idle", json!({"sessionID": session_id}));
 
-        let _ = writer.write(vec![refine_store::WriteOp::Sql {
-            sql: "UPDATE session SET agent = ?2, model = ?3, cost = ?4, tokens_input = ?5, \\
-                  tokens_output = ?6, tokens_cache_read = ?7, time_updated = ?8 WHERE id = ?1"
-                .into(),
-            params: vec![
-                session_id.into(),
-                agent.into(),
-                json!({"id": model, "providerID": ctx.provider_id, "variant": "default"})
-                    .to_string()
-                    .into(),
-                total_cost.into(),
-                (total_usage.prompt_tokens as i64).into(),
-                (total_usage.completion_tokens as i64).into(),
-                (total_usage.cached_tokens as i64).into(),
-                t_done.into(),
-            ],
-        }]);
+        refine_store::finalize_session_prompt(
+            writer,
+            session_id,
+            &refine_store::PromptStats {
+                agent: &agent,
+                model_json: &json!({
+                    "id": model,
+                    "providerID": ctx.provider_id,
+                    "variant": "default"
+                })
+                .to_string(),
+                cost: total_cost,
+                tokens_input: total_usage.prompt_tokens,
+                tokens_output: total_usage.completion_tokens,
+                tokens_cache_read: total_usage.cached_tokens,
+                time_updated: t_done,
+            },
+        )
+        .context("finalize session prompt row")?;
 
         return Ok((assistant_info, parts));
     }

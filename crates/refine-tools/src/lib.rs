@@ -116,6 +116,45 @@ pub struct ToolResult {
     pub exit: Option<i32>,
     pub title: String,
     pub error: bool,
+    /// Custom part-state metadata (todowrite → {todos}); None → bash-style
+    /// {output, exit, truncated} template in the runner.
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// todowrite: validate the list (persistence happens in the runner, which
+/// owns the writer + event bus; v1 todowrite also runs permission.assert —
+/// our loop-level gate covers that before execute).
+fn todowrite(input: &Value) -> Result<ToolResult> {
+    let todos = input
+        .get("todos")
+        .and_then(|t| t.as_array())
+        .ok_or_else(|| anyhow::anyhow!("todowrite.todos must be an array"))?;
+    let mut normalized = Vec::with_capacity(todos.len());
+    for t in todos {
+        let content = t
+            .get("content")
+            .and_then(|c| c.as_str())
+            .ok_or_else(|| anyhow::anyhow!("todo.content required"))?;
+        let status = t
+            .get("status")
+            .and_then(|x| x.as_str())
+            .unwrap_or("pending");
+        let priority = t.get("priority").and_then(|x| x.as_str()).unwrap_or("");
+        normalized.push(json!({
+            "content": content,
+            "status": status,
+            "priority": priority,
+        }));
+    }
+    let output = serde_json::to_string_pretty(&json!({"todos": normalized}))?;
+    Ok(ToolResult {
+        output,
+        truncated: false,
+        exit: None,
+        title: "todowrite".into(),
+        error: false,
+        metadata: Some(json!({"todos": normalized})),
+    })
 }
 
 pub fn schemas() -> Vec<Value> {
@@ -126,6 +165,7 @@ pub fn schemas() -> Vec<Value> {
         json!({"type":"function","function":{"name":"edit","description":"Replace exact text in a file.","parameters":{"type":"object","properties":{"filePath":{"type":"string","description":"The absolute path to the file to edit"},"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["filePath","oldText","newText"]}}}),
         json!({"type":"function","function":{"name":"glob","description":"Find files by glob pattern.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}}}),
         json!({"type":"function","function":{"name":"grep","description":"Regex search file contents.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"}},"required":["pattern"]}}}),
+        json!({"type":"function","function":{"name":"todowrite","description":"Create and maintain a structured task list for the current coding session. Use it to track progress during multi-step work and keep todo statuses current.","parameters":{"type":"object","properties":{"todos":{"type":"array","description":"The updated todo list","items":{"type":"object","properties":{"content":{"type":"string"},"status":{"type":"string","description":"pending | in_progress | completed"},"priority":{"type":"string"}},"required":["content","status"]}}},"required":["todos"]}}}),
         json!({"type":"function","function":{"name":"question","description":QUESTION_DESCRIPTION,"parameters":{"type":"object","properties":{"questions":{"type":"array","description":"Questions to ask","items":{"type":"object","properties":{"question":{"type":"string","description":"Complete question"},"header":{"type":"string","description":"Very short label (max 30 chars)"},"options":{"type":"array","description":"Available choices","items":{"type":"object","properties":{"label":{"type":"string","description":"Display text (1-5 words, concise)"},"description":{"type":"string","description":"Explanation of choice"}},"required":["label","description"]}},"multiple":{"type":"boolean","description":"Allow selecting multiple choices"}},"required":["question","header","options"]}}},"required":["questions"]}}}),
     ]
 }
@@ -176,6 +216,7 @@ pub fn execute(name: &str, input: &Value, cwd: &Path) -> Result<ToolResult> {
         "edit" => edit(input, cwd),
         "glob" => glob(input, cwd),
         "grep" => grep(input, cwd),
+        "todowrite" => todowrite(input),
         other => bail!("unknown tool: {other}"),
     }
 }
@@ -257,6 +298,7 @@ fn bash(input: &Value, cwd: &Path) -> Result<ToolResult> {
         exit: Some(code),
         title: shell_title(command),
         error: timed_out || code != 0,
+        metadata: None,
     })
 }
 
@@ -289,6 +331,7 @@ fn read(input: &Value, cwd: &Path) -> Result<ToolResult> {
         exit: None,
         title: fp.to_string(),
         error: false,
+        metadata: None,
     })
 }
 
@@ -306,6 +349,7 @@ fn write(input: &Value, cwd: &Path) -> Result<ToolResult> {
         exit: None,
         title: fp.to_string(),
         error: false,
+        metadata: None,
     })
 }
 
@@ -331,6 +375,7 @@ fn edit(input: &Value, cwd: &Path) -> Result<ToolResult> {
         exit: None,
         title: fp.to_string(),
         error: false,
+        metadata: None,
     })
 }
 
@@ -351,6 +396,7 @@ fn glob(input: &Value, cwd: &Path) -> Result<ToolResult> {
         exit: None,
         title: pattern.to_string(),
         error: false,
+        metadata: None,
     })
 }
 
@@ -399,6 +445,7 @@ fn grep(input: &Value, cwd: &Path) -> Result<ToolResult> {
         exit: None,
         title: pattern.to_string(),
         error: false,
+        metadata: None,
     })
 }
 
@@ -561,6 +608,28 @@ mod tests {
     }
 
     #[test]
+    fn todowrite_normalizes_and_reports() {
+        let r = execute(
+            "todowrite",
+            &json!({"todos": [
+                {"content": "step one", "status": "in_progress"},
+                {"content": "step two", "status": "pending", "priority": "high"}
+            ]}),
+            Path::new("/"),
+        )
+        .unwrap();
+        let meta = r.metadata.expect("todos metadata for the part state");
+        assert_eq!(meta["todos"][0]["status"], "in_progress");
+        assert_eq!(meta["todos"][1]["priority"], "high");
+        assert_eq!(meta["todos"][0]["priority"], "", "priority defaults empty");
+        assert!(r.output.contains("step one"));
+        assert_eq!(r.title, "todowrite");
+        assert!(!r.error);
+        // missing todos → Err (model gets a tool failure, not a panic)
+        assert!(execute("todowrite", &json!({"nope": []}), Path::new("/")).is_err());
+    }
+
+    #[test]
     fn truncation_bounds() {
         let big = "x".repeat(MAX_BYTES + 100);
         let (out, t) = truncate(big);
@@ -625,20 +694,17 @@ mod tests {
     }
 
     #[test]
-    fn schemas_cover_seven_tools_including_question() {
+    fn schemas_cover_eight_tools() {
         let s = schemas();
-        assert_eq!(
-            s.len(),
-            7,
-            "six exec tools + question (gated, never executed)"
-        );
+        assert_eq!(s.len(), 8, "six exec + question (gated) + todowrite");
         for spec in &s {
             assert_eq!(spec["type"], "function");
             assert!(spec["function"]["name"].as_str().is_some());
             assert!(spec["function"]["parameters"]["type"] == "object");
         }
-        let q = &s[6];
-        assert_eq!(q["function"]["name"], "question");
+        assert_eq!(s[6]["function"]["name"], "todowrite");
+        assert_eq!(s[7]["function"]["name"], "question");
+        let q = &s[7];
         let params = &q["function"]["parameters"];
         assert_eq!(params["required"][0], "questions");
         let item = &params["properties"]["questions"]["items"];

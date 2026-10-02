@@ -534,3 +534,84 @@ pub fn update_part(
     }])?;
     Ok(n > 0)
 }
+
+/// End-of-prompt session row update (agent/model/cost/tokens/time).
+/// Single-line SQL (a `\` line-continuation once produced a literal backslash
+/// → syntax error → was swallowed by `let _ =` — AGENTS §2.5 forbids the
+/// swallow; this fn propagates and is covered by a row-affecting test).
+pub struct PromptStats<'a> {
+    pub agent: &'a str,
+    pub model_json: &'a str,
+    pub cost: f64,
+    pub tokens_input: u64,
+    pub tokens_output: u64,
+    pub tokens_cache_read: u64,
+    pub time_updated: i64,
+}
+
+pub fn finalize_session_prompt(
+    writer: &Writer,
+    session_id: &str,
+    stats: &PromptStats<'_>,
+) -> anyhow::Result<usize> {
+    writer.write(vec![WriteOp::Sql {
+        sql: "UPDATE session SET agent = ?2, model = ?3, cost = ?4, tokens_input = ?5, tokens_output = ?6, tokens_cache_read = ?7, time_updated = ?8 WHERE id = ?1".into(),
+        params: vec![
+            session_id.into(),
+            stats.agent.into(),
+            stats.model_json.into(),
+            stats.cost.into(),
+            (stats.tokens_input as i64).into(),
+            (stats.tokens_output as i64).into(),
+            (stats.tokens_cache_read as i64).into(),
+            stats.time_updated.into(),
+        ],
+    }])
+}
+
+#[cfg(test)]
+mod finalize_tests {
+    use super::*;
+
+    #[test]
+    fn finalize_writes_agent_and_model_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::writer::db_path(dir.path());
+        let w = Writer::spawn(db.clone()).unwrap();
+        w.write(vec![WriteOp::Sql {
+            sql: "INSERT INTO session (id, project_id, directory, path, slug, title, version, time_created, time_updated) VALUES ('ses_f', 'global', '/w', 's', 's', 't', '1', 1, 1)".into(),
+            params: vec![],
+        }])
+        .unwrap();
+        finalize_session_prompt(
+            &w,
+            "ses_f",
+            &PromptStats {
+                agent: "build",
+                model_json: "{\"id\":\"m\",\"providerID\":\"p\",\"variant\":\"default\"}",
+                cost: 0.5,
+                tokens_input: 11,
+                tokens_output: 22,
+                tokens_cache_read: 33,
+                time_updated: 1234,
+            },
+        )
+        .expect("finalize must not fail (negative control: was silently swallowed)");
+        drop(w); // join writer → flushed
+        let conn = crate::pragma::open_reader(&db).unwrap();
+        let (agent, model, tin, tcache): (String, String, i64, i64) = conn
+            .query_row(
+                "SELECT agent, model, tokens_input, tokens_cache_read FROM session WHERE id = 'ses_f'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(agent, "build");
+        assert!(
+            model.contains("\"providerID\":\"p\""),
+            "model json: {model}"
+        );
+        assert_eq!(tin, 11);
+        assert_eq!(tcache, 33);
+    }
+}

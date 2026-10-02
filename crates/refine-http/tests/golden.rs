@@ -1134,3 +1134,268 @@ async fn question_pending_reply_reject_flow() {
         refine_core::question::Outcome::Rejected
     ));
 }
+
+// ---- oc-remote Batch 4: command expansion + shell + busy ----
+
+#[test]
+fn command_expansion_matches_v1_semantics() {
+    // $ARGUMENTS verbatim
+    assert_eq!(
+        refine_http::expand_command("Review $ARGUMENTS carefully", "the diff --staged"),
+        "Review the diff --staged carefully"
+    );
+    // v1: the LAST placeholder position swallows args[position-1..] joined —
+    // with $2 max, $2 = "B C D" and $1 = "A" (port-faithful, not intuitive)
+    assert_eq!(
+        refine_http::expand_command("fix $2 with $1", "A B C D"),
+        "fix B C D with A"
+    );
+    // last position joins remaining args
+    assert_eq!(
+        refine_http::expand_command("run $1", "one two three"),
+        "run one two three"
+    );
+    // no placeholders + args → appended
+    assert_eq!(
+        refine_http::expand_command("plain template", "extra args"),
+        "plain template\n\nextra args"
+    );
+    // no placeholders + empty args → untouched (trimmed)
+    assert_eq!(refine_http::expand_command("  plain  ", ""), "plain");
+    // quoted args split like v1 argsRegex
+    assert_eq!(
+        refine_http::split_command_args(r#"one "two three" 'four five' six"#),
+        vec!["one", "two three", "four five", "six"]
+    );
+    // missing positional → empty string, final result trimmed (v1)
+    assert_eq!(refine_http::expand_command("x $5", "a"), "x");
+}
+
+#[tokio::test]
+async fn shell_runs_direct_and_records_messages() {
+    let st = refine_http::AppState::with_payloads(None, refine_http::Payloads::default());
+    refine_store::insert_session(
+        &st.writer,
+        &serde_json::json!({
+            "id": "ses_shell",
+            "projectID": "global",
+            "directory": "/work",
+            "path": "ses_shell",
+            "slug": "ses_shell",
+            "title": "shell",
+            "version": "1",
+            "time": {"created": 1, "updated": 2},
+        }),
+    )
+    .unwrap();
+    let app = refine_http::router(st.clone());
+
+    // missing command → 400
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/session/ses_shell/shell")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"agent":"build"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // direct execution (NO model call — works without an LLM endpoint)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/session/ses_shell/shell")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"agent":"build","command":"echo SHELL_OK"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    assert_eq!(v["info"]["role"], "assistant");
+    assert_eq!(v["parts"][0]["type"], "tool");
+    assert_eq!(v["parts"][0]["tool"], "bash");
+    assert_eq!(v["parts"][0]["state"]["status"], "completed");
+    assert_eq!(v["parts"][0]["state"]["output"], "SHELL_OK\n");
+    assert_eq!(v["parts"][0]["state"]["title"], "");
+    assert_eq!(v["parts"][0]["state"]["metadata"]["output"], "SHELL_OK\n");
+
+    // history: synthetic user text part + assistant bash part
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/session/ses_shell/message")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let msgs = body_json(resp).await;
+    let arr = msgs.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(
+        arr[0]["parts"][0]["text"],
+        "The following tool was executed by the user"
+    );
+    assert_eq!(arr[0]["parts"][0]["synthetic"], true);
+    assert_eq!(arr[1]["parts"][0]["tool"], "bash");
+    assert_eq!(arr[1]["info"]["role"], "assistant");
+    assert_eq!(
+        arr[1]["info"]["cost"].as_f64(),
+        Some(0.0),
+        "shell never costs model tokens"
+    );
+}
+
+#[tokio::test]
+async fn command_unknown_400_emits_session_error_and_lists_available() {
+    let st = refine_http::AppState::with_payloads(None, refine_http::Payloads::default());
+    refine_store::insert_session(
+        &st.writer,
+        &serde_json::json!({
+            "id": "ses_cmd",
+            "projectID": "global",
+            "directory": "/work",
+            "path": "ses_cmd",
+            "slug": "ses_cmd",
+            "title": "cmd",
+            "version": "1",
+            "time": {"created": 1, "updated": 2},
+        }),
+    )
+    .unwrap();
+    let app = refine_http::router(st.clone());
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/session/ses_cmd/command")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"command":"nope","arguments":""}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = body_json(resp).await;
+    // empty command list (Payloads::default) → no hint suffix
+    assert!(
+        v["data"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Command not found: \"nope\""),
+        "{v}"
+    );
+    // session.error persisted (durable) — read the event table
+    let events = st.db.clone();
+    let conn = refine_store::pragma::open_reader(&events).unwrap();
+    let n: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM event WHERE type = 'session.error'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        n >= 1,
+        "session.error durable event emitted (oc-remote toast path)"
+    );
+}
+
+#[tokio::test]
+async fn command_expands_and_persists_user_message_before_llm_fails() {
+    use refine_http::{AppState, LlmRegistry, Payloads, Wires};
+    let dir = std::env::temp_dir().join(format!(
+        "refine-cmd-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = refine_store::writer::db_path(&dir);
+    let writer = std::sync::Arc::new(refine_store::Writer::spawn(db.clone()).unwrap());
+    let blobs = std::sync::Arc::new(refine_store::BlobStore::new(dir.join("blobs")).unwrap());
+    let llm = LlmRegistry {
+        endpoints: [(
+            "fake".to_string(),
+            ("http://127.0.0.1:9".to_string(), String::new()),
+        )]
+        .into_iter()
+        .collect(),
+        pricing: Default::default(),
+        default_model: ("fake".into(), "m".into()),
+        systems: Default::default(),
+        default_agent: "build".into(),
+    };
+    let payloads = Payloads {
+        command: vec![serde_json::json!({
+        "name": "review",
+        "description": "Review changes",
+        "hints": ["$ARGUMENTS"],
+        "source": "builtin",
+        "template": "You are reviewing: $ARGUMENTS\nBe terse.",
+        })],
+        ..Default::default()
+    };
+    let st = AppState::with_wiring(
+        None,
+        payloads,
+        Wires {
+            db: db.clone(),
+            blobs,
+            writer,
+            llm,
+        },
+    );
+    refine_store::insert_session(
+        &st.writer,
+        &serde_json::json!({
+            "id": "ses_cmd2",
+            "projectID": "global",
+            "directory": "/work",
+            "path": "ses_cmd2",
+            "slug": "ses_cmd2",
+            "title": "cmd2",
+            "version": "1",
+            "time": {"created": 1, "updated": 2},
+        }),
+    )
+    .unwrap();
+    let app = refine_http::router(st.clone());
+
+    // known command with args → expansion persisted as the user message
+    // (LLM endpoint is dead → run_prompt fails AFTER persisting — same
+    // pattern as the prompt_async test; the assertion is the expansion)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/session/ses_cmd2/command")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"command":"review","arguments":"PR 42"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 500, "dead endpoint after persist");
+
+    let msgs = refine_store::load_messages(&db, "ses_cmd2", None).unwrap();
+    assert!(
+        !msgs.is_empty(),
+        "user message persisted before provider failure"
+    );
+    let text = msgs[0].1[0]["text"].as_str().unwrap();
+    assert_eq!(text, "You are reviewing: PR 42\nBe terse.");
+}
