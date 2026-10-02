@@ -90,6 +90,7 @@ fn regex_match(s: &[u8], p: &[u8]) -> bool {
 
 /// v1 permission evaluation: find LAST rule matching (permission, resource);
 /// default = ask (core/permission.ts evaluate()).
+#[derive(Clone, Debug)]
 pub struct Rule {
     pub permission: String,
     pub pattern: String,

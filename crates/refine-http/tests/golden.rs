@@ -438,3 +438,113 @@ async fn experimental_session_search_substring_and_project_keys() {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(bytes.as_ref(), b"[]", "no match → empty array");
 }
+
+// ---- M5: prompt_async (oc-remote send path, freeze session.prompt_async) ----
+
+#[tokio::test]
+async fn prompt_async_returns_204_persists_user_message_and_404s_unknown() {
+    use refine_http::{AppState, LlmRegistry, Payloads, Wires};
+
+    // temp-backed store + a deliberately dead endpoint (background task must
+    // fail AFTER persisting the user message — that ordering is the contract)
+    let dir = std::env::temp_dir().join(format!(
+        "refine-async-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = refine_store::writer::db_path(&dir);
+    let writer = std::sync::Arc::new(refine_store::Writer::spawn(db.clone()).unwrap());
+    let blobs = std::sync::Arc::new(refine_store::BlobStore::new(dir.join("blobs")).unwrap());
+    let llm = LlmRegistry {
+        endpoints: [(
+            "fake".to_string(),
+            ("http://127.0.0.1:9".to_string(), String::new()),
+        )]
+        .into_iter()
+        .collect(),
+        pricing: Default::default(),
+        default_model: ("fake".into(), "m".into()),
+        systems: Default::default(),
+        default_agent: "build".into(),
+    };
+    let st = AppState::with_wiring(
+        None,
+        Payloads::default(),
+        Wires {
+            db: db.clone(),
+            blobs,
+            writer,
+            llm,
+        },
+    );
+    refine_store::insert_session(
+        &st.writer,
+        &serde_json::json!({
+            "id": "ses_async",
+            "projectID": "global",
+            "directory": "/work",
+            "path": "ses_async",
+            "slug": "ses_async",
+            "title": "async",
+            "version": "1",
+            "time": {"created": 1, "updated": 2},
+        }),
+    )
+    .unwrap();
+    let app = refine_http::router(st.clone());
+
+    // 1. unknown session → 404 freeze envelope (checked BEFORE spawn)
+    let req = Request::builder()
+        .method("POST")
+        .uri("/session/ses_nope/prompt_async")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"parts":[{"type":"text","text":"hi"}]}"#))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        std::str::from_utf8(&bytes).unwrap(),
+        r#"{"name":"NotFoundError","data":{"message":"Session not found: ses_nope"}}"#
+    );
+
+    // 2. valid → 204, empty body, client messageId honored, background persists
+    let req = Request::builder()
+        .method("POST")
+        .uri("/session/ses_async/prompt_async")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"messageId":"msg_client_0001","parts":[{"type":"text","text":"ping"}],
+                "model":{"providerID":"fake","modelID":"m"},"agent":"build"}"#,
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "204 immediately");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(bytes.is_empty(), "NoContent body must be empty");
+
+    // background task persists the user message (then fails at the dead
+    // endpoint — logged, never panics: panic=abort would kill the test)
+    let mut saw_user = false;
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let req = Request::builder()
+            .uri("/session/ses_async/message")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        if let Some(arr) = v.as_array()
+            && arr.iter().any(|m| m["info"]["id"] == "msg_client_0001")
+        {
+            saw_user = true;
+            break;
+        }
+    }
+    assert!(saw_user, "background prompt persisted the user message");
+}

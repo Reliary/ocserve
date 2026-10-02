@@ -21,6 +21,7 @@ use std::time::Instant;
 /// Bound on provider↔tool round trips per prompt (AGENTS §2.3: bounded).
 pub const MAX_STEPS: usize = 25;
 
+#[derive(Clone)]
 pub struct LlmEndpoint {
     pub base_url: String,
     pub api_key: String,
@@ -28,6 +29,7 @@ pub struct LlmEndpoint {
     pub pricing: Option<(f64, f64, f64)>,
 }
 
+#[derive(Clone)]
 pub struct PromptContext {
     pub db: PathBuf,
     pub blobs: Arc<BlobStore>,
@@ -169,7 +171,12 @@ pub async fn run_prompt(
         .to_string();
 
     // ---- persist user message (text parts; file parts land with M3) ----
-    let user_msg_id = msg_id();
+    let user_msg_id = match payload.get("messageId").and_then(|v| v.as_str()) {
+        Some(id) if id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => {
+            id.to_string()
+        }
+        _ => msg_id(),
+    };
     let mut user_parts = Vec::new();
     for p in payload["parts"]
         .as_array()

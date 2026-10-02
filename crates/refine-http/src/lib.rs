@@ -127,6 +127,14 @@ pub struct AppState {
     pub mcp: std::sync::OnceLock<std::sync::Arc<refine_mcp::McpHub>>,
     /// Plugin sidecar (M4b): async mutex — trigger() takes &mut across await.
     pub plugins: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<refine_plugin::Sidecar>>>,
+    /// Per-session prompt serialization (queue semantics). Bounded: entries
+    /// exist only for in-flight prompts + transient races, removed post-run
+    /// when uncontended (AGENTS §2.3 — active-set bound, no eviction).
+    pub prompt_locks: std::sync::Arc<
+        parking_lot::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+        >,
+    >,
 }
 
 /// LLM endpoint resolution for the prompt runner (assembled by Runtime).
@@ -221,6 +229,9 @@ impl AppState {
             gate: refine_core::PermissionGate::new(),
             mcp: std::sync::OnceLock::new(),
             plugins: std::sync::OnceLock::new(),
+            prompt_locks: std::sync::Arc::new(parking_lot::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             db: w.db,
             blobs: w.blobs,
             writer: w.writer,
@@ -632,11 +643,12 @@ async fn get_messages(
 
 /// POST /session/{id}/message — sync prompt (blocks until stream completes,
 /// returns {info, parts}; captured in testdata/m2/prompt_response.json).
-async fn post_message(
-    State(st): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    Json(payload): Json<Value>,
-) -> Result<impl IntoResponse, ApiError> {
+/// Resolve agent/model/system/endpoint/rules into a runnable prompt context.
+/// Shared by POST /message (sync) and POST /prompt_async (backgrounded).
+fn build_prompt_context(
+    st: &Arc<AppState>,
+    payload: &Value,
+) -> Result<refine_core::prompt::PromptContext, ApiError> {
     let agent = payload
         .get("agent")
         .and_then(|a| a.as_str())
@@ -706,23 +718,105 @@ async fn post_message(
         mcp: st.mcp.get().cloned(),
         plugins: st.plugins.get().cloned(),
     };
+    Ok(ctx)
+}
+
+/// Per-session prompt lock (insert-only while active; bounded by in-flight).
+async fn lock_session(
+    st: &Arc<AppState>,
+    sid: &str,
+) -> Result<std::sync::Arc<tokio::sync::Mutex<()>>, ApiError> {
+    let lock = {
+        let mut map = st.prompt_locks.lock();
+        if map.len() >= 64 && !map.contains_key(sid) {
+            return Err(ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                name: "ServiceUnavailableError",
+                message: "too many concurrent prompts".into(),
+            });
+        }
+        map.entry(sid.to_string())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    Ok(lock)
+}
+
+fn prompt_err(e: anyhow::Error) -> ApiError {
+    let msg = format!("{e:#}");
+    if msg.starts_with("Session not found") {
+        ApiError::not_found(msg)
+    } else {
+        ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: msg,
+        }
+    }
+}
+
+async fn post_message(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(payload): Json<Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    let ctx = build_prompt_context(&st, &payload)?;
+    let lock = lock_session(&st, &id).await?;
+    let _guard = lock.lock().await;
     let writer = st.writer.clone();
     let result = refine_core::prompt::run_prompt(&ctx, &writer, &id, &payload)
         .await
-        .map_err(|e| {
-            let msg = format!("{e:#}");
-            if msg.starts_with("Session not found") {
-                ApiError::not_found(msg)
-            } else {
-                ApiError {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    name: "InternalError",
-                    message: msg,
-                }
-            }
-        })?;
+        .map_err(prompt_err)?;
+    drop(_guard);
+    {
+        let mut map = st.prompt_locks.lock();
+        if let Some(arc) = map.get(&id)
+            && std::sync::Arc::strong_count(arc) <= 2
+        {
+            map.remove(&id);
+        }
+    }
     let (info, parts) = result;
     Ok(Json(json!({"info": info, "parts": parts})))
+}
+
+/// POST /session/{id}/prompt_async — v1 `session.prompt_async` (oc-remote's
+/// send path): same PromptPayload as /message, **204 immediately**, prompt
+/// runs in the background; results arrive on SSE. Errors: NotFound (bad
+/// session) / BadRequest before spawn; background failures are logged
+/// (upstream handlers/session.ts logs "prompt_async failed", no reply body).
+async fn post_prompt_async(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(payload): Json<Value>,
+) -> Result<StatusCode, ApiError> {
+    if !refine_store::session_exists(&st.db, &id).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })? {
+        return Err(ApiError::not_found(format!("Session not found: {id}")));
+    }
+    let ctx = build_prompt_context(&st, &payload)?;
+    let lock = lock_session(&st, &id).await?;
+    let writer = st.writer.clone();
+    let locks = st.prompt_locks.clone();
+    let sid = id.clone();
+    tokio::spawn(async move {
+        let guard = lock.lock().await;
+        match refine_core::prompt::run_prompt(&ctx, &writer, &sid, &payload).await {
+            Ok(_) => {}
+            Err(e) => tracing::error!("prompt_async failed session={sid}: {e:#}"),
+        }
+        drop(guard);
+        let mut map = locks.lock();
+        if let Some(arc) = map.get(&sid)
+            && std::sync::Arc::strong_count(arc) <= 2
+        {
+            map.remove(&sid);
+        }
+    });
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Freeze-shaped event id: `evt_` + 26 hex chars (upstream ids are time+random
@@ -920,6 +1014,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/lsp", get(lsp_list))
         .route("/project/{id}/directories", get(project_directories))
         .route("/vcs", get(vcs_info))
+        .route(
+            "/session/{id}/prompt_async",
+            axum::routing::post(post_prompt_async),
+        )
         .route("/experimental/session", get(get_experimental_sessions))
         .route("/mcp", get(get_mcp))
         .route("/permission", get(get_permissions))
