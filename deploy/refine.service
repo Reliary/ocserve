@@ -3,6 +3,10 @@
 [Unit]
 Description=refine (opencode-compatible server, freeze 1.18.31)
 After=network.target
+# StartLimit* belong HERE ([Unit]) — as [Service] options systemd ignores
+# them (observed: bind-fail restart loop reached 1582 without tripping).
+StartLimitBurst=5
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple
@@ -14,8 +18,6 @@ Environment=MIMALLOC_PURGE_DELAY=500
 Environment=MIMALLOC_ARENA_EAGER_COMMIT=0
 Restart=on-failure
 RestartSec=5
-StartLimitBurst=5
-StartLimitIntervalSec=60
 # Combined cgroup budget: refine ≤300MB + node plugin sidecar ≤160MB (both
 # measured — MEMORY.md provenance note) + headroom. Children share this
 # cgroup, so MemoryMax must cover the sidecar or systemd OOM-kills plugins.
