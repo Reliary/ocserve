@@ -1,20 +1,25 @@
 //! Sync prompt runner: POST /session/{id}/message semantics (captured live,
-//! testdata/m2/session_fixture.json + prompt_response.json).
+//! testdata/m2/session_fixture.json + prompt_response.json + tool_fixture).
 //!
-//! Flow: persist user message → durable events + sync twins → stream provider
-//! → message.part.delta frames → persist assistant message (step-start, text,
-//! step-finish) → durable events → session.status/idle/diff → return {info, parts}.
+//! M2b: multi-step loop — stream → tool calls → permission gate → execute →
+//! persist tool parts → next turn → final message. All assistants parent the
+//! user message (fixture fact). Durable events carry sync twins (per-session
+//! seq, seeded once).
 
 use crate::event::{EventBus, frame, sync_frame};
-use crate::ids::{evt_id, msg_id, prt_id};
+use crate::ids::{msg_id, prt_id};
+use crate::permission::PermissionGate;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use refine_llm::{ChatMessage, Client, StreamEvent, ToolCallAssembler, Usage};
 use refine_store::{BlobStore, insert_message};
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Bound on provider↔tool round trips per prompt (AGENTS §2.3: bounded).
+pub const MAX_STEPS: usize = 25;
 
 pub struct LlmEndpoint {
     pub base_url: String,
@@ -34,6 +39,10 @@ pub struct PromptContext {
     pub endpoint: LlmEndpoint,
     pub model_id: String,
     pub provider_id: String,
+    /// Agent permission rules (v1 {permission, pattern, action}, last wins).
+    pub rules: Vec<refine_tools::Rule>,
+    /// Permission rendezvous (ask → event → reply).
+    pub gate: Arc<PermissionGate>,
 }
 
 fn now_ms() -> i64 {
@@ -74,21 +83,65 @@ fn emit_live(ctx: &PromptContext, event_type: &str, properties: Value) {
         .publish(frame(&ctx.directory, event_type, properties));
 }
 
-/// Run one synchronous prompt to completion.
-/// Returns the assistant (info, parts) — the HTTP response body.
+/// Reconstruct provider messages from stored history (text + tool parts).
+fn to_provider_messages(history: &[(Value, Vec<Value>)]) -> Vec<ChatMessage> {
+    let mut out = Vec::new();
+    for (info, parts) in history {
+        let role = info["role"].as_str().unwrap_or("user");
+        let text: String = parts
+            .iter()
+            .filter(|p| p["type"] == "text")
+            .filter_map(|p| p["text"].as_str())
+            .collect();
+        let tool_parts: Vec<&Value> = parts.iter().filter(|p| p["type"] == "tool").collect();
+        if tool_parts.is_empty() {
+            if !text.is_empty() || role == "user" {
+                out.push(ChatMessage::text(role, text));
+            }
+            continue;
+        }
+        // assistant with tool calls: declare calls, then emit results
+        let calls: Vec<Value> = tool_parts
+            .iter()
+            .map(|p| {
+                json!({
+                    "id": p["callID"],
+                    "type": "function",
+                    "function": {
+                        "name": p["tool"],
+                        "arguments": p["state"]["input"].to_string(),
+                    }
+                })
+            })
+            .collect();
+        out.push(ChatMessage::assistant_with_tools(text, calls));
+        for p in &tool_parts {
+            let output = p["state"]["output"]
+                .as_str()
+                .or_else(|| p["state"]["metadata"]["output"].as_str())
+                .unwrap_or_default();
+            out.push(ChatMessage::tool_result(
+                p["callID"].as_str().unwrap_or_default(),
+                output,
+            ));
+        }
+    }
+    out
+}
+
+/// Run one prompt to completion (possibly multi-step via tools).
+/// Returns the FINAL assistant (info, parts) — the HTTP response body.
 pub async fn run_prompt(
     ctx: &PromptContext,
     writer: &refine_store::Writer,
     session_id: &str,
     payload: &Value,
 ) -> Result<(Value, Vec<Value>)> {
-    // 1. session must exist (friendly 404 upstream of the insert)
     if !refine_store::session_exists(&ctx.db, session_id)? {
         anyhow::bail!("Session not found: {session_id}");
     }
     let mut seq = refine_store::next_event_seq(&ctx.db, session_id)?;
 
-    // 2. resolve model/agent from payload (agent default from ctx)
     let model = payload
         .pointer("/model/modelID")
         .and_then(|v| v.as_str())
@@ -101,10 +154,9 @@ pub async fn run_prompt(
         .unwrap_or(&ctx.agent)
         .to_string();
 
-    // 3. persist user message (text parts only; file parts = M2b with tools)
+    // ---- persist user message (text parts; file parts land with M3) ----
     let user_msg_id = msg_id();
     let mut user_parts = Vec::new();
-    let mut input_text = String::new();
     for p in payload["parts"]
         .as_array()
         .map(|a| a.as_slice())
@@ -112,7 +164,6 @@ pub async fn run_prompt(
     {
         if p["type"] == "text" {
             let text = p["text"].as_str().unwrap_or("").to_string();
-            input_text.push_str(&text);
             user_parts.push(json!({
                 "id": prt_id(),
                 "sessionID": session_id,
@@ -141,19 +192,18 @@ pub async fn run_prompt(
     )
     .context("persist user message")?;
 
-    // 4. durable events (capture order: session.updated → message.updated → part)
-    let session_info = json!({
-        "id": session_id,
-        "model": {"id": model, "providerID": ctx.provider_id, "variant": "default"},
-        "agent": agent,
-    });
     emit_durable(
         ctx,
         writer,
         session_id,
         "session.updated",
         json!({
-            "sessionID": session_id, "info": session_info,
+            "sessionID": session_id,
+            "info": {
+                "id": session_id,
+                "model": {"id": model, "providerID": ctx.provider_id, "variant": "default"},
+                "agent": agent,
+            },
         }),
         &mut seq,
     )?;
@@ -162,9 +212,7 @@ pub async fn run_prompt(
         writer,
         session_id,
         "message.updated",
-        json!({
-            "sessionID": session_id, "info": user_info,
-        }),
+        json!({"sessionID": session_id, "info": user_info}),
         &mut seq,
     )?;
     for part in &user_parts {
@@ -173,239 +221,457 @@ pub async fn run_prompt(
             writer,
             session_id,
             "message.part.updated",
-            json!({
-                "sessionID": session_id, "part": part,
-            }),
+            json!({"sessionID": session_id, "part": part}),
             &mut seq,
         )?;
     }
     emit_live(
         ctx,
         "session.status",
-        json!({
-            "sessionID": session_id, "status": {"type": "busy"},
-        }),
+        json!({"sessionID": session_id, "status": {"type": "busy"}}),
     );
 
-    // 5. history → provider messages
+    // ---- provider context ----
     let history = refine_store::load_messages(&ctx.db, session_id)?;
-    let mut messages = vec![ChatMessage {
-        role: "system".into(),
-        content: ctx.system.clone(),
-    }];
-    for (info, parts) in &history {
-        let mut content = String::new();
-        for p in parts {
-            if p["type"] == "text" {
-                content.push_str(p["text"].as_str().unwrap_or(""));
+    let mut messages = vec![ChatMessage::text("system", ctx.system.clone())];
+    messages.extend(to_provider_messages(&history));
+    let tools = refine_tools::schemas();
+
+    let client = Client::new(ctx.endpoint.base_url.clone(), ctx.endpoint.api_key.clone());
+    let mut total_usage = Usage::default();
+    let mut total_cost = 0.0f64;
+    let mut step = 0usize;
+
+    loop {
+        step += 1;
+        if step > MAX_STEPS {
+            anyhow::bail!("prompt exceeded {MAX_STEPS} steps (bounded loop, AGENTS §2.3)");
+        }
+        let started = Instant::now();
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut finish: Option<String> = None;
+        let mut usage: Option<Usage> = None;
+        let mut assembler = ToolCallAssembler::default();
+
+        let mut stream = client
+            .chat_stream(&model, &messages, None, Some(&tools))
+            .await
+            .context("provider stream open")?;
+        while let Some(ev) = stream.next().await {
+            match ev.context("provider stream")? {
+                StreamEvent::TextDelta(t) => {
+                    emit_live(
+                        ctx,
+                        "message.part.delta",
+                        json!({
+                            "sessionID": session_id, "messageID": user_msg_id, "partID": "",
+                            "field": "text", "delta": t,
+                        }),
+                    );
+                    text.push_str(&t);
+                }
+                StreamEvent::ReasoningDelta(r) => {
+                    emit_live(
+                        ctx,
+                        "message.part.delta",
+                        json!({
+                            "sessionID": session_id, "messageID": user_msg_id, "partID": "",
+                            "field": "reasoning", "delta": r,
+                        }),
+                    );
+                    reasoning.push_str(&r);
+                }
+                StreamEvent::ToolCallDelta {
+                    index,
+                    id,
+                    name,
+                    arguments_delta,
+                } => {
+                    assembler.push(index, id, name, arguments_delta);
+                }
+                StreamEvent::Done {
+                    finish: f,
+                    usage: u,
+                } => {
+                    if f.is_some() {
+                        finish = f;
+                    }
+                    if u.is_some() {
+                        usage = u;
+                    }
+                }
             }
         }
-        if content.is_empty() {
+        let tool_calls = assembler.finish();
+        let elapsed_ms = started.elapsed().as_millis() as i64;
+        let t_done = now_ms();
+        let finish_reason = finish.unwrap_or_else(|| "stop".into());
+        let u = usage.clone().unwrap_or_default();
+        total_usage.prompt_tokens += u.prompt_tokens;
+        total_usage.completion_tokens += u.completion_tokens;
+        total_usage.total_tokens += u.total_tokens;
+        total_usage.cached_tokens += u.cached_tokens;
+        let step_cost = compute_cost(&ctx.endpoint.pricing, &u);
+        total_cost += step_cost;
+        let assistant_id = msg_id();
+
+        // ---- tool-call turn ----
+        if finish_reason == "tool_calls" && !tool_calls.is_empty() {
+            let mut parts = vec![json!({
+                "type": "step-start", "id": prt_id(),
+                "sessionID": session_id, "messageID": assistant_id,
+            })];
+            if !reasoning.is_empty() {
+                parts.push(json!({
+                    "type": "reasoning", "text": reasoning,
+                    "time": {"start": t_done - elapsed_ms, "end": t_done},
+                    "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
+                }));
+            }
+            if !text.is_empty() {
+                parts.push(json!({
+                    "type": "text", "text": text,
+                    "time": {"start": t_done - elapsed_ms, "end": t_done},
+                    "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
+                }));
+            }
+
+            let mut provider_tool_results = Vec::new();
+            for call in &tool_calls {
+                let resource = permission_resource(&call.name, &call.arguments);
+                let part_id = prt_id();
+                let mut running = json!({
+                    "type": "tool", "id": part_id,
+                    "sessionID": session_id, "messageID": assistant_id,
+                    "callID": call.id, "tool": call.name,
+                    "state": {
+                        "status": "running",
+                        "input": serde_json::from_str::<Value>(&call.arguments)
+                            .unwrap_or_else(|_| json!({"raw": call.arguments})),
+                        "time": {"start": now_ms()},
+                    },
+                });
+                emit_durable(
+                    ctx,
+                    writer,
+                    session_id,
+                    "message.part.updated",
+                    json!({"sessionID": session_id, "part": running}),
+                    &mut seq,
+                )?;
+
+                // ---- permission gate ----
+                let key = format!("{}:{}", call.name, resource);
+                let effect = if ctx.gate.check_always(session_id, &key) {
+                    "allow".to_string()
+                } else {
+                    refine_tools::evaluate(&call.name, &resource, &ctx.rules)
+                };
+                let mut allowed = effect == "allow";
+                if effect == "ask" {
+                    let perm_id = crate::ids::evt_id(); // 26-char request id
+                    let request = json!({
+                        "id": perm_id,
+                        "sessionID": session_id,
+                        "action": call.name,
+                        "resource": resource,
+                        "patterns": [resource],
+                        "always": [resource],
+                        "metadata": {},
+                        "tool": {"messageID": assistant_id, "callID": call.id},
+                    });
+                    let rx = ctx.gate.register(&perm_id, request.clone());
+                    emit_durable(
+                        ctx,
+                        writer,
+                        session_id,
+                        "permission.asked",
+                        json!({
+                            "sessionID": session_id,
+                            "id": perm_id,
+                            "permission": call.name,
+                            "patterns": [resource],
+                            "always": [resource],
+                            "metadata": {},
+                            "tool": {"messageID": assistant_id, "callID": call.id},
+                        }),
+                        &mut seq,
+                    )?;
+                    let reply = ctx.gate.wait(&perm_id, rx).await;
+                    emit_durable(
+                        ctx,
+                        writer,
+                        session_id,
+                        "permission.replied",
+                        json!({"sessionID": session_id, "requestID": perm_id}),
+                        &mut seq,
+                    )?;
+                    allowed = reply == "once" || reply == "always";
+                    if reply == "always" {
+                        ctx.gate.grant_always(session_id, &key);
+                    }
+                }
+
+                // ---- execute ----
+                let exec_start = now_ms();
+                let (output, meta, title, is_err) = if allowed {
+                    match refine_tools::execute(
+                        &call.name,
+                        &serde_json::from_str::<Value>(&call.arguments)
+                            .unwrap_or_else(|_| json!({})),
+                        Path::new(&ctx.directory),
+                    ) {
+                        Ok(r) => (
+                            r.output,
+                            json!({
+                                "output": "", // set below (avoid double-copy in state)
+                                "exit": r.exit,
+                                "truncated": r.truncated,
+                            }),
+                            r.title,
+                            r.error,
+                        ),
+                        Err(e) => (format!("Error: {e:#}"), json!({}), call.name.clone(), true),
+                    }
+                } else {
+                    (
+                        "Permission denied".to_string(),
+                        json!({}),
+                        call.name.clone(),
+                        true,
+                    )
+                };
+                running["state"] = json!({
+                    "status": if is_err { "error" } else { "completed" },
+                    "input": serde_json::from_str::<Value>(&call.arguments)
+                        .unwrap_or_else(|_| json!({"raw": call.arguments})),
+                    "output": output,
+                    "title": title,
+                    "metadata": {"output": "", "exit": meta["exit"], "truncated": meta["truncated"]},
+                    "time": {"start": exec_start, "end": now_ms()},
+                });
+                // metadata.output mirrors output (capture fact)
+                running["state"]["metadata"]["output"] = running["state"]["output"].clone();
+                emit_durable(
+                    ctx,
+                    writer,
+                    session_id,
+                    "message.part.updated",
+                    json!({"sessionID": session_id, "part": running}),
+                    &mut seq,
+                )?;
+                parts.push(running);
+                provider_tool_results.push((call.id.clone(), output));
+            }
+
+            // persist the tool-step assistant message (parent = user message)
+            let step_info = json!({
+                "parentID": user_msg_id,
+                "role": "assistant",
+                "mode": "primary",
+                "agent": agent,
+                "path": {"cwd": ctx.directory, "root": "/"},
+                "cost": step_cost,
+                "tokens": {
+                    "total": u.total_tokens, "input": u.prompt_tokens,
+                    "output": u.completion_tokens, "reasoning": 0,
+                    "cache": {"write": 0, "read": u.cached_tokens},
+                },
+                "modelID": model,
+                "providerID": ctx.provider_id,
+                "time": {"created": t_done - elapsed_ms, "completed": t_done},
+                "finish": "tool-calls",
+                "id": assistant_id,
+                "sessionID": session_id,
+            });
+            parts.push(json!({
+                "reason": "tool-calls", "type": "step-finish",
+                "tokens": step_info["tokens"], "cost": step_cost,
+                "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
+            }));
+            insert_message(writer, Some(&*ctx.blobs), session_id, &step_info, &parts)
+                .context("persist tool-step message")?;
+            for part in &parts {
+                emit_durable(
+                    ctx,
+                    writer,
+                    session_id,
+                    "message.part.updated",
+                    json!({"sessionID": session_id, "part": part}),
+                    &mut seq,
+                )?;
+            }
+            emit_durable(
+                ctx,
+                writer,
+                session_id,
+                "message.updated",
+                json!({"sessionID": session_id, "info": step_info}),
+                &mut seq,
+            )?;
+            emit_durable(
+                ctx,
+                writer,
+                session_id,
+                "session.updated",
+                json!({
+                    "sessionID": session_id,
+                    "info": {"id": session_id, "cost": total_cost, "time": {"updated": t_done}},
+                }),
+                &mut seq,
+            )?;
+
+            // extend provider conversation for the next turn
+            let calls_json: Vec<Value> = tool_calls
+                .iter()
+                .map(|c| {
+                    json!({
+                        "id": c.id,
+                        "type": "function",
+                        "function": {"name": c.name, "arguments": c.arguments},
+                    })
+                })
+                .collect();
+            messages.push(ChatMessage::assistant_with_tools(text, calls_json));
+            for (cid, out) in provider_tool_results {
+                messages.push(ChatMessage::tool_result(cid, out));
+            }
             continue;
         }
-        messages.push(ChatMessage {
-            role: info["role"].as_str().unwrap_or("user").to_string(),
-            content,
-        });
-    }
 
-    // 6. stream
-    let client = Client::new(ctx.endpoint.base_url.clone(), ctx.endpoint.api_key.clone());
-    let started = Instant::now();
-    let mut text = String::new();
-    let mut reasoning = String::new();
-    let mut finish: Option<String> = None;
-    let mut usage: Option<Usage> = None;
-    let mut assembler = ToolCallAssembler::default();
-    let mut delta_emitted = false;
-
-    let mut stream = client
-        .chat_stream(&model, &messages, None)
-        .await
-        .context("provider stream open")?;
-    while let Some(ev) = stream.next().await {
-        match ev.context("provider stream")? {
-            StreamEvent::TextDelta(t) => {
-                text.push_str(&t);
-                if !delta_emitted {
-                    delta_emitted = true;
-                }
-                emit_live(
-                    ctx,
-                    "message.part.delta",
-                    json!({
-                        "sessionID": session_id,
-                        "messageID": user_msg_id, // placeholder — final part ids assigned below
-                        "partID": "",
-                        "field": "text",
-                        "delta": t,
-                    }),
-                );
-            }
-            StreamEvent::ReasoningDelta(r) => {
-                reasoning.push_str(&r);
-                emit_live(
-                    ctx,
-                    "message.part.delta",
-                    json!({
-                        "sessionID": session_id,
-                        "messageID": user_msg_id,
-                        "partID": "",
-                        "field": "reasoning",
-                        "delta": r,
-                    }),
-                );
-            }
-            StreamEvent::ToolCallDelta {
-                index,
-                id,
-                name,
-                arguments_delta,
-            } => {
-                assembler.push(index, id, name, arguments_delta);
-                // tool execution = M2b (tool loop lands next)
-            }
-            StreamEvent::Done {
-                finish: f,
-                usage: u,
-            } => {
-                if f.is_some() {
-                    finish = f;
-                }
-                if u.is_some() {
-                    usage = u;
-                }
-            }
+        // ---- final turn ----
+        let mut parts = vec![json!({
+            "type": "step-start", "id": prt_id(),
+            "sessionID": session_id, "messageID": assistant_id,
+        })];
+        if !reasoning.is_empty() {
+            parts.push(json!({
+                "type": "reasoning", "text": reasoning,
+                "time": {"start": t_done - elapsed_ms, "end": t_done},
+                "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
+            }));
         }
-    }
-    let _tool_calls = assembler.finish();
-    let elapsed_ms = started.elapsed().as_millis() as i64;
-    let t_done = now_ms();
+        parts.push(json!({
+            "type": "text", "text": text, "time": {"start": t_done - elapsed_ms, "end": t_done},
+            "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
+        }));
+        let assistant_info = json!({
+            "parentID": user_msg_id,
+            "role": "assistant",
+            "mode": "primary",
+            "agent": agent,
+            "path": {"cwd": ctx.directory, "root": "/"},
+            "cost": total_cost,
+            "tokens": {
+                "total": total_usage.total_tokens, "input": total_usage.prompt_tokens,
+                "output": total_usage.completion_tokens, "reasoning": 0,
+                "cache": {"write": 0, "read": total_usage.cached_tokens},
+            },
+            "modelID": model,
+            "providerID": ctx.provider_id,
+            "time": {"created": t_done - elapsed_ms, "completed": t_done},
+            "finish": finish_reason,
+            "id": assistant_id,
+            "sessionID": session_id,
+        });
+        parts.push(json!({
+            "reason": finish_reason, "type": "step-finish",
+            "tokens": assistant_info["tokens"], "cost": total_cost,
+            "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
+        }));
+        insert_message(
+            writer,
+            Some(&*ctx.blobs),
+            session_id,
+            &assistant_info,
+            &parts,
+        )
+        .context("persist assistant message")?;
 
-    // 7. assistant message + parts (wire shape from fixture)
-    let assistant_id = msg_id();
-    let step_start = json!({"type": "step-start", "id": prt_id(), "sessionID": session_id, "messageID": assistant_id});
-    let text_part = json!({
-        "type": "text", "text": text, "time": {"start": t_done - elapsed_ms, "end": t_done},
-        "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
-    });
-    let u = usage.clone().unwrap_or_default();
-    let cost = compute_cost(&ctx.endpoint.pricing, &u);
-    let finish_reason = finish.unwrap_or_else(|| "stop".into());
-    let step_finish = json!({
-        "reason": finish_reason,
-        "type": "step-finish",
-        "tokens": {
-            "total": u.total_tokens, "input": u.prompt_tokens, "output": u.completion_tokens,
-            "reasoning": 0,
-            "cache": {"write": 0, "read": u.cached_tokens},
-        },
-        "cost": cost,
-        "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
-    });
-    let assistant_info = json!({
-        "parentID": user_msg_id,
-        "role": "assistant",
-        "mode": "primary",
-        "agent": user_info["agent"],
-        "path": {"cwd": ctx.directory, "root": "/"},
-        "cost": cost,
-        "tokens": {
-            "total": u.total_tokens, "input": u.prompt_tokens, "output": u.completion_tokens,
-            "reasoning": 0,
-            "cache": {"write": 0, "read": u.cached_tokens},
-        },
-        "modelID": model,
-        "providerID": ctx.provider_id,
-        "time": {"created": t_done - elapsed_ms, "completed": t_done},
-        "finish": finish_reason,
-        "id": assistant_id,
-        "sessionID": session_id,
-    });
-    let assistant_parts = vec![step_start.clone(), text_part.clone(), step_finish.clone()];
-    insert_message(
-        writer,
-        Some(&*ctx.blobs),
-        session_id,
-        &assistant_info,
-        &assistant_parts,
-    )
-    .context("persist assistant message")?;
-
-    // 8. events: durable part/message/session, then live status/idle/diff
-    for part in [&step_start, &text_part, &step_finish] {
+        for part in &parts {
+            emit_durable(
+                ctx,
+                writer,
+                session_id,
+                "message.part.updated",
+                json!({"sessionID": session_id, "part": part}),
+                &mut seq,
+            )?;
+        }
         emit_durable(
             ctx,
             writer,
             session_id,
-            "message.part.updated",
+            "message.updated",
+            json!({"sessionID": session_id, "info": assistant_info}),
+            &mut seq,
+        )?;
+        emit_durable(
+            ctx,
+            writer,
+            session_id,
+            "session.updated",
             json!({
-                "sessionID": session_id, "part": part,
+                "sessionID": session_id,
+                "info": {
+                    "id": session_id,
+                    "cost": total_cost,
+                    "tokens": assistant_info["tokens"],
+                    "time": {"updated": t_done},
+                },
             }),
             &mut seq,
         )?;
-    }
-    emit_durable(
-        ctx,
-        writer,
-        session_id,
-        "message.updated",
-        json!({
-            "sessionID": session_id, "info": assistant_info,
-        }),
-        &mut seq,
-    )?;
-    let session_info = json!({
-        "id": session_id,
-        "cost": cost,
-        "tokens": assistant_info["tokens"],
-        "time": {"updated": t_done},
-    });
-    emit_durable(
-        ctx,
-        writer,
-        session_id,
-        "session.updated",
-        json!({
-            "sessionID": session_id, "info": session_info,
-        }),
-        &mut seq,
-    )?;
-    emit_live(
-        ctx,
-        "session.status",
-        json!({
-            "sessionID": session_id, "status": {"type": "idle"},
-        }),
-    );
-    emit_live(
-        ctx,
-        "session.diff",
-        json!({"sessionID": session_id, "diff": []}),
-    );
-    emit_live(ctx, "session.idle", json!({"sessionID": session_id}));
+        emit_live(
+            ctx,
+            "session.status",
+            json!({"sessionID": session_id, "status": {"type": "idle"}}),
+        );
+        emit_live(
+            ctx,
+            "session.diff",
+            json!({"sessionID": session_id, "diff": []}),
+        );
+        emit_live(ctx, "session.idle", json!({"sessionID": session_id}));
 
-    // 9. update session row tokens/cost (best-effort)
-    let _ = writer.write(vec![refine_store::WriteOp::Sql {
-        sql: "UPDATE session SET agent = ?2, model = ?3, cost = ?4, tokens_input = ?5, \
-              tokens_output = ?6, tokens_cache_read = ?7, time_updated = ?8 WHERE id = ?1"
-            .into(),
-        params: vec![
-            session_id.into(),
-            agent.into(),
-            json!({"id": model, "providerID": ctx.provider_id, "variant": "default"})
-                .to_string()
+        let _ = writer.write(vec![refine_store::WriteOp::Sql {
+            sql: "UPDATE session SET agent = ?2, model = ?3, cost = ?4, tokens_input = ?5, \\
+                  tokens_output = ?6, tokens_cache_read = ?7, time_updated = ?8 WHERE id = ?1"
                 .into(),
-            cost.into(),
-            (u.prompt_tokens as i64).into(),
-            (u.completion_tokens as i64).into(),
-            (u.cached_tokens as i64).into(),
-            t_done.into(),
-        ],
-    }]);
+            params: vec![
+                session_id.into(),
+                agent.into(),
+                json!({"id": model, "providerID": ctx.provider_id, "variant": "default"})
+                    .to_string()
+                    .into(),
+                total_cost.into(),
+                (total_usage.prompt_tokens as i64).into(),
+                (total_usage.completion_tokens as i64).into(),
+                (total_usage.cached_tokens as i64).into(),
+                t_done.into(),
+            ],
+        }]);
 
-    let _ = evt_id;
-    Ok((assistant_info, assistant_parts))
+        return Ok((assistant_info, parts));
+    }
+}
+
+/// Permission resource per tool (v1: fs tools → path, bash → command).
+fn permission_resource(tool: &str, arguments: &str) -> String {
+    let Ok(v) = serde_json::from_str::<Value>(arguments) else {
+        return "*".to_string();
+    };
+    match tool {
+        "bash" => v["command"].as_str().unwrap_or("*").to_string(),
+        "read" | "write" | "edit" => v["filePath"].as_str().unwrap_or("*").to_string(),
+        "glob" | "grep" => v["path"]
+            .as_str()
+            .or_else(|| v["pattern"].as_str())
+            .unwrap_or("*")
+            .to_string(),
+        _ => "*".to_string(),
+    }
 }
 
 fn compute_cost(pricing: &Option<(f64, f64, f64)>, u: &Usage) -> f64 {

@@ -14,6 +14,41 @@ use serde_json::{Value, json};
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// OpenAI tool-result linkage (role="tool").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Assistant tool-call declarations (role="assistant", finish=tool_calls).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<Value>>,
+}
+
+impl ChatMessage {
+    pub fn text(role: &str, content: impl Into<String>) -> Self {
+        Self {
+            role: role.to_string(),
+            content: content.into(),
+            tool_call_id: None,
+            tool_calls: None,
+        }
+    }
+
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".to_string(),
+            content: content.into(),
+            tool_call_id: Some(tool_call_id.into()),
+            tool_calls: None,
+        }
+    }
+
+    pub fn assistant_with_tools(content: impl Into<String>, tool_calls: Vec<Value>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: content.into(),
+            tool_call_id: None,
+            tool_calls: Some(tool_calls),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -228,24 +263,22 @@ pub fn build_request(
     model: &str,
     messages: &[ChatMessage],
     max_tokens: Option<u32>,
-    with_tools: bool,
+    tools: Option<&[Value]>,
 ) -> Value {
     let mut body = json!({
         "model": model,
-        "messages": messages
-            .iter()
-            .map(|m| json!({"role": m.role, "content": m.content}))
-            .collect::<Vec<_>>(),
+        "messages": serde_json::to_value(messages).expect("messages serialize"),
         "stream": true,
         "stream_options": {"include_usage": true},
     });
     if let Some(mt) = max_tokens {
         body["max_tokens"] = json!(mt);
     }
-    if with_tools {
-        // tools are injected by the caller via `tools` — kept out of M2 body
-        // until the tool loop lands (PLAN M2b)
-        let _ = &body;
+    if let Some(t) = tools
+        && !t.is_empty()
+    {
+        body["tools"] = serde_json::to_value(t).expect("tools serialize");
+        body["tool_choice"] = json!("auto");
     }
     body
 }
@@ -272,8 +305,9 @@ impl Client {
         model: &str,
         messages: &[ChatMessage],
         max_tokens: Option<u32>,
+        tools: Option<&[Value]>,
     ) -> Result<futures_util::stream::BoxStream<'static, Result<StreamEvent>>> {
-        let body = build_request(model, messages, max_tokens, false);
+        let body = build_request(model, messages, max_tokens, tools);
         let resp = self
             .http
             .post(format!("{}/chat/completions", self.base_url))

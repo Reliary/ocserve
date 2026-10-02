@@ -17,6 +17,8 @@ sha2.workspace = true
 hex.workspace = true
 refine-store.workspace = true
 refine-llm.workspace = true
+refine-tools.workspace = true
+parking_lot.workspace = true
 futures-util.workspace = true
 
 [dev-dependencies]

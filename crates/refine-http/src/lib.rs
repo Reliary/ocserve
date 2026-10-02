@@ -88,6 +88,8 @@ pub struct AppState {
     pub writer: std::sync::Arc<refine_store::Writer>,
     /// Provider registry + default model + agent systems (from Runtime).
     pub llm: LlmRegistry,
+    /// Permission rendezvous shared by runner + reply routes.
+    pub gate: std::sync::Arc<refine_core::PermissionGate>,
 }
 
 /// LLM endpoint resolution for the prompt runner (assembled by Runtime).
@@ -179,6 +181,7 @@ impl AppState {
             auth,
             requests: std::sync::atomic::AtomicU64::new(0),
             bus: refine_core::EventBus::new(),
+            gate: refine_core::PermissionGate::new(),
             db: w.db,
             blobs: w.blobs,
             writer: w.writer,
@@ -318,6 +321,30 @@ async fn lsp_list() -> Json<Value> {
 }
 async fn project_directories() -> Json<Value> {
     Json(json!([]))
+}
+
+/// POST /permission/{id}/reply — {reply: once|always|reject} (oc-remote contract).
+async fn post_permission_reply(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let reply = body
+        .get("reply")
+        .and_then(|v| v.as_str())
+        .unwrap_or("reject")
+        .to_string();
+    if !st.gate.reply(&id, &reply) {
+        return Err(ApiError::not_found(format!(
+            "Permission request not found: {id}"
+        )));
+    }
+    Ok(Json(json!({})))
+}
+
+/// GET /permission — pending permission requests.
+async fn get_permissions(State(st): State<Arc<AppState>>) -> Json<Value> {
+    Json(serde_json::Value::Array(st.gate.list()))
 }
 
 /// GET /vcs — {branch, default_branch} (values cwd-dependent; keys golden).
@@ -571,6 +598,24 @@ async fn post_message(
             message: format!("no endpoint configured for provider {pid}"),
         })?;
     let pricing = st.llm.pricing.get(&(pid.clone(), mid.clone())).copied();
+    // agent permission rules (v1 wire shape → evaluator)
+    let rules: Vec<refine_tools::Rule> = st
+        .agent
+        .iter()
+        .find(|a| a["name"].as_str() == Some(agent.as_str()))
+        .and_then(|a| a["permission"].as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    Some(refine_tools::Rule {
+                        permission: r["permission"].as_str()?.to_string(),
+                        pattern: r["pattern"].as_str()?.to_string(),
+                        action: r["action"].as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let ctx = refine_core::prompt::PromptContext {
         db: st.db.clone(),
         blobs: st.blobs.clone(),
@@ -585,6 +630,8 @@ async fn post_message(
         },
         model_id: mid,
         provider_id: pid,
+        rules,
+        gate: st.gate.clone(),
     };
     let writer = st.writer.clone();
     let result = refine_core::prompt::run_prompt(&ctx, &writer, &id, &payload)
@@ -759,6 +806,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/lsp", get(lsp_list))
         .route("/project/{id}/directories", get(project_directories))
         .route("/vcs", get(vcs_info))
+        .route("/permission", get(get_permissions))
+        .route(
+            "/permission/{id}/reply",
+            axum::routing::post(post_permission_reply),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_gate,

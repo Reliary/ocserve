@@ -45,6 +45,9 @@ milestone).
 | K-IMPORT | import peak ≤budget; original untouched; hash equality | — | planned — M3 |
 | K-SLOWCLIENT | stall 30 s → disconnect → REST reconcile | — | planned — M2 |
 | K-PROVIDER | recorded streams replay byte-exact; chunk-boundary buffering | `refine_llm` fixture tests (2 recordings), buffered line parser (live 500 → fixed), stress 5/5 exact | green for fixtures; 10k fuzz — M5 nightly |
+| K-TOOLLOOP | multi-step: stream→tool→execute→next turn→final; structure = upstream capture | live E2E ×3 (TOOL_OK/M2B_OK/final DONE), message chain matches tool_fixture (user→tool-calls→stop) | green |
+| K-PERM | ask event → client reply → gate → execute; timeout → deny + map cleanup | live flow (ask→reply 200→file written→DONE), 300s-timeout cleanup fix, pending-list session filter | green; permission id prefix evt_ (upstream prefix unverified — noted) |
+| K-TRUNC | tool output ≤50KB/2000 lines; bash timeout bounded | `refine-tools` truncation_bounds + bash_timeout_enforced (124, <5s) | green |
 | K-MEMORY-24H | 24 h soak: every sample <300 MB, swap 0, slope <1 MB/h | — | planned — M5 |
 
 ## Test design techniques coverage (TESTING §4)
