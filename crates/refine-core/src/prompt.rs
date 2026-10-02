@@ -43,6 +43,8 @@ pub struct PromptContext {
     pub rules: Vec<refine_tools::Rule>,
     /// Permission rendezvous (ask → event → reply).
     pub gate: Arc<PermissionGate>,
+    /// MCP hub (M4a): namespaced tools merged into the provider tool list.
+    pub mcp: Option<Arc<refine_mcp::McpHub>>,
 }
 
 fn now_ms() -> i64 {
@@ -235,7 +237,19 @@ pub async fn run_prompt(
     let history = refine_store::load_messages(&ctx.db, session_id, None)?;
     let mut messages = vec![ChatMessage::text("system", ctx.system.clone())];
     messages.extend(to_provider_messages(&history));
-    let tools = refine_tools::schemas();
+    let mut tools = refine_tools::schemas();
+    if let Some(hub) = &ctx.mcp {
+        // cached after first prompt (listChanged=false servers); failures
+        // degrade to builtin-only tools, never block the prompt
+        let mcp_tools =
+            tokio::time::timeout(std::time::Duration::from_secs(30), hub.tool_schemas())
+                .await
+                .unwrap_or_else(|_| {
+                    tracing::warn!("mcp tool schema fetch timed out");
+                    Vec::new()
+                });
+        tools.extend(mcp_tools);
+    }
 
     let client = Client::new(ctx.endpoint.base_url.clone(), ctx.endpoint.api_key.clone());
     let mut total_usage = Usage::default();
@@ -416,12 +430,39 @@ pub async fn run_prompt(
                 // ---- execute ----
                 let exec_start = now_ms();
                 let (output, meta, title, is_err) = if allowed {
-                    match refine_tools::execute(
-                        &call.name,
-                        &serde_json::from_str::<Value>(&call.arguments)
-                            .unwrap_or_else(|_| json!({})),
-                        Path::new(&ctx.directory),
-                    ) {
+                    let input = serde_json::from_str::<Value>(&call.arguments)
+                        .unwrap_or_else(|_| json!({}));
+                    let builtin = refine_tools::schemas()
+                        .iter()
+                        .any(|s| s["function"]["name"] == call.name);
+                    let exec = if builtin {
+                        refine_tools::execute(&call.name, &input, Path::new(&ctx.directory))
+                    } else if let Some(hub) = &ctx.mcp {
+                        match hub.call(&call.name, input).await {
+                            Some(Ok(text)) => Ok(refine_tools::ToolResult {
+                                output: text,
+                                truncated: false,
+                                exit: None,
+                                title: call.name.clone(),
+                                error: false,
+                            }),
+                            Some(Err(e)) => Err(e),
+                            None => refine_tools::execute(
+                                &call.name,
+                                &serde_json::from_str::<Value>(&call.arguments)
+                                    .unwrap_or_else(|_| json!({})),
+                                Path::new(&ctx.directory),
+                            ),
+                        }
+                    } else {
+                        refine_tools::execute(
+                            &call.name,
+                            &serde_json::from_str::<Value>(&call.arguments)
+                                .unwrap_or_else(|_| json!({})),
+                            Path::new(&ctx.directory),
+                        )
+                    };
+                    match exec {
                         Ok(r) => (
                             r.output,
                             json!({

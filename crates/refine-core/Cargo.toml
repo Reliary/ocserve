@@ -18,6 +18,7 @@ hex.workspace = true
 refine-store.workspace = true
 refine-llm.workspace = true
 refine-tools.workspace = true
+refine-mcp.workspace = true
 parking_lot.workspace = true
 futures-util.workspace = true
 

@@ -1082,6 +1082,7 @@ dependencies = [
  "refine-core",
  "refine-http",
  "refine-importer",
+ "refine-mcp",
  "refine-store",
  "reqwest",
  "rusqlite",
@@ -1104,6 +1105,7 @@ dependencies = [
  "hex",
  "parking_lot",
  "refine-llm",
+ "refine-mcp",
  "refine-store",
  "refine-tools",
  "serde",
@@ -1129,6 +1131,7 @@ dependencies = [
  "parking_lot",
  "refine-core",
  "refine-llm",
+ "refine-mcp",
  "refine-store",
  "refine-tools",
  "reqwest",
@@ -1178,6 +1181,8 @@ name = "refine-mcp"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "parking_lot",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

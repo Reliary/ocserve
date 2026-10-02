@@ -24,6 +24,7 @@ toml.workspace = true
 refine-core.workspace = true
 refine-store.workspace = true
 refine-http.workspace = true
+refine-mcp.workspace = true
 refine-importer.workspace = true
 rusqlite.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json"] }

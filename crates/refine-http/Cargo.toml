@@ -21,6 +21,7 @@ refine-store.workspace = true
 refine-core.workspace = true
 refine-llm.workspace = true
 refine-tools.workspace = true
+refine-mcp.workspace = true
 futures-util.workspace = true
 metrics.workspace = true
 parking_lot.workspace = true

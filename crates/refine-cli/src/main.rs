@@ -133,6 +133,9 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     // Assemble config-derived payloads (fail fast if config unreadable)
     let rt = runtime::Runtime::load()
         .context("load runtime config (opencode.json/auth/models cache)")?;
+    // M4a: probe MCP servers before serving (statuses captured, never fatal)
+    let mcp_cfgs =
+        refine_mcp::parse_config(rt.config.get("mcp").unwrap_or(&serde_json::Value::Null));
     let llm = rt.llm_registry();
     let payloads = refine_http::Payloads {
         config: rt.config,
@@ -161,6 +164,9 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
             llm,
         },
     );
+    let hub = refine_mcp::McpHub::probe_all(&mcp_cfgs).await;
+    tracing::info!("mcp probe: {}", hub.statuses());
+    let _ = state.mcp.set(std::sync::Arc::new(hub));
     let app = refine_http::router(state);
 
     let addr = format!("{hostname}:{port}");

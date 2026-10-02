@@ -123,6 +123,8 @@ pub struct AppState {
     pub llm: LlmRegistry,
     /// Permission rendezvous shared by runner + reply routes.
     pub gate: std::sync::Arc<refine_core::PermissionGate>,
+    /// MCP hub probed at serve boot (OnceLock: tests run without probing).
+    pub mcp: std::sync::OnceLock<std::sync::Arc<refine_mcp::McpHub>>,
 }
 
 /// LLM endpoint resolution for the prompt runner (assembled by Runtime).
@@ -215,6 +217,7 @@ impl AppState {
             requests: std::sync::atomic::AtomicU64::new(0),
             bus: refine_core::EventBus::new(),
             gate: refine_core::PermissionGate::new(),
+            mcp: std::sync::OnceLock::new(),
             db: w.db,
             blobs: w.blobs,
             writer: w.writer,
@@ -354,6 +357,16 @@ async fn lsp_list() -> Json<Value> {
 }
 async fn project_directories() -> Json<Value> {
     Json(json!([]))
+}
+
+/// GET /mcp — {name: {status, error?}} (freeze capture §1146).
+async fn get_mcp(State(st): State<Arc<AppState>>) -> Json<Value> {
+    let hub = st
+        .mcp
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::sync::Arc::new(refine_mcp::McpHub::default()));
+    Json(hub.statuses())
 }
 
 /// GET /experimental/session?search=&roots=&limit= — session title search
@@ -706,6 +719,7 @@ async fn post_message(
         provider_id: pid,
         rules,
         gate: st.gate.clone(),
+        mcp: st.mcp.get().cloned(),
     };
     let writer = st.writer.clone();
     let result = refine_core::prompt::run_prompt(&ctx, &writer, &id, &payload)
@@ -881,6 +895,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/project/{id}/directories", get(project_directories))
         .route("/vcs", get(vcs_info))
         .route("/experimental/session", get(get_experimental_sessions))
+        .route("/mcp", get(get_mcp))
         .route("/permission", get(get_permissions))
         .route(
             "/permission/{id}/reply",

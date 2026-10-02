@@ -53,6 +53,7 @@ milestone).
 | K-SEARCH | GET /experimental/session substring-on-title + project embed; "not a content search" | `experimental_session_search_substring_and_project_keys` (incl. non-match = []); manifest keys golden (30 keys) | green |
 | K-LATENCY | query gates: count/session/page on16k-msg session | idx_part_session (v4) 86ms→**0.4ms** covering-index plan asserted live; session list p95 2.3ms, metrics p95 4.4ms | green |
 | K-RETENTION | ring bound (200k/session + 30d) enforced at boot/import/throttled-append; backup VACUUM INTO + restore drill | `ring_cap_keeps_newest...`, `age_window_drops_old_but_never_unknown_timestamps` (negative controls: no prune → fails), `vacuum_into_backup_restores_clean` (integrity+counts+overwrite-refusal); live boot: 5,148 rows pruned, 0 >30d remain | green |
+| K-MCP | MCP client (stdio NDJSON + StreamableHTTP/SSE), handshake 2025-06-18, paginated tools/list, namespaced call; /mcp status shape; prompt-end-to-end | `mcp_client.rs` 4 tests (fake stdio server: handshake,2-page list, isError→Err, statuses+namespace+dispatch fallthrough); live: context7 connected via real HTTP/SSE, /mcp statuses byte-shape match freeze capture (§1146), full prompt cycle: model called context7_resolve-library-id → user `*`-ask permission → reply → tool output → answer | green |
 | K-MEMORY-24H | 24 h soak: every sample <300 MB, swap 0, slope <1 MB/h | — | planned — M5 |
 
 ## Test design techniques coverage (TESTING §4)
