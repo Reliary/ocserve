@@ -31,6 +31,8 @@ traceable test, every test has a traceable requirement.
    | whole-session `Value` materialization (OOM-killed the cgroup twice) | `check-guards.sh` rule 3 (`load_messages` banned in HTTP) | streamed responses carry **no Content-Length** (asserted in `page_headers_...`); big-session live gate K-MSG-FIELDS |
    | happy-path-only state cleanup (abort leaked `prompt_locks`; permission asks leaked on abort) | RAII `LockRelease` / `PendingGuard` — cleanup lives in `Drop`, never after an `.await` | `abort_releases_prompt_locks_and_tasks`, `dropping_pending_guard_clears_entries` |
    | provider hang → permanent busy + stuck lock queue | stall watchdog covers open AND read phases (`REFINE_PROVIDER_STALL_SECS`, default 120s) | `silent_provider_fails_within_stall_budget_and_releases_state` (1s budget, own binary) |
+   | part written without its search projection (FTS silently misses rows) | `check-guards.sh` rule 4: `msg_part` INSERT/UPDATE only in `refine-store/src` (helpers carry the companion) | search suite: blob-hit, backfill idempotence, PATCH-reindex, cascade-delete |
+   | literal backslash at EOL in any SQL string (shipped ONCE in W1 — stray `\` reached SQLite) | `check-guards.sh` rule 2 widened to any `\\$` EOL in `crates/*/src` (was `sql:`-prefixed only — the widening itself has a planted-violation negative control) | backfill/search suites execute every SQL path |
 
    **Named divergences (K-SYNC bridge):** legacy-delta sync is *additive-only* — upstream
    message/part **edits and deletes are not pulled** (rare in v1; a legacy edit after sync

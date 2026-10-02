@@ -281,10 +281,8 @@ pub fn sync_tick_at(st: &Arc<AppState>, legacy_path: &std::path::Path) -> Result
                     info.to_string().into(),
                 ],
             }];
-            let mut part_seq: i64 = 0;
             let mut merged_parts: Vec<serde_json::Value> = Vec::new();
-            for p in &m.parts {
-                part_seq += 1;
+            for (part_seq, p) in (1_i64..).zip(m.parts.iter()) {
                 let mut pv: serde_json::Value =
                     serde_json::from_str(&p.data).unwrap_or(serde_json::Value::Null);
                 pv["id"] = serde_json::Value::String(p.id.clone());
@@ -297,19 +295,17 @@ pub fn sync_tick_at(st: &Arc<AppState>, legacy_path: &std::path::Path) -> Result
                     } else {
                         (Some(p.data.clone()), None)
                     };
-                ops.push(refine_store::WriteOp::Sql {
-                    sql: "INSERT INTO msg_part (id, message_id, session_id, seq, type, byte_len, inline, blob_sha) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)".into(),
-                    params: vec![
-                        p.id.clone().into(),
-                        m.id.clone().into(),
-                        sid.clone().into(),
-                        part_seq.into(),
-                        ptype.to_string().into(),
-                        (p.data.len() as i64).into(),
-                        inline.into(),
-                        sha.into(),
-                    ],
-                });
+                ops.extend(refine_store::part_row_ops(&refine_store::PartRow {
+                    id: &p.id,
+                    message_id: &m.id,
+                    session_id: &sid,
+                    seq: part_seq,
+                    ptype,
+                    byte_len: p.data.len() as i64,
+                    inline,
+                    blob_sha: sha,
+                    text: &p.data,
+                }));
                 merged_parts.push(pv);
                 stats.parts += 1;
             }

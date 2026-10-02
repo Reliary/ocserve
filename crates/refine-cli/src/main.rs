@@ -184,6 +184,18 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     );
     let writer_for_sampler = writer.clone();
     let wal_path_sampler = db_path.with_extension("db-wal");
+    // W1 one-time search backfill (idempotent/resumable; ~7.5s measured
+    // scale for126k parts; later boots no-op via the parity check)
+    match refine_store::backfill_part_search(&writer, &db_path) {
+        Ok((0, 0, _)) => {}
+        Ok((idx, skip, ms)) => {
+            tracing::info!("search backfill: {idx} indexed, {skip} skipped, {ms}ms");
+            refine_metrics::counter("refine_search_backfilled_total", idx);
+        }
+        Err(e) => {
+            tracing::warn!("search backfill failed (search incomplete until next boot): {e:#}")
+        }
+    }
     let state = AppState::with_wiring(
         None,
         payloads,

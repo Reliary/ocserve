@@ -30,10 +30,10 @@ pub fn boot_checks(data_dir: &std::path::Path) -> Result<()> {
     }
     // 5. FTS roundtrip on the real DB (catches broken builds — M0 finding)
     conn.execute_batch(
-        "INSERT INTO search_doc (id, title, excerpt, updated_at) VALUES (-1, 'boot fts probe', '', 0);
-         INSERT INTO search_fts(rowid, title, excerpt) SELECT id, title, excerpt FROM search_doc WHERE id = -1;
-         DELETE FROM search_fts WHERE rowid = -1;
-         DELETE FROM search_doc WHERE id = -1;",
+        "CREATE VIRTUAL TABLE temp.boot_fts_probe USING fts5(x, tokenize='trigram');
+         INSERT INTO temp.boot_fts_probe VALUES ('boot fts probe');
+         SELECT count(*) FROM temp.boot_fts_probe WHERE boot_fts_probe MATCH '\"ts prob\"';
+         DROP TABLE temp.boot_fts_probe;",
     )
     .context("FTS5 roundtrip (broken FTS build?)")?;
     tracing::info!("boot checks OK");

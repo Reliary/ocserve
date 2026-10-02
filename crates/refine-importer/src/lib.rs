@@ -101,12 +101,11 @@ pub fn import_last_n(source: &Path, data_dir: &Path, limit: u32) -> Result<()> {
         tracing::info!("event retention enforced at import: {pruned} pruned");
     }
     println!(
-        "payloads: {} messages, {} parts ({} blobbed), {} events, {} search_docs in {}ms; peak RSS {} MB",
+        "payloads: {} messages, {} parts ({} blobbed), {} events in {}ms; peak RSS {} MB",
         stats.messages,
         stats.parts,
         stats.parts_blobbed,
         stats.events,
-        stats.search_docs,
         stats.elapsed_ms,
         payload::peak_rss_mb()
             .map(|m| m.to_string())

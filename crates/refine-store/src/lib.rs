@@ -11,7 +11,7 @@ pub mod schema;
 pub mod writer;
 
 pub use blob::BlobStore;
-pub use writer::{WriteOp, Writer};
+pub use writer::{WriteOp, Writer, apply_ops};
 
 /// Upstream wire shape of a session list entry (PLAN F1; keys verified against
 /// recorded manifest session_list keys).
@@ -94,6 +94,9 @@ pub fn insert_message(
         let ptype = p["type"].as_str().unwrap_or("text").to_string();
         let text = p.to_string();
         let byte_len = text.len() as i64;
+        // upsert built before `text` moves into the inline branch (FK order:
+        // msg_part row first, then the projection — push order below)
+        let upsert = part_search_upsert_ops(&pid, session_id, &id, &text);
         let (inline, blob_sha) = match blobs.filter(|_| text.len() > INLINE_PART_MAX) {
             Some(store) => {
                 let (sha, _, _) = store.put(text.as_bytes())?;
@@ -115,8 +118,66 @@ pub fn insert_message(
                 blob_sha.into(),
             ],
         });
+        ops.push(upsert); // uncompressed text even for blobbed parts (W1)
     }
     writer.write(ops).map(|_| ())
+}
+
+/// Upsert into the content-search projection (W1). Runs the au trigger on
+/// conflict → FTS shadow reindexed. Text = the stored part JSON.
+pub fn part_search_upsert_ops(
+    part_id: &str,
+    session_id: &str,
+    message_id: &str,
+    text: &str,
+) -> WriteOp {
+    WriteOp::Sql {
+        sql: "INSERT INTO part_search (part_id, session_id, message_id, text) VALUES (?1, ?2, ?3, ?4) \
+              ON CONFLICT(part_id) DO UPDATE SET text = excluded.text"
+            .into(),
+        params: vec![
+            part_id.into(),
+            session_id.into(),
+            message_id.into(),
+            text.into(),
+        ],
+    }
+}
+
+/// One part row's write pair (msg_part INSERT with an EXPLICIT seq +
+/// part_search upsert). The only legal way for code OUTSIDE refine-store
+/// (importer, sync) to create parts — check-guards.sh rule 4 enforces it.
+pub struct PartRow<'a> {
+    pub id: &'a str,
+    pub message_id: &'a str,
+    pub session_id: &'a str,
+    pub seq: i64,
+    pub ptype: &'a str,
+    pub byte_len: i64,
+    pub inline: Option<String>,
+    pub blob_sha: Option<String>,
+    pub text: &'a str,
+}
+
+pub fn part_row_ops(row: &PartRow<'_>) -> Vec<WriteOp> {
+    vec![
+        WriteOp::Sql {
+            sql: "INSERT INTO msg_part (id, message_id, session_id, seq, type, byte_len, inline, blob_sha) \
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                .into(),
+            params: vec![
+                row.id.into(),
+                row.message_id.into(),
+                row.session_id.into(),
+                row.seq.into(),
+                row.ptype.into(),
+                row.byte_len.into(),
+                row.inline.clone().into(),
+                row.blob_sha.clone().into(),
+            ],
+        },
+        part_search_upsert_ops(row.id, row.session_id, row.message_id, row.text),
+    ]
 }
 
 /// Load history for prompt assembly: (info, parts) ordered by msg.seq.
@@ -711,29 +772,34 @@ pub fn delete_part(
 pub fn update_part(
     writer: &Writer,
     blobs: &BlobStore,
+    session_id: &str,
     message_id: &str,
     part_id: &str,
     data: &serde_json::Value,
 ) -> anyhow::Result<bool> {
     let text = data.to_string();
     let byte_len = text.len() as i64;
+    let upsert = part_search_upsert_ops(part_id, session_id, message_id, &text);
     let (inline, sha) = if text.len() > INLINE_PART_MAX {
         let (sha, _, _) = blobs.put(text.as_bytes())?;
         (None, Some(sha))
     } else {
         (Some(text), None)
     };
-    let n = writer.write(vec![WriteOp::Sql {
-        sql: "UPDATE msg_part SET byte_len = ?3, inline = ?4, blob_sha = ?5 WHERE id = ?1 AND message_id = ?2"
-            .into(),
-        params: vec![
-            part_id.into(),
-            message_id.into(),
-            byte_len.into(),
-            inline.into(),
-            sha.into(),
-        ],
-    }])?;
+    let n = writer.write(vec![
+        WriteOp::Sql {
+            sql: "UPDATE msg_part SET byte_len = ?3, inline = ?4, blob_sha = ?5 WHERE id = ?1 AND message_id = ?2"
+                .into(),
+            params: vec![
+                part_id.into(),
+                message_id.into(),
+                byte_len.into(),
+                inline.into(),
+                sha.into(),
+            ],
+        },
+        upsert,
+    ])?;
     Ok(n > 0)
 }
 
@@ -889,6 +955,207 @@ pub fn session_count(db: &std::path::Path) -> anyhow::Result<i64> {
     let conn = pragma::open_reader(db)?;
     conn.query_row("SELECT count(*) FROM session", [], |r| r.get(0))
         .map_err(Into::into)
+}
+
+/// (part_id, message_id, session_id, inline, blob_sha)
+type PartSrcRow = (String, String, String, Option<String>, Option<String>, i64);
+
+/// One-time part content backfill (W1): index every msg_part not yet in
+/// part_search. Idempotent (`ON CONFLICT` upsert + NOT EXISTS selection) so
+/// an interrupted run resumes; blobbed parts decompress through the blob
+/// store. Returns (indexed, skipped, elapsed_ms).
+pub fn backfill_part_search(
+    writer: &Writer,
+    db: &std::path::Path,
+) -> anyhow::Result<(u64, u64, u64)> {
+    let t0 = std::time::Instant::now();
+    let conn = pragma::open_reader(db)?;
+    let total: i64 = conn.query_row("SELECT count(*) FROM msg_part", [], |r| r.get(0))?;
+    let have: i64 = conn.query_row("SELECT count(*) FROM part_search", [], |r| r.get(0))?;
+    if have >= total {
+        return Ok((0, 0, t0.elapsed().as_millis() as u64));
+    }
+    let blobs = crate::blob::BlobStore::new(
+        db.parent()
+            .ok_or_else(|| anyhow::anyhow!("db parent"))?
+            .join("blobs"),
+    )?;
+    let mut stmt = conn.prepare(
+        "SELECT id, message_id, session_id, inline, blob_sha, byte_len FROM msg_part p WHERE NOT EXISTS (SELECT 1 FROM part_search ps WHERE ps.part_id = p.id) ORDER BY session_id, message_id, seq",
+    )?;
+    let rows: Vec<PartSrcRow> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+    drop(conn);
+    let mut indexed = 0u64;
+    let mut skipped = 0u64;
+    let mut batch: Vec<WriteOp> = Vec::with_capacity(200);
+    for (pid, mid, sid, inline, sha, byte_len) in rows {
+        let text = match inline {
+            Some(t) => t,
+            None => {
+                let Some(sha) = sha else {
+                    skipped += 1;
+                    continue;
+                };
+                match blobs.get(&sha, byte_len.max(0) as u64) {
+                    Ok(bytes) => match String::from_utf8(bytes) {
+                        Ok(t) => t,
+                        Err(_) => {
+                            skipped += 1;
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("backfill blob {sha}: {e:#}");
+                        skipped += 1;
+                        continue;
+                    }
+                }
+            }
+        };
+        batch.push(part_search_upsert_ops(&pid, &sid, &mid, &text));
+        indexed += 1;
+        if batch.len() >= 200 {
+            writer.write(std::mem::take(&mut batch))?;
+        }
+    }
+    if !batch.is_empty() {
+        writer.write(batch)?;
+    }
+    Ok((indexed, skipped, t0.elapsed().as_millis() as u64))
+}
+
+/// Search hit (W1 contract — PLAN §17 block).
+pub struct SearchHit {
+    pub session_id: String,
+    pub message_id: String,
+    pub part_id: String,
+    pub role: String,
+    pub time: i64,
+    pub text: String,
+}
+
+/// Content search over part payloads. ≥3 chars → trigram FTS MATCH (quoted
+/// phrase, substring semantics); shorter → LIKE fallback (same projection).
+/// One SQL statement; `limit+1` probe reports `truncated`.
+pub fn search_parts(
+    db: &std::path::Path,
+    needle: &str,
+    scope: Option<&str>,
+    limit: u32,
+    offset: u32,
+) -> anyhow::Result<(Vec<SearchHit>, bool)> {
+    let conn = pragma::open_reader(db)?;
+    let chars = needle.chars().count();
+    let (cond, param): (String, String) = if chars >= 3 {
+        // FTS phrase: double quotes are escaped by doubling inside a phrase
+        (
+            "ps.rowid IN (SELECT rowid FROM part_search_fts WHERE part_search_fts MATCH ?1)"
+                .to_string(),
+            format!("\"{}\"", needle.replace('"', "\"\"")),
+        )
+    } else {
+        (
+            "ps.text LIKE ?1 ESCAPE '\\'".to_string(),
+            format!(
+                "%{}%",
+                needle
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            ),
+        )
+    };
+    let scope_sql = if scope.is_some() {
+        " AND ps.session_id = ?2"
+    } else {
+        ""
+    };
+    // single-line SQL: `\` line continuations inside strings are the exact
+    // bug class check-guards rule 2 exists for (a stray literal backslash
+    // reaches SQLite → parse error). Never split SQL across lines.
+    let limit_idx = if scope.is_some() { "3" } else { "2" };
+    let offset_idx = if scope.is_some() { "4" } else { "3" };
+    let sql = format!(
+        "SELECT ps.session_id, ps.message_id, ps.part_id, m.role, m.time_created, ps.text FROM part_search ps JOIN msg m ON m.id = ps.message_id WHERE {cond}{scope_sql} ORDER BY m.time_created DESC, ps.rowid DESC LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let probe = limit as i64 + 1;
+    let off = offset as i64;
+    let rows: Vec<SearchHit> = if let Some(sc) = scope {
+        stmt.query_map(rusqlite::params![param, sc, probe, off], row_hit)?
+            .filter_map(|r| r.ok())
+            .collect()
+    } else {
+        stmt.query_map(rusqlite::params![param, probe, off], row_hit)?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+    let mut hits = rows;
+    let truncated = hits.len() as u32 > limit;
+    if truncated {
+        hits.truncate(limit as usize);
+    }
+    drop(stmt);
+    Ok((hits, truncated))
+}
+
+fn row_hit(r: &rusqlite::Row<'_>) -> rusqlite::Result<SearchHit> {
+    Ok(SearchHit {
+        session_id: r.get(0)?,
+        message_id: r.get(1)?,
+        part_id: r.get(2)?,
+        role: r.get(3)?,
+        time: r.get(4)?,
+        text: r.get(5)?,
+    })
+}
+
+/// Snippet: ±80 chars around the first case-insensitive match; all slices
+/// clamped to char boundaries (lowercasing can shift byte offsets — never
+/// panic, at worst a fuzzy window).
+pub fn snippet(text: &str, needle: &str) -> String {
+    const WIN: usize = 80;
+    let lower = text.to_lowercase();
+    let pos = lower.find(&needle.to_lowercase());
+    let center = pos.unwrap_or(0);
+    let start = floor_boundary(text, center.saturating_sub(WIN));
+    let end = ceil_boundary(text, (center + needle.len() + WIN).min(text.len()));
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.push_str(&text[start..end]);
+    if end < text.len() {
+        out.push('…');
+    }
+    out
+}
+
+fn floor_boundary(s: &str, mut i: usize) -> usize {
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_boundary(s: &str, mut i: usize) -> usize {
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 #[cfg(test)]

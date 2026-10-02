@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -110,16 +110,36 @@ CREATE TABLE import_sync (
     last_sync_ms INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
-CREATE TABLE search_doc (
-    id      INTEGER PRIMARY KEY,
-    title   TEXT NOT NULL DEFAULT '',
-    excerpt TEXT NOT NULL DEFAULT '',
-    updated_at INTEGER NOT NULL DEFAULT 0
+-- content search over part payloads (trigram = substring semantics >=3
+-- chars — W1; LIKE fallback for shorter needles at the query layer).
+-- text holds the UNCOMPRESSED stored JSON even for blobbed parts, so
+-- zstd payloads stay searchable. ad/au triggers keep the FTS shadow in
+-- lockstep; FK cascade fires them on session/msg/part deletion (proven:
+-- child triggers fire on FK cascade with recursive_triggers=OFF).
+CREATE TABLE part_search (
+    rowid      INTEGER PRIMARY KEY,
+    part_id    TEXT NOT NULL UNIQUE REFERENCES msg_part(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    text       TEXT NOT NULL
 ) STRICT;
 
-CREATE VIRTUAL TABLE search_fts USING fts5(
-    title, excerpt, content='search_doc', content_rowid='id', tokenize='unicode61'
+CREATE VIRTUAL TABLE part_search_fts USING fts5(
+    text, content='part_search', content_rowid='rowid', tokenize='trigram'
 );
+
+CREATE TRIGGER part_search_ai AFTER INSERT ON part_search BEGIN
+    INSERT INTO part_search_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
+CREATE TRIGGER part_search_ad AFTER DELETE ON part_search BEGIN
+    INSERT INTO part_search_fts(part_search_fts, rowid, text)
+    VALUES ('delete', old.rowid, old.text);
+END;
+CREATE TRIGGER part_search_au AFTER UPDATE ON part_search BEGIN
+    INSERT INTO part_search_fts(part_search_fts, rowid, text)
+    VALUES ('delete', old.rowid, old.text);
+    INSERT INTO part_search_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
 
 -- blob chunk index: content-addressed, fixed-size rows (STORAGE.md §4)
 CREATE TABLE blob_chunk (
@@ -214,6 +234,38 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                     cursor TEXT,
                     last_sync_ms INTEGER NOT NULL DEFAULT 0
                 ) STRICT;",
+                )?;
+            }
+            6 => {
+                // v6→v7: part content search (W1). Trigram stack + drop the
+                // dead title tables (search_doc/search_fts never populated —
+                // count=0 live; title search runs in-memory contains).
+                // Backfill runs at boot (store::backfill_part_search).
+                conn.execute_batch(
+                    "CREATE TABLE part_search (
+                        rowid      INTEGER PRIMARY KEY,
+                        part_id    TEXT NOT NULL UNIQUE REFERENCES msg_part(id) ON DELETE CASCADE,
+                        session_id TEXT NOT NULL,
+                        message_id TEXT NOT NULL,
+                        text       TEXT NOT NULL
+                    ) STRICT;
+                    CREATE VIRTUAL TABLE part_search_fts USING fts5(
+                        text, content='part_search', content_rowid='rowid', tokenize='trigram'
+                    );
+                    CREATE TRIGGER part_search_ai AFTER INSERT ON part_search BEGIN
+                        INSERT INTO part_search_fts(rowid, text) VALUES (new.rowid, new.text);
+                    END;
+                    CREATE TRIGGER part_search_ad AFTER DELETE ON part_search BEGIN
+                        INSERT INTO part_search_fts(part_search_fts, rowid, text)
+                        VALUES ('delete', old.rowid, old.text);
+                    END;
+                    CREATE TRIGGER part_search_au AFTER UPDATE ON part_search BEGIN
+                        INSERT INTO part_search_fts(part_search_fts, rowid, text)
+                        VALUES ('delete', old.rowid, old.text);
+                        INSERT INTO part_search_fts(rowid, text) VALUES (new.rowid, new.text);
+                    END;
+                    DROP TABLE IF EXISTS search_fts;
+                    DROP TABLE IF EXISTS search_doc;",
                 )?;
             }
             other => {
@@ -341,49 +393,84 @@ mod fts_m0 {
     use super::*;
     use crate::pragma;
 
-    /// M0 decisive experiment (PLAN §13): FTS5 external-content LOCAL lifecycle
-    /// must work on the bundled build; ATTACH-based designs are already falsified
-    /// on-box (content-name qualification + trigger restrictions) — we assert the
-    /// local design we chose actually functions.
+    /// W1 lifecycle: trigram substring search over the part content stack —
+    /// fresh-create shape, mid-word match, update reindex, FK-cascade cleanup
+    /// (child triggers fire on FK cascade — proven live-in-RAM before build).
     #[test]
-    fn external_content_lifecycle_local() {
+    fn part_search_lifecycle_trigram() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("t.db");
         let conn = pragma::create_new(&p).unwrap();
         migrate(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO search_doc (id, title, excerpt, updated_at) VALUES (1, 'hello world', 'some body', 1)",
-            [],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO search_fts(rowid, title, excerpt) SELECT id, title, excerpt FROM search_doc",
-            [],
-        ).unwrap();
-        let n: i64 = conn
+        let has: i64 = conn
             .query_row(
-                "SELECT count(*) FROM search_fts WHERE search_fts MATCH 'hello'",
+                "SELECT count(*) FROM sqlite_master WHERE name IN ('part_search','part_search_fts')",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 1);
-        // update path: edit doc then rebuild its row
-        conn.execute("UPDATE search_doc SET title='goodbye moon' WHERE id=1", [])
-            .unwrap();
-        conn.execute("DELETE FROM search_fts WHERE rowid=1", [])
-            .unwrap();
-        conn.execute(
-            "INSERT INTO search_fts(rowid, title, excerpt) SELECT id, title, excerpt FROM search_doc WHERE id=1",
-            [],
-        ).unwrap();
-        let n: i64 = conn
+        assert_eq!(has, 2, "trigram stack on fresh create");
+        let dead: i64 = conn
             .query_row(
-                "SELECT count(*) FROM search_fts WHERE search_fts MATCH 'moon'",
+                "SELECT count(*) FROM sqlite_master WHERE name IN ('search_doc','search_fts')",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(dead, 0, "dead title-search tables dropped");
+        conn.execute_batch(
+            "INSERT INTO session (id, project_id, directory, path, slug, title, version, time_created, time_updated) VALUES ('ses_1','global','/w','s','s','t','1',1,1);
+             INSERT INTO msg (id, session_id, role, seq, time_created, info) VALUES ('m1','ses_1','user',1,1,'{}');
+             INSERT INTO msg_part (id, message_id, session_id, seq, type, byte_len, inline, blob_sha)
+             VALUES ('p1','m1','ses_1',1,'text',44,'{}',NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part_search (part_id, session_id, message_id, text)
+             VALUES ('p1','ses_1','m1','{\"type\":\"text\",\"text\":\"the REFINE engine is fast\"}')",
+            [],
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM part_search_fts WHERE part_search_fts MATCH '\"efin\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "mid-word substring match");
+        conn.execute(
+            "UPDATE part_search SET text='completely different zebra payload' WHERE part_id='p1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM part_search_fts WHERE part_search_fts MATCH '\"zebra\"'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM part_search_fts WHERE part_search_fts MATCH '\"efin\"'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "update reindexed"
+        );
+        conn.execute("DELETE FROM msg WHERE id='m1'", []).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM part_search", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "FK cascade cleaned part_search (ad trigger path)"
+        );
     }
 
     /// M0 experiment: contentless FTS5 (`content=''`) behavior on the BUNDLED build.

@@ -201,6 +201,18 @@ fn exec_op(conn: &Connection, op: &WriteOp, affected: &mut usize) -> Result<()> 
     }
 }
 
+/// Execute ops on a CALLER-owned connection (the importer runs inside its
+/// own explicit transaction on the dst connection — same param conversion
+/// as the writer thread). Keeps msg_part writes funnelled through the
+/// part_* op builders (check-guards rule 4).
+pub fn apply_ops(conn: &Connection, ops: &[WriteOp]) -> Result<usize> {
+    let mut affected = 0;
+    for op in ops {
+        exec_op(conn, op, &mut affected)?;
+    }
+    Ok(affected)
+}
+
 /// Path helpers shared with the CLI.
 pub fn db_path(data_dir: &Path) -> PathBuf {
     data_dir.join("refine.db")

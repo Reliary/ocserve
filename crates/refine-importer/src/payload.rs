@@ -18,7 +18,6 @@ pub struct PayloadStats {
     pub parts: u64,
     pub parts_blobbed: u64,
     pub events: u64,
-    pub search_docs: u64,
     pub elapsed_ms: u64,
 }
 
@@ -68,7 +67,6 @@ pub fn import_payloads(
         parts: 0,
         parts_blobbed: 0,
         events: 0,
-        search_docs: 0,
         elapsed_ms: 0,
     };
     dst.execute_batch("BEGIN")?;
@@ -116,10 +114,6 @@ pub fn import_payloads(
              WHERE session_id IN ({ph}) ORDER BY session_id, time_created, id"
         ))?;
         let mut rows = stmt.query(rusqlite::params_from_iter(session_ids))?;
-        let mut insert = dst.prepare(
-            "INSERT INTO msg_part (id, message_id, session_id, seq, type, byte_len, inline, blob_sha) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        )?;
         let mut batch = 0;
         while let Some(row) = rows.next()? {
             let id: String = row.get(0)?;
@@ -139,11 +133,22 @@ pub fn import_payloads(
                 stats.parts_blobbed += 1;
                 (None, Some(sha))
             } else {
-                (Some(data), None)
+                (Some(data.clone()), None)
             };
-            insert.execute(rusqlite::params![
-                id, mid, sid, my_seq, ptype, byte_len, inline, sha
-            ])?;
+            // part_row_ops = msg_part row + part_search projection (W1);
+            // check-guards rule 4 keeps msg_part INSERTs inside refine-store
+            let ops = refine_store::part_row_ops(&refine_store::PartRow {
+                id: &id,
+                message_id: &mid,
+                session_id: &sid,
+                seq: my_seq,
+                ptype: &ptype,
+                byte_len,
+                inline,
+                blob_sha: sha,
+                text: &data,
+            });
+            refine_store::apply_ops(&dst, &ops)?;
             stats.parts += 1;
             batch += 1;
             if batch >= 500 {
@@ -180,33 +185,6 @@ pub fn import_payloads(
                 batch = 0;
             }
         }
-    }
-    dst.execute_batch("COMMIT")?;
-
-    // ---- search_doc (session title projection — oc-remote: "not a content
-    // search"; external-content FTS rebuilt from this) ----
-    dst.execute_batch("BEGIN")?;
-    {
-        let mut stmt = src.prepare(&format!(
-            "SELECT id, title, time_updated FROM session WHERE id IN ({ph})"
-        ))?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(session_ids))?;
-        let mut insert = dst.prepare(
-            "INSERT INTO search_doc (id, title, excerpt, updated_at) VALUES (?1, ?2, '', ?3)",
-        )?;
-        // search_doc.id must be stable INTEGER — use session rowid ordering:
-        while let Some(row) = rows.next()? {
-            let _sid: String = row.get(0)?;
-            let title: String = row.get(1)?;
-            let updated: i64 = row.get(2)?;
-            let rid = (stats.search_docs + 1) as i64;
-            insert.execute(rusqlite::params![rid, title, updated])?;
-            stats.search_docs += 1;
-        }
-        // keep doc ids aligned with... search endpoint LIKEs session.title
-        // directly (contract observed); search_doc/FTS = storage gate + future
-        // content search. Rebuild index now (external content).
-        dst.execute_batch("INSERT INTO search_fts(search_fts) VALUES('rebuild')")?;
     }
     dst.execute_batch("COMMIT")?;
 

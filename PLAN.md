@@ -364,6 +364,23 @@ content can come from the other. Implication for the delta bridge: REST freshnes
 makes the fusion consistent instead of contradictory; until then, sends from a view write
 to that view's server and the two DBs diverge underneath a unified display.
 
+## 16.7. `POST /session/search` contract (W1 — fork client codes against this)
+
+```
+POST /session/search       Content-Type: application/json
+{ "query": string          // required, trimmed, 1..=512 chars
+  "sessionID"?: string     // optional scope
+  "limit"?: int            // default 50, clamped 1..=200
+  "offset"?: int }         // default 0
+→ 200 { "hits": [ { "sessionID", "messageID", "partID",
+                    "role", "time", "snippet" } ], "truncated": bool }
+→ 400 {"name":"BadRequest","data":{"message":"query must be ..."}}  (empty/oversized)
+```
+Semantics: case-insensitive **substring** (trigram ≥3 chars, LIKE ≤2 — identical
+results either way); matches part payload JSON text; blobbed parts included;
+`truncated=true` when more hits remain past limit+offset; snippet = ±80 chars
+around the first match with ellipses; hits ordered by message time DESC.
+
 ## 17. oc-remote route coverage (exhaustive client audit)
 
 Source: static extraction of all58 route templates + call graph from

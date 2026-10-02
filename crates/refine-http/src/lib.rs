@@ -784,6 +784,62 @@ async fn get_messages(
     Ok(resp)
 }
 
+/// POST /session/search — W1 content search over part payloads (contract
+/// block PLAN §17). ≥3 chars → trigram FTS substring MATCH; shorter → LIKE
+/// fallback (same projection, one query either way). Inline AND blobbed
+/// parts covered (projection stores uncompressed text).
+async fn search_messages(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let query = body
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if query.is_empty() || query.chars().count() > 512 {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            name: "BadRequest",
+            message: "query must be a non-empty string of at most 512 characters".into(),
+        });
+    }
+    let scope = body
+        .get("sessionID")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let limit = body
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50)
+        .clamp(1, 200) as u32;
+    let offset = body.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let (hits, truncated) =
+        refine_store::search_parts(&st.db, &query, scope.as_deref(), limit, offset).map_err(
+            |e| ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                name: "InternalError",
+                message: format!("{e:#}"),
+            },
+        )?;
+    let out = json!({
+        "hits": hits
+            .iter()
+            .map(|h| json!({
+                "sessionID": h.session_id,
+                "messageID": h.message_id,
+                "partID": h.part_id,
+                "role": h.role,
+                "time": h.time,
+                "snippet": refine_store::snippet(&h.text, &query),
+            }))
+            .collect::<Vec<_>>(),
+        "truncated": truncated,
+    });
+    Ok(Json(out))
+}
+
 /// POST /session/{id}/message — sync prompt (blocks until stream completes,
 /// returns {info, parts}; captured in testdata/m2/prompt_response.json).
 /// v1 currentModel(sessionID): payload.model → session's stored model
@@ -1209,7 +1265,7 @@ async fn patch_part_route(
             message: "part id/sessionID/messageID must match the path".into(),
         });
     }
-    refine_store::update_part(&st.writer, &st.blobs, &mid, &pid, &part)
+    refine_store::update_part(&st.writer, &st.blobs, &sid, &mid, &pid, &part)
         .map_err(|e| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             name: "InternalError",
@@ -2152,6 +2208,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/project/current", get(get_project_current))
         .route("/session", get(get_sessions).post(post_session))
         .route("/session/status", get(session_status))
+        .route("/session/search", axum::routing::post(search_messages))
         .route(
             "/session/{id}",
             get(get_session)

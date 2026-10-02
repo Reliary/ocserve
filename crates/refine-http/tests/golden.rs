@@ -1258,8 +1258,10 @@ async fn shell_runs_direct_and_records_messages() {
     );
     assert_eq!(user["parts"][0]["synthetic"], true);
     assert_eq!(asst["parts"][0]["tool"], "bash");
+    // role-located, not index: same-ms id ties order deterministically per
+    // run but the ids themselves are generated (parallel-suite flake caught)
     assert_eq!(
-        arr[1]["info"]["cost"].as_f64(),
+        asst["info"]["cost"].as_f64(),
         Some(0.0),
         "shell never costs model tokens"
     );

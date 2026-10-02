@@ -152,3 +152,10 @@ from `reliary8/.../schema.rs:45-52`).
 - **v6**: `import_sync(session_id TEXT PRIMARY KEY, cursor TEXT, last_sync_ms INT)` — legacy-delta
   sync state (dev bridge; plan §17). Migrations run as a step loop (v1-v2 chains no longer
   skip intermediate DDL — fixed with v6).
+
+- **v7**: `part_search` + `part_search_fts` (FTS5 external-content, `tokenize='trigram'`)
+  with `part_search_ai/ad/au` triggers; drops dead `search_doc`/`search_fts`. `text` stores
+  the uncompressed part JSON (blobbed parts searchable). One-time boot backfill
+  (`backfill_part_search`, idempotent via NOT EXISTS + upsert). **SQL strings are never
+  split across lines** — literal-backslash-in-SQL is check-guards rule 2 (it shipped once in
+  this very feature; see TESTING §1.6).

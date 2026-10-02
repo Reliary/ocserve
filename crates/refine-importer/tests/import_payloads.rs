@@ -1,6 +1,7 @@
 //! M3 payload import gates (TESTING §4 + §6): streaming counts, byte parity,
-//! blob spill threshold, event/search_doc fill. Synthetic source mimics the
-//! upstream schema (message/part/event columns verified against live DB).
+//! blob spill threshold, events, and the W1 search projection (both inline
+//! AND blobbed parts indexed). Synthetic source mimics the upstream schema
+//! (message/part/event columns verified against live DB).
 
 use refine_importer::payload::import_payloads;
 use rusqlite::{Connection, OpenFlags};
@@ -81,9 +82,31 @@ fn import_counts_byte_parity_and_blob_spill() {
     assert_eq!(stats.parts, 2, "two source parts");
     assert_eq!(stats.parts_blobbed, 1, "only the >8KB part spills to blobs");
     assert_eq!(stats.events, 2);
-    assert_eq!(stats.search_docs, 1);
 
     let dst = Connection::open_with_flags(&target, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+
+    // W1: BOTH parts reach the search projection — including the blobbed one
+    // (the FTS win: zstd payloads stay searchable via uncompressed text)
+    let ps_count: i64 = dst
+        .query_row("SELECT count(*) FROM part_search", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ps_count, 2, "inline + blob parts indexed");
+    let blob_hits: i64 = dst
+        .query_row(
+            "SELECT count(*) FROM part_search_fts WHERE part_search_fts MATCH '\"xxxxxxxxxx\"'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(blob_hits, 1, "blobbed part content is searchable");
+    let small_hits: i64 = dst
+        .query_row(
+            "SELECT count(*) FROM part_search_fts WHERE part_search_fts MATCH '\"hello\"'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(small_hits, 1, "inline part searchable");
     let src_c = Connection::open_with_flags(&src, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
 
     // byte parity: inline part identical to source bytes
@@ -127,20 +150,4 @@ fn import_counts_byte_parity_and_blob_spill() {
         .flatten()
         .collect();
     assert_eq!(payloads, vec!["{\"seq\":1}", "{\"seq\":2}"]);
-
-    // search_doc title filled from session title
-    let title: String = dst
-        .query_row("SELECT title FROM search_doc LIMIT 1", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(title, "Imported session");
-
-    // FTS external-content index responds (rebuild ran)
-    let hits: i64 = dst
-        .query_row(
-            "SELECT count(*) FROM search_fts WHERE search_fts MATCH 'Imported'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(hits, 1, "FTS matches the imported title");
 }

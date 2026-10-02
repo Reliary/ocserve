@@ -145,6 +145,27 @@ pub struct McpClient {
     transport: Transport,
 }
 
+/// MCP spawn PATH (W2): systemd's PATH has no user tool dirs — boot log
+/// showed `spawn context-mode: No such file`. Prepend standard user
+/// locations that exist and aren't already in PATH; never drop entries.
+pub fn mcp_child_path(parent_path: &str, home: &str) -> String {
+    let candidates = [
+        format!("{home}/.local/bin"),
+        format!("{home}/bin"),
+        format!("{home}/.bun/bin"), // bun global bins (context-mode)
+        "/home/linuxbrew/.linuxbrew/bin".to_string(),
+    ];
+    let existing: Vec<&str> = parent_path.split(':').collect();
+    let mut merged: Vec<String> = candidates
+        .into_iter()
+        .filter(|c| std::path::Path::new(c).is_dir() && !existing.contains(&c.as_str()))
+        .collect();
+    if !parent_path.is_empty() {
+        merged.push(parent_path.to_string());
+    }
+    merged.join(":")
+}
+
 impl McpClient {
     /// Spawn (local) or prepare (remote). Errors are transport-level only;
     /// initialize() performs the handshake.
@@ -155,7 +176,10 @@ impl McpClient {
                     anyhow::bail!("empty command for mcp server {}", cfg.name);
                 };
                 let mut cmd = tokio::process::Command::new(prog);
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+                let base_path = std::env::var("PATH").unwrap_or_default();
                 cmd.args(rest)
+                    .env("PATH", mcp_child_path(&base_path, &home))
                     .envs(env.iter().cloned())
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
@@ -522,5 +546,32 @@ impl McpHub {
             return Some(result);
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::mcp_child_path;
+
+    #[test]
+    fn prepends_existing_home_dirs_once_and_keeps_parent() {
+        let home = std::env::temp_dir();
+        std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+        let parent = "/usr/bin:/bin";
+        let merged = mcp_child_path(parent, home.to_str().unwrap());
+        assert!(merged.starts_with(&format!("{}", home.join(".local/bin").display())));
+        assert!(merged.ends_with(parent), "parent PATH preserved: {merged}");
+        // idempotent: already-present candidate is not duplicated
+        let merged2 = mcp_child_path(&merged, home.to_str().unwrap());
+        assert_eq!(merged, merged2, "no duplicate entries");
+        // non-existent home subdirs are skipped
+        let merged3 = mcp_child_path(parent, "/nonexistent-home-xyz");
+        assert!(
+            !merged3.contains("nonexistent-home-xyz") && merged3.ends_with(parent),
+            "no phantom dirs from a missing home: {merged3}"
+        );
+        // empty parent tolerated
+        let merged4 = mcp_child_path("", home.to_str().unwrap());
+        assert!(merged4.contains(".local/bin"));
     }
 }
