@@ -1219,6 +1219,7 @@ name = "refine-store"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "hex",
  "parking_lot",
  "r2d2",

@@ -68,8 +68,12 @@ The bulk profile is used **only by the importer**, in a throwaway process (dual-
 from `reliary8/.../schema.rs:45-52`).
 
 **Rules learned from your repos (adopt verbatim):**
-- Set pragmas **once at connection open**; never re-issue `journal_mode` on a live handle
-  (reliary8 `mcp.rs` deadlock trap).
+- Set *configuration* pragmas **once at connection open**; never re-issue `journal_mode` on a
+  live handle (reliary8 `mcp.rs` deadlock trap). *Operational* pragmas are exempt: the CLI
+  sampler queues `PRAGMA incremental_vacuum(4096)` every 15s and `PRAGMA optimize` hourly
+  onto the WRITER connection (drains freelist a bounded amount; no-op at freelist=0; never a
+  full VACUUM online) — W3 amendment: the "never re-issue" ban targets configuration at open,
+  not state-mutating maintenance (2026-10).
 - `BEGIN IMMEDIATE` for every write; RAII guard that rolls back on early `?` return
   (`ingest.rs:493-508`).
 - `prepare_cached` for every stable statement.

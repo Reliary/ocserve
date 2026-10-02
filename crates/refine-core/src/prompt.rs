@@ -149,6 +149,22 @@ fn to_provider_messages(history: &[(Value, Vec<Value>)]) -> Vec<ChatMessage> {
 
 /// Run one prompt to completion (possibly multi-step via tools).
 /// Returns the FINAL assistant (info, parts) — the HTTP response body.
+/// Provider stall budget (A3 watchdog). Env-overridable ONLY so integration
+/// tests can shrink it in their own process (tests/stall.rs sets
+/// REFINE_PROVIDER_STALL_SECS=1); production default 120s — deltas keep
+/// resetting it, so only a truly silent socket trips it.
+fn provider_stall() -> std::time::Duration {
+    static S: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        std::time::Duration::from_secs(
+            std::env::var("REFINE_PROVIDER_STALL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120),
+        )
+    })
+}
+
 pub async fn run_prompt(
     ctx: &PromptContext,
     writer: &refine_store::Writer,
@@ -298,12 +314,27 @@ pub async fn run_prompt(
         let mut usage: Option<Usage> = None;
         let mut assembler = ToolCallAssembler::default();
 
-        let mut stream = match client
-            .chat_stream(&model, &messages, None, Some(&tools))
-            .await
+        // Watchdog covers BOTH hang points: response headers (.send inside
+        // chat_stream) and the read loop below — a silent socket at either
+        // stage must fail, never hang busy (A3).
+        let mut stream = match tokio::time::timeout(
+            provider_stall(),
+            client.chat_stream(&model, &messages, None, Some(&tools)),
+        )
+        .await
         {
-            Ok(st) => st,
-            Err(e) => {
+            Err(_) => {
+                refine_metrics::labeled_counter(
+                    "refine_llm_stream_errors_total",
+                    &format!("provider=\"{}\",model=\"{model}\"", ctx.provider_id),
+                    1,
+                );
+                anyhow::bail!(
+                    "provider stream open stalled: no response headers within {}s (watchdog)",
+                    provider_stall().as_secs()
+                );
+            }
+            Ok(Err(e)) => {
                 refine_metrics::labeled_counter(
                     "refine_llm_stream_errors_total",
                     &format!("provider=\"{}\",model=\"{model}\"", ctx.provider_id),
@@ -311,8 +342,21 @@ pub async fn run_prompt(
                 );
                 return Err(e).context("provider stream open");
             }
+            Ok(Ok(st)) => st,
         };
-        while let Some(ev) = stream.next().await {
+        // Stall watchdog (antagonism A3): a provider that accepts then goes
+        // silent would otherwise hang run_prompt forever → lock held →
+        // status busy forever → later prompts queue forever. No byte for
+        // 120s = error → guards unwind → session self-heals.
+        loop {
+            let ev = match tokio::time::timeout(provider_stall(), stream.next()).await {
+                Err(_) => anyhow::bail!(
+                    "provider stream stalled: no data for {}s (watchdog)",
+                    provider_stall().as_secs()
+                ),
+                Ok(None) => break,
+                Ok(Some(ev)) => ev,
+            };
             match ev.context("provider stream")? {
                 StreamEvent::TextDelta(t) => {
                     if llm_ttft.is_none() {
@@ -511,7 +555,7 @@ pub async fn run_prompt(
                         "metadata": {},
                         "tool": {"messageID": assistant_id, "callID": call.id},
                     });
-                    let rx = ctx.gate.register(&perm_id, request.clone());
+                    let (rx, _perm_guard) = ctx.gate.clone().register(&perm_id, request.clone());
                     emit_durable(
                         ctx,
                         writer,

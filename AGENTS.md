@@ -83,8 +83,10 @@ chore(ci): mutation gate for refine-core                           # TESTING §1
   under `testdata/` with LFS policy decided at M0), profiler dumps, `target/`.
 
 **Before every commit:** `cargo fmt --check && cargo clippy --workspace -- -D warnings &&
-cargo test --workspace` (plus the area's gate: storage → `STORAGE.md §7`, memory →
-`MEMORY.md §5`, wire → differential replay). Pre-commit hook runs the banned-string check
+cargo test --workspace && ./scripts/check-guards.sh && ./scripts/check-matrix.sh`
+(plus the area's gate: storage → `STORAGE.md §7`, memory → `MEMORY.md §5`, wire →
+differential replay). `check-guards.sh` is the static guardrail set (swallowed storage
+writes, backslash SQL, session materialization in HTTP — see TESTING §1.6). Pre-commit hook runs the banned-string check
 and the docs-required check (changing a behavior without touching the matrix fails).
 
 ## 4. Branching strategy

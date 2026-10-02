@@ -182,30 +182,8 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     let blobs = std::sync::Arc::new(
         refine_store::BlobStore::new(data_dir.join("blobs")).context("blob store")?,
     );
-    // SRE §2 sampler: rss/peak, wal bytes, writer queue depth (15s cadence)
-    {
-        let writer_for_metrics = writer.clone();
-        let wal_path = db_path.with_extension("db-wal");
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tick.tick().await;
-                refine_metrics::sample_rss();
-                refine_metrics::gauge(
-                    "refine_writer_queue_depth",
-                    writer_for_metrics.queue_depth(),
-                );
-                let wal = std::fs::metadata(&wal_path)
-                    .map(|m| m.len() as i64)
-                    .unwrap_or(0);
-                refine_metrics::gauge("refine_wal_bytes", wal);
-                if let Some(rss) = sidecar_rss(std::process::id()) {
-                    refine_metrics::gauge("refine_sidecar_rss_bytes", rss);
-                }
-            }
-        });
-    }
+    let writer_for_sampler = writer.clone();
+    let wal_path_sampler = db_path.with_extension("db-wal");
     let state = AppState::with_wiring(
         None,
         payloads,
@@ -226,6 +204,69 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
             .unwrap_or(0) as i64,
     );
     let _ = state.mcp.set(std::sync::Arc::new(hub));
+
+    // SRE §2 sampler (15s): rss/peak, wal, queue, sidecar + lifecycle gauges
+    // (antagonism W3: transient maps MUST be watchable — leak-audit test
+    // covers CI, this covers the live soak) + bounded storage maintenance.
+    {
+        let writer_m = writer_for_sampler.clone();
+        let wal_path = wal_path_sampler.clone();
+        let st = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut n: u64 = 0;
+            loop {
+                tick.tick().await;
+                n += 1;
+                refine_metrics::sample_rss();
+                refine_metrics::gauge("refine_writer_queue_depth", writer_m.queue_depth());
+                let wal = std::fs::metadata(&wal_path)
+                    .map(|m| m.len() as i64)
+                    .unwrap_or(0);
+                refine_metrics::gauge("refine_wal_bytes", wal);
+                if let Some(rss) = sidecar_rss(std::process::id()) {
+                    refine_metrics::gauge("refine_sidecar_rss_bytes", rss);
+                }
+                refine_metrics::gauge("refine_prompt_locks", st.prompt_locks.lock().len() as i64);
+                refine_metrics::gauge("refine_prompt_tasks", st.prompt_tasks.lock().len() as i64);
+                refine_metrics::gauge(
+                    "refine_question_pending",
+                    st.question_gate.list().len() as i64,
+                );
+                refine_metrics::gauge("refine_permission_pending", st.gate.pending_len() as i64);
+                if let Ok(c) = refine_store::session_count(&st.db) {
+                    refine_metrics::gauge("refine_sessions_total", c);
+                }
+                // Storage maintenance (STORAGE §2 amendment: operational
+                // pragmas run on the WRITER connection — config pragmas stay
+                // in open()): drain freelist a bounded 4096 pages/tick (no-op
+                // at freelist=0), refresh planner stats hourly. Never a
+                // full VACUUM (online cost) — incremental only.
+                let w = writer_m.clone();
+                let optimize = n.is_multiple_of(240);
+                let join = tokio::task::spawn_blocking(move || {
+                    let mut ops = vec![refine_store::WriteOp::Sql {
+                        sql: "PRAGMA incremental_vacuum(4096)".into(),
+                        params: vec![],
+                    }];
+                    if optimize {
+                        ops.push(refine_store::WriteOp::Sql {
+                            sql: "PRAGMA optimize".into(),
+                            params: vec![],
+                        });
+                    }
+                    w.write(ops)
+                })
+                .await;
+                match join {
+                    Err(e) => tracing::error!("maintenance task join: {e}"),
+                    Ok(Err(e)) => tracing::error!("storage maintenance: {e:#}"),
+                    Ok(Ok(_)) => {}
+                }
+            }
+        });
+    }
 
     // M4b: plugin sidecar — materialize host, spawn Node, load configured
     // plugins (statuses logged like /mcp; load failures never block serving)

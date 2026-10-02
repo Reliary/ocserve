@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -49,6 +49,7 @@ CREATE TABLE msg (
 ) STRICT;
 
 CREATE INDEX idx_msg_session ON msg(session_id, seq);
+CREATE INDEX idx_msg_page ON msg(session_id, time_created, id);
 
 -- parts: small payloads inline (≤8KB per MEMORY §6), large → blob store
 CREATE TABLE msg_part (
@@ -178,6 +179,13 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                 "CREATE INDEX IF NOT EXISTS idx_part_session ON msg_part(session_id, seq);",
             )?;
         }
+        4 => {
+            // v4→v5: cursor-paging window index (session_id, time_created, id)
+            // — tuple-ordered before/limit pages without scanning the session.
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_msg_page ON msg(session_id, time_created, id);",
+            )?;
+        }
         other => {
             bail!(
                 "database schema version {other} != expected {SCHEMA_VERSION}; \
@@ -235,6 +243,7 @@ fn migrate_message_tables(conn: &Connection) -> Result<()> {
             info TEXT NOT NULL
         ) STRICT;
         CREATE INDEX idx_msg_session ON msg(session_id, seq);
+        CREATE INDEX idx_msg_page ON msg(session_id, time_created, id);
         CREATE TABLE msg_part (
             id TEXT PRIMARY KEY,
             message_id TEXT NOT NULL REFERENCES msg(id) ON DELETE CASCADE,

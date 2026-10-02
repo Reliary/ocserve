@@ -19,17 +19,47 @@ pub struct PermissionGate {
     requests: parking_lot::Mutex<HashMap<String, Value>>,
 }
 
+/// Drop-guard: mirrors question::PendingGuard (happy-path-only cleanup is a
+/// banned class — AGENTS §2.3/§2.5; antagonism A2).
+pub struct PendingGuard {
+    gate: Arc<PermissionGate>,
+    id: String,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.gate.pending.lock().remove(&self.id);
+        self.gate.requests.lock().remove(&self.id);
+    }
+}
+
 impl PermissionGate {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
-    /// Register a pending ask; returns the receiver for the reply string.
-    pub fn register(&self, id: &str, request: Value) -> tokio::sync::oneshot::Receiver<String> {
+    /// Register a pending ask; returns the receiver AND a drop-guard. The
+    /// guard removes both pending+requests entries on ANY exit (abort/panic
+    /// included) — timeout cleanup alone misses the killed-task case
+    /// (antagonism A2; QuestionGate's PendingGuard is the same pattern).
+    pub fn register(
+        self: Arc<Self>,
+        id: &str,
+        request: Value,
+    ) -> (tokio::sync::oneshot::Receiver<String>, PendingGuard) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending.lock().insert(id.to_string(), tx);
         self.requests.lock().insert(id.to_string(), request);
-        rx
+        let guard = PendingGuard {
+            gate: self,
+            id: id.to_string(),
+        };
+        (rx, guard)
+    }
+
+    /// Gauge support: number of asks awaiting a reply.
+    pub fn pending_len(&self) -> usize {
+        self.pending.lock().len()
     }
 
     /// Resolve a pending ask from a client reply. Unknown id → false.
@@ -74,5 +104,34 @@ impl PermissionGate {
     /// Pending request list for GET /permission.
     pub fn list(&self) -> Vec<Value> {
         self.requests.lock().values().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    #[test]
+    fn dropping_pending_guard_clears_entries() {
+        let gate = Arc::new(PermissionGate::default());
+        let (rx, guard) = gate
+            .clone()
+            .register("perm_t", serde_json::json!({"tool":"bash"}));
+        assert_eq!(gate.pending_len(), 1);
+        drop(guard); // abort path: the ask future dies without reply/timeout
+        assert_eq!(gate.pending_len(), 0, "guard must clear pending (A2)");
+        assert!(!gate.reply("perm_t", "once"), "already cleared");
+        drop(rx);
+    }
+
+    #[test]
+    fn reply_then_guard_drop_is_idempotent() {
+        let gate = Arc::new(PermissionGate::default());
+        let (rx, guard) = gate.clone().register("perm_r", serde_json::json!({}));
+        assert!(gate.reply("perm_r", "allow"));
+        assert_eq!(gate.pending_len(), 0);
+        drop(guard); // no-op after reply
+        assert_eq!(gate.pending_len(), 0);
+        drop(rx);
     }
 }

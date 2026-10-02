@@ -20,6 +20,17 @@ traceable test, every test has a traceable requirement.
    rerun. Quarantine with an issue and a deadline; no `sleep`-based synchronization.
 5. **Coverage is a floor, not a goal**: branch gates on core crates; the *effectiveness*
    signal is mutation score + adversarial findings caught by tests, not % lines.
+6. **Every shipped bug class gets a guard pair** (static check + behavioral test) so the
+   class cannot return silently. `scripts/check-guards.sh` runs with the commit gates;
+   negative controls for each rule planted and asserted at script introduction (2026-10):
+
+   | Shipped bug | Static guard | Behavioral test |
+   |---|---|---|
+   | swallowed storage write (`let _ = writer.write` — finalize SQL failed silently for days) | `check-guards.sh` rule 1 | `finalize_writes_agent_and_model_columns` (row-affecting) |
+   | literal `\\` backslash in a SQL string (syntax error, also swallowed) | `check-guards.sh` rule 2 | every WriteOp executes in tests |
+   | whole-session `Value` materialization (OOM-killed the cgroup twice) | `check-guards.sh` rule 3 (`load_messages` banned in HTTP) | streamed responses carry **no Content-Length** (asserted in `page_headers_...`); big-session live gate K-MSG-FIELDS |
+   | happy-path-only state cleanup (abort leaked `prompt_locks`; permission asks leaked on abort) | RAII `LockRelease` / `PendingGuard` — cleanup lives in `Drop`, never after an `.await` | `abort_releases_prompt_locks_and_tasks`, `dropping_pending_guard_clears_entries` |
+   | provider hang → permanent busy + stuck lock queue | stall watchdog covers open AND read phases (`REFINE_PROVIDER_STALL_SECS`, default 120s) | `silent_provider_fails_within_stall_budget_and_releases_state` (1s budget, own binary) |
 
 ## 2. Test basis and artifacts
 

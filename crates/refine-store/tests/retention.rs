@@ -209,3 +209,76 @@ fn load_messages_merges_column_ids_into_imported_shaped_rows() {
     assert_eq!(info1["id"], "msg_own");
     assert_eq!(info1["sessionID"], "ses_m");
 }
+
+// ---- W1: cursor page ordering + schema v5 ----
+
+#[test]
+fn page_messages_uses_tuple_order_with_same_ms_tiebreak() {
+    use refine_store::{Writer, page_messages};
+    let dir = tempfile::tempdir().unwrap();
+    let db = refine_store::writer::db_path(dir.path());
+    let w = Writer::spawn(db.clone()).unwrap();
+    w.write(vec![refine_store::WriteOp::Sql {
+        sql: "INSERT INTO session (id, project_id, directory, path, slug, title, version, time_created, time_updated) VALUES ('ses_t', 'global', '/w', 's', 's', 't', '1', 1, 1)".into(),
+        params: vec![],
+    }])
+    .unwrap();
+    // three messages: two share time_created (insertion order OPPOSITE to id
+    // order — the A1 split-brain scenario), one older
+    w.write(vec![
+        refine_store::WriteOp::Sql {
+            sql: "INSERT INTO msg (id, session_id, role, seq, time_created, info) VALUES ('msg_b', 'ses_t', 'user', 1, 1000, '{}')".into(),
+            params: vec![],
+        },
+        refine_store::WriteOp::Sql {
+            sql: "INSERT INTO msg (id, session_id, role, seq, time_created, info) VALUES ('msg_a', 'ses_t', 'user', 2, 1000, '{}')".into(),
+            params: vec![],
+        },
+        refine_store::WriteOp::Sql {
+            sql: "INSERT INTO msg (id, session_id, role, seq, time_created, info) VALUES ('msg_c', 'ses_t', 'user', 3, 2000, '{}')".into(),
+            params: vec![],
+        },
+    ])
+    .unwrap();
+    drop(w);
+
+    // newest-first walk: msg_c (2000), then same-ms pair by id DESC: msg_b, msg_a
+    let (rows, more, next) = page_messages(&db, "ses_t", 10, None).unwrap();
+    let ids: Vec<&str> = rows.iter().map(|(i, _)| i.as_str()).collect();
+    assert_eq!(ids, ["msg_a", "msg_b", "msg_c"], "ASC after DESC window");
+    assert!(!more && next.is_none());
+
+    // page of 1 from the top: newest = msg_c; cursor = msg_c; older = tie pair
+    let (rows1, more1, next1) = page_messages(&db, "ses_t", 1, None).unwrap();
+    assert_eq!(rows1[0].0, "msg_c");
+    assert!(more1);
+    let cur = next1.unwrap();
+    let (cid, ctime) = refine_store::decode_cursor(&cur).unwrap();
+    assert_eq!((cid.as_str(), ctime), ("msg_c", 2000));
+    let (rows2, more2, _) = page_messages(&db, "ses_t", 10, Some((&cid, ctime))).unwrap();
+    let ids2: Vec<&str> = rows2.iter().map(|(i, _)| i.as_str()).collect();
+    assert_eq!(ids2, ["msg_a", "msg_b"], "same-ms pair ordered by id ASC");
+    assert!(!more2);
+}
+
+#[test]
+fn fresh_schema_has_page_index_v5() {
+    use refine_store::Writer;
+    let dir = tempfile::tempdir().unwrap();
+    let db = refine_store::writer::db_path(dir.path());
+    let w = Writer::spawn(db.clone()).unwrap();
+    drop(w);
+    let conn = refine_store::pragma::open_reader(&db).unwrap();
+    let has: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_msg_page'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(has, 1, "v5 page index must exist on fresh create");
+    let ver: i64 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(ver, refine_store::schema::SCHEMA_VERSION);
+}

@@ -62,6 +62,11 @@ pub enum HttpError {
         status: StatusCode,
         tag: &'static str,
     },
+    /// Effect query-decode failure envelope (freeze probes: `?limit=abc` →
+    /// {"name":"BadRequest","data":{"message":...,"kind":"Query"}}).
+    Query {
+        message: String,
+    },
 }
 
 impl From<ApiError> for HttpError {
@@ -78,6 +83,19 @@ impl IntoResponse for HttpError {
                 let body = format!("{{\"_tag\":\"{tag}\"}}");
                 (
                     status,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+                    .into_response()
+            }
+            HttpError::Query { message } => {
+                let body = serde_json::json!({
+                    "name": "BadRequest",
+                    "data": {"message": message, "kind": "Query"}
+                })
+                .to_string();
+                (
+                    StatusCode::BAD_REQUEST,
                     [(axum::http::header::CONTENT_TYPE, "application/json")],
                     body,
                 )
@@ -496,8 +514,26 @@ async fn get_session(
         .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))
 }
 
-async fn session_status() -> impl IntoResponse {
-    Json(json!({}))
+/// GET /session/status — map of NON-idle sessions only (upstream
+/// session/status.ts deletes idle entries; probe fixture: status_busy.body).
+/// Busy = held/contended prompt lock OR a live background prompt task —
+/// queued-but-not-yet-running prompts count (client's send is admitted).
+async fn session_status(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut out = serde_json::Map::new();
+    let mut busy = |sid: &str| {
+        out.insert(sid.to_string(), serde_json::json!({"type": "busy"}));
+    };
+    for (sid, arc) in st.prompt_locks.lock().iter() {
+        if arc.try_lock().is_err() {
+            busy(sid);
+        }
+    }
+    for (sid, (_gen, handle)) in st.prompt_tasks.lock().iter() {
+        if !handle.is_finished() {
+            busy(sid);
+        }
+    }
+    Json(serde_json::Value::Object(out))
 }
 
 /// GET /path — env-derived at boot (upstream keys: home/state/config/worktree/directory).
@@ -629,15 +665,24 @@ async fn get_messages(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, HttpError> {
-    // freeze parity: upstream rejects EVERY `before` value (§1090) with the
-    // Effect HttpApi tagged body — not a divergence, a recorded fact.
-    if q.contains_key("before") {
-        return Err(HttpError::Tagged {
-            status: StatusCode::BAD_REQUEST,
-            tag: "BadRequest",
-        });
-    }
+    // Freeze rule order (handlers/session.ts:110-117 + observed matrix in
+    // message_page_contract.json): query-shape errors FIRST (Effect decodes
+    // the whole query before the handler), then before-rules, then session.
+    let limit: Option<u64> = match q.get("limit") {
+        None => None,
+        Some(raw) if raw.is_empty() => None, // `limit=` observed as full history
+        Some(raw) => Some(parse_limit(raw).map_err(|message| HttpError::Query { message })?),
+    };
+    let before: Option<(String, i64)> = match (q.get("before").map(String::as_str), limit) {
+        (Some(_), None) => return Err(tagged_bad_request()),
+        (Some(b), Some(_)) => {
+            Some(refine_store::decode_cursor(b).map_err(|_| tagged_bad_request())?)
+        }
+        (None, _) => None,
+    };
     if !refine_store::session_exists(&st.db, &id).map_err(|e| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         name: "InternalError",
@@ -645,7 +690,29 @@ async fn get_messages(
     })? {
         return Err(ApiError::not_found(format!("Session not found: {id}")).into());
     }
-    let limit: Option<usize> = q.get("limit").and_then(|l| l.parse::<usize>().ok());
+    // limit>0 → tuple-ordered cursor page (upstream MessageV2.page); absent/0
+    // → full history. Headers ONLY when older messages remain (their rule).
+    let mut page_n: Option<u64> = None;
+    let mut page_next: Option<String> = None;
+    let walk: refine_store::MessageWalk = match limit.filter(|n| *n > 0) {
+        Some(n) => {
+            let (rows, _more, next) = refine_store::page_messages(
+                &st.db,
+                &id,
+                n,
+                before.as_ref().map(|(b, t)| (b.as_str(), *t)),
+            )
+            .map_err(|e| ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                name: "InternalError",
+                message: format!("{e:#}"),
+            })?;
+            page_n = Some(n);
+            page_next = next;
+            refine_store::MessageWalk::Window(rows)
+        }
+        None => refine_store::MessageWalk::Seq { limit: None },
+    };
     // STREAMED response: one message per chunk through a bounded channel —
     // materializing a 16k-message session as Values OOM-killed the cgroup
     // (93MB response ≈ 400MB+ parsed; AGENTS §2.3 violation caught live).
@@ -655,7 +722,7 @@ async fn get_messages(
     let sid = id.clone();
     std::thread::spawn(move || {
         let mut first = true;
-        let r = refine_store::for_each_message_json(&db, &sid, limit, |chunk| {
+        let r = refine_store::for_each_message_json(&db, &sid, walk, |chunk| {
             let framed = if first {
                 first = false;
                 format!("[{chunk}")
@@ -683,8 +750,29 @@ async fn get_messages(
             )
         })
     });
-    let resp = axum::response::Response::builder()
-        .header(axum::http::header::CONTENT_TYPE, "application/json")
+    let mut builder = axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/json");
+    // Page headers (upstream session.ts:133-147): Link echoes the request
+    // origin (Host; x-forwarded-proto honored) + X-Next-Cursor + expose list.
+    if let (Some(n), Some(cur)) = (&page_n, &page_next) {
+        let scheme = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("http");
+        let host = headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("localhost");
+        let link = format!(
+            "<{scheme}://{host}{}?limit={n}&before={cur}>; rel=\"next\"",
+            uri.path()
+        );
+        builder = builder
+            .header("x-next-cursor", cur.as_str())
+            .header("link", link)
+            .header("access-control-expose-headers", "Link, X-Next-Cursor");
+    }
+    let resp = builder
         .body(axum::body::Body::from_stream(body_stream))
         .map_err(|e| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -802,10 +890,96 @@ fn build_prompt_context(
 }
 
 /// Per-session prompt lock (insert-only while active; bounded by in-flight).
-async fn lock_session(
-    st: &Arc<AppState>,
-    sid: &str,
-) -> Result<std::sync::Arc<tokio::sync::Mutex<()>>, ApiError> {
+/// JS-Number-style rendering for Effect query error messages (JS prints
+/// ≥1e21 in exponent form WITH a plus sign: "1e+21"; Rust's Display does
+/// not — mirror observed upstream bytes).
+fn fmt_js(v: f64) -> String {
+    if v.is_finite() && v.abs() >= 1e21 {
+        let raw = format!("{v:e}"); // e.g. 1e21 / -1.5e21
+        if let Some(pos) = raw.find('e') {
+            return format!("{}e+{}", &raw[..pos], &raw[pos + 1..]);
+        }
+        raw
+    } else {
+        format!("{v}")
+    }
+}
+
+/// `?limit=` validation — freeze-probed matrix (message_page_contract.json):
+/// absent/empty/0 → full history; integers (incl. "+5", "1e3") accepted up
+/// to 2^53-1; negatives → range message; non-integers → integer message
+/// (junk → "NaN"); mirror Effect's NumberFromString + Int + nonnegative
+/// checks in observed order (integer-ness first, then ≥0). Rust's f64 parse
+/// diverges from JS Number only on hex/whitespace forms — clients never
+/// send those (documented, corpus note).
+fn parse_limit(raw: &str) -> Result<u64, String> {
+    const INT_MSG: &str = "Expected an integer, got {}\n  at [\"limit\"]";
+    match raw.parse::<f64>() {
+        Err(_) => Err(INT_MSG.replace("{}", "NaN")),
+        Ok(v) if v.is_nan() => Err(INT_MSG.replace("{}", "NaN")),
+        Ok(v) if v.is_infinite() => {
+            Err(INT_MSG.replace("{}", if v > 0.0 { "Infinity" } else { "-Infinity" }))
+        }
+        Ok(v) if v.trunc() != v => Err(INT_MSG.replace("{}", &fmt_js(v))),
+        Ok(v) if v.abs() > 9007199254740991.0 => Err(INT_MSG.replace("{}", &fmt_js(v))),
+        Ok(v) if v < 0.0 => Err(format!(
+            "Expected a value greater than or equal to 0, got {}\n  at [\"limit\"]",
+            fmt_js(v)
+        )),
+        Ok(v) => Ok(v as u64),
+    }
+}
+
+fn tagged_bad_request() -> HttpError {
+    HttpError::Tagged {
+        status: StatusCode::BAD_REQUEST,
+        tag: "BadRequest",
+    }
+}
+
+/// Abort-safe cleanup (antagonism A2): remove the prompt_locks entry when the
+/// holder's task ends ANY way — normal completion, `?abort`, task panic,
+/// delete_session — because post-run cleanup code never executes on abort
+/// (entries only self-heal on the next prompt). Holds its own Arc clone so
+/// the strong_count ≤ 2 check is exact during Drop. Concurrent holders or
+/// waiters push the count above 2 → skip (entry stays — it's live).
+struct LockRelease {
+    locks: std::sync::Arc<
+        parking_lot::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+        >,
+    >,
+    sid: String,
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+impl LockRelease {
+    fn arc(&self) -> &std::sync::Arc<tokio::sync::Mutex<()>> {
+        &self.lock
+    }
+}
+
+impl Drop for LockRelease {
+    fn drop(&mut self) {
+        // EXACT reference accounting (the first design had callers holding a
+        // separate Arc clone → drop-order dependent skip, caught by the abort
+        // test): ALL locking goes through arc() so the only refs are the map
+        // entry + this release. remove iff count ≤ 2 (map + self).
+        let mut map = self.locks.lock();
+        if let Some(arc) = map.get(&self.sid)
+            && std::sync::Arc::strong_count(arc) <= 2
+        {
+            map.remove(&self.sid);
+        }
+    }
+}
+
+/// Session prompt lock + abort-safe cleanup in ONE object: callers lock via
+/// `release.arc()` (never a second Arc clone) so Drop's count is exact, and
+/// dropping release — normal end, `?`, panic, or task abort — evicts the map
+/// entry. Concurrent holders/waiters each hold their own release (count > 2)
+/// so live entries are never evicted.
+async fn lock_session(st: &Arc<AppState>, sid: &str) -> Result<LockRelease, ApiError> {
     let lock = {
         let mut map = st.prompt_locks.lock();
         if map.len() >= 64 && !map.contains_key(sid) {
@@ -819,7 +993,11 @@ async fn lock_session(
             .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     };
-    Ok(lock)
+    Ok(LockRelease {
+        locks: std::sync::Arc::clone(&st.prompt_locks),
+        sid: sid.to_string(),
+        lock,
+    })
 }
 
 fn prompt_err(e: anyhow::Error) -> ApiError {
@@ -841,21 +1019,13 @@ async fn post_message(
     Json(payload): Json<Value>,
 ) -> Result<impl IntoResponse, ApiError> {
     let ctx = build_prompt_context(&st, &payload, &id)?;
-    let lock = lock_session(&st, &id).await?;
-    let _guard = lock.lock().await;
+    let _release = lock_session(&st, &id).await?;
+    let _guard = _release.arc().lock().await;
     let writer = st.writer.clone();
     let result = refine_core::prompt::run_prompt(&ctx, &writer, &id, &payload)
         .await
         .map_err(prompt_err)?;
     drop(_guard);
-    {
-        let mut map = st.prompt_locks.lock();
-        if let Some(arc) = map.get(&id)
-            && std::sync::Arc::strong_count(arc) <= 2
-        {
-            map.remove(&id);
-        }
-    }
     let (info, parts) = result;
     Ok(Json(json!({"info": info, "parts": parts})))
 }
@@ -878,9 +1048,11 @@ async fn post_prompt_async(
         return Err(ApiError::not_found(format!("Session not found: {id}")));
     }
     let ctx = build_prompt_context(&st, &payload, &id)?;
-    let lock = lock_session(&st, &id).await?;
+    // release MOVES INTO the task: the handler returns 204 immediately, so a
+    // handler-scoped guard would drop (and evict the lock entry) while the
+    // prompt is still running (antagonism A2 — ownership, not just RAII).
+    let release = lock_session(&st, &id).await?;
     let writer = st.writer.clone();
-    let locks = st.prompt_locks.clone();
     let sid = id.clone();
     let generation = st
         .prompt_gen
@@ -888,20 +1060,13 @@ async fn post_prompt_async(
     let tasks = st.prompt_tasks.clone();
     let tasks_insert = st.prompt_tasks.clone();
     let handle = tokio::spawn(async move {
-        let guard = lock.lock().await;
+        let _release = release;
+        let guard = _release.arc().lock().await;
         match refine_core::prompt::run_prompt(&ctx, &writer, &sid, &payload).await {
             Ok(_) => {}
             Err(e) => tracing::error!("prompt_async failed session={sid}: {e:#}"),
         }
         drop(guard);
-        {
-            let mut map = locks.lock();
-            if let Some(arc) = map.get(&sid)
-                && std::sync::Arc::strong_count(arc) <= 2
-            {
-                map.remove(&sid);
-            }
-        }
         let mut t = tasks.lock();
         if let Some((g, _)) = t.get(&sid)
             && *g == generation
@@ -1576,8 +1741,8 @@ async fn post_command(
     }
 
     let ctx = build_prompt_context(&st, &cmd_payload, &id)?;
-    let lock = lock_session(&st, &id).await?;
-    let Ok(_guard) = lock.try_lock() else {
+    let _release = lock_session(&st, &id).await?;
+    let Ok(_guard) = _release.arc().try_lock() else {
         return Err(session_busy(&id));
     };
     let writer = st.writer.clone();
@@ -1585,14 +1750,6 @@ async fn post_command(
         .await
         .map_err(prompt_err)?;
     drop(_guard);
-    {
-        let mut map = st.prompt_locks.lock();
-        if let Some(arc) = map.get(&id)
-            && std::sync::Arc::strong_count(arc) <= 2
-        {
-            map.remove(&id);
-        }
-    }
     Ok(Json(json!({"info": info, "parts": parts})))
 }
 
@@ -1630,8 +1787,8 @@ async fn post_shell(
         })?;
     let (pid, mid) = resolve_model(&st, &payload, &id);
 
-    let lock = lock_session(&st, &id).await?;
-    let Ok(_guard) = lock.try_lock() else {
+    let _release = lock_session(&st, &id).await?;
+    let Ok(_guard) = _release.arc().try_lock() else {
         return Err(session_busy(&id));
     };
     let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
@@ -2096,4 +2253,46 @@ pub fn sse_expected_headers() -> Vec<(&'static str, &'static str)> {
 #[allow(dead_code)]
 fn _assert_header_value(v: &str) -> HeaderValue {
     HeaderValue::from_str(v).expect("static header value")
+}
+
+#[cfg(test)]
+mod limit_matrix {
+    use super::parse_limit;
+
+    #[test]
+    fn matches_probe_envelopes() {
+        // Byte strings from message_page_contract.json probes (upstream 1.18.31)
+        assert_eq!(
+            parse_limit("abc").unwrap_err(),
+            "Expected an integer, got NaN\n  at [\"limit\"]"
+        );
+        assert_eq!(
+            parse_limit("5.5").unwrap_err(),
+            "Expected an integer, got 5.5\n  at [\"limit\"]"
+        );
+        assert_eq!(
+            parse_limit("-0.5").unwrap_err(),
+            "Expected an integer, got -0.5\n  at [\"limit\"]"
+        );
+        assert_eq!(
+            parse_limit("-1").unwrap_err(),
+            "Expected a value greater than or equal to 0, got -1\n  at [\"limit\"]"
+        );
+        assert_eq!(
+            parse_limit("999999999999999999999").unwrap_err(),
+            "Expected an integer, got 1e+21\n  at [\"limit\"]"
+        );
+        assert_eq!(
+            parse_limit("Infinity").unwrap_err(),
+            "Expected an integer, got Infinity\n  at [\"limit\"]"
+        );
+    }
+
+    #[test]
+    fn accepts_integers_like_js_number() {
+        assert_eq!(parse_limit("+5"), Ok(5));
+        assert_eq!(parse_limit("1e3"), Ok(1000)); // JS Number("1e3") = 1000
+        assert_eq!(parse_limit("0"), Ok(0));
+        assert_eq!(parse_limit("9007199254740991"), Ok(9007199254740991)); // 2^53-1
+    }
 }

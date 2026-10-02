@@ -122,15 +122,109 @@ pub fn insert_message(
 /// Load history for prompt assembly: (info, parts) ordered by msg.seq.
 /// `limit` = return the LAST n messages ascending (upstream `?limit=` live
 /// contract §1084); None = full history.
+/// Cursor format — byte-compatible with upstream MessageV2.cursor
+/// (message-v2.ts:71-84): base64url(JSON {"id","time"}), no padding.
+pub fn encode_cursor(id: &str, time_created: i64) -> String {
+    use base64::Engine as _;
+    let json = format!("{{\"id\":\"{id}\",\"time\":{time_created}}}");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+}
+
+/// Decode an upstream-shaped cursor. Errors on malformed base64, bad JSON,
+/// non-`msg_` ids, or negative time — mirrors upstream's Schema checks
+/// (id: MessageID brand, time ≥ 0) closely enough that garbage 400s.
+pub fn decode_cursor(s: &str) -> anyhow::Result<(String, i64)> {
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s)
+        .map_err(|e| anyhow::anyhow!("cursor base64: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&raw).map_err(|e| anyhow::anyhow!("cursor json: {e}"))?;
+    let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("");
+    let time = v.get("time").and_then(|x| x.as_i64());
+    match (id.starts_with("msg_"), time) {
+        (true, Some(t)) if t >= 0 => Ok((id.to_string(), t)),
+        _ => anyhow::bail!("cursor fields"),
+    }
+}
+
+/// One paged window (upstream MessageV2.page semantics): newest `limit`
+/// messages older than the cursor, tuple-ordered `(time_created DESC,
+/// id DESC) LIMIT limit+1` → extra row signals `more` → reversed to ASC.
+/// The cursor is derived from the OLDEST kept row. Returns the window's
+/// ordered message (id, info) rows, `more`, and the next cursor.
+/// (window rows ASC, more, next-cursor)
+pub type PageWindow = (Vec<(String, String)>, bool, Option<String>);
+
+pub fn page_messages(
+    db: &std::path::Path,
+    session_id: &str,
+    limit: u64,
+    before: Option<(&str, i64)>,
+) -> anyhow::Result<PageWindow> {
+    let conn = pragma::open_reader(db)?;
+    let n = limit.saturating_add(1);
+    let rows: Vec<(String, String, i64)> = match before {
+        Some((bid, btime)) => {
+            let mut stmt = conn.prepare(
+                "SELECT id, info, time_created FROM msg WHERE session_id = ?1 \
+                 AND (time_created < ?2 OR (time_created = ?2 AND id < ?3)) \
+                 ORDER BY time_created DESC, id DESC LIMIT ?4",
+            )?;
+            stmt.query_map((session_id, btime, bid, n as i64), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect()
+        }
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT id, info, time_created FROM msg WHERE session_id = ?1 \
+                 ORDER BY time_created DESC, id DESC LIMIT ?2",
+            )?;
+            stmt.query_map((session_id, n as i64), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect()
+        }
+    };
+    let more = rows.len() as u64 > limit;
+    let mut kept: Vec<(String, String, i64)> = rows;
+    if more {
+        kept.pop(); // the +1 probe row
+    }
+    let next = if more {
+        kept.last().map(|(id, _, t)| encode_cursor(id, *t))
+    } else {
+        None
+    };
+    kept.reverse(); // ASC
+    Ok((
+        kept.into_iter().map(|(i, info, _)| (i, info)).collect(),
+        more,
+        next,
+    ))
+}
+
 /// Walk a session's messages one at a time, yielding each message's FULL
 /// response JSON object (`{"info":…,"parts":[…]}`) to `visit`. Bounded by
 /// design (AGENTS §2.3): peak = one message — the old Vec<Value> path
 /// OOM-killed the cgroup on a 16k-message session (93MB response ≈ 400MB+
 /// as serde Values). Column merge applied per row (see merge_columns).
+/// What to walk: full/tail history (seq order) or an explicit pre-ordered
+/// cursor window from `page_messages` (tuple order).
+pub enum MessageWalk {
+    /// last `limit` messages in seq order (`None` = all)
+    Seq { limit: Option<usize> },
+    /// pre-computed (id, info) window in response order (already ASC)
+    Window(Vec<(String, String)>),
+}
+
 pub fn for_each_message_json(
     db: &std::path::Path,
     session_id: &str,
-    limit: Option<usize>,
+    walk: MessageWalk,
     mut visit: impl FnMut(String) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let conn = pragma::open_reader(db)?;
@@ -139,22 +233,29 @@ pub fn for_each_message_json(
             .ok_or_else(|| anyhow::anyhow!("db parent"))?
             .join("blobs"),
     )?;
-    let mut stmt = match limit {
-        Some(_) => conn.prepare(
-            "SELECT id, info FROM (SELECT id, info, seq FROM msg WHERE session_id = ?1 \
-             ORDER BY seq DESC LIMIT ?2) ORDER BY seq",
-        )?,
-        None => conn.prepare("SELECT id, info FROM msg WHERE session_id = ?1 ORDER BY seq")?,
-    };
-    let msgs: Vec<(String, String)> = match limit {
-        Some(n) => stmt
-            .query_map((session_id, n as i64), |r| Ok((r.get(0)?, r.get(1)?)))?
-            .filter_map(|r| r.ok())
-            .collect(),
-        None => stmt
-            .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .filter_map(|r| r.ok())
-            .collect(),
+    let msgs: Vec<(String, String)> = match walk {
+        MessageWalk::Window(w) => w,
+        MessageWalk::Seq { limit } => {
+            let mut stmt = match limit {
+                Some(_) => conn.prepare(
+                    "SELECT id, info FROM (SELECT id, info, seq FROM msg WHERE session_id = ?1 \
+                     ORDER BY seq DESC LIMIT ?2) ORDER BY seq",
+                )?,
+                None => {
+                    conn.prepare("SELECT id, info FROM msg WHERE session_id = ?1 ORDER BY seq")?
+                }
+            };
+            match limit {
+                Some(n) => stmt
+                    .query_map((session_id, n as i64), |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .filter_map(|r| r.ok())
+                    .collect(),
+                None => stmt
+                    .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .filter_map(|r| r.ok())
+                    .collect(),
+            }
+        }
     };
     let mut pstmt = conn.prepare(
         "SELECT id, inline, blob_sha, byte_len FROM msg_part WHERE message_id = ?1 ORDER BY seq",
@@ -665,6 +766,13 @@ pub fn finalize_session_prompt(
             stats.time_updated.into(),
         ],
     }])
+}
+
+/// Count of session rows (sampler gauge; cheap integer scan).
+pub fn session_count(db: &std::path::Path) -> anyhow::Result<i64> {
+    let conn = pragma::open_reader(db)?;
+    conn.query_row("SELECT count(*) FROM session", [], |r| r.get(0))
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
