@@ -16,6 +16,7 @@
 //! - /experimental/console, /experimental/capabilities: static captures
 
 use anyhow::{Context, Result};
+use refine_http::LlmRegistry;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -659,6 +660,176 @@ fn build_commands(cfg: &Value) -> Result<Vec<Value>> {
         }
     }
     Ok(cmds)
+}
+
+impl Runtime {
+    /// Assemble the LLM registry from auth/config/models-cache/state
+    /// (endpoints, pricing, default model, agent systems).
+    pub fn llm_registry(&self) -> LlmRegistry {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let read_json = |p: &str| -> Option<Value> {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+        };
+        let auth = read_json(&format!("{home}/.local/share/opencode/auth.json"))
+            .unwrap_or_else(|| json!({}));
+        let cfg = read_json(&format!("{home}/.config/opencode/opencode.json"))
+            .unwrap_or_else(|| json!({}));
+        let cache =
+            read_json(&format!("{home}/.cache/opencode/models.json")).unwrap_or_else(|| json!({}));
+        let state_model = read_json(&format!("{home}/.local/state/opencode/model.json"))
+            .unwrap_or_else(|| json!({}));
+
+        // Known default endpoints for auth'd providers without config baseURL
+        // (provider quirks live in code-data, PLAN §8 — extend as needed).
+        let defaults: [(&str, &str); 2] = [
+            ("deepseek", "https://api.deepseek.com/v1"),
+            ("openrouter", "https://openrouter.ai/api/v1"),
+        ];
+
+        let mut endpoints = std::collections::HashMap::new();
+        if let Some(obj) = auth.as_object() {
+            for (pid, entry) in obj {
+                let key = entry.get("key").and_then(|k| k.as_str()).unwrap_or("");
+                if key.is_empty() {
+                    continue; // oauth-typed entries: M2 supports key auth only
+                }
+                let base = cfg
+                    .pointer(&format!("/provider/{pid}/options/baseURL"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .or_else(|| {
+                        defaults
+                            .iter()
+                            .find(|(d, _)| d == pid)
+                            .map(|(_, u)| (*u).to_string())
+                    });
+                if let Some(base) = base {
+                    endpoints.insert(pid.clone(), (base, key.to_string()));
+                }
+            }
+        }
+        // config providers without auth entries (baseURL + env-less key)
+        if let Some(provs) = cfg.get("provider").and_then(|v| v.as_object()) {
+            for (pid, p) in provs {
+                if endpoints.contains_key(pid) {
+                    continue;
+                }
+                if let Some(base) = p.pointer("/options/baseURL").and_then(|v| v.as_str()) {
+                    let key = auth
+                        .pointer(&format!("/{pid}/key"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    endpoints.insert(pid.clone(), (base.to_string(), key.to_string()));
+                }
+            }
+        }
+
+        // pricing from models cache: (in, out, cache_read) USD per MTok
+        let mut pricing = std::collections::HashMap::new();
+        if let Some(provs) = cache.as_object() {
+            for (pid, p) in provs {
+                if let Some(models) = p.get("models").and_then(|v| v.as_object()) {
+                    for (mid, m) in models {
+                        let c = m.get("cost");
+                        if let (Some(i), Some(o)) = (
+                            c.and_then(|c| c.get("input")).and_then(|v| v.as_f64()),
+                            c.and_then(|c| c.get("output")).and_then(|v| v.as_f64()),
+                        ) {
+                            let cr = c
+                                .and_then(|c| c.get("cache_read"))
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0);
+                            pricing.insert((pid.clone(), mid.clone()), (i, o, cr));
+                        }
+                    }
+                }
+            }
+        }
+        // config-defined model costs
+        if let Some(provs) = cfg.get("provider").and_then(|v| v.as_object()) {
+            for (pid, p) in provs {
+                if let Some(models) = p.get("models").and_then(|v| v.as_object()) {
+                    for (mid, m) in models {
+                        if let (Some(i), Some(o)) = (
+                            m.pointer("/cost/input").and_then(|v| v.as_f64()),
+                            m.pointer("/cost/output").and_then(|v| v.as_f64()),
+                        ) {
+                            let cr = m
+                                .pointer("/cost/cache_read")
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0);
+                            pricing.insert((pid.clone(), mid.clone()), (i, o, cr));
+                        }
+                    }
+                }
+            }
+        }
+
+        // default model from opencode state (recent[0] → favorite[0] → first endpoint)
+        let default_model = state_model
+            .pointer("/recent/0")
+            .map(|m| {
+                (
+                    m.get("providerID")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    m.get("modelID")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            })
+            .filter(|(p, m)| !p.is_empty() && !m.is_empty())
+            .or_else(|| {
+                state_model.pointer("/favorite/0").map(|m| {
+                    (
+                        m.get("providerID")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        m.get("modelID")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    )
+                })
+            })
+            .filter(|(p, m)| !p.is_empty() && !m.is_empty())
+            .unwrap_or_else(|| {
+                endpoints
+                    .keys()
+                    .next()
+                    .map(|p| (p.clone(), String::new()))
+                    .unwrap_or_default()
+            });
+
+        // agent systems from the assembled agent list
+        let mut systems = std::collections::HashMap::new();
+        for a in &self.agent {
+            if let (Some(name), Some(prompt)) = (
+                a.get("name").and_then(|v| v.as_str()),
+                a.get("prompt").and_then(|v| v.as_str()),
+            ) {
+                systems.insert(name.to_string(), prompt.to_string());
+            }
+        }
+
+        let default_agent = cfg
+            .pointer("/default_agent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("build")
+            .to_string();
+        LlmRegistry {
+            endpoints,
+            pricing,
+            default_model,
+            systems,
+            default_agent,
+        }
+    }
 }
 
 #[cfg(test)]

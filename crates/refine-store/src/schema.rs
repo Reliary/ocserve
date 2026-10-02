@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -38,34 +38,31 @@ CREATE TABLE session (
 CREATE INDEX idx_session_updated ON session(time_updated DESC);
 CREATE INDEX idx_session_parent ON session(parent_id) WHERE parent_id IS NOT NULL;
 
--- message metadata; payload refs the blob store
-CREATE TABLE message (
+-- messages: full wire info as JSON (small, ≤1KB typical); ordered by seq
+CREATE TABLE msg (
     id          TEXT PRIMARY KEY,
     session_id  TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
     role        TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
     time_created INTEGER NOT NULL,
-    model       TEXT,
-    provider_id TEXT,
-    tokens_in   INTEGER,
-    tokens_out  INTEGER,
-    blob_sha    TEXT NOT NULL
+    info        TEXT NOT NULL
 ) STRICT;
 
-CREATE INDEX idx_message_session ON message(session_id, time_created, id);
+CREATE INDEX idx_msg_session ON msg(session_id, seq);
 
--- part metadata; large payloads out-of-DB
-CREATE TABLE part (
+-- parts: small payloads inline (≤8KB per MEMORY §6), large → blob store
+CREATE TABLE msg_part (
     id          TEXT PRIMARY KEY,
-    message_id  TEXT NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+    message_id  TEXT NOT NULL REFERENCES msg(id) ON DELETE CASCADE,
     session_id  TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
     type        TEXT NOT NULL,
-    time_created INTEGER NOT NULL,
     byte_len    INTEGER NOT NULL,
+    inline      TEXT,
     blob_sha    TEXT
 ) STRICT;
 
-CREATE INDEX idx_part_message ON part(message_id, time_created);
-CREATE INDEX idx_part_session ON part(session_id);
+CREATE INDEX idx_part_msg ON msg_part(message_id, seq);
 
 -- bounded event ring (never RAM; never unbounded: PLAN §5)
 CREATE TABLE event (
@@ -138,8 +135,9 @@ CREATE TABLE import_manifest (
 ) STRICT;
 ";
 
-/// Apply schema to a fresh DB and stamp user_version. Handles 0→current and
-/// 1→2 (adds session metadata columns); refuses anything else.
+/// Apply schema to a fresh DB and stamp user_version. Handles 0→current,
+/// 1→current (session columns + message tables), 2→3 (message tables);
+/// refuses anything else.
 pub fn migrate(conn: &Connection) -> Result<()> {
     let ver: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -167,6 +165,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                  ALTER TABLE session ADD COLUMN tokens_cache_read INTEGER NOT NULL DEFAULT 0;
                  ALTER TABLE session ADD COLUMN tokens_cache_write INTEGER NOT NULL DEFAULT 0;",
             )?;
+            migrate_message_tables(conn)?;
+        }
+        2 => {
+            migrate_message_tables(conn)?;
         }
         other => {
             bail!(
@@ -176,6 +178,67 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         }
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+/// v2→v3 message/part → msg/msg_part wire-shape migration (empty-table safe).
+fn migrate_message_tables(conn: &Connection) -> Result<()> {
+    let has_legacy: bool = conn
+        .query_row(
+            "SELECT count(*) > 0 FROM sqlite_master \
+             WHERE type='table' AND name IN ('message','part')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if has_legacy {
+        let msg_count: i64 = conn
+            .query_row("SELECT count(*) FROM message", [], |r| r.get(0))
+            .unwrap_or(0);
+        let part_count: i64 = conn
+            .query_row("SELECT count(*) FROM part", [], |r| r.get(0))
+            .unwrap_or(0);
+        if msg_count > 0 || part_count > 0 {
+            bail!(
+                "message-table migration refuses to drop {msg_count} messages/{part_count} parts; \
+                 re-import instead"
+            );
+        }
+        conn.execute_batch("DROP TABLE part; DROP TABLE message;")?;
+    }
+    // idempotent: skip create if msg already exists (partial migration)
+    let has_new: bool = conn
+        .query_row(
+            "SELECT count(*) > 0 FROM sqlite_master WHERE type='table' AND name='msg'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if has_new {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE TABLE msg (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+            role TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            time_created INTEGER NOT NULL,
+            info TEXT NOT NULL
+        ) STRICT;
+        CREATE INDEX idx_msg_session ON msg(session_id, seq);
+        CREATE TABLE msg_part (
+            id TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL REFERENCES msg(id) ON DELETE CASCADE,
+            session_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            byte_len INTEGER NOT NULL,
+            inline TEXT,
+            blob_sha TEXT
+        ) STRICT;
+        CREATE INDEX idx_part_msg ON msg_part(message_id, seq);",
+    )?;
     Ok(())
 }
 

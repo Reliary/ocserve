@@ -1,0 +1,76 @@
+//! Upstream-shaped resource IDs: `<prefix>_<26 chars>` where the first 10 hex
+//! chars encode ms-timestamp LE (matches observed `msg_0fa1e3f770014jHIfQNh0Lhiu3`).
+
+use sha2::{Digest, Sha256};
+
+fn encode(ms: u64, rand_tail: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(ms.to_le_bytes());
+    h.update(rand_tail);
+    let hex = hex::encode(h.finalize());
+    // upstream body = 26 chars: 13-char time hex + 13-char hash slice
+    // (observed `msg_0fa1e3f770014jHIfQNh0Lhiu3`)
+    let time_hex = format!("{ms:013x}"); // pads; current ms fits 13
+    format!("{time_hex}{}", &hex[..13])
+}
+
+pub fn msg_id() -> String {
+    let ms = now_ms();
+    let nonce: Vec<u8> = std::iter::repeat_with(rand_byte).take(8).collect();
+    format!("msg_{}", encode(ms, &nonce[..8]))
+}
+
+pub fn prt_id() -> String {
+    let ms = now_ms();
+    let nonce: Vec<u8> = std::iter::repeat_with(rand_byte).take(8).collect();
+    format!("prt_{}", encode(ms, &nonce[..8]))
+}
+
+pub fn ses_id() -> String {
+    let ms = now_ms();
+    let nonce: Vec<u8> = std::iter::repeat_with(rand_byte).take(8).collect();
+    format!("ses_{}", encode(ms, &nonce[..8]))
+}
+
+pub fn evt_id() -> String {
+    let ms = now_ms();
+    let nonce: Vec<u8> = std::iter::repeat_with(rand_byte).take(8).collect();
+    format!("evt_{}", encode(ms, &nonce[..8]))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn rand_byte() -> u8 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = RandomState::new().build_hasher();
+    h.write_u64(now_ms());
+    h.finish() as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_have_upstream_shape() {
+        for id in [msg_id(), prt_id(), ses_id(), evt_id()] {
+            let (prefix, body) = id.split_once('_').unwrap();
+            assert!(matches!(prefix, "msg" | "prt" | "ses" | "evt"));
+            assert_eq!(body.len(), 26, "upstream ids are prefix+26: {id}");
+            assert!(body.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+        }
+    }
+
+    #[test]
+    fn ids_unique_enough() {
+        let a = msg_id();
+        let b = msg_id();
+        assert_ne!(a, b, "collision within a millisecond: {a}");
+    }
+}

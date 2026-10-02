@@ -8,6 +8,10 @@ description = "Provider clients: openai-compatible first; stream assembly + fuzz
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
+futures-core = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+futures-util.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true

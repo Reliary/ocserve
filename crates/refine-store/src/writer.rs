@@ -40,23 +40,13 @@ impl Writer {
     /// ops are drained until either the channel dries or `max_wait` elapses.
     pub fn spawn(path: PathBuf) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<Batch>();
+        // Open + migrate SYNCHRONOUSLY (fail-fast at boot; the DB must exist
+        // and be migrated before any reader can race us — M2 500 finding).
+        let conn = crate::pragma::open_writer(&path)?;
+        crate::schema::migrate(&conn)?;
         let handle = std::thread::Builder::new()
             .name("refine-writer".into())
-            .spawn(move || {
-                let conn = match crate::pragma::open_writer(&path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        // Fail fast at boot; the sender will see closed-channel errors.
-                        tracing::error!("writer open failed: {e:#}");
-                        return;
-                    }
-                };
-                if let Err(e) = crate::schema::migrate(&conn) {
-                    tracing::error!("schema migrate failed: {e:#}");
-                    return;
-                }
-                run_loop(&conn, rx);
-            })?;
+            .spawn(move || run_loop(&conn, rx))?;
         Ok(Self {
             tx: Some(tx),
             handle: Some(handle),

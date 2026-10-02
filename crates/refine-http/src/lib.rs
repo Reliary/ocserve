@@ -2,7 +2,7 @@
 
 use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode};
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -80,6 +80,37 @@ pub struct AppState {
     pub auth: Option<(String, String)>,
     /// Request counter for /metrics (bounded, monotonic).
     pub requests: std::sync::atomic::AtomicU64,
+    // ---- M2 prompt runtime (wired by CLI) ----
+    /// Bounded broadcast of encoded global-event frames.
+    pub bus: refine_core::EventBus,
+    pub db: std::path::PathBuf,
+    pub blobs: std::sync::Arc<refine_store::BlobStore>,
+    pub writer: std::sync::Arc<refine_store::Writer>,
+    /// Provider registry + default model + agent systems (from Runtime).
+    pub llm: LlmRegistry,
+}
+
+/// LLM endpoint resolution for the prompt runner (assembled by Runtime).
+#[derive(Default)]
+pub struct LlmRegistry {
+    /// providerID → (base_url, api_key)
+    pub endpoints: std::collections::HashMap<String, (String, String)>,
+    /// (providerID, modelID) → (input, output, cache_read) USD/MTok
+    pub pricing: std::collections::HashMap<(String, String), (f64, f64, f64)>,
+    /// default (providerID, modelID) from opencode state
+    pub default_model: (String, String),
+    /// agent name → system prompt (only agents with explicit prompts)
+    pub systems: std::collections::HashMap<String, String>,
+    /// config default_agent (upstream session rows record it at prompt time)
+    pub default_agent: String,
+}
+
+/// Real runtime pieces passed at construction (no interior mutability, no unsafe).
+pub struct Wires {
+    pub db: std::path::PathBuf,
+    pub blobs: std::sync::Arc<refine_store::BlobStore>,
+    pub writer: std::sync::Arc<refine_store::Writer>,
+    pub llm: LlmRegistry,
 }
 
 impl AppState {
@@ -91,8 +122,38 @@ impl AppState {
         Self::with_payloads(auth, Payloads::default())
     }
 
-    /// Build from pre-assembled route payloads (CLI's `Runtime::load()` output).
+    /// Build from pre-assembled route payloads with a temp-backed store
+    /// (tests / simple construction — real pieces, no placeholders).
     pub fn with_payloads(auth: Option<(String, String)>, p: Payloads) -> Arc<Self> {
+        let dir = std::env::temp_dir().join(format!(
+            "refine-http-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp data dir");
+        let db = refine_store::writer::db_path(&dir);
+        let writer =
+            std::sync::Arc::new(refine_store::Writer::spawn(db.clone()).expect("temp writer"));
+        let blobs = std::sync::Arc::new(
+            refine_store::BlobStore::new(dir.join("blobs")).expect("temp blobs"),
+        );
+        Self::with_wiring(
+            auth,
+            p,
+            Wires {
+                db,
+                blobs,
+                writer,
+                llm: LlmRegistry::default(),
+            },
+        )
+    }
+
+    /// One-shot construction with real runtime wiring (CLI path).
+    pub fn with_wiring(auth: Option<(String, String)>, p: Payloads, w: Wires) -> Arc<Self> {
         let home = std::env::var("HOME").unwrap_or_default();
         let worktree = std::env::current_dir()
             .map(|p| p.display().to_string())
@@ -117,6 +178,11 @@ impl AppState {
             }),
             auth,
             requests: std::sync::atomic::AtomicU64::new(0),
+            bus: refine_core::EventBus::new(),
+            db: w.db,
+            blobs: w.blobs,
+            writer: w.writer,
+            llm: w.llm,
         })
     }
 }
@@ -272,12 +338,11 @@ async fn vcs_info() -> impl IntoResponse {
 }
 
 async fn get_sessions(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let mut v: Vec<serde_json::Value> = st.sessions.read().values().cloned().collect();
-    v.sort_by(|a, b| {
-        b["time"]["updated"]
-            .as_i64()
-            .unwrap_or(0)
-            .cmp(&a["time"]["updated"].as_i64().unwrap_or(0))
+    // Fresh DB rows (upstream semantics) — the boot map was stale after
+    // prompts (M2 finding); load_sessions_wire orders by time_updated DESC.
+    let v = refine_store::load_sessions_wire(&st.db).unwrap_or_else(|e| {
+        tracing::error!("session list read failed: {e:#}");
+        Vec::new()
     });
     Json(v)
 }
@@ -286,10 +351,12 @@ async fn get_session(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    st.sessions
-        .read()
-        .get(&id)
-        .cloned()
+    refine_store::load_session_wire(&st.db, &id)
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("{e:#}"),
+        })?
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))
 }
@@ -373,6 +440,171 @@ fn read_vm_rss_kb() -> u64 {
         .unwrap_or(0)
 }
 
+// ---- M2: session create + sync prompt + message list ----
+
+/// Two-word slug (upstream generates like "stellar-orchid" — entropy from id).
+fn slug_for(id: &str) -> String {
+    const A: &[&str] = &[
+        "stellar", "amber", "quiet", "cobalt", "rapid", "lunar", "vivid", "crisp", "amber", "ivory",
+    ];
+    const B: &[&str] = &[
+        "orchid", "falcon", "meadow", "canyon", "ember", "drift", "quartz", "harbor", "summit",
+        "ripple",
+    ];
+    let h = id
+        .bytes()
+        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+    format!(
+        "{}-{}",
+        A[(h % A.len() as u64) as usize],
+        B[((h >> 16) % B.len() as u64) as usize]
+    )
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// POST /session — create (wire shape from captured fixture: cost, directory,
+/// id, path, projectID, slug, time, title, tokens, version).
+async fn post_session(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    let id = refine_core::ids::ses_id();
+    let now = now_ms();
+    let worktree = st.paths["worktree"].as_str().unwrap_or("/").to_string();
+    let title = body
+        .get("title")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    let info = json!({
+        "id": id,
+        "projectID": "global",
+        "directory": worktree,
+        "path": worktree.trim_start_matches('/'),
+        "slug": slug_for(&id),
+        "title": title,
+        "version": FREEZE_VERSION,
+        "time": {"created": now, "updated": now},
+        "cost": 0,
+        "tokens": {"input": 0, "output": 0, "reasoning": 0,
+                   "cache": {"read": 0, "write": 0}},
+    });
+    refine_store::insert_session(&st.writer, &info).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })?;
+    st.bus.publish(refine_core::event::frame(
+        st.paths["directory"].as_str().unwrap_or("/"),
+        "session.created",
+        json!({"sessionID": id, "info": info}),
+    ));
+    Ok(Json(info))
+}
+
+/// GET /session/{id}/message — [{info, parts}] (captured wrapper shape).
+async fn get_messages(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    if !refine_store::session_exists(&st.db, &id).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })? {
+        return Err(ApiError::not_found(format!("Session not found: {id}")));
+    }
+    let msgs = refine_store::load_messages(&st.db, &id).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })?;
+    let out: Vec<Value> = msgs
+        .into_iter()
+        .map(|(info, parts)| json!({"info": info, "parts": parts}))
+        .collect();
+    Ok(Json(out))
+}
+
+/// POST /session/{id}/message — sync prompt (blocks until stream completes,
+/// returns {info, parts}; captured in testdata/m2/prompt_response.json).
+async fn post_message(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(payload): Json<Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    let agent = payload
+        .get("agent")
+        .and_then(|a| a.as_str())
+        .filter(|a| !a.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| st.llm.default_agent.clone());
+    let system = st
+        .llm
+        .systems
+        .get(&agent)
+        .cloned()
+        .unwrap_or_else(|| crate::BUILD_SYSTEM_BLURB.to_string());
+    let (pid, mid) = match (
+        payload
+            .pointer("/model/providerID")
+            .and_then(|v| v.as_str()),
+        payload.pointer("/model/modelID").and_then(|v| v.as_str()),
+    ) {
+        (Some(p), Some(m)) => (p.to_string(), m.to_string()),
+        _ => st.llm.default_model.clone(),
+    };
+    let (base_url, api_key) = st
+        .llm
+        .endpoints
+        .get(&pid)
+        .cloned()
+        .ok_or_else(|| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            name: "BadRequest",
+            message: format!("no endpoint configured for provider {pid}"),
+        })?;
+    let pricing = st.llm.pricing.get(&(pid.clone(), mid.clone())).copied();
+    let ctx = refine_core::prompt::PromptContext {
+        db: st.db.clone(),
+        blobs: st.blobs.clone(),
+        bus: st.bus.clone(),
+        directory: st.paths["directory"].as_str().unwrap_or("/").to_string(),
+        agent: agent.clone(),
+        system,
+        endpoint: refine_core::prompt::LlmEndpoint {
+            base_url,
+            api_key,
+            pricing,
+        },
+        model_id: mid,
+        provider_id: pid,
+    };
+    let writer = st.writer.clone();
+    let result = refine_core::prompt::run_prompt(&ctx, &writer, &id, &payload)
+        .await
+        .map_err(|e| {
+            let msg = format!("{e:#}");
+            if msg.starts_with("Session not found") {
+                ApiError::not_found(msg)
+            } else {
+                ApiError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    name: "InternalError",
+                    message: msg,
+                }
+            }
+        })?;
+    let (info, parts) = result;
+    Ok(Json(json!({"info": info, "parts": parts})))
+}
+
 /// Freeze-shaped event id: `evt_` + 26 hex chars (upstream ids are time+random
 /// 26-char alphanumerics; ours hash a nanos counter — clients only require
 /// uniqueness, and byte-golden normalizes this span).
@@ -396,24 +628,51 @@ fn evt_id(kind: &str) -> String {
 /// - first frame: server.connected WITHOUT directory/project wrapper
 /// - then 10s JSON heartbeats
 /// - frames wrapped: {"directory":..,"project":..,"payload":..} (except server.connected)
-async fn global_event() -> Response {
+async fn global_event(State(st): State<Arc<AppState>>) -> Response {
     let connected = Event::default().data(
         json!({"payload":{"id":evt_id("connected"),"type":"server.connected","properties":{}}})
             .to_string(),
     );
-    let events = stream::once(async move { Ok::<_, std::convert::Infallible>(connected) })
-        .chain(stream::unfold((), |()| async {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            let ev = Event::default().data(
-                json!({"payload":{"id":evt_id("heartbeat"),"type":"server.heartbeat","properties":{}}})
-                    .to_string(),
-            );
-            Some((Ok(ev), ()))
-        }));
-    // KeepAlive frames disabled: upstream sends no retry/comment keep-alive bytes.
-    let mut resp = Sse::new(events)
-        .keep_alive(KeepAlive::new().text("disabled-until-unreachable"))
-        .into_response();
+    let rx = st.bus.subscribe();
+    // The stream must own a bus clone: if the Router/state were dropped while
+    // a subscriber still streams (oneshot tests), the Sender must survive.
+    let bus_keepalive = st.bus.clone();
+    // Timeout-driven merge: heartbeat at exact 10s cadence regardless of
+    // traffic; bus frames yielded as they arrive; Lagged/Closed ends the
+    // stream (bounded-queue disconnect, PLAN §4).
+    let events = stream::once(async move { Ok::<_, std::convert::Infallible>(connected) }).chain(
+        stream::unfold(
+            (
+                rx,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+                bus_keepalive,
+            ),
+            |(mut rx, mut next_hb, bus)| async move {
+                {
+                    let dur = next_hb.saturating_duration_since(tokio::time::Instant::now());
+                    match tokio::time::timeout(dur.max(Duration::from_millis(1)), rx.recv()).await {
+                        Ok(Ok(frame)) => Some((
+                            Ok(Event::default().data(frame.to_string())),
+                            (rx, next_hb, bus),
+                        )),
+                        Ok(Err(_lagged_or_closed)) => None,
+                        Err(_elapsed) => {
+                            let hb = Event::default().data(
+                                json!({"payload":{"id":evt_id("heartbeat"),
+                                    "type":"server.heartbeat","properties":{}}})
+                                .to_string(),
+                            );
+                            next_hb += Duration::from_secs(10);
+                            Some((Ok(hb), (rx, next_hb, bus)))
+                        }
+                    }
+                }
+            },
+        ),
+    );
+    // No axum KeepAlive: the freeze stream carries zero comment/retry frames
+    // (PLAN §3 byte-golden); the 10s heartbeat payload is the only activity.
+    let mut resp = Sse::new(events).into_response();
     // Freeze header set — axum's defaults differ (no-transform / nosniff / accel).
     let h = resp.headers_mut();
     for (k, v) in sse_expected_headers() {
@@ -480,9 +739,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/path", get(get_path))
         .route("/project", get(get_projects))
         .route("/project/current", get(get_project_current))
-        .route("/session", get(get_sessions))
+        .route("/session", get(get_sessions).post(post_session))
         .route("/session/status", get(session_status))
         .route("/session/{id}", get(get_session))
+        .route(
+            "/session/{id}/message",
+            get(get_messages).post(post_message),
+        )
         .route("/global/event", get(global_event))
         .route("/metrics", get(metrics))
         // TUI-attach probes (captured live; PLAN §2 hit-set expansion)

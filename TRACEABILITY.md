@@ -13,7 +13,7 @@ milestone).
 
 | Req | Requirement | Tests | Status |
 |---|---|---|---|
-| F1 | Drop-in: both frozen clients work unchanged (PLAN §3) | `golden::*`, `replay` 24/24 with 7 declared deferrals (M2/M4), live TUI attach 12 s zero-error run, `auth_metrics::*` | partial — oc-remote device run pending (wire contract validated by replay) |
+| F1 | Drop-in: both frozen clients work unchanged (PLAN §3) | `golden::*`, `replay` 24/24 with 7 declared deferrals (M2/M4), live TUI attach 12 s zero-error run, `auth_metrics::*` | partial — E2E prompt stream works live (5/5 exact, deepseek); oc-remote device run still pending |
 | F2 | Plugin + MCP compatibility (3+3) | — | planned — M4 (TESTING §8) |
 | F3 | Import 20 sessions, original untouched (PLAN §9) | metadata pass live-tested (20 rows, ro+query_only, original untouched); payload streaming + hash equality — M3 | partial |
 | F4 | Pure Rust request path (PLAN §2) | (architecture; no runtime Node/Bun in workspace deps — `cargo tree` audit planned M2) | partial |
@@ -36,7 +36,7 @@ milestone).
 
 | ID | Kill criterion | Tests | Status |
 |---|---|---|---|
-| K-SSE-BYTES | raw SSE frames+headers byte-golden; no `id:`/`retry:`; 10 s heartbeat | `golden::sse_headers_match_freeze`, `golden::sse_first_frame_matches_upstream` | green (headers, first frame, 10 s heartbeat cadence via paused-time `heartbeat_cadence_and_shape`) |
+| K-SSE-BYTES | raw SSE frames+headers byte-golden; no `id:`/`retry:`; 10 s heartbeat | `golden::sse_headers_match_freeze`, `golden::sse_first_frame_matches_upstream` | green (headers, first frame, 10 s heartbeat via paused-time test + live check; durable/sync twin parity 4/2/2 vs capture; bus owns sender → oneshot EOF regression covered) |
 | K-ENVELOPE | P0 route schema/status identical to upstream | `golden::health_bytes_match_upstream`, `golden::notfound_envelope_matches_upstream`, `golden::session_status_bytes_match_upstream`, `refine replay --allow-missing` (3 pass/4 skip/2 data-gap) | partial — grows per M1-M3 route work |
 | K-CRASH | SIGKILL blob/DB protocol: quick_check, zero dangling refs | `crash_fuzz::sigkill_fuzz_blob_db_protocol` (25 iters CI; 1000 nightly per SRE §5) | green |
 | K-CACHE | aggregate page cache ≤32 MB declared+enforced | `cache_fixture` (budget arithmetic, profile asserts) | green |
@@ -44,7 +44,7 @@ milestone).
 | K-VERSION | bundled SQLite ≥3.51.3 at boot | `pragma::tests::version_gate_passes_on_bundled` + `refine doctor` boot gate | green |
 | K-IMPORT | import peak ≤budget; original untouched; hash equality | — | planned — M3 |
 | K-SLOWCLIENT | stall 30 s → disconnect → REST reconcile | — | planned — M2 |
-| K-PROVIDER | 10k chunk-boundary fuzz byte-matches assembled output | — | planned — M2 |
+| K-PROVIDER | recorded streams replay byte-exact; chunk-boundary buffering | `refine_llm` fixture tests (2 recordings), buffered line parser (live 500 → fixed), stress 5/5 exact | green for fixtures; 10k fuzz — M5 nightly |
 | K-MEMORY-24H | 24 h soak: every sample <300 MB, swap 0, slope <1 MB/h | — | planned — M5 |
 
 ## Test design techniques coverage (TESTING §4)

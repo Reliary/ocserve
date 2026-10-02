@@ -13,4 +13,11 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+sha2.workspace = true
+hex.workspace = true
 refine-store.workspace = true
+refine-llm.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

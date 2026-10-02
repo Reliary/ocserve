@@ -133,6 +133,7 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     // Assemble config-derived payloads (fail fast if config unreadable)
     let rt = runtime::Runtime::load()
         .context("load runtime config (opencode.json/auth/models cache)")?;
+    let llm = rt.llm_registry();
     let payloads = refine_http::Payloads {
         config: rt.config,
         agent: rt.agent,
@@ -143,25 +144,23 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
         console: rt.console,
         capabilities: rt.capabilities,
     };
-    let state = AppState::with_payloads(None, payloads);
-    // populate sessions from store (M1: boot snapshot; M2+ live updates)
-    {
-        let db = refine_store::writer::db_path(&data_dir);
-        if db.exists() {
-            match refine_store::load_sessions_wire(&db) {
-                Ok(list) => {
-                    let mut map = state.sessions.write();
-                    for s in &list {
-                        if let Some(id) = s.get("id").and_then(|v| v.as_str()) {
-                            map.insert(id.to_string(), s.clone());
-                        }
-                    }
-                    tracing::info!("loaded {} sessions from store", list.len());
-                }
-                Err(e) => tracing::warn!("session preload failed (continuing): {e:#}"),
-            }
-        }
-    }
+    let db_path = refine_store::writer::db_path(&data_dir);
+    let writer = std::sync::Arc::new(
+        refine_store::Writer::spawn(db_path.clone()).context("spawn store writer")?,
+    );
+    let blobs = std::sync::Arc::new(
+        refine_store::BlobStore::new(data_dir.join("blobs")).context("blob store")?,
+    );
+    let state = AppState::with_wiring(
+        None,
+        payloads,
+        refine_http::Wires {
+            db: db_path,
+            blobs,
+            writer,
+            llm,
+        },
+    );
     let app = refine_http::router(state);
 
     let addr = format!("{hostname}:{port}");
