@@ -1,6 +1,8 @@
 //! refine-importer: streaming read-only import of the N most recent sessions.
 //! Source DB is never opened read-write (PLAN §9 / STORAGE.md §5).
 
+pub mod payload;
+
 use anyhow::{Context, Result};
 use rusqlite::OpenFlags;
 use std::path::Path;
@@ -89,5 +91,20 @@ pub fn import_last_n(source: &Path, data_dir: &Path, limit: u32) -> Result<()> {
     }
     tracing::info!("imported {n} session rows (metadata pass)");
     // Source connection dropped here — still read-only for its whole life.
+
+    // M3 payload phase: messages/parts/events + search_doc (streamed)
+    let stats = payload::import_payloads(source, &db, &ids)?;
+    println!(
+        "payloads: {} messages, {} parts ({} blobbed), {} events, {} search_docs in {}ms; peak RSS {} MB",
+        stats.messages,
+        stats.parts,
+        stats.parts_blobbed,
+        stats.events,
+        stats.search_docs,
+        stats.elapsed_ms,
+        payload::peak_rss_mb()
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "?".into()),
+    );
     Ok(())
 }

@@ -120,30 +120,63 @@ pub fn insert_message(
 }
 
 /// Load history for prompt assembly: (info, parts) ordered by msg.seq.
+/// `limit` = return the LAST n messages ascending (upstream `?limit=` live
+/// contract §1084); None = full history.
 pub fn load_messages(
     db: &std::path::Path,
     session_id: &str,
+    limit: Option<usize>,
 ) -> anyhow::Result<Vec<(serde_json::Value, Vec<serde_json::Value>)>> {
     let conn = pragma::open_reader(db)?;
-    let mut stmt = conn.prepare("SELECT id, info FROM msg WHERE session_id = ?1 ORDER BY seq")?;
-    let msgs: Vec<(String, String)> = stmt
-        .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .filter_map(|r| r.ok())
-        .collect();
+    let mut stmt = match limit {
+        Some(_) => conn.prepare(
+            "SELECT id, info FROM (SELECT id, info, seq FROM msg WHERE session_id = ?1 \
+             ORDER BY seq DESC LIMIT ?2) ORDER BY seq",
+        )?,
+        None => conn.prepare("SELECT id, info FROM msg WHERE session_id = ?1 ORDER BY seq")?,
+    };
+    let msgs: Vec<(String, String)> = match limit {
+        Some(n) => stmt
+            .query_map((session_id, n as i64), |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect(),
+        None => stmt
+            .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect(),
+    };
     let mut out = Vec::new();
+    // Blob-resolving reader: parts above INLINE_PART_MAX live in the blob
+    // store (import + prompt paths both write them); never silently drop.
+    let blobs = crate::blob::BlobStore::new(
+        db.parent()
+            .ok_or_else(|| anyhow::anyhow!("db parent"))?
+            .join("blobs"),
+    )?;
     for (mid, info_txt) in msgs {
         let info: serde_json::Value = serde_json::from_str(&info_txt)?;
-        let mut pstmt =
-            conn.prepare("SELECT inline FROM msg_part WHERE message_id = ?1 ORDER BY seq")?;
-        let parts: Vec<serde_json::Value> = pstmt
-            .query_map([&mid], |r| {
-                let t: Option<String> = r.get(0)?;
-                Ok(t)
-            })?
-            .filter_map(|r| r.ok())
-            .flatten()
-            .filter_map(|t| serde_json::from_str(&t).ok())
-            .collect();
+        let mut pstmt = conn.prepare(
+            "SELECT inline, blob_sha, byte_len FROM msg_part WHERE message_id = ?1 ORDER BY seq",
+        )?;
+        let mut parts: Vec<serde_json::Value> = Vec::new();
+        let mut rows = pstmt.query([&mid])?;
+        while let Some(row) = rows.next()? {
+            let inline: Option<String> = row.get(0)?;
+            let sha: Option<String> = row.get(1)?;
+            let byte_len: i64 = row.get(2)?;
+            let txt = match inline {
+                Some(t) => t,
+                None => match (&sha, byte_len) {
+                    (Some(sha), len) => {
+                        String::from_utf8_lossy(&blobs.get(sha, len as u64)?).into_owned()
+                    }
+                    (None, _) => continue, // corrupt row: no payload at all
+                },
+            };
+            if let Ok(v) = serde_json::from_str(&txt) {
+                parts.push(v);
+            }
+        }
         out.push((info, parts));
     }
     Ok(out)

@@ -279,3 +279,162 @@ async fn heartbeat_cadence_and_shape() {
     );
     assert!(!text.contains("retry:"));
 }
+
+// ---- M3: message paging + experimental session search (TESTING §4) ----
+
+async fn seed_session(st: &refine_http::AppState, sid: &str, n_msgs: usize) {
+    let w = st.writer.clone();
+    let blobs = st.blobs.clone();
+    for i in 0..n_msgs {
+        let info = serde_json::json!({
+            "id": format!("msg_{i:04}"),
+            "sessionID": sid,
+            "role": if i % 2 == 0 { "user" } else { "assistant" },
+            "time": {"created": 1700000000000 + i as i64},
+        });
+        let parts = vec![serde_json::json!({
+            "id": format!("prt_{i:04}"),
+            "sessionID": sid,
+            "messageID": info["id"],
+            "type": "text",
+            "text": format!("line {i}"),
+        })];
+        refine_store::insert_message(&w, Some(&*blobs), sid, &info, &parts).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn message_paging_limit_returns_last_n_ascending() {
+    let st = refine_http::AppState::with_payloads(None, refine_http::Payloads::default());
+    refine_store::insert_session(
+        &st.writer,
+        &serde_json::json!({
+            "id": "ses_page",
+            "projectID": "global",
+            "directory": "/work",
+            "path": "ses_page",
+            "slug": "ses_page",
+            "title": "paging",
+            "version": "1",
+            "time": {"created": 1, "updated": 2},
+        }),
+    )
+    .unwrap();
+    seed_session(&st, "ses_page", 120).await;
+    let app = refine_http::router(st);
+
+    // limit=50 → the LAST 50 messages, ascending (upstream live contract §1084)
+    let req = Request::builder()
+        .uri("/session/ses_page/message?limit=50")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let msgs = v.as_array().unwrap();
+    assert_eq!(msgs.len(), 50, "limit=50 yields 50");
+    assert_eq!(msgs[0]["info"]["id"], "msg_0070", "starts at msg 70");
+    assert_eq!(msgs[49]["info"]["id"], "msg_0119", "ends at last message");
+
+    // no limit → full history
+    let req = Request::builder()
+        .uri("/session/ses_page/message")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 120);
+}
+
+#[tokio::test]
+async fn message_before_param_rejects_like_freeze() {
+    // Freeze fact (§1090): upstream 1.18.31 rejects EVERY `before` value with
+    // Effect HttpApi BadRequest body {"_tag":"BadRequest"} — parity, not a bug.
+    let st = refine_http::AppState::with_payloads(None, refine_http::Payloads::default());
+    refine_store::insert_session(
+        &st.writer,
+        &serde_json::json!({
+            "id": "ses_before",
+            "projectID": "global",
+            "directory": "/work",
+            "path": "ses_before",
+            "slug": "ses_before",
+            "title": "before",
+            "version": "1",
+            "time": {"created": 1, "updated": 2},
+        }),
+    )
+    .unwrap();
+    let app = refine_http::router(st);
+    for q in [
+        "before=anything",
+        "before=0",
+        "before=msg_x",
+        "before=2026-01-01",
+    ] {
+        let req = Request::builder()
+            .uri(format!("/session/ses_before/message?{q}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{q} must 400 like upstream"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            r#"{"_tag":"BadRequest"}"#,
+            "{q} body byte-equal freeze"
+        );
+    }
+}
+
+#[tokio::test]
+async fn experimental_session_search_substring_and_project_keys() {
+    let st = refine_http::AppState::with_payloads(None, refine_http::Payloads::default());
+    for (sid, title) in [
+        ("ses_s1", "OpenCode v1 vs v2 comparison"),
+        ("ses_s2", "unrelated work"),
+    ] {
+        refine_store::insert_session(
+            &st.writer,
+            &serde_json::json!({
+                "id": sid,
+                "projectID": "global",
+                "directory": "/work",
+                "path": sid,
+                "slug": sid,
+                "title": title,
+                "version": "1",
+                "time": {"created": 1, "updated": 2},
+            }),
+        )
+        .unwrap();
+    }
+    let app = refine_http::router(st);
+    let req = Request::builder()
+        .uri("/experimental/session?search=opencode&roots=true&limit=50")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let rows = v.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "case-insensitive substring match");
+    assert_eq!(rows[0]["id"], "ses_s1");
+    assert_eq!(rows[0]["project"]["id"], "global");
+    assert_eq!(rows[0]["project"]["worktree"], "/");
+    // oc-remote: "not a content search" — message text must NOT match
+    let req = Request::builder()
+        .uri("/experimental/session?search=zzznomatchxyz")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(bytes.as_ref(), b"[]", "no match → empty array");
+}

@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -63,6 +63,7 @@ CREATE TABLE msg_part (
 ) STRICT;
 
 CREATE INDEX idx_part_msg ON msg_part(message_id, seq);
+CREATE INDEX idx_part_session ON msg_part(session_id, seq);
 
 -- bounded event ring (never RAM; never unbounded: PLAN §5)
 CREATE TABLE event (
@@ -170,6 +171,13 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         2 => {
             migrate_message_tables(conn)?;
         }
+        3 => {
+            // v3→v4: session-scoped part index (M3 latency gate: count(*) on
+            // the 16k-msg session was an 86ms table scan without it).
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_part_session ON msg_part(session_id, seq);",
+            )?;
+        }
         other => {
             bail!(
                 "database schema version {other} != expected {SCHEMA_VERSION}; \
@@ -237,7 +245,8 @@ fn migrate_message_tables(conn: &Connection) -> Result<()> {
             inline TEXT,
             blob_sha TEXT
         ) STRICT;
-        CREATE INDEX idx_part_msg ON msg_part(message_id, seq);",
+        CREATE INDEX idx_part_msg ON msg_part(message_id, seq);
+CREATE INDEX idx_part_session ON msg_part(session_id, seq);",
     )?;
     Ok(())
 }

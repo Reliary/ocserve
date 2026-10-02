@@ -54,6 +54,39 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Handler error: normal envelopes + Effect HttpApi tagged decode errors
+/// (freeze parity: `?before=` → body exactly {"_tag":"BadRequest"} §1090).
+pub enum HttpError {
+    Api(ApiError),
+    Tagged {
+        status: StatusCode,
+        tag: &'static str,
+    },
+}
+
+impl From<ApiError> for HttpError {
+    fn from(e: ApiError) -> Self {
+        HttpError::Api(e)
+    }
+}
+
+impl IntoResponse for HttpError {
+    fn into_response(self) -> Response {
+        match self {
+            HttpError::Api(e) => e.into_response(),
+            HttpError::Tagged { status, tag } => {
+                let body = format!("{{\"_tag\":\"{tag}\"}}");
+                (
+                    status,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+                    .into_response()
+            }
+        }
+    }
+}
+
 /// App state shared by handlers.
 pub struct AppState {
     /// Static config payload served at GET /config (recorded corpus).
@@ -323,6 +356,37 @@ async fn project_directories() -> Json<Value> {
     Json(json!([]))
 }
 
+/// GET /experimental/session?search=&roots=&limit= — session title search
+/// (oc-remote searchSessions: "not a content search"); rows = list wire shape
+/// + embedded project {id, worktree} (observed contract, manifest keys mode).
+async fn get_experimental_sessions(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
+    let mut v = refine_store::load_sessions_wire(&st.db).unwrap_or_else(|e| {
+        tracing::error!("session list read failed: {e:#}");
+        Vec::new()
+    });
+    if let Some(search) = q.get("search").filter(|s| !s.is_empty()) {
+        let needle = search.to_lowercase();
+        v.retain(|s| {
+            s["title"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains(&needle)
+        });
+    }
+    if let Some(limit) = q.get("limit").and_then(|l| l.parse::<usize>().ok()) {
+        v.truncate(limit);
+    }
+    // roots=true is implicit: our store holds root sessions only (M3 scope).
+    for row in &mut v {
+        row["project"] = json!({"id": "global", "worktree": "/"});
+    }
+    Json(Value::Array(v))
+}
+
 /// POST /permission/{id}/reply — {reply: once|always|reject} (oc-remote contract).
 async fn post_permission_reply(
     State(st): State<Arc<AppState>>,
@@ -539,24 +603,34 @@ async fn post_session(
 async fn get_messages(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<impl IntoResponse, ApiError> {
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<impl IntoResponse, HttpError> {
+    // freeze parity: upstream rejects EVERY `before` value (§1090) with the
+    // Effect HttpApi tagged body — not a divergence, a recorded fact.
+    if q.contains_key("before") {
+        return Err(HttpError::Tagged {
+            status: StatusCode::BAD_REQUEST,
+            tag: "BadRequest",
+        });
+    }
     if !refine_store::session_exists(&st.db, &id).map_err(|e| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         name: "InternalError",
         message: format!("{e:#}"),
     })? {
-        return Err(ApiError::not_found(format!("Session not found: {id}")));
+        return Err(ApiError::not_found(format!("Session not found: {id}")).into());
     }
-    let msgs = refine_store::load_messages(&st.db, &id).map_err(|e| ApiError {
+    let limit: Option<usize> = q.get("limit").and_then(|l| l.parse::<usize>().ok());
+    let msgs = refine_store::load_messages(&st.db, &id, limit).map_err(|e| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         name: "InternalError",
         message: format!("{e:#}"),
     })?;
-    let out: Vec<Value> = msgs
+    let arr: Vec<serde_json::Value> = msgs
         .into_iter()
         .map(|(info, parts)| json!({"info": info, "parts": parts}))
         .collect();
-    Ok(Json(out))
+    Ok(Json(serde_json::Value::Array(arr)))
 }
 
 /// POST /session/{id}/message — sync prompt (blocks until stream completes,
@@ -806,6 +880,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/lsp", get(lsp_list))
         .route("/project/{id}/directories", get(project_directories))
         .route("/vcs", get(vcs_info))
+        .route("/experimental/session", get(get_experimental_sessions))
         .route("/permission", get(get_permissions))
         .route(
             "/permission/{id}/reply",

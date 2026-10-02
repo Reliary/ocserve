@@ -48,6 +48,10 @@ milestone).
 | K-TOOLLOOP | multi-step: stream→tool→execute→next turn→final; structure = upstream capture | live E2E ×3 (TOOL_OK/M2B_OK/final DONE), message chain matches tool_fixture (user→tool-calls→stop) | green |
 | K-PERM | ask event → client reply → gate → execute; timeout → deny + map cleanup | live flow (ask→reply 200→file written→DONE), 300s-timeout cleanup fix, pending-list session filter | green; permission id prefix evt_ (upstream prefix unverified — noted) |
 | K-TRUNC | tool output ≤50KB/2000 lines; bash timeout bounded | `refine-tools` truncation_bounds + bash_timeout_enforced (124, <5s) | green |
+| K-IMPORT | streamed payload import: counts parity, byte-equal parts, blob spill >8KB, event verbatim, FTS rebuild; peak RSS <300MB | `import_counts_byte_parity_and_blob_spill` (synthetic source, byte+FTS asserts); live run: 36k msgs/123k parts/461k events/85s, VmHWM **102 MB**, parity 200/200, freelist 0% | green |
+| K-PAGE | `?limit=` last-N ascending; `?before=` → 400 {"_tag":"BadRequest"} byte-exact (upstream rejects all values §1090) | `message_paging_limit_returns_last_n_ascending`, `message_before_param_rejects_like_freeze` (red→green TDD); live big-session: limit=50 **12.6ms**, no-limit 93.2MB in **787ms** (upstream same session single-run 17.7s — parity, unpaired) | green |
+| K-SEARCH | GET /experimental/session substring-on-title + project embed; "not a content search" | `experimental_session_search_substring_and_project_keys` (incl. non-match = []); manifest keys golden (30 keys) | green |
+| K-LATENCY | query gates: count/session/page on16k-msg session | idx_part_session (v4) 86ms→**0.4ms** covering-index plan asserted live; session list p95 2.3ms, metrics p95 4.4ms | green |
 | K-MEMORY-24H | 24 h soak: every sample <300 MB, swap 0, slope <1 MB/h | — | planned — M5 |
 
 ## Test design techniques coverage (TESTING §4)

@@ -232,7 +232,7 @@ pub async fn run_prompt(
     );
 
     // ---- provider context ----
-    let history = refine_store::load_messages(&ctx.db, session_id)?;
+    let history = refine_store::load_messages(&ctx.db, session_id, None)?;
     let mut messages = vec![ChatMessage::text("system", ctx.system.clone())];
     messages.extend(to_provider_messages(&history));
     let tools = refine_tools::schemas();
