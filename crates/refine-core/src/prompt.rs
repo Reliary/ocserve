@@ -259,7 +259,7 @@ pub async fn run_prompt_with(
         "time": {"created": t_created},
         "summary": {"diffs": []},
         "agent": agent,
-        "model": {"providerID": model, "modelID": model},
+        "model": {"providerID": ctx.provider_id, "modelID": model},
     });
     if opts.persist_user {
         insert_message(
