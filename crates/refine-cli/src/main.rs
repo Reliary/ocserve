@@ -25,6 +25,14 @@ enum Cmd {
         #[arg(long)]
         data_dir: Option<std::path::PathBuf>,
     },
+    /// Online backup: VACUUM INTO a fresh file (STORAGE §5 / cutover drill)
+    Backup {
+        /// Destination file (must not exist)
+        #[arg(long)]
+        dest: std::path::PathBuf,
+        #[arg(long)]
+        data_dir: Option<std::path::PathBuf>,
+    },
     /// Boot self-checks: versions, pragmas, FTS, disk, config (SRE.md §1)
     Doctor {
         #[arg(long)]
@@ -86,6 +94,16 @@ fn main() -> Result<()> {
             data_dir.unwrap_or_else(default_data_dir),
         )),
         Cmd::Doctor { data_dir } => doctor(data_dir.unwrap_or_else(default_data_dir)),
+        Cmd::Backup { dest, data_dir } => {
+            let dir = data_dir.unwrap_or_else(default_data_dir);
+            let db = refine_store::writer::db_path(&dir);
+            // drill finding: VACUUM INTO on a READ_ONLY handle fails (SQLITE_READONLY);
+            // open a writer conn (WAL + busy_timeout make this safe alongside a live server)
+            let conn = refine_store::pragma::open_writer(&db)?;
+            refine_store::backup_to(&conn, &dest)?;
+            println!("backup: {} → {}", db.display(), dest.display());
+            Ok(())
+        }
         Cmd::Import {
             source,
             limit,

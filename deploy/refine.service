@@ -1,0 +1,30 @@
+# refine — systemd user unit (SRE.md §5 / MEMORY.md sidecar boundary).
+# Install: cp deploy/refine.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now refine
+[Unit]
+Description=refine (opencode-compatible server, freeze 1.18.31)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/src/refine/target/release/refine serve --port 4912
+WorkingDirectory=%h/src/refine
+Environment=REFINE_DATA_DIR=%h/.local/share/refine
+Environment=RUST_LOG=refine=info
+Environment=MIMALLOC_PURGE_DELAY=500
+Environment=MIMALLOC_ARENA_EAGER_COMMIT=0
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+# Combined cgroup budget: refine ≤300MB + node plugin sidecar ≤160MB (both
+# measured — MEMORY.md provenance note) + headroom. Children share this
+# cgroup, so MemoryMax must cover the sidecar or systemd OOM-kills plugins.
+MemoryMax=480M
+MemorySwapMax=0
+ProtectSystem=strict
+ReadWritePaths=%h/.local/share/refine %h/.local/share/opencode %h/.cache/opencode %h/.config/opencode %h/src/reliary8
+NoNewPrivileges=true
+PrivateTmp=false
+
+[Install]
+WantedBy=default.target
