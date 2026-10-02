@@ -1,0 +1,69 @@
+{
+ "info": {
+  "parentID": "msg_0fa1e3f770014jHIfQNh0Lhiu3",
+  "role": "assistant",
+  "mode": "plan",
+  "agent": "plan",
+  "path": {
+   "cwd": "~",
+   "root": "/"
+  },
+  "cost": 0.003958926,
+  "tokens": {
+   "total": 28125,
+   "input": 26325,
+   "output": 8,
+   "reasoning": 0,
+   "cache": {
+    "write": 0,
+    "read": 1792
+   }
+  },
+  "modelID": "deepseek-v4-flash",
+  "providerID": "opencode-go",
+  "time": {
+   "created": 1790902681650,
+   "completed": 1790902684512
+  },
+  "finish": "stop",
+  "id": "msg_0fa1e40320021uzxinLPieHWUJ",
+  "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD"
+ },
+ "parts": [
+  {
+   "type": "step-start",
+   "id": "prt_0fa1e4b11001nq7GD4aaMgEhbd",
+   "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+   "messageID": "msg_0fa1e40320021uzxinLPieHWUJ"
+  },
+  {
+   "type": "text",
+   "text": "HELLO_REFINE",
+   "time": {
+    "start": 1790902684453,
+    "end": 1790902684460
+   },
+   "id": "prt_0fa1e4b25001wzf7iBoGuNGm2E",
+   "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+   "messageID": "msg_0fa1e40320021uzxinLPieHWUJ"
+  },
+  {
+   "reason": "stop",
+   "type": "step-finish",
+   "tokens": {
+    "total": 28125,
+    "input": 26325,
+    "output": 8,
+    "reasoning": 0,
+    "cache": {
+     "write": 0,
+     "read": 1792
+    }
+   },
+   "cost": 0.003958926,
+   "id": "prt_0fa1e4b300016vTkLM1ca17Ary",
+   "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+   "messageID": "msg_0fa1e40320021uzxinLPieHWUJ"
+  }
+ ]
+}

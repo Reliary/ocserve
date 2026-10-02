@@ -1,0 +1,123 @@
+{
+ "session": {
+  "id": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+  "slug": "stellar-orchid",
+  "projectID": "global",
+  "directory": "~",
+  "path": "home/USER",
+  "cost": 0,
+  "tokens": {
+   "input": 0,
+   "output": 0,
+   "reasoning": 0,
+   "cache": {
+    "read": 0,
+    "write": 0
+   }
+  },
+  "title": "refine-contract-probe",
+  "version": "1.18.31",
+  "time": {
+   "created": 1790902617070,
+   "updated": 1790902617070
+  }
+ },
+ "messages": [
+  {
+   "info": {
+    "id": "msg_0fa1e3f770014jHIfQNh0Lhiu3",
+    "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+    "role": "user",
+    "time": {
+     "created": 1790902681463
+    },
+    "summary": {
+     "diffs": []
+    },
+    "agent": "plan",
+    "model": {
+     "providerID": "opencode-go",
+     "modelID": "deepseek-v4-flash"
+    }
+   },
+   "parts": [
+    {
+     "id": "prt_0fa1e3f83001JiHmClmYNlen2r",
+     "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+     "messageID": "msg_0fa1e3f770014jHIfQNh0Lhiu3",
+     "type": "text",
+     "text": "Reply with exactly: HELLO_REFINE"
+    }
+   ]
+  },
+  {
+   "info": {
+    "id": "msg_0fa1e40320021uzxinLPieHWUJ",
+    "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+    "role": "assistant",
+    "time": {
+     "created": 1790902681650,
+     "completed": 1790902684512
+    },
+    "parentID": "msg_0fa1e3f770014jHIfQNh0Lhiu3",
+    "modelID": "deepseek-v4-flash",
+    "providerID": "opencode-go",
+    "mode": "plan",
+    "agent": "plan",
+    "path": {
+     "cwd": "~",
+     "root": "/"
+    },
+    "cost": 0.003958926,
+    "tokens": {
+     "total": 28125,
+     "input": 26325,
+     "output": 8,
+     "reasoning": 0,
+     "cache": {
+      "read": 1792,
+      "write": 0
+     }
+    },
+    "finish": "stop"
+   },
+   "parts": [
+    {
+     "id": "prt_0fa1e4b11001nq7GD4aaMgEhbd",
+     "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+     "messageID": "msg_0fa1e40320021uzxinLPieHWUJ",
+     "type": "step-start"
+    },
+    {
+     "id": "prt_0fa1e4b25001wzf7iBoGuNGm2E",
+     "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+     "messageID": "msg_0fa1e40320021uzxinLPieHWUJ",
+     "type": "text",
+     "text": "HELLO_REFINE",
+     "time": {
+      "start": 1790902684453,
+      "end": 1790902684460
+     }
+    },
+    {
+     "id": "prt_0fa1e4b300016vTkLM1ca17Ary",
+     "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+     "messageID": "msg_0fa1e40320021uzxinLPieHWUJ",
+     "type": "step-finish",
+     "reason": "stop",
+     "cost": 0.003958926,
+     "tokens": {
+      "total": 28125,
+      "input": 26325,
+      "output": 8,
+      "reasoning": 0,
+      "cache": {
+       "read": 1792,
+       "write": 0
+      }
+     }
+    }
+   ]
+  }
+ ]
+}
