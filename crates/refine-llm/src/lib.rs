@@ -306,14 +306,22 @@ impl Client {
         messages: &[ChatMessage],
         max_tokens: Option<u32>,
         tools: Option<&[Value]>,
+        session_id: Option<&str>,
     ) -> Result<futures_util::stream::BoxStream<'static, Result<StreamEvent>>> {
         let body = build_request(model, messages, max_tokens, tools);
-        let resp = self
+        let mut req = self
             .http
             .post(format!("{}/chat/completions", self.base_url))
             .bearer_auth(&self.api_key)
             .header("content-type", "application/json")
-            .header("accept", "text/event-stream")
+            .header("accept", "text/event-stream");
+        // opencode-go gateway requires it for routing (live 400:
+        // MissingSessionID — user's oc-remote send hit this 2026-10-02);
+        // direct providers ignore unknown headers.
+        if let Some(sid) = session_id {
+            req = req.header("x-opencode-session", sid);
+        }
+        let resp = req
             .body(serde_json::to_vec(&body)?)
             .send()
             .await
@@ -379,6 +387,82 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// x-opencode-session must ride on provider requests when a session is
+    /// known (opencode-go gateway 400s MissingSessionID without it — the
+    /// user's oc-remote send hit exactly this on 2026-10-02; live-verified
+    /// HDR_OK after the fix, this test pins the wire bytes).
+    #[tokio::test]
+    async fn chat_stream_sends_session_header_when_provided() {
+        use tokio::io::AsyncReadExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut got = String::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                got.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if got.contains("\r\n\r\n") || n == 0 {
+                    break;
+                }
+            }
+            let _ = tx.send(got);
+            // close without a response: chat_stream errors AFTER the request
+            // bytes (with headers) are on the wire — that's the assertion point
+        });
+        let client = Client::new(format!("http://{addr}"), "key");
+        let msgs = vec![ChatMessage::text("user", "hi")];
+        let _ = client
+            .chat_stream("m", &msgs, None, None, Some("ses_hdr_test"))
+            .await;
+        let req = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("captured request")
+            .unwrap();
+        let lower = req.to_ascii_lowercase();
+        assert!(
+            lower.contains("x-opencode-session: ses_hdr_test"),
+            "session header missing from request head:\n{req}"
+        );
+        // Authorization still present alongside it
+        assert!(lower.contains("authorization: bearer"), "auth header gone");
+    }
+
+    /// Absent session → header absent (direct providers see no change).
+    #[tokio::test]
+    async fn chat_stream_omits_session_header_when_none() {
+        use tokio::io::AsyncReadExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut got = String::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                got.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if got.contains("\r\n\r\n") || n == 0 {
+                    break;
+                }
+            }
+            let _ = tx.send(got);
+        });
+        let client = Client::new(format!("http://{addr}"), "key");
+        let msgs = vec![ChatMessage::text("user", "hi")];
+        let _ = client.chat_stream("m", &msgs, None, None, None).await;
+        let req = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("captured request")
+            .unwrap();
+        assert!(
+            !req.to_ascii_lowercase().contains("x-opencode-session"),
+            "header must be omitted when no session: {req}"
+        );
+    }
 
     const STOP_FIXTURE: &[u8] = include_bytes!("../../../testdata/m2/llm_stream_stop.bin");
     const REASONING_FIXTURE: &[u8] = include_bytes!("../../../testdata/m2/llm_stream_deepseek.bin");

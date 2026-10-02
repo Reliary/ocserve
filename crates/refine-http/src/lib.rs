@@ -56,6 +56,8 @@ impl IntoResponse for ApiError {
 
 /// Handler error: normal envelopes + Effect HttpApi tagged decode errors
 /// (freeze parity: `?before=` → body exactly {"_tag":"BadRequest"} §1090).
+pub mod sync;
+
 pub enum HttpError {
     Api(ApiError),
     Tagged {

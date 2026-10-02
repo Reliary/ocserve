@@ -147,3 +147,8 @@ from `reliary8/.../schema.rs:45-52`).
 5. SIGKILL fuzz (blob/DB protocol) ×1000 iterations: boot clean, no dangling refs.
 6. Backup/restore drill green.
 7. Import fixture (incl. 122 MB row): peak RSS < 300 MB, canonical hash equality.
+
+## Schema versions (continued)
+- **v6**: `import_sync(session_id TEXT PRIMARY KEY, cursor TEXT, last_sync_ms INT)` — legacy-delta
+  sync state (dev bridge; plan §17). Migrations run as a step loop (v1-v2 chains no longer
+  skip intermediate DDL — fixed with v6).

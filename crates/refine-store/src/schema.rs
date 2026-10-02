@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -102,6 +102,14 @@ CREATE TABLE todo (
 CREATE INDEX idx_todo_session ON todo(session_id);
 
 -- FTS5 external-content projection, MAIN DB only (STORAGE.md §1 — ATTACH impossible)
+-- legacy-delta sync state (dev bridge: legacy -> refine additive pulls;
+-- dropped relevance once the final migration lands — PLAN §17)
+CREATE TABLE import_sync (
+    session_id TEXT PRIMARY KEY,
+    cursor TEXT,
+    last_sync_ms INTEGER NOT NULL DEFAULT 0
+) STRICT;
+
 CREATE TABLE search_doc (
     id      INTEGER PRIMARY KEY,
     title   TEXT NOT NULL DEFAULT '',
@@ -147,14 +155,26 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     if ver == SCHEMA_VERSION {
         return Ok(());
     }
-    match ver {
-        0 => {
-            conn.execute_batch(DDL)?;
+    // Step loop (fixes a latent flaw: the old one-shot match stamped
+    // user_version = SCHEMA even when intermediate arms were skipped, so a
+    // v1/v2 database would silently miss later steps' DDL). Fresh DBs (0)
+    // get the current DDL and jump straight to SCHEMA_VERSION; every other
+    // version advances exactly one step per pass.
+    loop {
+        let ver: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if ver == SCHEMA_VERSION {
+            break;
         }
-        1 => {
-            // v1→v2: session list fields (PLAN F1 — TUI/oc-remote list shape).
-            conn.execute_batch(
-                "ALTER TABLE session ADD COLUMN path TEXT NOT NULL DEFAULT '';
+        match ver {
+            0 => {
+                conn.execute_batch(DDL)?;
+                conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                break;
+            }
+            1 => {
+                // v1→v2: session list fields (PLAN F1 — TUI/oc-remote list shape).
+                conn.execute_batch(
+                    "ALTER TABLE session ADD COLUMN path TEXT NOT NULL DEFAULT '';
                  ALTER TABLE session ADD COLUMN agent TEXT;
                  ALTER TABLE session ADD COLUMN model TEXT;
                  ALTER TABLE session ADD COLUMN cost REAL NOT NULL DEFAULT 0;
@@ -166,34 +186,46 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                  ALTER TABLE session ADD COLUMN tokens_reasoning INTEGER NOT NULL DEFAULT 0;
                  ALTER TABLE session ADD COLUMN tokens_cache_read INTEGER NOT NULL DEFAULT 0;
                  ALTER TABLE session ADD COLUMN tokens_cache_write INTEGER NOT NULL DEFAULT 0;",
-            )?;
-            migrate_message_tables(conn)?;
+                )?;
+                migrate_message_tables(conn)?;
+            }
+            2 => {
+                migrate_message_tables(conn)?;
+            }
+            3 => {
+                // v3→v4: session-scoped part index (M3 latency gate: count(*) on
+                // the 16k-msg session was an 86ms table scan without it).
+                conn.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS idx_part_session ON msg_part(session_id, seq);",
+                )?;
+            }
+            4 => {
+                // v4→v5: cursor-paging window index (session_id, time_created, id)
+                // — tuple-ordered before/limit pages without scanning the session.
+                conn.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS idx_msg_page ON msg(session_id, time_created, id);",
+                )?;
+            }
+            5 => {
+                // v5→v6: legacy-delta sync state (additive bridge; see sync.rs)
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS import_sync (
+                    session_id TEXT PRIMARY KEY,
+                    cursor TEXT,
+                    last_sync_ms INTEGER NOT NULL DEFAULT 0
+                ) STRICT;",
+                )?;
+            }
+            other => {
+                bail!(
+                    "database schema version {other} out of step for {SCHEMA_VERSION}; \
+                 refuse to touch it (upgrade path runs through migrations)"
+                );
+            }
         }
-        2 => {
-            migrate_message_tables(conn)?;
-        }
-        3 => {
-            // v3→v4: session-scoped part index (M3 latency gate: count(*) on
-            // the 16k-msg session was an 86ms table scan without it).
-            conn.execute_batch(
-                "CREATE INDEX IF NOT EXISTS idx_part_session ON msg_part(session_id, seq);",
-            )?;
-        }
-        4 => {
-            // v4→v5: cursor-paging window index (session_id, time_created, id)
-            // — tuple-ordered before/limit pages without scanning the session.
-            conn.execute_batch(
-                "CREATE INDEX IF NOT EXISTS idx_msg_page ON msg(session_id, time_created, id);",
-            )?;
-        }
-        other => {
-            bail!(
-                "database schema version {other} != expected {SCHEMA_VERSION}; \
-                 refuse to touch it (upgrade path runs through `refine import`/migrations)"
-            );
-        }
+        let now: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        conn.pragma_update(None, "user_version", now + 1)?;
     }
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
 

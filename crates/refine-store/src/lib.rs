@@ -236,14 +236,17 @@ pub fn for_each_message_json(
     let msgs: Vec<(String, String)> = match walk {
         MessageWalk::Window(w) => w,
         MessageWalk::Seq { limit } => {
+            // (time_created, id) — same tuple as cursor pages; merged
+            // legacy/refine timelines stay chronological (seq = write-order
+            // bookkeeping only; sync appends older-by-time rows later)
             let mut stmt = match limit {
                 Some(_) => conn.prepare(
-                    "SELECT id, info FROM (SELECT id, info, seq FROM msg WHERE session_id = ?1 \
-                     ORDER BY seq DESC LIMIT ?2) ORDER BY seq",
+                    "SELECT id, info FROM (SELECT id, info, time_created FROM msg WHERE session_id = ?1 \
+                     ORDER BY time_created DESC, id DESC LIMIT ?2) ORDER BY time_created, id",
                 )?,
-                None => {
-                    conn.prepare("SELECT id, info FROM msg WHERE session_id = ?1 ORDER BY seq")?
-                }
+                None => conn.prepare(
+                    "SELECT id, info FROM msg WHERE session_id = ?1 ORDER BY time_created, id",
+                )?,
             };
             match limit {
                 Some(n) => stmt
@@ -766,6 +769,119 @@ pub fn finalize_session_prompt(
             stats.time_updated.into(),
         ],
     }])
+}
+
+/// Read-only opener for the LEGACY opencode database (delta sync source).
+/// Deliberately NOT `pragma::open_reader`: that applies our connection
+/// profile — this touches nothing but busy_timeout, and only because
+/// READ_ONLY flags make every write attempt fail anyway. Never write here.
+pub fn open_legacy_ro(path: &std::path::Path) -> anyhow::Result<rusqlite::Connection> {
+    use anyhow::Context as _;
+    let uri = format!(
+        "file:{}?mode=ro",
+        path.to_str()
+            .context("legacy path utf-8")?
+            .replace('?', "%3f")
+    );
+    let conn = rusqlite::Connection::open_with_flags(
+        &uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_URI | rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .context("open legacy read-only")?;
+    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+    Ok(conn)
+}
+
+/// One legacy message with its parts (legacy row shapes; `data` verbatim).
+pub struct LegacyMsg {
+    pub id: String,
+    pub time_created: i64,
+    pub data: String,
+    pub parts: Vec<LegacyPart>,
+}
+
+pub struct LegacyPart {
+    pub id: String,
+    pub time_created: i64,
+    pub data: String,
+}
+
+/// Pull messages NEWER than the tuple cursor from the legacy DB, ordered
+/// (time_created, id) ASC — upstream's own `message_session_time_created_id_idx`
+/// seeks this; parts via `part_message_id_id_idx`. `cap` bounds one tick;
+/// `has_more` (cap+1 probe) tells the caller to keep the cursor and continue
+/// next tick. Tuple semantics match encode/decode_cursor (time, id).
+pub fn pull_legacy_delta(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    cursor: Option<(&str, i64)>,
+    cap: u64,
+) -> anyhow::Result<(Vec<LegacyMsg>, bool)> {
+    let mut msgs: Vec<LegacyMsg> = match cursor {
+        Some((cid, ctime)) => {
+            let mut stmt = conn.prepare(
+                "SELECT id, time_created, data FROM message \
+                 WHERE session_id = ?1 AND (time_created > ?2 OR (time_created = ?2 AND id > ?3)) \
+                 ORDER BY time_created, id LIMIT ?4",
+            )?;
+            stmt.query_map((session_id, ctime, cid, cap as i64 + 1), row_to_legacy)?
+                .filter_map(|r| r.ok())
+                .collect()
+        }
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT id, time_created, data FROM message \
+                 WHERE session_id = ?1 ORDER BY time_created, id LIMIT ?2",
+            )?;
+            stmt.query_map((session_id, cap as i64 + 1), row_to_legacy)?
+                .filter_map(|r| r.ok())
+                .collect()
+        }
+    };
+    let has_more = msgs.len() as u64 > cap;
+    if has_more {
+        msgs.truncate(cap as usize);
+    }
+    // parts for the window (one IN query; index-proven EXPLAIN in plan)
+    if !msgs.is_empty() {
+        let ph = (0..msgs.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT message_id, id, time_created, data FROM part \
+             WHERE message_id IN ({ph}) ORDER BY message_id, time_created, id"
+        ))?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(msgs.len());
+        for m in &msgs {
+            params.push(&m.id);
+        }
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                LegacyPart {
+                    id: r.get(1)?,
+                    time_created: r.get(2)?,
+                    data: r.get(3)?,
+                },
+            ))
+        })?;
+        for row in rows.flatten() {
+            if let Some(m) = msgs.iter_mut().find(|m| m.id == row.0) {
+                m.parts.push(row.1);
+            }
+        }
+    }
+    Ok((msgs, has_more))
+}
+
+fn row_to_legacy(r: &rusqlite::Row<'_>) -> rusqlite::Result<LegacyMsg> {
+    Ok(LegacyMsg {
+        id: r.get(0)?,
+        time_created: r.get(1)?,
+        data: r.get(2)?,
+        parts: Vec::new(),
+    })
 }
 
 /// Count of session rows (sampler gauge; cheap integer scan).

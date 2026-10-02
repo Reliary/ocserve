@@ -1241,13 +1241,23 @@ async fn shell_runs_direct_and_records_messages() {
     let msgs = body_json(resp).await;
     let arr = msgs.as_array().unwrap();
     assert_eq!(arr.len(), 2);
+    // Full-history order is upstream's canonical (time_created, id) tuple
+    // (message-v2.ts older() helper): same-ms ties order by id, NOT
+    // insertion — locate by role/content instead of index.
+    let user = arr
+        .iter()
+        .find(|m| m["info"]["role"] == "user")
+        .expect("synthetic user message");
+    let asst = arr
+        .iter()
+        .find(|m| m["info"]["role"] == "assistant")
+        .expect("assistant message");
     assert_eq!(
-        arr[0]["parts"][0]["text"],
+        user["parts"][0]["text"],
         "The following tool was executed by the user"
     );
-    assert_eq!(arr[0]["parts"][0]["synthetic"], true);
-    assert_eq!(arr[1]["parts"][0]["tool"], "bash");
-    assert_eq!(arr[1]["info"]["role"], "assistant");
+    assert_eq!(user["parts"][0]["synthetic"], true);
+    assert_eq!(asst["parts"][0]["tool"], "bash");
     assert_eq!(
         arr[1]["info"]["cost"].as_f64(),
         Some(0.0),

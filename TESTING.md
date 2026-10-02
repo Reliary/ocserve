@@ -32,6 +32,12 @@ traceable test, every test has a traceable requirement.
    | happy-path-only state cleanup (abort leaked `prompt_locks`; permission asks leaked on abort) | RAII `LockRelease` / `PendingGuard` — cleanup lives in `Drop`, never after an `.await` | `abort_releases_prompt_locks_and_tasks`, `dropping_pending_guard_clears_entries` |
    | provider hang → permanent busy + stuck lock queue | stall watchdog covers open AND read phases (`REFINE_PROVIDER_STALL_SECS`, default 120s) | `silent_provider_fails_within_stall_budget_and_releases_state` (1s budget, own binary) |
 
+   **Named divergences (K-SYNC bridge):** legacy-delta sync is *additive-only* — upstream
+   message/part **edits and deletes are not pulled** (rare in v1; a legacy edit after sync
+   shows as the original in refine). Legacy **wins** title/time_updated for imported sessions
+   (a rename done in refine is overwritten on the next tick). Both are accepted trade-offs for
+   a development bridge that dies at final migration.
+
 ## 2. Test basis and artifacts
 
 | Artifact | Content | Owner/review |

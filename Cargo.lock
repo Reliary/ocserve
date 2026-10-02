@@ -1141,6 +1141,7 @@ dependencies = [
  "refine-store",
  "refine-tools",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

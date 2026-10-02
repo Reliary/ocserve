@@ -205,6 +205,46 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     );
     let _ = state.mcp.set(std::sync::Arc::new(hub));
 
+    // Legacy→refine delta sync (development bridge; kill switch
+    // REFINE_LEGACY_SYNC=0). 60s cadence after a 5s settle, fail-soft: any
+    // source error logs + counts, the task never dies.
+    if refine_http::sync::sync_enabled() {
+        let st = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                match refine_http::sync::sync_tick(&st) {
+                    Ok(s) => {
+                        if s.messages > 0 || s.backlog {
+                            tracing::info!(
+                                "legacy sync: {} messages, {} parts, {} sessions, backlog={}",
+                                s.messages,
+                                s.parts,
+                                s.sessions,
+                                s.backlog
+                            );
+                        }
+                        refine_metrics::counter("refine_sync_messages_total", s.messages);
+                        refine_metrics::gauge(
+                            "refine_sync_last_epoch_seconds",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0),
+                        );
+                    }
+                    Err(e) => {
+                        refine_metrics::counter("refine_sync_errors_total", 1);
+                        tracing::warn!("legacy sync tick failed: {e:#}");
+                    }
+                }
+            }
+        });
+    }
+
     // SRE §2 sampler (15s): rss/peak, wal, queue, sidecar + lifecycle gauges
     // (antagonism W3: transient maps MUST be watchable — leak-audit test
     // covers CI, this covers the live soak) + bounded storage maintenance.

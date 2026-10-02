@@ -319,7 +319,7 @@ pub async fn run_prompt(
         // stage must fail, never hang busy (A3).
         let mut stream = match tokio::time::timeout(
             provider_stall(),
-            client.chat_stream(&model, &messages, None, Some(&tools)),
+            client.chat_stream(&model, &messages, None, Some(&tools), Some(session_id)),
         )
         .await
         {

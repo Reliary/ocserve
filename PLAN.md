@@ -349,6 +349,21 @@ byte-golden capture of live `/global/event`; contentless-FTS retest under bundle
 Live 33 GB DB reclaim while refine is built: `VACUUM` (~21 GB back), rotate 577 MB logs, WAL
 checkpoint, raise `cache_size`, `swappiness` 150 → 10. Optional; not part of refine.
 
+## 16.5. Client behavior discovered in the field (2026-10-02, oc-remote)
+
+**Cross-server SSE fusion**: `OpenCodeConnectionService` keeps an SSE connection to
+**every saved server simultaneously** ("Maintains persistent SSE connections to one or
+more servers"), all feeding **one `EventReducer` whose message/part maps are keyed by
+`sessionId` only** (`EventReducer.kt:81,144` — `serverId` tracks session *ownership*,
+never content; `ChatViewModel.kt:602-606` combines those flows without serverId
+filtering). Consequence: a session that exists on two servers (imported copy + live
+source) displays live events from **both** SSE streams in either server's view — the
+user watched a legacy session stream live while the bound REST connection (refine)
+returned the frozen import snapshot. REST requests follow the bound connection; live
+content can come from the other. Implication for the delta bridge: REST freshness (K-SYNC)
+makes the fusion consistent instead of contradictory; until then, sends from a view write
+to that view's server and the two DBs diverge underneath a unified display.
+
 ## 17. oc-remote route coverage (exhaustive client audit)
 
 Source: static extraction of all58 route templates + call graph from
