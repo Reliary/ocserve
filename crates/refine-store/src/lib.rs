@@ -122,6 +122,102 @@ pub fn insert_message(
 /// Load history for prompt assembly: (info, parts) ordered by msg.seq.
 /// `limit` = return the LAST n messages ascending (upstream `?limit=` live
 /// contract §1084); None = full history.
+/// Walk a session's messages one at a time, yielding each message's FULL
+/// response JSON object (`{"info":…,"parts":[…]}`) to `visit`. Bounded by
+/// design (AGENTS §2.3): peak = one message — the old Vec<Value> path
+/// OOM-killed the cgroup on a 16k-message session (93MB response ≈ 400MB+
+/// as serde Values). Column merge applied per row (see merge_columns).
+pub fn for_each_message_json(
+    db: &std::path::Path,
+    session_id: &str,
+    limit: Option<usize>,
+    mut visit: impl FnMut(String) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let conn = pragma::open_reader(db)?;
+    let blobs = crate::blob::BlobStore::new(
+        db.parent()
+            .ok_or_else(|| anyhow::anyhow!("db parent"))?
+            .join("blobs"),
+    )?;
+    let mut stmt = match limit {
+        Some(_) => conn.prepare(
+            "SELECT id, info FROM (SELECT id, info, seq FROM msg WHERE session_id = ?1 \
+             ORDER BY seq DESC LIMIT ?2) ORDER BY seq",
+        )?,
+        None => conn.prepare("SELECT id, info FROM msg WHERE session_id = ?1 ORDER BY seq")?,
+    };
+    let msgs: Vec<(String, String)> = match limit {
+        Some(n) => stmt
+            .query_map((session_id, n as i64), |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect(),
+        None => stmt
+            .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect(),
+    };
+    let mut pstmt = conn.prepare(
+        "SELECT id, inline, blob_sha, byte_len FROM msg_part WHERE message_id = ?1 ORDER BY seq",
+    )?;
+    for (mid, info_txt) in msgs {
+        // string-only assembly: parse→merge→serialize per row, never a
+        // json!-wrapper Value tree (the wrapper roughly doubled transient
+        // churn during the 101MB stream — measured RSS 599/600MB)
+        let info: serde_json::Value = serde_json::from_str(&info_txt)?;
+        let info = merge_columns(info, &mid, session_id, None);
+        let mut chunk = String::with_capacity(info_txt.len() + 1024);
+        chunk.push_str("{\"info\":");
+        chunk.push_str(&info.to_string());
+        chunk.push_str(",\"parts\":[");
+        let mut rows = pstmt.query([&mid])?;
+        let mut first_part = true;
+        while let Some(row) = rows.next()? {
+            let part_id: String = row.get(0)?;
+            let inline: Option<String> = row.get(1)?;
+            let sha: Option<String> = row.get(2)?;
+            let byte_len: i64 = row.get(3)?;
+            let txt = match inline {
+                Some(t) => t,
+                None => match (&sha, byte_len) {
+                    (Some(sha), len) => {
+                        String::from_utf8_lossy(&blobs.get(sha, len as u64)?).into_owned()
+                    }
+                    (None, _) => continue,
+                },
+            };
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                let merged = merge_columns(v, &part_id, session_id, Some(&mid));
+                if !first_part {
+                    chunk.push(',');
+                }
+                first_part = false;
+                chunk.push_str(&merged.to_string());
+            }
+        }
+        chunk.push_str("]}");
+        visit(chunk)?;
+    }
+    Ok(())
+}
+
+/// Response-time column merge — v1 parity (source store keeps `data` blobs
+/// WITHOUT id/sessionID(/messageID); those live in columns and are merged
+/// into every response. Our own writes already carry them; the merge is
+/// authoritative-from-column either way — same as upstream serving).
+fn merge_columns(
+    mut v: serde_json::Value,
+    id: &str,
+    session_id: &str,
+    message_id: Option<&str>,
+) -> serde_json::Value {
+    v["id"] = serde_json::Value::String(id.to_string());
+    v["sessionID"] = serde_json::Value::String(session_id.to_string());
+    if let Some(mid) = message_id {
+        v["messageID"] = serde_json::Value::String(mid.to_string());
+    }
+    v
+}
+
 pub fn load_messages(
     db: &std::path::Path,
     session_id: &str,
@@ -155,15 +251,17 @@ pub fn load_messages(
     )?;
     for (mid, info_txt) in msgs {
         let info: serde_json::Value = serde_json::from_str(&info_txt)?;
+        let info = merge_columns(info, &mid, session_id, None);
         let mut pstmt = conn.prepare(
-            "SELECT inline, blob_sha, byte_len FROM msg_part WHERE message_id = ?1 ORDER BY seq",
+            "SELECT id, inline, blob_sha, byte_len FROM msg_part WHERE message_id = ?1 ORDER BY seq",
         )?;
         let mut parts: Vec<serde_json::Value> = Vec::new();
         let mut rows = pstmt.query([&mid])?;
         while let Some(row) = rows.next()? {
-            let inline: Option<String> = row.get(0)?;
-            let sha: Option<String> = row.get(1)?;
-            let byte_len: i64 = row.get(2)?;
+            let part_id: String = row.get(0)?;
+            let inline: Option<String> = row.get(1)?;
+            let sha: Option<String> = row.get(2)?;
+            let byte_len: i64 = row.get(3)?;
             let txt = match inline {
                 Some(t) => t,
                 None => match (&sha, byte_len) {
@@ -174,7 +272,7 @@ pub fn load_messages(
                 },
             };
             if let Ok(v) = serde_json::from_str(&txt) {
-                parts.push(v);
+                parts.push(merge_columns(v, &part_id, session_id, Some(&mid)));
             }
         }
         out.push((info, parts));

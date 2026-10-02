@@ -646,16 +646,52 @@ async fn get_messages(
         return Err(ApiError::not_found(format!("Session not found: {id}")).into());
     }
     let limit: Option<usize> = q.get("limit").and_then(|l| l.parse::<usize>().ok());
-    let msgs = refine_store::load_messages(&st.db, &id, limit).map_err(|e| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        name: "InternalError",
-        message: format!("{e:#}"),
-    })?;
-    let arr: Vec<serde_json::Value> = msgs
-        .into_iter()
-        .map(|(info, parts)| json!({"info": info, "parts": parts}))
-        .collect();
-    Ok(Json(serde_json::Value::Array(arr)))
+    // STREAMED response: one message per chunk through a bounded channel —
+    // materializing a 16k-message session as Values OOM-killed the cgroup
+    // (93MB response ≈ 400MB+ parsed; AGENTS §2.3 violation caught live).
+    // Peak = channel(4) chunks + the message being built.
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(4);
+    let db = st.db.clone();
+    let sid = id.clone();
+    std::thread::spawn(move || {
+        let mut first = true;
+        let r = refine_store::for_each_message_json(&db, &sid, limit, |chunk| {
+            let framed = if first {
+                first = false;
+                format!("[{chunk}")
+            } else {
+                format!(",{chunk}")
+            };
+            tx.blocking_send(framed)
+                .map_err(|_| anyhow::anyhow!("client disconnected"))
+        });
+        if let Err(e) = r {
+            tracing::error!("message stream aborted session={sid}: {e:#}");
+        }
+        // best-effort close bracket (valid JSON even after a mid-stream error)
+        let _ = tx.blocking_send(if first {
+            "[]".to_string()
+        } else {
+            "]".to_string()
+        });
+    });
+    let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|chunk| {
+            (
+                Ok::<axum::body::Bytes, std::convert::Infallible>(axum::body::Bytes::from(chunk)),
+                rx,
+            )
+        })
+    });
+    let resp = axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from_stream(body_stream))
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("response build: {e}"),
+        })?;
+    Ok(resp)
 }
 
 /// POST /session/{id}/message — sync prompt (blocks until stream completes,

@@ -14,7 +14,8 @@ ExecStart=%h/src/refine/target/release/refine serve --port 4912
 WorkingDirectory=%h/src/refine
 Environment=REFINE_DATA_DIR=%h/.local/share/refine
 Environment=RUST_LOG=refine=info
-Environment=MIMALLOC_PURGE_DELAY=500
+Environment=MIMALLOC_PURGE_DELAY=100
+Environment=MIMALLOC_PAGE_RESET=1
 Environment=MIMALLOC_ARENA_EAGER_COMMIT=0
 Restart=on-failure
 RestartSec=5

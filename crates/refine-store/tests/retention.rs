@@ -156,3 +156,56 @@ fn vacuum_into_backup_restores_clean() {
         assert!(backup_to(&conn, &dest).is_err(), "overwrite refused");
     }
 }
+
+// ---- response-time column merge (oc-remote parse contract) ----
+
+#[test]
+fn load_messages_merges_column_ids_into_imported_shaped_rows() {
+    use refine_store::{Writer, load_messages};
+    let dir = tempfile::tempdir().unwrap();
+    let db = refine_store::writer::db_path(dir.path());
+    let w = Writer::spawn(db.clone()).unwrap();
+    // session row (FK)
+    w.write(vec![refine_store::WriteOp::Sql {
+        sql: "INSERT INTO session (id, project_id, directory, path, slug, title, version, time_created, time_updated) VALUES ('ses_m', 'global', '/w', 's', 's', 't', '1', 1, 1)".into(),
+        params: vec![],
+    }])
+    .unwrap();
+    // message written IMPORT-SHAPED: info lacks id + sessionID (source data blob)
+    w.write(vec![refine_store::WriteOp::Sql {
+        sql: "INSERT INTO msg (id, session_id, role, seq, time_created, info) VALUES ('msg_imported', 'ses_m', 'assistant', 1, 100, '{\"role\":\"assistant\",\"time\":{\"created\":100}}')".into(),
+        params: vec![],
+    }])
+    .unwrap();
+    // part written IMPORT-SHAPED: data = {type,text} only
+    w.write(vec![refine_store::WriteOp::Sql {
+        sql: "INSERT INTO msg_part (id, message_id, session_id, seq, type, byte_len, inline, blob_sha) VALUES ('prt_imported', 'msg_imported', 'ses_m', 1, 'text', 28, '{\"type\":\"text\",\"text\":\"hi\"}', NULL)".into(),
+        params: vec![],
+    }])
+    .unwrap();
+    // our-shaped row too (must stay correct — column-authoritative)
+    w.write(vec![refine_store::WriteOp::Sql {
+        sql: "INSERT INTO msg (id, session_id, role, seq, time_created, info) VALUES ('msg_own', 'ses_m', 'user', 2, 101, '{\"id\":\"msg_own\",\"sessionID\":\"ses_m\",\"role\":\"user\"}')".into(),
+        params: vec![],
+    }])
+    .unwrap();
+    drop(w); // flush
+
+    let msgs = load_messages(&db, "ses_m", None).unwrap();
+    assert_eq!(msgs.len(), 2);
+    let (info0, parts0) = &msgs[0];
+    // oc-remote requires id + sessionID on every message info (field error
+    // was: Fields [id, sessionID] ... missing at path $[0].info)
+    assert_eq!(info0["id"], "msg_imported", "column id merged");
+    assert_eq!(info0["sessionID"], "ses_m", "column sessionID merged");
+    assert_eq!(info0["role"], "assistant", "data fields preserved");
+    // part fields: id / sessionID / messageID (parsePart contract)
+    assert_eq!(parts0[0]["id"], "prt_imported");
+    assert_eq!(parts0[0]["sessionID"], "ses_m");
+    assert_eq!(parts0[0]["messageID"], "msg_imported");
+    assert_eq!(parts0[0]["text"], "hi");
+    // our own row: id stays (column-authoritative, same value)
+    let (info1, _) = &msgs[1];
+    assert_eq!(info1["id"], "msg_own");
+    assert_eq!(info1["sessionID"], "ses_m");
+}
