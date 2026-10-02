@@ -8,13 +8,27 @@ use axum::routing::get;
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use futures_util::stream;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Freeze (PLAN §3): version reported by `/global/health`.
 pub const FREEZE_VERSION: &str = "1.18.31";
+
+/// Pre-assembled payloads for config-derived routes (built by refine-cli's
+/// `Runtime::load()`; kept crate-local so http doesn't depend on cli).
+#[derive(Default)]
+pub struct Payloads {
+    pub config: serde_json::Value,
+    pub agent: Vec<serde_json::Value>,
+    pub api_agent: Vec<serde_json::Value>,
+    pub command: Vec<serde_json::Value>,
+    pub config_providers: serde_json::Value,
+    pub provider: serde_json::Value,
+    pub console: serde_json::Value,
+    pub capabilities: serde_json::Value,
+}
 
 /// Upstream error envelope: {"name":"NotFoundError","data":{"message":"..."}} (captured live).
 pub struct ApiError {
@@ -44,18 +58,65 @@ impl IntoResponse for ApiError {
 pub struct AppState {
     /// Static config payload served at GET /config (recorded corpus).
     pub config: serde_json::Value,
-    /// Agents payload for GET /agent.
+    /// Agents payload for GET /agent (default-first order).
     pub agent: Vec<serde_json::Value>,
+    /// Agents for GET /api/agent (declaration order, natives first).
+    pub api_agent: Vec<serde_json::Value>,
+    /// Commands payload for GET /command.
+    pub command: Vec<serde_json::Value>,
+    /// GET /config/providers payload (providers + default).
+    pub config_providers: serde_json::Value,
+    /// GET /provider payload (all + default + connected).
+    pub provider: serde_json::Value,
+    /// GET /experimental/console payload.
+    pub console: serde_json::Value,
+    /// GET /experimental/capabilities payload.
+    pub capabilities: serde_json::Value,
     /// Known sessions (M1: served from store as it comes online).
     pub sessions: parking_lot::RwLock<HashMap<String, serde_json::Value>>,
+    /// Runtime paths for GET /path (env-derived at boot; never stored in repo).
+    pub paths: serde_json::Value,
+    /// Auth mode: None = off (freeze default), Some(("user","pass")) = basic.
+    pub auth: Option<(String, String)>,
+    /// Request counter for /metrics (bounded, monotonic).
+    pub requests: std::sync::atomic::AtomicU64,
 }
 
 impl AppState {
     pub fn new() -> Arc<Self> {
+        Self::with_auth(None)
+    }
+
+    pub fn with_auth(auth: Option<(String, String)>) -> Arc<Self> {
+        Self::with_payloads(auth, Payloads::default())
+    }
+
+    /// Build from pre-assembled route payloads (CLI's `Runtime::load()` output).
+    pub fn with_payloads(auth: Option<(String, String)>, p: Payloads) -> Arc<Self> {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let worktree = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "/".into());
         Arc::new(Self {
-            config: json!({}), // replaced by CLI with recorded corpus
-            agent: vec![],
+            config: p.config,
+            agent: p.agent,
+            api_agent: p.api_agent,
+            command: p.command,
+            config_providers: p.config_providers,
+            provider: p.provider,
+            console: p.console,
+            capabilities: p.capabilities,
             sessions: parking_lot::RwLock::new(HashMap::new()),
+            // upstream /path shape (keys golden: home/state/config/worktree/directory)
+            paths: json!({
+                "home": home,
+                "state": format!("{home}/.local/state/opencode"),
+                "config": format!("{home}/.config/opencode"),
+                "worktree": worktree,
+                "directory": worktree,
+            }),
+            auth,
+            requests: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }
@@ -70,6 +131,144 @@ async fn get_config(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 
 async fn get_agent(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     Json(st.agent.clone())
+}
+
+async fn get_command(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(st.command.clone())
+}
+
+async fn get_config_providers(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(st.config_providers.clone())
+}
+
+async fn get_provider(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(st.provider.clone())
+}
+
+async fn get_console(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(st.console.clone())
+}
+
+async fn get_capabilities(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(st.capabilities.clone())
+}
+
+/// v2-style location envelope shared by /api/* routes (captured live).
+fn api_location(st: &AppState) -> Value {
+    let dir = st.paths["directory"].as_str().unwrap_or("/");
+    json!({
+        "directory": dir,
+        "project": {"id": "global", "directory": "/"},
+    })
+}
+
+/// GET /api/location — captured shape (keys golden: directory/project/{id,directory}).
+async fn get_api_location(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(api_location(&st))
+}
+
+/// GET /api/agent — v2-shaped agent list (permission triple renamed to
+/// {action, resource, effect}; natives-first order; no plugin agents).
+async fn get_api_agent(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let data: Vec<Value> = st
+        .api_agent
+        .iter()
+        .map(|a| {
+            let perms: Vec<Value> = a["permission"]
+                .as_array()
+                .map(|rules| {
+                    rules
+                        .iter()
+                        .map(|r| {
+                            json!({
+                                "action": r["permission"],
+                                "resource": r["pattern"],
+                                "effect": r["action"],
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut out = json!({
+                "id": a["name"],
+                "hidden": a.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false),
+                "mode": a["mode"],
+                "permissions": perms,
+                "request": {"headers": {}, "body": {}},
+            });
+            if let Some(d) = a.get("description") {
+                out["description"] = d.clone();
+            }
+            // system: explicit prompt, else the captured build default
+            if let Some(p) = a.get("prompt") {
+                out["system"] = p.clone();
+            } else if a["name"] == "build" {
+                out["system"] = json!(BUILD_SYSTEM_BLURB);
+            }
+            out
+        })
+        .collect();
+    Json(json!({"location": api_location(&st), "data": data}))
+}
+
+/// Captured from live /api/agent (build has no prompt; upstream serves this blurb).
+const BUILD_SYSTEM_BLURB: &str = "You are an AI coding agent. Help the user accomplish software \
+engineering tasks by inspecting the workspace, making targeted changes, and using tools according \
+to the configured permissions.";
+
+/// GET /api/command — {location, data:[{description,name,template}]}.
+async fn get_api_command(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let data: Vec<Value> = st
+        .command
+        .iter()
+        .map(|c| {
+            json!({
+                "name": c["name"],
+                "description": c.get("description").and_then(|v| v.as_str()).unwrap_or(""),
+                "template": c.get("template").and_then(|v| v.as_str()).unwrap_or(""),
+            })
+        })
+        .collect();
+    Json(json!({"location": api_location(&st), "data": data}))
+}
+
+/// GET /api/reference — always empty (no references configured).
+async fn get_api_reference(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(json!({"location": api_location(&st), "data": []}))
+}
+
+/// Empty-shape routes captured live: {}, [].
+async fn experimental_resource() -> Json<Value> {
+    Json(json!({}))
+}
+async fn experimental_workspace() -> Json<Value> {
+    Json(json!([]))
+}
+async fn formatter_list() -> Json<Value> {
+    Json(json!([]))
+}
+async fn lsp_list() -> Json<Value> {
+    Json(json!([]))
+}
+async fn project_directories() -> Json<Value> {
+    Json(json!([]))
+}
+
+/// GET /vcs — {branch, default_branch} (values cwd-dependent; keys golden).
+async fn vcs_info() -> impl IntoResponse {
+    let git = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git").args(args).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!s.is_empty()).then_some(s)
+    };
+    Json(json!({
+        "branch": git(&["rev-parse", "--abbrev-ref", "HEAD"]),
+        "default_branch": git(&["symbolic-ref", "refs/remotes/origin/HEAD"])
+            .map(|r| r.trim_start_matches("refs/remotes/origin/").to_string()),
+    }))
 }
 
 async fn get_sessions(State(st): State<Arc<AppState>>) -> impl IntoResponse {
@@ -97,6 +296,81 @@ async fn get_session(
 
 async fn session_status() -> impl IntoResponse {
     Json(json!({}))
+}
+
+/// GET /path — env-derived at boot (upstream keys: home/state/config/worktree/directory).
+async fn get_path(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(st.paths.clone())
+}
+
+/// GET /project — global project + current worktree project (keys: id/worktree/time/sandboxes).
+async fn get_projects(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let worktree = st.paths["worktree"].as_str().unwrap_or("/").to_string();
+    let project = |id: &str, wt: &str| {
+        json!({
+            "id": id,
+            "worktree": wt,
+            "time": {"created": now_ms, "updated": now_ms, "initialized": now_ms},
+            "sandboxes": [],
+        })
+    };
+    Json(json!([
+        project("global", "/"),
+        project("current", &worktree),
+    ]))
+}
+
+/// GET /project/current — same shape, single object.
+async fn get_project_current(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let worktree = st.paths["worktree"].as_str().unwrap_or("/");
+    Json(json!({
+        "id": "global",
+        "worktree": worktree,
+        "time": {"created": now_ms, "updated": now_ms, "initialized": now_ms},
+        "sandboxes": [],
+    }))
+}
+
+/// Prometheus text format for the KPI series (SRE §2). Internal bind only.
+async fn metrics(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let rss = read_vm_rss_kb();
+    let body = format!(
+        "# HELP refine_requests_total HTTP requests handled\n\
+         # TYPE refine_requests_total counter\n\
+         refine_requests_total {}\n\
+         # HELP refine_rss_bytes resident set size\n\
+         # TYPE refine_rss_bytes gauge\n\
+         refine_rss_bytes {}\n",
+        st.requests.load(std::sync::atomic::Ordering::Relaxed),
+        rss * 1024,
+    );
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
+}
+
+fn read_vm_rss_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(0)
 }
 
 /// Freeze-shaped event id: `evt_` + 26 hex chars (upstream ids are time+random
@@ -153,17 +427,103 @@ async fn global_event() -> Response {
     resp
 }
 
-/// Router for the P0 surface. Auth (off per freeze) is layered by the CLI.
+/// Basic auth middleware (N6/PLAN §3: auth mode is a freeze artifact — live
+/// instance is passwordless, so default is off; `basic` mode 401s everything
+/// without matching credentials, including SSE and /metrics).
+async fn auth_gate(
+    State(st): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<Response, ApiError> {
+    st.requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Hit-set capture (M1 §PLAN C4): every request path logged for the
+    // differential route inventory.
+    tracing::info!("req {} {}", req.method(), req.uri().path());
+    if let Some((user, pass)) = &st.auth {
+        let authorized = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Basic "))
+            .and_then(|b64| {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.decode(b64).ok()
+            })
+            .map(|raw| {
+                let text = String::from_utf8_lossy(&raw);
+                text == format!("{user}:{pass}")
+            })
+            .unwrap_or(false);
+        if !authorized {
+            return Err(ApiError {
+                status: StatusCode::UNAUTHORIZED,
+                name: "UnauthorizedError",
+                message: "unauthorized".into(),
+            });
+        }
+    }
+    Ok(next.run(req).await)
+}
+
+/// Router for the P0 surface. Auth is an AppState decision (freeze §3).
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/global/health", get(health))
         .route("/config", get(get_config))
+        .route("/config/providers", get(get_config_providers))
+        .route("/provider", get(get_provider))
         .route("/agent", get(get_agent))
+        .route("/command", get(get_command))
+        .route("/experimental/console", get(get_console))
+        .route("/experimental/capabilities", get(get_capabilities))
+        .route("/path", get(get_path))
+        .route("/project", get(get_projects))
+        .route("/project/current", get(get_project_current))
         .route("/session", get(get_sessions))
         .route("/session/status", get(session_status))
         .route("/session/{id}", get(get_session))
         .route("/global/event", get(global_event))
+        .route("/metrics", get(metrics))
+        // TUI-attach probes (captured live; PLAN §2 hit-set expansion)
+        .route("/api/location", get(get_api_location))
+        .route("/api/agent", get(get_api_agent))
+        .route("/api/command", get(get_api_command))
+        .route("/api/reference", get(get_api_reference))
+        .route("/experimental/resource", get(experimental_resource))
+        .route("/experimental/workspace", get(experimental_workspace))
+        .route("/formatter", get(formatter_list))
+        .route("/lsp", get(lsp_list))
+        .route("/project/{id}/directories", get(project_directories))
+        .route("/vcs", get(vcs_info))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_gate,
+        ))
         .with_state(state)
+}
+
+/// JSON key-path projection: `$`, `$.a`, `$.a[].b`, … (values ignored).
+/// Shared oracle for keys-mode golden comparisons (manifest mode=keys).
+pub fn keypaths(v: &serde_json::Value, prefix: &str, out: &mut std::collections::BTreeSet<String>) {
+    match v {
+        serde_json::Value::Object(m) => {
+            for (k, val) in m {
+                let p = format!("{prefix}.{k}");
+                out.insert(p.clone());
+                keypaths(val, &p, out);
+            }
+        }
+        serde_json::Value::Array(a) => {
+            let p = format!("{prefix}[]");
+            if let Some(first) = a.first() {
+                keypaths(first, &p, out);
+            } else {
+                out.insert(p);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Header values the SSE route must carry (asserted by tests against golden bytes).

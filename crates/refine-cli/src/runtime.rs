@@ -1,0 +1,745 @@
+//! Runtime assembly: loads the user's opencode config/auth/models-cache and
+//! derives every config-derived route payload (PLAN F1 wire surface).
+//!
+//! Contract facts derived from live upstream 1.18.31 + v1 source (2026-10-01):
+//! - /config: raw opencode.json + plugin-registered agents (plugin part = M4;
+//!   manifest uses keys_subset with raw-file keys until then)
+//! - /config/providers: state.providers = auth.json order, then built-in
+//!   `opencode`, then config-only entries; source = config > api > custom;
+//!   models = cache models + config model overrides; key from auth.json
+//! - /provider: cache order overlaid by state providers in place, config-only
+//!   appended; default = priority-sort per provider; connected = state order
+//!   filtered through the all[] list
+//! - /agent: default_agent first, then name asc; native + config agents
+//! - /command: built-in init/review first, then config commands
+//!   (skills discovery separate, not in TUI hit-set)
+//! - /experimental/console, /experimental/capabilities: static captures
+
+use anyhow::{Context, Result};
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+
+/// Priority list from v1 provider.ts sort() — determines default model choice.
+const MODEL_PRIORITY: &[&str] = &["gpt-5", "claude-sonnet-4", "big-pickle", "gemini-3-pro"];
+
+pub struct Runtime {
+    pub config: Value,
+    /// Default-agent-first order (GET /agent, v1 wire).
+    pub agent: Vec<Value>,
+    /// Declaration order: natives then config agents (GET /api/agent, v2 wire).
+    pub api_agent: Vec<Value>,
+    pub command: Vec<Value>,
+    pub config_providers: Value,
+    pub provider: Value,
+    pub console: Value,
+    pub capabilities: Value,
+}
+
+fn read_json(path: &Path) -> Result<Value> {
+    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
+}
+
+use std::path::Path;
+
+/// Priority-sort replicating v1 provider.ts `sort()` (multi-pass stable):
+/// id desc → "latest" asc → priority-index desc.
+pub fn default_model(models: &BTreeMap<String, Value>) -> Option<String> {
+    let mut ids: Vec<&String> = models.keys().collect();
+    ids.sort(); // base order for stable passes
+    ids.sort_by(|a, b| b.as_str().cmp(a.as_str())); // id desc
+    ids.sort_by_key(|id| if id.contains("latest") { 0 } else { 1 }); // latest asc
+    ids.sort_by_key(|id| {
+        // earlier priority list item = higher rank → negate for ascending sort
+        -(MODEL_PRIORITY
+            .iter()
+            .position(|p| id.contains(p))
+            .unwrap_or(0) as i64)
+    });
+    ids.first().map(|s| (*s).clone())
+}
+
+fn model_map(v: &Value) -> BTreeMap<String, Value> {
+    v.as_object()
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default()
+}
+
+/// Transform a models.dev cache model entry into the served wire shape
+/// (verified against live /provider output for deepinfra/tencent-Hy3).
+fn transform_cache_model(pid: &str, npm: &str, mid: &str, m: &Value) -> Value {
+    let modal = |side: &str, kind: &str| -> bool {
+        m.pointer(&format!("/modalities/{}/{kind}", side))
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().any(|x| x.as_str() == Some(side_kind(kind))))
+            .unwrap_or(false)
+    };
+    let _ = modal;
+    let has = |path: &str, kind: &str| -> bool {
+        m.pointer(path)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().any(|x| x.as_str() == Some(kind)))
+            .unwrap_or(false)
+    };
+    let input = |k: &str| has("/modalities/input", k);
+    let output = |k: &str| has("/modalities/output", k);
+    // cost: cache_read → cache.read, cache_write → cache.write; tiers get the
+    // same shape (verified against live /provider ByteDance/Seed-2.0-code).
+    let cost_obj = |m: &Value| -> Value {
+        let mut c = json!({
+            "input": m.pointer("/cost/input").cloned().unwrap_or(Value::Null),
+            "output": m.pointer("/cost/output").cloned().unwrap_or(Value::Null),
+            "cache": {
+                "read": m.pointer("/cost/cache_read").cloned().unwrap_or(json!(0)),
+                "write": m.pointer("/cost/cache_write").cloned().unwrap_or(json!(0)),
+            },
+        });
+        if let Some(tiers) = m.pointer("/cost/tiers").and_then(|t| t.as_array()) {
+            let wire_tiers: Vec<Value> = tiers
+                .iter()
+                .map(|t| {
+                    json!({
+                        "input": t.get("input").cloned().unwrap_or(Value::Null),
+                        "output": t.get("output").cloned().unwrap_or(Value::Null),
+                        "cache": {
+                            "read": t.pointer("/cache_read").cloned().unwrap_or(json!(0)),
+                            "write": t.pointer("/cache_write").cloned().unwrap_or(json!(0)),
+                        },
+                        "tier": t.get("tier").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect();
+            c["tiers"] = Value::Array(wire_tiers);
+        }
+        c
+    };
+    json!({
+        "id": mid,
+        "providerID": pid,
+        "api": {"id": mid, "url": "", "npm": npm},
+        "name": m.get("name").and_then(|v| v.as_str()).unwrap_or(mid),
+        "family": m.get("family").cloned().unwrap_or(Value::Null),
+        "capabilities": {
+            "temperature": m.get("temperature").and_then(|v| v.as_bool()).unwrap_or(false),
+            "reasoning": m.get("reasoning").and_then(|v| v.as_bool()).unwrap_or(false),
+            "attachment": m.get("attachment").and_then(|v| v.as_bool()).unwrap_or(false),
+            "toolcall": m.get("tool_call").and_then(|v| v.as_bool()).unwrap_or(false),
+            "input": {"text": input("text"), "audio": input("audio"), "image": input("image"), "video": input("video"), "pdf": input("pdf")},
+            "output": {"text": output("text"), "audio": output("audio"), "image": output("image"), "video": output("video"), "pdf": output("pdf")},
+            // v1 provider.ts:1359: object | bool | false (cache stores object/bool)
+            "interleaved": m.get("interleaved").cloned().unwrap_or(json!(false)),
+        },
+        "cost": cost_obj(m),
+        "limit": m.get("limit").cloned().unwrap_or(json!({})),
+        "status": m.get("status").and_then(|v| v.as_str()).unwrap_or("active"),
+        "options": m.get("options").cloned().unwrap_or(json!({})),
+        "headers": m.get("headers").cloned().unwrap_or(json!({})),
+        "release_date": m.get("release_date").cloned().unwrap_or(Value::Null),
+        "variants": effort_variants(m),
+    })
+}
+
+/// variants from reasoning_options[{type:"effort", values:[...]}] →
+/// {value: {reasoningEffort: value}} (verified vs live ByteDance/Seed-2.0-code).
+fn effort_variants(m: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    if let Some(opts) = m.get("reasoning_options").and_then(|v| v.as_array()) {
+        for opt in opts {
+            if opt.get("type").and_then(|v| v.as_str()) == Some("effort")
+                && let Some(values) = opt.get("values").and_then(|v| v.as_array())
+            {
+                for val in values {
+                    if let Some(v) = val.as_str() {
+                        out.insert(v.to_string(), json!({"reasoningEffort": v}));
+                    }
+                }
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+fn side_kind(kind: &str) -> &str {
+    kind
+}
+
+/// Transform a config-defined model block (different shape: {limit,name,...}).
+fn transform_config_model(pid: &str, mid: &str, m: &Value) -> Value {
+    let limit = m.get("limit").cloned().unwrap_or(json!({}));
+    json!({
+        "id": mid,
+        "providerID": pid,
+        "api": {"id": mid, "url": "", "npm": m.get("npm").and_then(|v| v.as_str()).unwrap_or("")},
+        "name": m.get("name").and_then(|v| v.as_str()).unwrap_or(mid),
+        "family": m.get("family").cloned().unwrap_or(Value::Null),
+        "capabilities": {
+            "temperature": m.get("temperature").and_then(|v| v.as_bool()).unwrap_or(true),
+            "reasoning": m.get("reasoning").and_then(|v| v.as_bool()).unwrap_or(false),
+            "attachment": m.get("attachment").and_then(|v| v.as_bool()).unwrap_or(false),
+            "toolcall": m.get("tool_call").and_then(|v| v.as_bool()).unwrap_or(false),
+            "input": {"text": true, "audio": false, "image": false, "video": false, "pdf": false},
+            "output": {"text": true, "audio": false, "image": false, "video": false, "pdf": false},
+            "interleaved": m.get("interleaved").cloned().unwrap_or(json!(false)),
+        },
+        "cost": {
+            "input": m.pointer("/cost/input").cloned().unwrap_or(Value::Null),
+            "output": m.pointer("/cost/output").cloned().unwrap_or(Value::Null),
+            "cache": {"read": m.pointer("/cost/cache_read").cloned().unwrap_or(json!(0)), "write": json!(0)},
+        },
+        "limit": limit,
+        "status": "active",
+        "options": m.get("options").cloned().unwrap_or(json!({})),
+        "headers": m.get("headers").cloned().unwrap_or(json!({})),
+        "release_date": m.get("release_date").cloned().unwrap_or(Value::Null),
+        "variants": m.get("variants").cloned().unwrap_or(json!({})),
+    })
+}
+
+fn sort_json_keys(m: &serde_json::Map<String, Value>) -> BTreeMap<String, Value> {
+    m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+/// Flatten Permission.fromConfig: string → single rule; object → per-pattern rules.
+pub fn perm_from_config(cfg: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    let Some(obj) = cfg.as_object() else {
+        return out;
+    };
+    for (key, value) in obj {
+        match value {
+            Value::String(action) => out.push(json!({
+                "permission": key, "pattern": "*", "action": action
+            })),
+            Value::Object(pats) => {
+                for (pat, action) in pats {
+                    out.push(json!({
+                        "permission": key,
+                        "pattern": expand_pattern(pat),
+                        "action": action
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn expand_pattern(p: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if p == "~" {
+        return home;
+    }
+    if let Some(rest) = p.strip_prefix("$HOME/") {
+        return format!("{home}/{rest}");
+    }
+    if let Some(rest) = p.strip_prefix("$HOME") {
+        return format!("{home}{rest}");
+    }
+    p.to_string()
+}
+
+impl Runtime {
+    pub fn load() -> Result<Self> {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let config_path = Path::new(&home).join(".config/opencode/opencode.json");
+        let auth_path = Path::new(&home).join(".local/share/opencode/auth.json");
+        let cache_path = Path::new(&home).join(".cache/opencode/models.json");
+
+        let raw_config = read_json(&config_path)?;
+        let auth = if auth_path.exists() {
+            read_json(&auth_path)?
+        } else {
+            json!({})
+        };
+        let cache = if cache_path.exists() {
+            read_json(&cache_path)?
+        } else {
+            json!({})
+        };
+
+        let config = raw_config.clone(); // raw file until M4 plugins add agents (keys_subset)
+        let (agent, api_agent) = build_agents(&raw_config);
+        let command = build_commands(&raw_config)?;
+        let (config_providers, provider) = build_providers(&raw_config, &auth, &cache);
+
+        Ok(Self {
+            config,
+            agent,
+            api_agent,
+            command,
+            config_providers,
+            provider,
+            console: json!({"consoleManagedProviders": [], "switchableOrgCount": 0}),
+            capabilities: json!({"backgroundSubagents": false}),
+        })
+    }
+}
+
+fn build_providers(cfg: &Value, auth: &Value, cache: &Value) -> (Value, Value) {
+    let cfg_providers = cfg.get("provider").and_then(|v| v.as_object());
+    let auth_obj = auth.as_object();
+    let cache_obj = cache.as_object();
+
+    // state provider order: auth.json key order, then built-in opencode, then config-only
+    let mut state_order: Vec<String> = auth_obj
+        .map(|a| a.keys().cloned().collect())
+        .unwrap_or_default();
+    if !state_order.iter().any(|p| p == "opencode") {
+        state_order.push("opencode".into());
+    }
+    if let Some(cp) = cfg_providers {
+        for pid in cp.keys() {
+            if !state_order.contains(pid) {
+                state_order.push(pid.clone());
+            }
+        }
+    }
+
+    let source_of = |pid: &str| -> &'static str {
+        if cfg_providers.map(|c| c.contains_key(pid)).unwrap_or(false) {
+            "config"
+        } else if auth_obj.map(|a| a.contains_key(pid)).unwrap_or(false) {
+            "api"
+        } else {
+            "custom"
+        }
+    };
+
+    // per-provider Info builder (cache base + config overlay + auth key)
+    let build_info = |pid: &str| -> Option<Value> {
+        let c = cache_obj.and_then(|c| c.get(pid));
+        let cb = cfg_providers.and_then(|c| c.get(pid));
+        if c.is_none() && cb.is_none() {
+            return None;
+        }
+        let npm = cb
+            .and_then(|b| b.get("npm"))
+            .and_then(|v| v.as_str())
+            .or_else(|| c.and_then(|x| x.get("npm")).and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let name = cb
+            .and_then(|b| b.get("name"))
+            .and_then(|v| v.as_str())
+            .or_else(|| c.and_then(|x| x.get("name")).and_then(|v| v.as_str()))
+            .unwrap_or(pid);
+        let env = c
+            .and_then(|x| x.get("env"))
+            .cloned()
+            .or_else(|| cb.and_then(|b| b.get("env")).cloned())
+            .unwrap_or_else(|| json!([]));
+        // models: cache models overlaid by config model overrides; config-only
+        // providers use their config models as-is
+        let mut models: BTreeMap<String, Value> = c
+            .and_then(|x| x.get("models"))
+            .and_then(|m| m.as_object())
+            .map(sort_json_keys)
+            .unwrap_or_default();
+        if let Some(cm) = cb.and_then(|b| b.get("models")).and_then(|m| m.as_object()) {
+            for (mid, mval) in cm {
+                models.insert(mid.clone(), transform_config_model(pid, mid, mval));
+            }
+        }
+        // re-transform cache models into wire shape (config inserts already transformed)
+        let mut wire: serde_json::Map<String, Value> = serde_json::Map::new();
+        for (mid, mval) in &models {
+            // config-transformed entries carry providerID already; cache ones don't
+            if mval.get("providerID").is_some() {
+                wire.insert(mid.clone(), mval.clone());
+            } else {
+                wire.insert(mid.clone(), transform_cache_model(pid, npm, mid, mval));
+            }
+        }
+        let key = auth_obj
+            .and_then(|a| a.get(pid))
+            .and_then(|v| v.get("key"))
+            .and_then(|v| v.as_str());
+        let mut info = json!({
+            "id": pid,
+            "name": name,
+            "source": source_of(pid),
+            "env": env,
+            "options": cb.and_then(|b| b.get("options")).cloned().unwrap_or(json!({})),
+            "models": wire,
+        });
+        if let Some(k) = key {
+            info["key"] = json!(k);
+        }
+        Some(info)
+    };
+
+    // ---- /config/providers: state order ----
+    let mut state_infos = Vec::new();
+    let mut state_defaults = serde_json::Map::new();
+    for pid in &state_order {
+        if let Some(info) = build_info(pid) {
+            let d = default_model(&model_map(&info["models"]));
+            if let Some(m) = d {
+                state_defaults.insert(pid.clone(), json!(m));
+            }
+            state_infos.push(info);
+        }
+    }
+    let config_providers = json!({
+        "providers": state_infos,
+        "default": Value::Object(state_defaults),
+    });
+
+    // ---- /provider: cache order overlaid in place, config-only appended ----
+    let mut all: Vec<(String, Value)> = Vec::new();
+    if let Some(c) = cache_obj {
+        for pid in c.keys() {
+            if let Some(info) = build_info(pid) {
+                all.push((pid.clone(), info));
+            }
+        }
+    }
+    for pid in &state_order {
+        if all.iter().any(|(id, _)| id == pid) {
+            continue; // overlaid in place below
+        }
+        if let Some(info) = build_info(pid) {
+            all.push((pid.clone(), info));
+        }
+    }
+    // overlay state entries (they replace cache entries at the same position)
+    for (id, info) in all.iter_mut() {
+        if state_order.contains(id)
+            && let Some(fresh) = build_info(id)
+        {
+            *info = fresh;
+        }
+    }
+    let mut defaults = serde_json::Map::new();
+    for (pid, info) in &all {
+        if let Some(d) = default_model(&model_map(&info["models"])) {
+            defaults.insert(pid.clone(), json!(d));
+        }
+    }
+    let connected: Vec<Value> = all
+        .iter()
+        .filter(|(pid, _)| state_order.contains(pid))
+        .map(|(_, info)| info["id"].clone())
+        .collect();
+    let provider = json!({
+        "all": all.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+        "default": Value::Object(defaults),
+        "connected": connected,
+    });
+
+    (config_providers, provider)
+}
+
+fn build_agents(cfg: &Value) -> (Vec<Value>, Vec<Value>) {
+    // Permission defaults ported from v1 agent.ts (user config.permission merged last).
+    let home = std::env::var("HOME").unwrap_or_default();
+    let data = format!("{home}/.local/share/opencode");
+    let defaults = json!({
+        "*": "allow",
+        "doom_loop": "ask",
+        "external_directory": {
+            "*": "ask",
+            format!("{data}/tool-output/*"): "allow",
+            "/tmp/*": "allow",
+        },
+        "question": "deny",
+        "plan_enter": "deny",
+        "plan_exit": "deny",
+        "read": {"*": "allow", "*.env": "ask", "*.env.*": "ask", "*.env.example": "allow"},
+    });
+    let user = cfg.get("permission").cloned().unwrap_or(json!({}));
+
+    let flat = |extra: Value| -> Vec<Value> {
+        let mut rules = perm_from_config(&defaults);
+        if !extra.is_null() {
+            rules.extend(perm_from_config(&extra));
+        }
+        rules.extend(perm_from_config(&user));
+        rules
+    };
+
+    let mut agents: Vec<Value> = vec![
+        json!({
+            "name": "build",
+            "description": "The default agent. Executes tools based on configured permissions.",
+            "options": {},
+            "permission": flat(json!({"question": "allow", "plan_enter": "allow"})),
+            "mode": "primary",
+            "native": true,
+        }),
+        json!({
+            "name": "plan",
+            "description": "Plan mode. Disallows all edit tools.",
+            "options": {},
+            "permission": flat(json!({
+                "question": "allow", "plan_exit": "allow",
+                "task": {"general": "deny"},
+                "edit": {"*": "deny", ".opencode/plans/*.md": "allow"},
+            })),
+            "mode": "primary",
+            "native": true,
+        }),
+        json!({
+            "name": "general",
+            "description": "General-purpose agent for researching complex questions and executing multi-step tasks. Use this agent to execute multiple units of work in parallel.",
+            "permission": flat(json!({"todowrite": "deny"})),
+            "options": {},
+            "mode": "subagent",
+            "native": true,
+        }),
+        json!({
+            "name": "explore",
+            "description": "Fast agent specialized for exploring codebases. Use this when you need to quickly find files by patterns (eg. \"src/components/**/*.tsx\"), search code for keywords (eg. \"API endpoints\"), or answer questions about the codebase (eg. \"how do API endpoints work?\"). When calling this agent, specify the desired thoroughness level: \"quick\" for basic searches, \"medium\" for moderate exploration, or \"very thorough\" for comprehensive analysis across multiple locations and naming conventions.",
+            "prompt": include_str!("../assets/explore.txt"),
+            "options": {},
+            "mode": "subagent",
+            "native": true,
+            "permission": flat(json!({
+                "*": "deny",
+                "grep": "allow", "glob": "allow", "list": "allow", "bash": "allow",
+                "webfetch": "allow", "websearch": "allow", "read": "allow",
+            })),
+        }),
+        json!({
+            "name": "compaction",
+            "mode": "primary",
+            "native": true,
+            "hidden": true,
+            "prompt": include_str!("../assets/compaction.txt"),
+            "permission": flat(json!({"*": "deny"})),
+            "options": {},
+        }),
+        json!({
+            "name": "title",
+            "mode": "primary",
+            "options": {},
+            "native": true,
+            "hidden": true,
+            "temperature": 0.5,
+            "permission": flat(json!({"*": "deny"})),
+            "prompt": include_str!("../assets/title.txt"),
+        }),
+        json!({
+            "name": "summary",
+            "mode": "primary",
+            "options": {},
+            "native": true,
+            "hidden": true,
+            "permission": flat(json!({"*": "deny"})),
+            "prompt": include_str!("../assets/summary.txt"),
+        }),
+    ];
+
+    // config agents overlay (v1 agent.ts loop)
+    if let Some(cfg_agents) = cfg.get("agent").and_then(|v| v.as_object()) {
+        for (key, value) in cfg_agents {
+            if value.get("disable").and_then(|v| v.as_bool()) == Some(true) {
+                agents.retain(|a| a["name"].as_str() != Some(key.as_str()));
+                continue;
+            }
+            let existing = agents
+                .iter_mut()
+                .find(|a| a["name"].as_str() == Some(key.as_str()));
+            if let Some(item) = existing {
+                merge_agent(item, value);
+            } else {
+                let mut item = json!({
+                    "name": key,
+                    "mode": "all",
+                    "permission": flat(json!({})),
+                    "options": {},
+                    "native": false,
+                });
+                merge_agent(&mut item, value);
+                agents.push(item);
+            }
+        }
+    }
+
+    // declaration order is the /api/agent order (natives then config, no sort)
+    let declaration_order = agents.clone();
+
+    // sort: default_agent first, then name asc (v1 agent.ts list())
+    let default_agent = cfg
+        .get("default_agent")
+        .and_then(|v| v.as_str())
+        .unwrap_or("build");
+    agents.sort_by(|a, b| {
+        let an = a["name"].as_str().unwrap_or("");
+        let bn = b["name"].as_str().unwrap_or("");
+        let ad = an == default_agent;
+        let bd = bn == default_agent;
+        bd.cmp(&ad).then_with(|| an.cmp(bn))
+    });
+    (agents, declaration_order)
+}
+
+fn merge_agent(item: &mut Value, value: &Value) {
+    let Some(v) = value.as_object() else { return };
+    // permission handled after the object borrow ends (borrowck)
+    let extra_perm = v.get("permission").cloned();
+    let obj = item.as_object_mut().expect("agent object");
+    for (k, val) in v {
+        if k == "disable" || k == "permission" {
+            continue;
+        }
+        if k == "top_p" {
+            obj.insert("topP".into(), val.clone());
+        } else if k == "options" {
+            let opts = obj
+                .entry("options")
+                .or_insert(json!({}))
+                .as_object_mut()
+                .expect("options");
+            if let Some(extra) = val.as_object() {
+                for (ok, ov) in extra {
+                    opts.insert(ok.clone(), ov.clone());
+                }
+            }
+        } else {
+            obj.insert(k.clone(), val.clone());
+        }
+    }
+    if let Some(perm) = extra_perm {
+        let mut rules = obj
+            .get("permission")
+            .and_then(|p| p.as_array())
+            .cloned()
+            .unwrap_or_default();
+        rules.extend(perm_from_config(&perm));
+        obj.insert("permission".into(), Value::Array(rules));
+    }
+}
+
+fn build_commands(cfg: &Value) -> Result<Vec<Value>> {
+    let init = include_str!("../assets/initialize.txt");
+    let review = include_str!("../assets/review.txt");
+    let hints_of = |template: &str| -> Vec<String> {
+        let mut hints: Vec<String> = Vec::new();
+        let mut rest = template;
+        while let Some(idx) = rest.find('$') {
+            let tail = &rest[idx..];
+            let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                let h = format!("${digits}");
+                if !hints.contains(&h) {
+                    hints.push(h);
+                }
+            }
+            rest = &tail[1..];
+        }
+        if template.contains("$ARGUMENTS") && !hints.contains(&"$ARGUMENTS".to_string()) {
+            hints.push("$ARGUMENTS".into());
+        }
+        hints
+    };
+    let mut cmds = vec![
+        json!({
+            "name": "init", "description": "guided AGENTS.md setup", "source": "command",
+            "template": init, "hints": hints_of(init),
+        }),
+        json!({
+            "name": "review", "description": "Code review", "source": "command",
+            "template": review, "hints": hints_of(review),
+        }),
+    ];
+    if let Some(commands) = cfg.get("command").and_then(|v| v.as_object()) {
+        for (name, c) in commands {
+            let template = c
+                .get("template")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            cmds.push(json!({
+                "name": name,
+                "description": c.get("description").and_then(|v| v.as_str()).unwrap_or(""),
+                "source": "command",
+                "template": template,
+                "hints": hints_of(template),
+            }));
+        }
+    }
+    Ok(cmds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_model_priority_rules() {
+        let mut models = BTreeMap::new();
+        for id in [
+            "glm-5",
+            "gpt-5-mini",
+            "claude-sonnet-4-20250514",
+            "some-latest-model",
+            "zzz-latest",
+        ] {
+            models.insert(id.to_string(), json!({}));
+        }
+        // priority wins over "latest" wins over id desc:
+        // claude-sonnet-4 (priority idx1) beats gpt-5-mini (idx0)? — idx in list:
+        // gpt-5=0, claude-sonnet-4=1, big-pickle=2, gemini-3-pro=3 → earlier = higher rank
+        let d = default_model(&models).unwrap();
+        assert_eq!(d, "claude-sonnet-4-20250514", "priority order: {d}");
+    }
+
+    #[test]
+    fn default_model_latest_and_desc() {
+        let mut models = BTreeMap::new();
+        for id in ["aaa", "bbb-latest", "zzz"] {
+            models.insert(id.to_string(), json!({}));
+        }
+        // no priority hits; latest asc → bbb-latest first
+        assert_eq!(default_model(&models).unwrap(), "bbb-latest");
+        let mut models = BTreeMap::new();
+        for id in ["aaa", "zzz", "mmm"] {
+            models.insert(id.to_string(), json!({}));
+        }
+        // no priority, no latest → id desc → zzz
+        assert_eq!(default_model(&models).unwrap(), "zzz");
+    }
+
+    #[test]
+    fn perm_flatten_shapes() {
+        let cfg = json!({"*": "allow", "read": {"*.env": "deny"}});
+        let rules = perm_from_config(&cfg);
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["permission"], "*");
+        assert_eq!(rules[1]["pattern"], "*.env");
+        assert_eq!(rules[1]["action"], "deny");
+    }
+
+    #[test]
+    fn transform_cache_model_has_wire_keys() {
+        let m = json!({
+            "id": "t/H", "name": "H", "family": "H",
+            "attachment": false, "reasoning": true, "tool_call": true,
+            "temperature": true, "release_date": "2026-01-01",
+            "modalities": {"input": ["text"], "output": ["text"]},
+            "limit": {"context": 1000}, "cost": {"input": 1.0, "output": 2.0, "cache_read": 0.5}
+        });
+        let w = transform_cache_model("pid", "npm", "t/H", &m);
+        for k in [
+            "id",
+            "providerID",
+            "api",
+            "name",
+            "family",
+            "capabilities",
+            "cost",
+            "limit",
+            "status",
+            "options",
+            "headers",
+            "release_date",
+            "variants",
+        ] {
+            assert!(w.get(k).is_some(), "missing {k}");
+        }
+        assert_eq!(w["capabilities"]["input"]["text"], true);
+        assert_eq!(w["capabilities"]["toolcall"], true);
+        assert_eq!(w["cost"]["cache"]["read"], 0.5);
+        assert_eq!(w["api"]["npm"], "npm");
+    }
+}

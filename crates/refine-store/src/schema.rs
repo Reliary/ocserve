@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -18,6 +18,18 @@ CREATE TABLE session (
     parent_id     TEXT,
     title         TEXT NOT NULL DEFAULT '',
     version       TEXT NOT NULL DEFAULT '1',
+    path          TEXT NOT NULL DEFAULT '',
+    agent         TEXT,
+    model         TEXT,
+    cost          REAL NOT NULL DEFAULT 0,
+    summary_additions INTEGER NOT NULL DEFAULT 0,
+    summary_deletions INTEGER NOT NULL DEFAULT 0,
+    summary_files     INTEGER NOT NULL DEFAULT 0,
+    tokens_input  INTEGER NOT NULL DEFAULT 0,
+    tokens_output INTEGER NOT NULL DEFAULT 0,
+    tokens_reasoning INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_write INTEGER NOT NULL DEFAULT 0,
     time_created  INTEGER NOT NULL,
     time_updated  INTEGER NOT NULL,
     version_dirt  INTEGER NOT NULL DEFAULT 0
@@ -126,7 +138,8 @@ CREATE TABLE import_manifest (
 ) STRICT;
 ";
 
-/// Apply schema to a fresh DB and stamp user_version. Idempotent: skips if stamped.
+/// Apply schema to a fresh DB and stamp user_version. Handles 0→current and
+/// 1→2 (adds session metadata columns); refuses anything else.
 pub fn migrate(conn: &Connection) -> Result<()> {
     let ver: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -134,13 +147,34 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     if ver == SCHEMA_VERSION {
         return Ok(());
     }
-    if ver != 0 {
-        bail!(
-            "database schema version {ver} != expected {SCHEMA_VERSION}; \
-             refuse to touch it (upgrade path runs through `refine import`/migrations)"
-        );
+    match ver {
+        0 => {
+            conn.execute_batch(DDL)?;
+        }
+        1 => {
+            // v1→v2: session list fields (PLAN F1 — TUI/oc-remote list shape).
+            conn.execute_batch(
+                "ALTER TABLE session ADD COLUMN path TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE session ADD COLUMN agent TEXT;
+                 ALTER TABLE session ADD COLUMN model TEXT;
+                 ALTER TABLE session ADD COLUMN cost REAL NOT NULL DEFAULT 0;
+                 ALTER TABLE session ADD COLUMN summary_additions INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE session ADD COLUMN summary_deletions INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE session ADD COLUMN summary_files INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE session ADD COLUMN tokens_input INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE session ADD COLUMN tokens_output INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE session ADD COLUMN tokens_reasoning INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE session ADD COLUMN tokens_cache_read INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE session ADD COLUMN tokens_cache_write INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        other => {
+            bail!(
+                "database schema version {other} != expected {SCHEMA_VERSION}; \
+                 refuse to touch it (upgrade path runs through `refine import`/migrations)"
+            );
+        }
     }
-    conn.execute_batch(DDL)?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -281,5 +315,56 @@ mod fts_m0 {
             conn.execute_batch("SELECT count(*) FROM cl WHERE cl MATCH 'hello';")
                 .expect("contentless roundtrip");
         }
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use crate::pragma;
+
+    /// v1→v2 ALTER path: old DBs gain list columns without data loss.
+    #[test]
+    fn migrates_v1_to_v2_preserving_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.db");
+        let conn = pragma::create_new(&p).unwrap();
+        // build a v1-shaped DB manually
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY, project_id TEXT NOT NULL DEFAULT 'global',
+                slug TEXT NOT NULL DEFAULT '', directory TEXT NOT NULL DEFAULT '',
+                parent_id TEXT, title TEXT NOT NULL DEFAULT '', version TEXT NOT NULL DEFAULT '1',
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                version_dirt INTEGER NOT NULL DEFAULT 0
+            ) STRICT;
+            INSERT INTO session (id, title, time_created, time_updated)
+            VALUES ('ses_old', 'from v1', 100, 200);",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+
+        migrate(&conn).unwrap();
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, SCHEMA_VERSION);
+        let (title, cost, tok): (String, f64, i64) = conn
+            .query_row(
+                "SELECT title, cost, tokens_input FROM session WHERE id='ses_old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "from v1");
+        assert_eq!(cost, 0.0);
+        assert_eq!(tok, 0);
+        // new columns exist and accept values
+        conn.execute(
+            "UPDATE session SET agent='build', model='{}', cost=1.5, tokens_input=42 WHERE id='ses_old'",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap(); // idempotent at v2
     }
 }

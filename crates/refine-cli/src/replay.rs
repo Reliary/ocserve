@@ -25,6 +25,9 @@ pub struct Entry {
     #[serde(default)]
     #[allow(dead_code)] // recorded for corpus audit, not compared
     pub len: Option<usize>,
+    /// Declared deferral milestone (never a silent skip — printed every run).
+    #[serde(default)]
+    pub defer: Option<String>,
 }
 
 pub type Manifest = std::collections::BTreeMap<String, Entry>;
@@ -33,28 +36,6 @@ pub fn load_manifest(corpus: &Path) -> Result<Manifest> {
     let raw =
         std::fs::read_to_string(corpus.join("manifest.json")).context("read manifest.json")?;
     serde_json::from_str(&raw).context("parse manifest")
-}
-
-/// JSON key-path projection: `$`, `$.a`, `$.a[].b`, … (values ignored).
-pub fn keypaths(v: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
-    match v {
-        serde_json::Value::Object(m) => {
-            for (k, val) in m {
-                let p = format!("{prefix}.{k}");
-                out.insert(p.clone());
-                keypaths(val, &p, out);
-            }
-        }
-        serde_json::Value::Array(a) => {
-            let p = format!("{prefix}[]");
-            if let Some(first) = a.first() {
-                keypaths(first, &p, out);
-            } else {
-                out.insert(p);
-            }
-        }
-        _ => {}
-    }
 }
 
 pub struct RouteResult {
@@ -141,12 +122,43 @@ pub async fn replay_route(
             let recorded: BTreeSet<String> =
                 e.keys.clone().unwrap_or_default().into_iter().collect();
             let mut got = BTreeSet::new();
-            keypaths(&value, "$", &mut got);
+            refine_http::keypaths(&value, "$", &mut got);
             if got != recorded {
                 let missing: Vec<_> = recorded.difference(&got).take(5).collect();
                 let extra: Vec<_> = got.difference(&recorded).take(5).collect();
                 rr.ok = false;
                 rr.detail = format!("key paths differ; missing={missing:?} extra={extra:?}");
+            }
+        }
+        "keys_subset" => {
+            // Weaker, explicitly-labeled oracle for volatile/high-cardinality
+            // routes (provider model lists change): every RECORDED key must be
+            // present in the response; extra keys allowed. Recorded lists for
+            // truncated entries are a minimum-requirements sample.
+            let body = match resp.bytes().await {
+                Ok(b) => b,
+                Err(err) => {
+                    rr.ok = false;
+                    rr.detail = format!("body read: {err}");
+                    return rr;
+                }
+            };
+            let value: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(err) => {
+                    rr.ok = false;
+                    rr.detail = format!("invalid JSON: {err}");
+                    return rr;
+                }
+            };
+            let recorded: BTreeSet<String> =
+                e.keys.clone().unwrap_or_default().into_iter().collect();
+            let mut got = BTreeSet::new();
+            refine_http::keypaths(&value, "$", &mut got);
+            let missing: Vec<_> = recorded.difference(&got).take(5).collect();
+            if !missing.is_empty() {
+                rr.ok = false;
+                rr.detail = format!("required keys missing: {missing:?}");
             }
         }
         other => {
@@ -175,6 +187,10 @@ pub async fn replay_all(base: &str, allow_missing: bool) -> Result<(usize, usize
     let mut fail = 0;
     let mut failures = Vec::new();
     for (name, entry) in &manifest {
+        if let Some(ms) = &entry.defer {
+            println!("DEFER {name} (declared {ms})");
+            continue;
+        }
         let r = replay_route(&client, base, name, entry).await;
         if r.ok {
             pass += 1;

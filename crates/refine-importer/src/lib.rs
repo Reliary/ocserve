@@ -42,28 +42,48 @@ pub fn import_last_n(source: &Path, data_dir: &Path, limit: u32) -> Result<()> {
     let conn = refine_store::pragma::open_writer(&db)?;
     refine_store::schema::migrate(&conn)?;
 
-    // Inventory + metadata copy (payload streaming lands with the full importer).
+    // Full metadata pass (list shape = TUI/oc-remote contract, PLAN F1):
     let ph = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let mut stmt =
-        src.prepare(&format!("SELECT id, project_id, slug, directory, title, time_created, time_updated FROM session WHERE id IN ({ph})"))?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, i64>(5)?,
-            r.get::<_, i64>(6)?,
-        ))
-    })?;
+    let mut stmt = src.prepare(&format!(
+        "SELECT id, project_id, slug, directory, title, version, path, agent, model, cost,
+                summary_additions, summary_deletions, summary_files,
+                tokens_input, tokens_output, tokens_reasoning,
+                tokens_cache_read, tokens_cache_write, time_created, time_updated
+         FROM session WHERE id IN ({ph})"
+    ))?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(ids.iter()))?;
     let mut n = 0;
-    for row in rows {
-        let (id, project_id, slug, directory, title, tc, tu) = row?;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
         conn.execute(
-            "INSERT OR REPLACE INTO session (id, project_id, slug, directory, title, time_created, time_updated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![id, project_id, slug, directory, title, tc, tu],
+            "INSERT OR REPLACE INTO session (
+                id, project_id, slug, directory, title, version, path, agent, model, cost,
+                summary_additions, summary_deletions, summary_files,
+                tokens_input, tokens_output, tokens_reasoning,
+                tokens_cache_read, tokens_cache_write, time_created, time_updated)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+            rusqlite::params![
+                id,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, f64>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, i64>(12)?,
+                row.get::<_, i64>(13)?,
+                row.get::<_, i64>(14)?,
+                row.get::<_, i64>(15)?,
+                row.get::<_, i64>(16)?,
+                row.get::<_, i64>(17)?,
+                row.get::<_, i64>(18)?,
+                row.get::<_, i64>(19)?,
+            ],
         )?;
         n += 1;
     }

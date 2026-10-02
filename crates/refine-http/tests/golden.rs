@@ -228,3 +228,54 @@ async fn session_status_bytes_match_upstream() {
     .expect("golden status body present");
     assert_eq!(body.as_ref(), &golden[..]);
 }
+
+/// KILL CRITERION K-SSE-BYTES: 10s heartbeat cadence, shape byte-equal to
+/// upstream (`id,type,properties` order), no id:/retry: lines.
+/// Uses tokio paused time — no real sleeps (TESTING §6: hangs are failures,
+/// so the clock is virtual and the read stays bounded).
+#[tokio::test(start_paused = true)]
+async fn heartbeat_cadence_and_shape() {
+    let resp = app()
+        .oneshot(
+            Request::builder()
+                .uri("/global/event")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+    let mut body = resp.into_body();
+
+    // Bound must exceed the 10s cadence: paused-time auto-advance jumps to the
+    // EARLIEST timer — a 3s timeout would fire before the heartbeat sleep.
+    async fn read_frame(body: &mut Body) -> bytes::Bytes {
+        tokio::time::timeout(std::time::Duration::from_secs(11), body.frame())
+            .await
+            .expect("frame within bound (11s virtual)")
+            .expect("stream open")
+            .expect("frame decodes")
+            .into_data()
+            .unwrap_or_default()
+    }
+
+    // frame 1: server.connected, immediate (would also trip an 11s bound only
+    // if the stream were dead)
+    let _f1 = read_frame(&mut body).await;
+    let t1 = tokio::time::Instant::now();
+
+    // frame 2: heartbeat must arrive at t=10s (paused clock auto-advances;
+    // if cadence were wrong the timeout fires first and panics)
+    let f2 = read_frame(&mut body).await;
+    let elapsed = t1.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_secs(10),
+        "heartbeat early: {elapsed:?}"
+    );
+    let text = String::from_utf8_lossy(&f2);
+    let norm = normalize_ids(text.trim_end_matches('\n'));
+    assert_eq!(
+        norm, r#"data: {"payload":{"id":"evt_<ID>","type":"server.heartbeat","properties":{}}}"#,
+        "heartbeat shape drifted"
+    );
+    assert!(!text.contains("retry:"));
+}
