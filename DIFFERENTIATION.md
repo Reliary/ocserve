@@ -59,8 +59,12 @@ Roll-in rules (P1c):
   client/oc-remote always sees upstream-faithful raw output.
 - bash/shell/command tool outputs only; **never** read/grep (model must see file bytes it
   will edit); MCP tool outputs = parked flag.
-- Runtime CLI discovery (`reliary sift --stdin`), graceful raw fallback; default **OFF**
-  until the Arc49-style gate passes (interleaved, score median non-regression, WC ≥15%).
+- Enabled via env `REFINE_SIFT` (`auto` = `reliary sift --stdin` with
+  `~/.local/bin` prepended, or an explicit binary path); default **OFF** until the
+  Arc49-style gate passes (interleaved, score median non-regression, WC ≥15%).
+- Bench precondition (parked, bench repo): llm-replay records per condition and must
+  fail loud on a messages-hash miss — a silent miss hits the live provider and
+  corrupts the comparison.
 - Hard guards: output ≤ raw AND output non-empty when raw non-empty (observed:
   `compress_unified` can return `""` on degenerate input — empty guard is load-bearing),
   subprocess timeout → raw, deterministic memoized per output hash.

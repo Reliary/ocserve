@@ -232,9 +232,13 @@ pub(crate) fn to_provider_messages(history: &[(Value, Vec<Value>)]) -> Vec<ChatM
                 .as_str()
                 .or_else(|| p["state"]["metadata"]["output"].as_str())
                 .unwrap_or_default();
+            // provider-boundary sift (P1c): history rebuild must emit the
+            // SAME bytes as the live site below or the prefix cache busts
+            let bound =
+                crate::sift_boundary::maybe_sift(p["tool"].as_str().unwrap_or_default(), output);
             out.push(ChatMessage::tool_result(
                 p["callID"].as_str().unwrap_or_default(),
-                output,
+                bound.to_string(),
             ));
         }
     }
@@ -1239,7 +1243,10 @@ pub async fn run_prompt_with(
                         ));
                     }
                     parts.push(running);
-                    provider_tool_results.push((call.id.clone(), output));
+                    // live-site sift: same fn + same raw bytes as the history
+                    // rebuild => deterministic identical send both times (P1c)
+                    let bound = crate::sift_boundary::maybe_sift(&call.name, &output);
+                    provider_tool_results.push((call.id.clone(), bound.to_string()));
                     // loop guard, post-exec (D1/P1b): spiral asks (declined →
                     // prompt aborts, session self-heals like the stall path);
                     // error-storm is metric-only — iterating on a failing test
@@ -1646,4 +1653,58 @@ fn compute_cost(pricing: &Option<(f64, f64, f64)>, u: &Usage) -> f64 {
         + u.completion_tokens as f64 * pout
         + u.cached_tokens as f64 * pcache)
         / 1_000_000.0
+}
+
+#[cfg(test)]
+mod sift_wiring_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fake_shrink() -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("refine-sift-wire-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("shrink.sh");
+        std::fs::write(
+            &p,
+            "#!/bin/sh\ncat >/dev/null\necho 'FAIL: assertion failed at lib.rs:42'\necho '[400 ok]'\n",
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&p, perm).unwrap();
+        p
+    }
+
+    #[test]
+    fn history_rebuild_sifts_bash_but_not_read() {
+        let _g = crate::sift_boundary::sift_env_lock();
+        unsafe { std::env::set_var("REFINE_SIFT", fake_shrink().to_str().unwrap()) };
+        let mut big = String::new();
+        for i in 0..600 {
+            big.push_str(&format!("line {i}: noise noise noise\n"));
+        }
+        let history = vec![(
+            json!({"id": "m1", "role": "assistant"}),
+            vec![
+                json!({"type": "tool", "callID": "c1", "tool": "bash",
+                        "state": {"output": big}}),
+                json!({"type": "tool", "callID": "c2", "tool": "read",
+                        "state": {"output": big}}),
+            ],
+        )];
+        let msgs = to_provider_messages(&history);
+        let results: Vec<&ChatMessage> = msgs.iter().filter(|m| m.role == "tool").collect();
+        assert_eq!(results.len(), 2);
+        let bash_out = results[0].content.as_str();
+        let read_out = results[1].content.as_str();
+        assert!(
+            bash_out.contains("[compressed"),
+            "bash must sift: {bash_out}"
+        );
+        assert!(bash_out.contains("assertion failed"), "signal kept");
+        assert!(bash_out.len() <= big.len(), "never inflate");
+        assert_eq!(read_out, big, "whitelist fence: read stays raw");
+        unsafe { std::env::remove_var("REFINE_SIFT") };
+    }
 }
