@@ -173,6 +173,16 @@ pub fn pin_tools(tools: &[(String, String, String)]) -> String {
     format!("{:016x}", h.finish())
 }
 
+/// Enforce mode (REFINE_MCP_TRUST=enforce): flagged tool metadata is
+/// excluded from the model's schema and flagged responses are withheld from
+/// the prompt. Default (unset/observe) keeps the observe-only posture.
+pub fn enforce() -> bool {
+    matches!(
+        std::env::var("REFINE_MCP_TRUST").unwrap_or_default().trim(),
+        "enforce" | "block"
+    )
+}
+
 /// Aggregate a server's trust verdict from per-tool findings.
 pub fn verdict(findings: &[String]) -> &'static str {
     if findings.is_empty() { "ok" } else { "flagged" }

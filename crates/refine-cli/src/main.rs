@@ -257,6 +257,11 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
         },
     );
     let hub = refine_mcp::McpHub::probe_all(&mcp_cfgs).await;
+    // P2b: persist TOFU pins next to the DB so an offline rug-pull (server
+    // edited while refine is down) trips drift at next boot
+    if !mcp_cfgs.is_empty() {
+        hub.set_pins_path(data_dir.join("mcp-pins.json"));
+    }
     tracing::info!("mcp probe: {}", hub.statuses());
     refine_metrics::gauge(
         "refine_mcp_connected",

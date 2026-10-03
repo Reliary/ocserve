@@ -1069,7 +1069,7 @@ pub async fn run_prompt_with(
 
                     // ---- execute ----
                     let exec_start = now_ms();
-                    let (output, meta, title, is_err) = if allowed {
+                    let (mut output, meta, title, is_err) = if allowed {
                         // v1 parity: tool.execute.before (tools.ts:107) — input
                         // {tool, sessionID, callID} (upstream-exact, minimal),
                         // output {args}; MUTATED args are what executes. The
@@ -1138,6 +1138,15 @@ pub async fn run_prompt_with(
                             true,
                         )
                     };
+                    // P2/P2b: runtime trust scan of MCP (non-builtin) responses —
+                    // the channel connect-time review never sees (OWASP MCP03).
+                    // MUST run BEFORE state assignment: history rebuild reads
+                    // state.output, so enforce has to withhold there too or the
+                    // raw response leaks back into the prompt next turn.
+                    // Observe (default): metric + log, output unchanged.
+                    if !builtin {
+                        output = refine_mcp::McpHub::guard_output(&call.name, output);
+                    }
                     running["state"] = json!({
                         "status": if is_err { "error" } else { "completed" },
                         "input": serde_json::from_str::<Value>(&call.arguments)
@@ -1191,13 +1200,6 @@ pub async fn run_prompt_with(
                             json!({"sessionID": session_id, "todos": todos}),
                             &mut seq,
                         )?;
-                    }
-
-                    // P2: observe-only trust scan of MCP (non-builtin) responses —
-                    // the runtime channel connect-time review never sees
-                    // (OWASP MCP03). Metric + log only, never blocks.
-                    if !builtin {
-                        refine_mcp::McpHub::observe_output(&call.name, &output);
                     }
 
                     // v1 hook: tool.execute.after (sequential in-host; failures are
