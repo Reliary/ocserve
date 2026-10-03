@@ -252,6 +252,57 @@ pub fn compaction_rows_path(
     compaction_rows(&conn, session_id)
 }
 
+/// Newest message + parts (summary-exit detection, M6) — O(latest message)
+/// via SQL LIMIT 1 + one parts query, NOT a full history load (per-prompt
+/// path runs this every round; a full load would double prompt cost).
+pub fn last_message(
+    db: &std::path::Path,
+    session_id: &str,
+) -> anyhow::Result<Option<(serde_json::Value, Vec<serde_json::Value>)>> {
+    let conn = pragma::open_reader(db)?;
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT id, info FROM msg WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
+            [session_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    let Some((mid, info_txt)) = row else {
+        return Ok(None);
+    };
+    let info: serde_json::Value = serde_json::from_str(&info_txt)?;
+    let info = merge_columns(info, &mid, session_id, None);
+    let blobs = crate::blob::BlobStore::new(
+        db.parent()
+            .ok_or_else(|| anyhow::anyhow!("db parent"))?
+            .join("blobs"),
+    )?;
+    let mut pstmt = conn.prepare(
+        "SELECT id, inline, blob_sha, byte_len FROM msg_part WHERE message_id = ?1 ORDER BY seq",
+    )?;
+    let mut parts: Vec<serde_json::Value> = Vec::new();
+    let mut rows = pstmt.query([&mid])?;
+    while let Some(row) = rows.next()? {
+        let part_id: String = row.get(0)?;
+        let inline: Option<String> = row.get(1)?;
+        let sha: Option<String> = row.get(2)?;
+        let byte_len: i64 = row.get(3)?;
+        let txt = match inline {
+            Some(t) => t,
+            None => match (&sha, byte_len) {
+                (Some(sha), len) => {
+                    String::from_utf8_lossy(&blobs.get(sha, len as u64)?).into_owned()
+                }
+                (None, _) => continue,
+            },
+        };
+        if let Ok(v) = serde_json::from_str(&txt) {
+            parts.push(merge_columns(v, &part_id, session_id, Some(&mid)));
+        }
+    }
+    Ok(Some((info, parts)))
+}
+
 /// Replace a message's info row (summary finalize: finish/error/completed).
 pub fn update_message_info(
     writer: &Writer,
