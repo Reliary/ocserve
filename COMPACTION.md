@@ -94,10 +94,12 @@ The algorithm every model request (and `/message` reads? — see §8) filters th
    then everything newer; all older history drops out **without deletion**.
 
 ### 2.6 Config keys (shared `opencode.json`, read-sites cited)
-`cfg.compaction?.` → `auto` (default true; schema `config.ts:152`), `reserved`
-(tokens buffer, `overflow.ts:16`), `prune` (`compaction.ts:275`), `tail_turns`
-(`:228`), `preserve_recent_tokens` (`:117`, default
-`min(15_000, max(2_000, usable·0.25))` — constants `:32-33`), `prompt` (`:431`).
+`cfg.compaction?.` → `auto` (default true; schema `config.ts:152`), `prune`
+(default **false**, `:154`), `tail_turns` (`:228`), `preserve_recent_tokens`
+(`:117`, default `min(15_000, max(2_000, usable·0.25))` — constants `:32-33`),
+`reserved` (`overflow.ts:16`). There is **no `cfg.compaction.prompt` key** —
+`compacting.prompt` is the HOOK output (resolved §8.3: schema read at the
+freeze tag confirms five keys only).
 Both servers read the same config file → **zero new config surface for refine**.
 
 ## 3. Wire/compat surfaces (the freeze list)
@@ -160,7 +162,7 @@ post-hoc only; a preflight changes failure modes — §6 D5).
 
 | ID | Divergence | Rationale |
 |---|---|---|
-| D1 | consecutive-auto cap = 3 → `ContextOverflowError` | upstream has no hard counter (only the summarize-overflow fail-hard); safety + stall-watchdog precedent |
+| D1 | consecutive-auto cap = 3 → `session.error` (`ContextOverflowError` payload) then stop compacting — the current answer is kept if one exists; pending-cap with no answer errors the prompt | upstream has no hard counter (only the summarize-overflow fail-hard); safety + stall-watchdog precedent |
 | D2 | conversation byte cap + tail-weighted truncation (P2) | AGENTS bounded-by-construction; upstream unbounded |
 | D3 | overflow classifier = our own unit with fixtures | upstream classifies inside provider SDKs; refine has no typed error map — false± each get tests |
 | D4 | config trust: your models declare `limit.context = 1_000_000` (A9) → triggers land late, mostly on the error path — **same as upstream on the same config** | freeze-faithful; optional doctor warning parked, not in M6 |
@@ -178,15 +180,20 @@ DOOM_LOOP is tool-loop not compaction (A2 corrected); A9 config limits; retentio
 permutation fully read (B10); conversation format read (serialize); prunes constants
 read. Remaining risks parked in §8.
 
-## 8. Open reading items (must be confirmed in Phase 2, before engine code)
+## 8. Open reading items — ALL RESOLVED (2026-10-03, freeze tag v1.18.31)
 
-1. `truncate()` used by `serialize` (compaction.ts — capture its cap/behavior).
-2. `processCompaction` tail-selection detail (`compaction.ts:335-428`, partially read).
-3. Exact `ConfigV1.compaction` schema key spellings beyond read-sites (`config.ts:149-165`
-   descriptions seen; verify `tail_turns`/`preserve_recent_tokens` wire spellings).
-4. Whether upstream applies `filterCompacted` to REST `/message` reads or only model
-   assembly (determines refine's read-path parity scope).
-5. `nextPrompt` content source (the compaction instruction text) — byte-capture.
+1. ✅ `truncate` =2,000 chars + `\n[truncated]` (`compaction.ts:30,51-52`) — in `serialize`.
+2. ✅ select/splitTurn read fully; port matches (head = fits budget, `tail_start_id`).
+3. ✅ Five config keys only (schema at tag); `prompt` = hook output, not config (§2.6 fixed).
+4. ✅ `filterCompacted` = **model assembly only** (`prompt.ts:1092` sole caller); REST
+   `/message` serves unfiltered history.
+5. ✅ `nextPrompt` = `compacting.prompt ?? [buildPrompt(prevSummary, conversation),
+   ...compacting.context].join("\n\n")` (`:381-393`); templates captured (§2.3).
+
+**Probe conflict resolved:** the W3-era "empty user marker (parts=[])" recording
+contradicts `create()` at the freeze tag (identical in1.18.31 and .34) — source
+wins: the manual anchor carries the compaction part. K-SUMMARIZE test rewritten
+to source truth (`dead_provider_persists_anchor_and_summary_shell_then_fails`).
 
 ## 9. Test plan (draft; K-COMPACTION row lands with Phase 2 code)
 
@@ -204,7 +211,7 @@ read. Remaining risks parked in §8.
 
 ## 10. Phases
 
-- **P1 (this doc):** done pending your review — stop here.
-- **P2:** resolve §8 readings → engine + trigger + classifier + manual-route retrofit →
-  tests/guards/matrix — **starts only on your explicit go**.
-- **P3:** live battery (real plugins, real config) + deploy + fresh soak.
+- **P1:** reviewed ✅. **P2 (2026-10-03):** §8 resolved; store+core+engine+trigger+
+  manual retrofit all landed (C1–C5); unit/integration suites green. **Remaining before
+  K-COMPACTION green:** §9 forced-overflow stub e2e (cap-3, no-inflation, hooks, P1/P7
+  equivalence) — then P3 live battery + deploy + fresh soak.

@@ -293,8 +293,42 @@ pub async fn process(
         (head.len(), tail)
     };
 
+    // messages.transform fires on the SESSION-SHAPED clone (compaction.ts:
+    // 379) — this site mirrors upstream's raw shape (the main builder sends
+    // OpenAI shape, §17). Fail-open: output must be the same length with
+    // info/parts or the original head serializes unchanged.
+    let head_vals: Vec<Value> = sel_msgs[..head_len]
+        .iter()
+        .map(|(info, parts)| json!({"info": info, "parts": parts}))
+        .collect();
+    let mt_out = hook_mutate(
+        ctx.plugins.as_ref(),
+        "experimental.chat.messages.transform",
+        json!({}),
+        json!({"messages": head_vals}),
+    )
+    .await;
+    let head_final: Vec<(Value, Vec<Value>)> =
+        match mt_out.get("messages").and_then(|a| a.as_array()) {
+            Some(arr)
+                if arr.len() == head_len
+                    && arr
+                        .iter()
+                        .all(|m| m["info"].is_object() && m["parts"].is_array()) =>
+            {
+                arr.iter()
+                    .map(|m| {
+                        (
+                            m["info"].clone(),
+                            m["parts"].as_array().cloned().unwrap_or_default(),
+                        )
+                    })
+                    .collect()
+            }
+            _ => sel_msgs[..head_len].to_vec(),
+        };
     // conversation (serialized head, bounded P2)
-    let head: Vec<String> = sel_msgs[..head_len]
+    let head: Vec<String> = head_final
         .iter()
         .map(|(info, parts)| serialize(info, parts))
         .filter(|s| !s.is_empty())

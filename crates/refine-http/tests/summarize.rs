@@ -128,7 +128,7 @@ async fn validation_404_and_busy_semantics() {
 }
 
 #[tokio::test]
-async fn dead_provider_persists_empty_user_marker_then_fails() {
+async fn dead_provider_persists_anchor_and_summary_shell_then_fails() {
     let dir = tempfile::tempdir().unwrap();
     let st = state(dir.path());
     seed(&st, "ses_d");
@@ -145,10 +145,12 @@ async fn dead_provider_persists_empty_user_marker_then_fails() {
         "provider failure surfaces: {}",
         String::from_utf8_lossy(&b)
     );
-    // probe parity: the EMPTY user marker persisted BEFORE the provider turn
-    // (upstream message[2] = parts:[] with model = summarize's model)
+    // C5 source-derived shape (freeze tag v1.18.31, handlers/session.ts:273 +
+    // compaction.ts:559-582): seed + ANCHOR (user with compaction part) +
+    // summary shell (persisted before the provider turn failed). The old
+    // "empty marker" recording was misattributed — re-verified at the tag.
     let msgs = refine_store::load_messages(&st.db, "ses_d", None).unwrap();
-    assert_eq!(msgs.len(), 2, "seed + empty marker (assistant never lands)");
+    assert_eq!(msgs.len(), 3, "seed + anchor + summary shell");
     let (info, parts) = &msgs[1];
     assert_eq!(info["role"], "user");
     assert_eq!(
@@ -157,13 +159,28 @@ async fn dead_provider_persists_empty_user_marker_then_fails() {
     );
     assert_eq!(
         info["model"]["modelID"], "m",
-        "marker carries summarize model"
+        "anchor carries summarize model"
     );
-    assert!(parts.is_empty(), "EMPTY user marker, probe byte-shape");
-    // history instruction NOT persisted (transient prelude)
+    assert_eq!(parts.len(), 1, "anchor has exactly the compaction part");
+    assert_eq!(parts[0]["type"], "compaction");
+    assert_eq!(parts[0]["auto"], false, "manual flow = auto:false");
+    // history instruction NOT persisted (prompt built transiently)
     let raw = serde_json::to_string(&msgs[1]).unwrap();
     assert!(
         !raw.contains("anchored summary"),
         "instruction stays transient"
     );
+    // summary shell: linked to the anchor, never finished (stream failed)
+    let (sinfo, sparts) = &msgs[2];
+    assert_eq!(sinfo["role"], "assistant");
+    assert_eq!(sinfo["summary"], true);
+    assert_eq!(sinfo["parentID"], info["id"]);
+    assert!(sinfo["finish"].is_null(), "shell never completed");
+    assert_eq!(sparts.len(), 1);
+    assert_eq!(sparts[0]["type"], "text");
+    // projection linked (pending_anchor must NOT re-fire forever)
+    let conn = refine_store::pragma::open_reader(&st.db).unwrap();
+    let rows = refine_store::compaction_rows(&conn, "ses_d").unwrap();
+    assert_eq!(rows.len(), 1, "projection row");
+    assert!(rows[0].summary_msg_id.is_some(), "shell auto-linked");
 }

@@ -1035,10 +1035,13 @@ async fn post_summarize(
         return Err(session_busy(&sid));
     };
 
-    // agent = last user message's agent (v1: findLast user ?? defaultAgent)
-    // Compaction reads the FULL history by design (upstream summarize does
-    // the same via session.messages()); bounded by session size, identical
-    // to upstream. The rule stays armed for routes serving lists/pages.
+    // C5 retrofit (M6, COMPACTION.md §3): manual summarize = v1 source
+    // (handlers/session.ts:273-293 at the FREEZE TAG v1.18.31, verified):
+    // compactSvc.create(anchor with compaction part) + loop → pending task
+    // → engine process → summary-exit. The run's outer machinery detects
+    // the pending anchor — no generation runs (exit via last-message
+    // summary check). Session-shaped history load ONLY for findLast user's
+    // agent (v1 line 280).
     let history = refine_store::load_messages(&st.db, &sid, None) // allow:load_messages (summarize compaction)
         .map_err(|e| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1052,46 +1055,6 @@ async fn post_summarize(
         .and_then(|(info, _)| info["agent"].as_str())
         .unwrap_or("build")
         .to_string();
-    let entries: Vec<String> = history
-        .iter()
-        .map(|(info, parts)| refine_core::compact::serialize(info, parts))
-        .filter(|s| !s.is_empty())
-        .collect();
-    // v1 parity: experimental.session.compacting (compaction.ts:373) —
-    // input {sessionID}, output {context: [], prompt: undefined}. `prompt`
-    // REPLACES the compaction prompt wholesale; otherwise the built prompt
-    // comes first and context items append (`prompt ?? [built, ...context]`).
-    let c_out = refine_core::prompt::hook_mutate(
-        st.plugins.get(),
-        "experimental.session.compacting",
-        json!({"sessionID": sid}),
-        json!({"context": [], "prompt": Value::Null}),
-    )
-    .await;
-    let custom = c_out
-        .get("prompt")
-        .and_then(|p| p.as_str())
-        .map(str::to_string);
-    let extra: Vec<String> = c_out
-        .get("context")
-        .and_then(|c| c.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
-    let prelude = match custom {
-        Some(p) => p,
-        None => {
-            let mut parts = vec![refine_core::compact::build_summary_prompt(&entries)];
-            parts.extend(extra);
-            parts.join("\n\n")
-        }
-    };
-
     let prompt_payload = json!({
         "model": {"providerID": provider, "modelID": model_id},
         "agent": agent,
@@ -1099,18 +1062,26 @@ async fn post_summarize(
     });
     let ctx = build_prompt_context(&st, &prompt_payload, &sid)?;
     let writer = st.writer.clone();
+    refine_core::compaction::persist_anchor(&ctx, &writer, &sid, &agent, false, false)
+        .await
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("{e:#}"),
+        })?;
     refine_core::prompt::run_prompt_with(
         &ctx,
         &writer,
         &sid,
         &prompt_payload,
         refine_core::prompt::RunOpts {
-            // upstream probe (2026-10-02): summarize persists an EMPTY user
-            // marker (parts=[]) + the assistant summary — 4-message shape
-            // [user, assistant, user, assistant] confirmed live on 1.18.31
-            persist_user: true,
-            skip_history: true,
-            prelude: Some(prelude),
+            // the ANCHOR is already the newest message — nothing from the
+            // payload persists; pending→engine→summary-exit short-circuits
+            // before any generation (persist_user=false keeps chat.message
+            // silent, P0c invariant)
+            persist_user: false,
+            skip_history: false,
+            prelude: None,
             tools_enabled: false,
         },
     )
