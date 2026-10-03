@@ -13,6 +13,7 @@ tests pass.
 | `MEMORY.md` | 300 MB budget lines, allocator/runtime settings, allocation rules, memory gates |
 | `SRE.md` | fail-fast boot checks, metric-per-KPI table, config knobs, CPU policy, CI/CD, systemd |
 | `TESTING.md` | test levels/techniques, traceability matrix, anti-theater rules, adversarial program, entry/exit criteria |
+| `COMPACTION.md` | auto-compaction (M6): upstream algorithm line-cited, wire/compat surfaces, schema v8 projection, perf improvements (P1–P8), divergence ledger, test plan |
 
 Precedence when documents disagree: `TESTING.md` gates always win (nothing ships untested);
 then `PLAN.md`; then the companion spec for that domain (`STORAGE`/`MEMORY`/`SRE`). Any

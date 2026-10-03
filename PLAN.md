@@ -379,6 +379,7 @@ byte-golden capture of live `/global/event`; contentless-FTS retest under bundle
 | 3 | Store + importer + FTS + all storage gates | import gates green; p95 <50 ms; full-scan detector clean; mutation threshold met |
 | 4 | Plugins (quickjs) + MCP + OAuth | 3+3 pass; restart preserves state; sidecar gate decided; OAuth expiry test green |
 | 5 | Soak + hardening | every §7 row green over 24 h; systemd hardening live; fault + security suites green; rollback drill done |
+| 6 | Auto-compaction (`COMPACTION.md` — design reviewed before code, §10 gate) | COMPACTION §9 suite green: stub overflow e2e, cap-3, P1/P7 equivalence, P3 atomicity, no-inflation, classifier +±, serialize golden, hook exactly-once with negative twins; K-SUMMARIZE re-verified byte `true`; K-COMPACTION green |
 
 ## 15. Open questions (originally "decide before M1" — statuses updated 2026-10-03)
 
