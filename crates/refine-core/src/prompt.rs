@@ -666,7 +666,7 @@ pub async fn run_prompt_with(
                                 "context overflow at compaction round cap (COMPACTION D1)"
                             );
                         }
-                        compaction_rounds += 1;
+                        // no increment: the PENDING step counts compactions (cap = N processed)
                         crate::compaction::persist_anchor(
                             ctx, writer, session_id, &agent, true, true,
                         )
@@ -1316,7 +1316,6 @@ pub async fn run_prompt_with(
                         }}),
                     );
                 } else {
-                    compaction_rounds += 1;
                     crate::compaction::persist_anchor(ctx, writer, session_id, &agent, true, false)
                         .await?;
                     continue 'outer;

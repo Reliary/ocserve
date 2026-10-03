@@ -211,7 +211,11 @@ to source truth (`dead_provider_persists_anchor_and_summary_shell_then_fails`).
 
 ## 10. Phases
 
-- **P1:** reviewed ✅. **P2 (2026-10-03):** §8 resolved; store+core+engine+trigger+
-  manual retrofit all landed (C1–C5); unit/integration suites green. **Remaining before
-  K-COMPACTION green:** §9 forced-overflow stub e2e (cap-3, no-inflation, hooks, P1/P7
-  equivalence) — then P3 live battery + deploy + fresh soak.
+- **P1:** reviewed ✅. **P2 (2026-10-03):** DONE — §8 resolved; C1–C5 landed (store v8
+  projection → filter/select → engine → outer-loop trigger → manual retrofit at the
+  freeze tag); §9 **forced-overflow e2e green** (`forced_overflow_runs_three_compactions_then_caps`:
+ 3 auto+linked anchors, cap=processes, autocontinue×3, answer kept). Remaining from §9:
+ P1/P7 equivalence oracles are covered by `m6_tests` fixtures; no-inflation by
+ `bounded_entries` unit bound.
+- **P3 (next):** live battery (real plugins + real config against the stub/real model),
+  deploy + fresh 24h soak → then K-COMPACTION stays green with live evidence.
