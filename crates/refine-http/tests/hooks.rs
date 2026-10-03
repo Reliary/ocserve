@@ -129,6 +129,7 @@ fn setup(addr: std::net::SocketAddr, tag: &str) -> Arc<AppState> {
     let writer = std::sync::Arc::new(refine_store::Writer::spawn(db.clone()).unwrap());
     let blobs = std::sync::Arc::new(refine_store::BlobStore::new(dir.join("blobs")).unwrap());
     let llm = LlmRegistry {
+        limits: std::collections::HashMap::new(),
         endpoints: [("fake".into(), (format!("http://{addr}"), String::new()))]
             .into_iter()
             .collect(),

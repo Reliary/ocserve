@@ -246,6 +246,11 @@ impl Runtime {
     /// 470→665→749MB then the cap killed dispose) — the reloader moves the
     /// fields instead of duplicating the whole payload set every call.
     pub fn into_payloads(self) -> refine_http::Payloads {
+        let compaction = self
+            .config
+            .pointer("/compaction")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         refine_http::Payloads {
             config: self.config,
             agent: self.agent,
@@ -255,6 +260,7 @@ impl Runtime {
             provider: self.provider,
             console: self.console,
             capabilities: self.capabilities,
+            compaction,
         }
     }
 
@@ -763,10 +769,14 @@ impl Runtime {
 
         // pricing from models cache: (in, out, cache_read) USD per MTok
         let mut pricing = std::collections::HashMap::new();
+        let mut limits = std::collections::HashMap::new();
         if let Some(provs) = cache.as_object() {
             for (pid, p) in provs {
                 if let Some(models) = p.get("models").and_then(|v| v.as_object()) {
                     for (mid, m) in models {
+                        limits.entry((pid.clone(), mid.clone())).or_insert_with(|| {
+                            m.get("limit").cloned().unwrap_or(serde_json::Value::Null)
+                        });
                         let c = m.get("cost");
                         if let (Some(i), Some(o)) = (
                             c.and_then(|c| c.get("input")).and_then(|v| v.as_f64()),
@@ -787,6 +797,9 @@ impl Runtime {
             for (pid, p) in provs {
                 if let Some(models) = p.get("models").and_then(|v| v.as_object()) {
                     for (mid, m) in models {
+                        limits.entry((pid.clone(), mid.clone())).or_insert_with(|| {
+                            m.get("limit").cloned().unwrap_or(serde_json::Value::Null)
+                        });
                         if let (Some(i), Some(o)) = (
                             m.pointer("/cost/input").and_then(|v| v.as_f64()),
                             m.pointer("/cost/output").and_then(|v| v.as_f64()),
@@ -860,6 +873,7 @@ impl Runtime {
         LlmRegistry {
             endpoints,
             pricing,
+            limits,
             default_model,
             systems,
             default_agent,

@@ -319,6 +319,45 @@ impl SseLineParser {
     }
 }
 
+/// Context-overflow classifier (M6, COMPACTION D3): provider rejected the
+/// REQUEST as too big (upstream processor.ts:629 ContextOverflowError
+/// class). False positives compact a healthy session; false negatives
+/// leave users stuck on 400s — both directions carry tests.
+pub fn looks_like_context_overflow(err_msg: &str) -> bool {
+    let m = err_msg.to_ascii_lowercase();
+    // must look like a request-size rejection, not auth/rate-limit/5xx
+    let status_ok = m.contains("provider 400")
+        || m.contains("provider 413")
+        || m.contains(" status 400")
+        || m.contains(" status 413");
+    if !status_ok {
+        return false;
+    }
+    const MARKERS: &[&str] = &[
+        "context length",
+        "context window",
+        "context_length",
+        "context_length_exceeded",
+        "maximum context",
+        "too many tokens",
+        "too long",
+        "input length",
+        "reduce the length",
+        "prompt is too long",
+        "exceeds the model",
+        "exceeds max",
+        "maximum context length",
+        "string too long",
+        "input is too long",
+        "tokens exceeds",
+        "exceeded the maximum",
+        "request too large",
+        "payload too large",
+        "max context",
+    ];
+    MARKERS.iter().any(|k| m.contains(k))
+}
+
 /// Request shaping from the `chat.params` / `chat.headers` plugin hooks
 /// (v1 parity: session/llm/request.ts:115/135). `Default` reproduces the
 /// pre-hook behavior byte-for-byte (no temperature, no extra headers).
@@ -779,5 +818,47 @@ mod tests {
                 assert_eq!(stop_text, "HELLO_REFINE", "assembled text drifted");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod overflow_classifier_tests {
+    use super::looks_like_context_overflow;
+
+    #[test]
+    fn detects_request_size_rejections() {
+        assert!(looks_like_context_overflow(
+            "provider 400: {\"error\":{\"message\":\"This model's maximum context length is 128000 tokens\"}}"
+        ));
+        assert!(looks_like_context_overflow(
+            "provider 413: prompt is too long: 250000 tokens > 200000 maximum"
+        ));
+        assert!(looks_like_context_overflow(
+            "provider 400: input length of 300000 exceeds maximum context length of 200000"
+        ));
+        assert!(looks_like_context_overflow(
+            "provider 400: The request exceeds the model's context limit"
+        ));
+    }
+
+    #[test]
+    fn never_flags_auth_rate_limit_or_server_errors() {
+        assert!(!looks_like_context_overflow(
+            "provider 401: invalid api key"
+        ));
+        assert!(!looks_like_context_overflow(
+            "provider 429: rate limit exceeded, retry later"
+        ));
+        assert!(!looks_like_context_overflow(
+            "provider 500: internal server error"
+        ));
+        assert!(!looks_like_context_overflow(
+            "provider stream open stalled: no response headers"
+        ));
+        assert!(!looks_like_context_overflow("connection reset by peer"));
+        //400 without size markers is NOT overflow (validation error etc.)
+        assert!(!looks_like_context_overflow(
+            "provider 400: model 'nope' not found"
+        ));
     }
 }

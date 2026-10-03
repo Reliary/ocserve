@@ -51,9 +51,15 @@ pub struct PromptContext {
     pub plugins: Option<Arc<tokio::sync::Mutex<refine_plugin::Sidecar>>>,
     /// Question rendezvous (v1 Question service): `question` tool gate.
     pub questions: Arc<crate::question::QuestionGate>,
+    /// model limit block from the catalog (M6: compaction trigger math).
+    pub model_limit: serde_json::Value,
+    /// compaction config (shared opencode.json `compaction` section).
+    pub compaction: crate::compact::CompactionCfg,
+    /// system prompt for compaction requests (hidden `compaction` agent).
+    pub compaction_system: String,
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -62,7 +68,7 @@ fn now_ms() -> i64 {
 
 /// Emit a durable event: persist to ring, publish plain frame + sync twin.
 /// `seq` is a session-local counter seeded once (avoids re-opening readers).
-fn emit_durable(
+pub(crate) fn emit_durable(
     ctx: &PromptContext,
     writer: &refine_store::Writer,
     session_id: &str,
@@ -132,7 +138,7 @@ pub async fn hook_mutate(
 }
 
 /// Emit a non-durable live event (delta/status/idle/diff — no sync twin, per capture).
-fn emit_live(ctx: &PromptContext, event_type: &str, properties: Value) {
+pub(crate) fn emit_live(ctx: &PromptContext, event_type: &str, properties: Value) {
     refine_metrics::labeled_counter(
         "refine_events_emitted_total",
         &format!("type=\"{event_type}\""),
@@ -143,7 +149,7 @@ fn emit_live(ctx: &PromptContext, event_type: &str, properties: Value) {
 }
 
 /// Reconstruct provider messages from stored history (text + tool parts).
-fn to_provider_messages(history: &[(Value, Vec<Value>)]) -> Vec<ChatMessage> {
+pub(crate) fn to_provider_messages(history: &[(Value, Vec<Value>)]) -> Vec<ChatMessage> {
     let mut out = Vec::new();
     for (info, parts) in history {
         let role = info["role"].as_str().unwrap_or("user");
@@ -194,7 +200,7 @@ fn to_provider_messages(history: &[(Value, Vec<Value>)]) -> Vec<ChatMessage> {
 /// tests can shrink it in their own process (tests/stall.rs sets
 /// REFINE_PROVIDER_STALL_SECS=1); production default 120s — deltas keep
 /// resetting it, so only a truly silent socket trips it.
-fn provider_stall() -> std::time::Duration {
+pub(crate) fn provider_stall() -> std::time::Duration {
     static S: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *S.get_or_init(|| {
         std::time::Duration::from_secs(

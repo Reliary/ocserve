@@ -24,6 +24,7 @@ async fn silent_provider_fails_within_stall_budget_and_releases_state() {
     let writer = std::sync::Arc::new(refine_store::Writer::spawn(db.clone()).unwrap());
     let blobs = std::sync::Arc::new(refine_store::BlobStore::new(dir.join("blobs")).unwrap());
     let llm = LlmRegistry {
+        limits: std::collections::HashMap::new(),
         endpoints: [("fake".into(), (format!("http://{addr}"), String::new()))]
             .into_iter()
             .collect(),

@@ -66,6 +66,8 @@ pub struct Payloads {
     pub provider: serde_json::Value,
     pub console: serde_json::Value,
     pub capabilities: serde_json::Value,
+    /// shared-config `compaction` section (M6 trigger/knobs).
+    pub compaction: serde_json::Value,
 }
 
 /// Upstream error envelope: {"name":"NotFoundError","data":{"message":"..."}} (captured live).
@@ -229,6 +231,8 @@ pub struct LlmRegistry {
     pub endpoints: std::collections::HashMap<String, (String, String)>,
     /// (providerID, modelID) → (input, output, cache_read) USD/MTok
     pub pricing: std::collections::HashMap<(String, String), (f64, f64, f64)>,
+    /// (providerID, modelID) → `limit` block (context/input) — M6 trigger
+    pub limits: std::collections::HashMap<(String, String), serde_json::Value>,
     /// default (providerID, modelID) from opencode state
     pub default_model: (String, String),
     /// agent name → system prompt (only agents with explicit prompts)
@@ -1475,6 +1479,22 @@ fn build_prompt_context(
                 .collect()
         })
         .unwrap_or_default();
+    let model_limit = st
+        .llm
+        .limits
+        .get(&(pid.clone(), mid.clone()))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let compaction = {
+        let payloads = st.payloads.read();
+        refine_core::compact::CompactionCfg::from_value(Some(&payloads.compaction))
+    };
+    let compaction_system = st
+        .llm
+        .systems
+        .get("compaction")
+        .cloned()
+        .unwrap_or_else(|| system.clone());
     let ctx = refine_core::prompt::PromptContext {
         db: st.db.clone(),
         blobs: st.blobs.clone(),
@@ -1494,6 +1514,9 @@ fn build_prompt_context(
         mcp: st.mcp.get().cloned(),
         plugins: st.plugins.get().cloned(),
         questions: st.question_gate.clone(),
+        model_limit,
+        compaction,
+        compaction_system,
     };
     Ok(ctx)
 }

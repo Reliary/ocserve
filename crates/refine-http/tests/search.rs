@@ -13,6 +13,7 @@ fn state(dir: &std::path::Path) -> std::sync::Arc<AppState> {
     let writer = std::sync::Arc::new(refine_store::Writer::spawn(db.clone()).unwrap());
     let blobs = std::sync::Arc::new(refine_store::BlobStore::new(dir.join("blobs")).unwrap());
     let llm = LlmRegistry {
+        limits: std::collections::HashMap::new(),
         endpoints: [("fake".into(), ("http://127.0.0.1:9".into(), String::new()))]
             .into_iter()
             .collect(),

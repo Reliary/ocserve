@@ -6,6 +6,7 @@
 //! land with M3 milestones.
 
 pub mod compact;
+pub mod compaction;
 pub mod event;
 pub mod ids;
 pub mod permission;

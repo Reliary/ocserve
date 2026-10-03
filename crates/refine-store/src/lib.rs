@@ -243,6 +243,32 @@ pub fn compaction_rows(
     Ok(rows)
 }
 
+/// Path-based projection reader (engine call sites — mirrors load_messages).
+pub fn compaction_rows_path(
+    db: &std::path::Path,
+    session_id: &str,
+) -> anyhow::Result<Vec<CompactionRow>> {
+    let conn = crate::pragma::open_reader(db)?;
+    compaction_rows(&conn, session_id)
+}
+
+/// Replace a message's info row (summary finalize: finish/error/completed).
+pub fn update_message_info(
+    writer: &Writer,
+    session_id: &str,
+    message_id: &str,
+    info: &serde_json::Value,
+) -> anyhow::Result<usize> {
+    writer.write(vec![WriteOp::Sql {
+        sql: "UPDATE msg SET info = ?3 WHERE id = ?1 AND session_id = ?2".into(),
+        params: vec![
+            message_id.into(),
+            session_id.into(),
+            info.to_string().into(),
+        ],
+    }])
+}
+
 fn now_ms_i64() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

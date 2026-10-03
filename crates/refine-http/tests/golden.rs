@@ -494,6 +494,7 @@ async fn prompt_async_returns_204_persists_user_message_and_404s_unknown() {
     let writer = std::sync::Arc::new(refine_store::Writer::spawn(db.clone()).unwrap());
     let blobs = std::sync::Arc::new(refine_store::BlobStore::new(dir.join("blobs")).unwrap());
     let llm = LlmRegistry {
+        limits: std::collections::HashMap::new(),
         endpoints: [(
             "fake".to_string(),
             ("http://127.0.0.1:9".to_string(), String::new()),
@@ -1373,6 +1374,7 @@ async fn command_expands_and_persists_user_message_before_llm_fails() {
     let writer = std::sync::Arc::new(refine_store::Writer::spawn(db.clone()).unwrap());
     let blobs = std::sync::Arc::new(refine_store::BlobStore::new(dir.join("blobs")).unwrap());
     let llm = LlmRegistry {
+        limits: std::collections::HashMap::new(),
         endpoints: [(
             "fake".to_string(),
             ("http://127.0.0.1:9".to_string(), String::new()),
