@@ -22,11 +22,14 @@
 #   --freeze-only control arm only (validate the harness; no npm/docker build)
 # Env: FROZEN (default 1.18.31 = PLAN §3 freeze), REFINE_BIN, DRIFT_PORT_F
 #      (4923), DRIFT_PORT_L (4924), FREEZE_RUNS (2), DRIFT_REPORT_DIR
-# cron: 0 6 * * * cd <repo> && scripts/drift-watch.sh >> /tmp/drift-watch.log 2>&1
+# cron: 0 6 * * * cd <repo> && scripts/drift-watch.sh >> bench/drift/cron.log 2>&1
+# Env vars are operator-trusted inputs (set them like PATH — only from your own
+# shell/cron): REFINE_BIN executes a binary, DRIFT_REPORT_DIR writes files.
 # Exit: 0 = report written (drift found is INFORMATION, not failure)
 #       1 = harness failure (npm/docker/health/replay crash/nondeterminism)
 set -euo pipefail
 cd "$(dirname "$0")/.."
+umask 077  # reports/dotfiles carry config key-paths — owner-only (review L5)
 
 FROZEN="${FROZEN:-1.18.31}"
 REFINE_BIN="${REFINE_BIN:-}"
@@ -98,6 +101,7 @@ report_write() {
         [ -n "$name" ] || continue
         local d
         d=$(grep -m1 "^FAIL ${name}:" "${REPORT_DIR}/.latest.out" 2>/dev/null | sed 's/^FAIL [^:]*: //' || echo "?")
+        d="${d//|/\\|}"   # keep the cell intact (server key names can contain |)
         echo "| \`${name}\` | ${d} | pass |"
       done <"$driftf"
     fi
@@ -128,6 +132,10 @@ run_selftest() {
   tmp=$(mktemp -d)
   # shellcheck disable=SC2064
   trap "rm -rf '$tmp'" RETURN
+  # detail-extraction coverage (review L4): never read the live
+  # bench/drift/.latest.out — use a canned target output instead
+  REPORT_DIR="$tmp"
+  printf '%s\n' 'FAIL config: status 400 != recorded 200 with | pipe' >"$tmp/.latest.out"
 
   # version_gt: strict, symmetric-safe, cross-major
   version_gt 1.18.34 1.18.31 || { echo "selftest: version_gt 1.18.34>1.18.31 failed"; bad=1; }
@@ -163,6 +171,10 @@ run_selftest() {
   grep -q "# upstream drift watch" "$tmp/r.md" || { echo "selftest: report header"; bad=1; }
   grep -q '`config`' "$tmp/r.md" || { echo "selftest: report drift row"; bad=1; }
   grep -q "kill criterion" "$tmp/r.md" || { echo "selftest: report coverage"; bad=1; }
+  # cell-position assert: the detail must START the cell (prefix stripped) —
+  # a plain substring grep passes even with a broken sed (proven by neg. control)
+  grep -qF '| status 400' "$tmp/r.md" || { echo "selftest: report detail extraction (L4)"; bad=1; }
+  grep -qF 'with \| pipe' "$tmp/r.md" || { echo "selftest: report pipe-escape"; bad=1; }
 
   if [ "$bad" -eq 0 ]; then echo "drift-watch selftest ok"; fi
   return "$bad"
@@ -189,6 +201,21 @@ wait_health() {
   return 1
 }
 
+verify_health_version() { # $1 url  $2 expected  $3 label (review M3/L1)
+  # The FROZEN/LATEST labels are asserted, not observed — a rebuilt control
+  # image or a package-retargeted latest arm would silently corrupt
+  # classification, so the version reported by the running server itself
+  # must match the label before anything is replayed.
+  local body v
+  body="$(curl -fsS -m 5 "$1/global/health" 2>/dev/null || true)"
+  v="$(printf '%s' "$body" | sed -n 's/.*"version"[: ]*"\([^"]*\)".*/\1/p')"
+  if [ "$v" != "$2" ]; then
+    echo "harness failure: $3 health reports version '${v:-unparseable}', expected $2 (label drift corrupts classification)"
+    exit 1
+  fi
+  echo "$3 version verified: $v"
+}
+
 start_container() { # $1 name  $2 image  $3 host-port
   docker rm -f "$1" >/dev/null 2>&1 || true
   docker run -d --name "$1" \
@@ -207,6 +234,19 @@ replay_once() { # $1 url  $2 outfile → echoes "pass fail defer"; crash if no s
     tail -n 5 "$2"
     exit 1
   fi
+  # fail closed (review M1): the summary prints even when the target died
+  # after health — 0-passed or transport errors are infrastructure, never
+  # version drift, and must never become a report
+  if grep -qE ': 0 passed' "$2"; then
+    echo "harness failure: target dead during replay (0 routes passed): $1"
+    tail -n 3 "$2"
+    exit 1
+  fi
+  if grep -q '^FAIL .*request failed' "$2"; then
+    echo "harness failure: transport errors during replay (not version drift): $1"
+    grep -m 2 '^FAIL .*request failed' "$2"
+    exit 1
+  fi
   grep '^replay ' "$2" | tail -n 1
 }
 
@@ -222,18 +262,29 @@ fi
 resolve_bin
 command -v docker >/dev/null || { echo "harness failure: docker missing"; exit 1; }
 command -v npm >/dev/null || { echo "harness failure: npm missing"; exit 1; }
+# determinism gate is the anti-noise guarantee — one run cannot separate
+# drift from noise, so a vacuous gate is a harness failure (review L3)
+[ "$FREEZE_RUNS" -ge 2 ] || { echo "harness failure: FREEZE_RUNS=$FREEZE_RUNS — need >=2 (determinism gate)"; exit 1; }
 
 echo "== drift watch: querying npm =="
 LATEST="$(npm view opencode-ai version 2>/dev/null)" || { echo "harness failure: npm view failed"; exit 1; }
+# registry output is untrusted: reject anything that is not a plain version
+# before it reaches docker build-arg / image tag / report (review L1)
+[[ "$LATEST" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]+)?$ ]] || { echo "harness failure: npm version has unexpected format: '$LATEST'"; exit 1; }
 V2="$(npm view 'opencode-ai@>=2.0.0' version 2>/dev/null || true)"
 if [ -n "$V2" ]; then V2NOTE="**PUBLISHED: ${V2}** — PLAN §8 adoption trigger review"; else V2NOTE="not on npm (pre-release tags only)"; fi
+V2NOTE="${V2NOTE//$'\n'/ }"; V2NOTE="${V2NOTE//|/\\|}"
 echo "latest=${LATEST}  freeze=${FROZEN}  v2=${V2NOTE}"
-
-cleanup
-trap cleanup EXIT
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$REPORT_DIR"
+# mutual exclusion (review M2): overlapping runs share fixed container
+# names/ports/dotfiles — one run's cleanup destroys the other's state and
+# classification could go false-negative (a missed upstream release)
+command -v flock >/dev/null || { echo "harness failure: flock missing (util-linux)"; exit 1; }
+exec 9>"$REPORT_DIR/.watch.lock"
+flock -n 9 || { echo "another drift watch is running (lock: $REPORT_DIR/.watch.lock)"; exit 1; }
+cleanup
 WORK="$(mktemp -d)"
 trap 'cleanup; rm -rf "$WORK"' EXIT
 
@@ -247,6 +298,7 @@ fi
 echo "== control arm: opencode ${FROZEN} (replay ×${FREEZE_RUNS}) =="
 start_container "$NAME_FREEZE" "$IMAGE_FREEZE" "$PORT_F"
 wait_health "http://127.0.0.1:$PORT_F"
+verify_health_version "http://127.0.0.1:$PORT_F" "$FROZEN" "control"
 # first-boot warmup: async catalog/agent loads settle on the first replay —
 # discard it so measured runs compare stable state (determinism gate below
 # caught exactly this: api_agent/api_command failed run 1 only, not run 2)
@@ -295,6 +347,7 @@ docker build -q -f bench/parity/Dockerfile.upstream-npm \
   echo "harness failure: latest image build failed"; exit 1; }
 start_container "$NAME_LATEST" "drift-upstream:${LATEST}" "$PORT_L"
 wait_health "http://127.0.0.1:$PORT_L"
+verify_health_version "http://127.0.0.1:$PORT_L" "$LATEST" "latest"
 # same warmup protocol as the control arm (arm symmetry)
 replay_once "http://127.0.0.1:$PORT_L" "$WORK/warmup.latest.out" >/dev/null
 echo "warmup replay (discarded) ok"
