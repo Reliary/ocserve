@@ -1,0 +1,18 @@
+# Latest-upstream arm for scripts/drift-watch.sh — opencode from npm at
+# ARG OCV (watches releases beyond the 1.18.31 freeze — PLAN §6 / §8).
+# Same apt set + same config mounts as the freeze arm (Dockerfile.upstream)
+# so arm-vs-arm differences are VERSION drift, not environment drift.
+# `opencode --version` in the build is the glibc/sanity gate (fails the
+# build fast if the npm binary will not run on this base image).
+FROM node:22-slim
+ARG OCV=1.18.34
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git procps \
+    && rm -rf /var/lib/apt/lists/*
+RUN npm install -g "opencode-ai@${OCV}" \
+    && opencode --version \
+    && echo "drift latest arm ok"
+ENV HOME=/root
+WORKDIR /root
+EXPOSE 4921
+ENTRYPOINT ["opencode", "serve", "--port", "4921", "--hostname", "0.0.0.0"]

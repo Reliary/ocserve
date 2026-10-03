@@ -7,6 +7,9 @@
 #      messages route must stream via for_each_message_json
 #   4. msg_part INSERT/UPDATE outside refine-store — every part write must
 #      carry its part_search projection companion (W1 FTS invariant)
+#   5. upstream drift watch broken (version compare / replay-output parse /
+#      set-difference / report writer) — the nightly watch would go silently
+#      wrong (PLAN §6/§8, K-DRIFT)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -42,6 +45,13 @@ if out=$(grep -rn --include='*.rs' -E 'INSERT (OR REPLACE |OR IGNORE )?INTO msg_
   echo "$out"; echo "FAIL: msg_part INSERT/UPDATE outside refine-store skips the search projection (use part_row_ops / insert_message / update_part)"; fail=1
 else
   echo "ok"
+fi
+
+echo "== guard: upstream drift-watch selftest =="
+if ./scripts/drift-watch.sh --selftest >/dev/null 2>&1; then
+  echo "ok"
+else
+  echo "FAIL: drift-watch --selftest (upstream drift watcher broken — PLAN §6/§8 watch)"; fail=1
 fi
 
 exit $fail

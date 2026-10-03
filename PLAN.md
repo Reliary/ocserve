@@ -153,7 +153,10 @@ Differential testing (McKeeman 1998; Roseau ICSME 2025):
    - provider stream fuzz: 10 k seeded chunk-boundary splits of recorded streams → assembled
      output byte-matches upstream
 5. **Ongoing**: every PR replays corpus against refine vs upstream container; nightly replays
-   against **latest** upstream release (triage report — adopt/ignore, never auto-merge);
+   against **latest** upstream release (triage report — adopt/ignore, never auto-merge) —
+   **implemented by `scripts/drift-watch.sh`** (freeze control ×2 + latest npm arm, same
+   config mounts, warmup-replayed first, drift/noise/anomaly set classification; nondeter-
+   ministic control aborts the run so drift is never claimed from noise);
    kill criterion for the whole strategy: if >20% of divergences found are unrecordable by
    the harness, shift to contract-by-probe.
 
@@ -193,7 +196,10 @@ recovery. **No savings percentages are claimed until the benchmark harness measu
 
 - **v1 freeze remains the contract.** `PLAN.md §3` wire/API/plugin surfaces are pinned to
   1.18.31; upstream v1 patch/minor releases (1.18.32–34) are watched via the nightly byte-
-  golden container replay; any change to a live freeze artifact (§3 tables) is its own
+  golden container replay — **implemented by `scripts/drift-watch.sh`** (dual-arm: freeze
+  control image replayed ×2 for determinism, npm `latest` arm, drift = set difference of
+  failure sets; selftest wired as `check-guards` rule 5; reports under `bench/drift/`,
+  gitignored); any change to a live freeze artifact (§3 tables) is its own
   `test(corpus): …` commit. This keeps the maintenance load at the "30–60 min per minor"
   level already designed for.
 - **v2 is gated, not chased.** The v2 line (v2.0.*) is recorded as *pre-release* in our
