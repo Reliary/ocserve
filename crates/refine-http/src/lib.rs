@@ -1053,7 +1053,40 @@ async fn post_summarize(
         .map(|(info, parts)| refine_core::compact::serialize(info, parts))
         .filter(|s| !s.is_empty())
         .collect();
-    let prelude = refine_core::compact::build_summary_prompt(&entries);
+    // v1 parity: experimental.session.compacting (compaction.ts:373) —
+    // input {sessionID}, output {context: [], prompt: undefined}. `prompt`
+    // REPLACES the compaction prompt wholesale; otherwise the built prompt
+    // comes first and context items append (`prompt ?? [built, ...context]`).
+    let c_out = refine_core::prompt::hook_mutate(
+        st.plugins.get(),
+        "experimental.session.compacting",
+        json!({"sessionID": sid}),
+        json!({"context": [], "prompt": Value::Null}),
+    )
+    .await;
+    let custom = c_out
+        .get("prompt")
+        .and_then(|p| p.as_str())
+        .map(str::to_string);
+    let extra: Vec<String> = c_out
+        .get("context")
+        .and_then(|c| c.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let prelude = match custom {
+        Some(p) => p,
+        None => {
+            let mut parts = vec![refine_core::compact::build_summary_prompt(&entries)];
+            parts.extend(extra);
+            parts.join("\n\n")
+        }
+    };
 
     let prompt_payload = json!({
         "model": {"providerID": provider, "modelID": model_id},

@@ -143,15 +143,35 @@ pub struct Sidecar {
     statuses: parking_lot::Mutex<HashMap<String, Value>>,
     /// server/directory context for loads (kept for future reloads)
     server: (String, String),
+    /// spawn identity for respawn-after-death
+    args: SpawnArgs,
+    /// successful loads (spec, entry, input) — replayed on respawn
+    loads: Vec<(String, PathBuf, Value)>,
+}
+
+#[derive(Clone)]
+struct SpawnArgs {
+    host_path: PathBuf,
+    server_url: String,
+    directory: String,
 }
 
 impl Sidecar {
     pub async fn spawn(host_path: &Path, server_url: &str, directory: &str) -> Result<Self> {
         let mut child = Command::new("node")
-            // MEMORY.md sidecar boundary (≤80MB target): cap the V8 heap so
-            // the loaded plugin bundles cannot balloon RSS (measured 148MB
-            // uncapped on first boot — M5 finding).
-            .arg("--max-old-space-size=64")
+            // MEMORY.md sidecar boundary: V8 heap cap (env-tunable). Default
+            // raised64→128 after the LIVE battery (2026-10-03): with the real
+            // plugin set the sidecar OOM-killed at64 (observed boot death →
+            // hooks broken-piped until restart). Measured 64/128/192/256:
+            // RSS flat ~145-148MB either way (native dominates; heap cap
+            // only binds when heap actually grows).
+            .arg(format!(
+                "--max-old-space-size={}",
+                std::env::var("REFINE_PLUGIN_HEAP_MB")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(128)
+            ))
             .arg("--max-semi-space-size=2")
             .arg(host_path)
             .stdin(std::process::Stdio::piped())
@@ -210,10 +230,53 @@ impl Sidecar {
             child,
             statuses: parking_lot::Mutex::new(HashMap::new()),
             server: (server_url.to_string(), directory.to_string()),
+            args: SpawnArgs {
+                host_path: host_path.to_path_buf(),
+                server_url: server_url.to_string(),
+                directory: directory.to_string(),
+            },
+            loads: Vec::new(),
         })
     }
 
+    /// Respawn after unexpected death (V8 OOM / crash) and replay every
+    /// previously loaded plugin. Without this a dead sidecar leaves ALL
+    /// hooks broken-piped until service restart (live battery finding
+    /// 2026-10-03: boot-time heap OOM, fail-open hid it in the prompt path).
+    pub async fn ensure_alive(&mut self) -> Result<()> {
+        match self.child.try_wait() {
+            Ok(None) => return Ok(()),
+            Ok(Some(status)) => {
+                tracing::error!("plugin sidecar exited ({status}) — respawning");
+            }
+            Err(e) => {
+                tracing::error!("plugin sidecar try_wait failed: {e} — respawning");
+            }
+        }
+        let args = self.args.clone();
+        let loads = std::mem::take(&mut self.loads);
+        let mut fresh = Sidecar::spawn(&args.host_path, &args.server_url, &args.directory).await?;
+        for (spec, entry, input) in &loads {
+            if let Err(e) = fresh.load_raw(spec, entry, input).await {
+                tracing::warn!("plugin {spec} reload after respawn failed: {e:#}");
+            }
+        }
+        *self = fresh;
+        Ok(())
+    }
+
+    /// Child pid (test/diag: force-kill to prove respawn).
+    pub fn child_pid(&self) -> u32 {
+        self.child.id().unwrap_or(0)
+    }
+
     pub async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.ensure_alive().await?;
+        self.request_raw(method, params).await
+    }
+
+    /// Unguarded RPC (respawn replay only — the fresh child is alive).
+    async fn request_raw(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -236,6 +299,12 @@ impl Sidecar {
 
     /// Load one plugin (v1 server-factory extraction happens host-side).
     pub async fn load(&mut self, spec: &str, entry: &Path, input: &Value) -> Result<Vec<String>> {
+        self.ensure_alive().await?;
+        self.load_raw(spec, entry, input).await
+    }
+
+    /// Unguarded load (respawn replay only — fresh child is alive).
+    async fn load_raw(&mut self, spec: &str, entry: &Path, input: &Value) -> Result<Vec<String>> {
         // server/directory context defaults from spawn (input may omit them)
         let mut input = input.clone();
         if input
@@ -260,7 +329,7 @@ impl Sidecar {
             "input": input,
             "options": Value::Null,
         });
-        let res = self.request("load", params).await?;
+        let res = self.request_raw("load", params).await?;
         let hooks: Vec<String> = res["hooks"]
             .as_array()
             .map(|a| {
@@ -273,6 +342,8 @@ impl Sidecar {
             spec.to_string(),
             json!({"ok": true, "hooks": hooks, "id": res["id"]}),
         );
+        self.loads
+            .push((spec.to_string(), entry.to_path_buf(), input));
         Ok(hooks)
     }
 
@@ -442,6 +513,56 @@ export default PluginModule.server;
         assert_eq!(st["synthetic"]["ok"], true);
         assert_eq!(st["synthetic"]["hooks"][0], "tool.execute.after");
 
+        sc.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sidecar_respawns_after_death_and_reloads_plugins() -> anyhow::Result<()> {
+        if which_node().is_none() {
+            panic!("node binary required for plugin-host tests (M4b environment gate)");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("plug.mjs"),
+            r#"
+export const PluginModule = {
+  id: "reaper",
+  server: async () => ({
+    "chat.message": async (_i, output) => { output.alive = true; },
+  }),
+};
+export default PluginModule.server;
+"#,
+        )
+        .unwrap();
+        let host = materialize_host(&dir.path().join("host"))?;
+        let mut sc = Sidecar::spawn(&host, "http://127.0.0.1:9", "/work").await?;
+        sc.load("reaper", &dir.path().join("plug.mjs"), &json!({}))
+            .await
+            .expect("load");
+        let pid = sc.child_pid();
+        // force-kill the child (the live OOM class: sidecar dies, hooks
+        // silently broken-piped until a respawn guard exists)
+        std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status()
+            .expect("kill -9");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // next RPC must respawn + replay loads + deliver the mutation
+        let out = sc
+            .trigger("chat.message", json!({"sessionID": "s"}), json!({}))
+            .await
+            .expect("trigger after respawn");
+        assert_eq!(out["alive"], true, "hook must fire after respawn");
+        assert_ne!(sc.child_pid(), pid, "child process must be replaced");
+        let st = sc.statuses();
+        assert_eq!(
+            st["reaper"]["ok"], true,
+            "previously loaded plugins must be reloaded"
+        );
         sc.shutdown().await;
         Ok(())
     }

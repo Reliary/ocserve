@@ -27,6 +27,22 @@ Module._resolveFilename = function (request, ...rest) {
 globalThis.Bun = Object.freeze({
   // Minimal marker: plugins branch on truthiness. Deliberately NO $ / sqlite /
   // filesystem surface — divergence documented in refine-plugin docs.
+  // `hash`: real Bun.hash surface used by plugins (magic-context
+  // directoryFallback: Bun.hash(p).toString(16) → stable project id). FNV-1a
+  // double-pass — deterministic per input across runs (ids need run-stability,
+  // never cross-runtime equality with Bun's wyhash). Missing entirely crashed
+  // the fallback path live (TypeError → plugin load failed on non-git cwd).
+  hash(value) {
+    const s = typeof value === "string" ? value : String(value);
+    let a = 0x811c9dc5;
+    let b = 0x9e3779b9;
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i);
+      a = Math.imul(a ^ c, 0x01000193) >>> 0;
+      b = Math.imul(b ^ (c + i), 0x85ebca6b) >>> 0;
+    }
+    return a * 65536 + (b >>> 16); // < 2^48: clean hex, exact in doubles
+  },
 });
 
 // ---- stdout discipline: protocol only -------------------------------

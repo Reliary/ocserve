@@ -261,6 +261,9 @@ export const PluginModule = {
       output.parts = output.parts.map((p) =>
         p.type === "text" ? { ...p, text: p.text + " [CMD]" } : p);
     },
+    "experimental.session.compacting": async (_i, output) => {
+      output.prompt = "CUSTOMPROMPT-XYZ";
+    },
   }),
 };
 export default PluginModule.server;
@@ -619,5 +622,62 @@ export default PluginModule.server;
             && got.contains("message.removed")
             && got.contains("session.deleted"),
         "event pump must deliver lifecycle events, got:\n{got}"
+    );
+}
+
+#[tokio::test]
+async fn summarize_fires_compacting_not_chat_message() {
+    require_node();
+    // two provider requests: (1) the seeding prompt (chat.message MUST fire)
+    // (2) the summarize turn (compacting MUST fire, chat.message MUST NOT)
+    let (addr, rx) = spawn_provider_scripted(vec![SSE_OK.to_string(), SSE_OK.to_string()]);
+    let st = setup(addr, "sum");
+    load_plugin(&st, "sum", FIXTURE).await;
+    let app = refine_http::router(st.clone());
+    run_prompt(app.clone(), &st, "sum", "seed-history").await;
+    let (_h1, b1) = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("prompt capture");
+    assert!(b1.contains("[CM]"), "prompt flow must fire chat.message");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/session/ses_sum/summarize")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"providerID":"fake","modelID":"m"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "summarize must run");
+    let (_h2, b2) = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("summarize capture");
+    // compacting hook REPLACED the prompt wholesale (compaction.ts:382)
+    assert!(
+        b2.contains("CUSTOMPROMPT-XYZ"),
+        "experimental.session.compacting prompt override must reach the wire:\n{b2}"
+    );
+    // the summarize user marker must NOT carry chat.message's [CM] tag
+    // (upstream summarize never triggers chat.message — fidelity gate on
+    // skip_history, not persist_user)
+    let conn = refine_store::pragma::open_reader(&st.db).unwrap();
+    // exactly ONE [CM]-tagged part in the session — the seed prompt's.
+    // (Summarize's user marker persists EMPTY parts, so counting rows for
+    // it would pass vacuously; the invariant is: summarize adds no new
+    // chat.message-mutated part.)
+    let tagged: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM msg_part WHERE session_id='ses_sum' AND inline LIKE '%[CM]%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        tagged, 1,
+        "summarize must not add a chat.message-mutated part (seed=1)"
     );
 }

@@ -304,10 +304,12 @@ pub async fn run_prompt_with(
     });
     // v1 parity: chat.message (prompt.ts:1000) fires BEFORE persistence so
     // plugins (magic-context) can mutate {message, parts} into history.
-    // Fidelity note: only the real user-prompt flow fires it — upstream's
-    // summarize path (compaction.ts) does not build a persisted user
-    // message here, so persist_user=false skips the trigger deliberately.
-    if opts.persist_user {
+    // Fidelity note: only the REAL prompt flow fires it — upstream's
+    // summarize (compaction.ts) persists its user marker through a
+    // different path and never triggers chat.message. persist_user alone
+    // can't distinguish (refine summarize persists the marker too, probe
+    // 2026-10-02) — skip_history can (summarize-only): gate on BOTH.
+    if opts.persist_user && !opts.skip_history {
         let out = hook_mutate(
             ctx.plugins.as_ref(),
             "chat.message",

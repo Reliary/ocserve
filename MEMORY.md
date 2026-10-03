@@ -37,7 +37,18 @@ margin documented in `deploy/refine.service` (fail-fast worked; the cap was tigh
 for allocator page retention during delta bursts).
 The original ≤80 MB target is **not achievable with these artifacts** on any single
 node process; boundary set to measured + headroom: sidecar **hard cap 160 MB** (systemd
-`MemoryMax` in the unit), combined refine+sidecar budget **460 MB**. Any future plugin
+`MemoryMax` in the unit), combined refine+sidecar budget **460 MB**.
+
+**V8 heap cap (2026-10-03, P0 battery):** at `--max-old-space-size=64` the real
+5-plugin set OOM-killed the sidecar once at boot (observed: `FATAL ERROR: Reached
+heap limit`, child zombie, every subsequent hook `Broken pipe` — fail-open hid it
+inside prompts). Controlled re-measure (4/5 plugins loading — gemini fails
+independently —10s+ settle, trigger+event exercised): RSS **flat 144-148 MB at
+64/128/192/256** — the V8 cap never binds baseline RSS (native/WASM dominates), so
+headroom is free. Default raised to **128** (`REFINE_PLUGIN_HEAP_MB` overrides), and
+`Sidecar::ensure_alive` now respawns + replays all loads on the next RPC after any
+death (`sidecar_respawns_after_death_and_reloads_plugins`). The160 MB systemd
+`MemoryMax` remains the hard boundary. Any future plugin
 addition must re-measure (gate: sidecar ≤160 MB after load, else a plugin is dropped or
 loads lazily).
 
