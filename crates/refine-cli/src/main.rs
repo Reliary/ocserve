@@ -221,6 +221,15 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
             tracing::warn!("search backfill failed (search incomplete until next boot): {e:#}")
         }
     }
+    // M6: compaction projection backfill (idempotent; legacy imports may
+    // carry upstream compaction anchors — COMPACTION.md §8.1 resolved)
+    match refine_store::backfill_compaction(&writer, &db_path) {
+        Ok((0, 0, _)) => {}
+        Ok((anchors, links, ms)) => {
+            tracing::info!("compaction backfill: {anchors} anchors, {links} summary links, {ms}ms");
+        }
+        Err(e) => tracing::warn!("compaction backfill failed (retries next boot): {e:#}"),
+    }
     // W6: search parity gauge (part rows vs projection) — mismatch after
     // backfill = indexed drift worth seeing on /metrics
     if let Ok(conn) = refine_store::pragma::open_reader(&db_path) {

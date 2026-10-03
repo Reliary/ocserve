@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -163,6 +163,21 @@ CREATE TABLE import_manifest (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 ) STRICT;
+
+-- compaction projection (M6): one row per compaction anchor part — assembly
+-- needs the LAST anchor + tail BEFORE a forward streaming pass (COMPACTION
+-- §5 P1); maintained by the part helpers exactly like part_search.
+CREATE TABLE compaction (
+    session_id     TEXT NOT NULL,
+    part_id        TEXT NOT NULL UNIQUE REFERENCES msg_part(id) ON DELETE CASCADE,
+    user_msg_id    TEXT NOT NULL REFERENCES msg(id) ON DELETE CASCADE,
+    auto           INTEGER NOT NULL DEFAULT 0,
+    overflow       INTEGER NOT NULL DEFAULT 0,
+    tail_start_id  TEXT,
+    summary_msg_id TEXT REFERENCES msg(id) ON DELETE SET NULL,
+    time_ms        INTEGER NOT NULL DEFAULT 0
+) STRICT;
+CREATE INDEX idx_compaction_session ON compaction(session_id, time_ms);
 ";
 
 /// Apply schema to a fresh DB and stamp user_version. Handles 0→current,
@@ -266,6 +281,24 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                     END;
                     DROP TABLE IF EXISTS search_fts;
                     DROP TABLE IF EXISTS search_doc;",
+                )?;
+            }
+            7 => {
+                // v7→v8: compaction projection (M6, COMPACTION.md §4).
+                // Backfill of pre-existing anchors runs at boot
+                // (store::backfill_compaction).
+                conn.execute_batch(
+                    "CREATE TABLE compaction (
+                        session_id     TEXT NOT NULL,
+                        part_id        TEXT NOT NULL UNIQUE REFERENCES msg_part(id) ON DELETE CASCADE,
+                        user_msg_id    TEXT NOT NULL REFERENCES msg(id) ON DELETE CASCADE,
+                        auto           INTEGER NOT NULL DEFAULT 0,
+                        overflow       INTEGER NOT NULL DEFAULT 0,
+                        tail_start_id  TEXT,
+                        summary_msg_id TEXT REFERENCES msg(id) ON DELETE SET NULL,
+                        time_ms        INTEGER NOT NULL DEFAULT 0
+                    ) STRICT;
+                    CREATE INDEX idx_compaction_session ON compaction(session_id, time_ms);",
                 )?;
             }
             other => {

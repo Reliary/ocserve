@@ -97,6 +97,8 @@ pub fn insert_message(
         // upsert built before `text` moves into the inline branch (FK order:
         // msg_part row first, then the projection — push order below)
         let upsert = part_search_upsert_ops(&pid, session_id, &id, &text);
+        let compaction_op =
+            (ptype == "compaction").then(|| compaction_upsert_ops(&pid, session_id, &id, &text));
         let (inline, blob_sha) = match blobs.filter(|_| text.len() > INLINE_PART_MAX) {
             Some(store) => {
                 let (sha, _, _) = store.put(text.as_bytes())?;
@@ -119,6 +121,19 @@ pub fn insert_message(
             ],
         });
         ops.push(upsert); // uncompressed text even for blobbed parts (W1)
+        if let Some(op) = compaction_op {
+            ops.push(op);
+        }
+    }
+    // summary assistants link to their anchor (M6): completedCompactions()
+    // reads summary_msg_id from the projection instead of scanning messages
+    if info["summary"] == serde_json::Value::Bool(true)
+        && let Some(parent) = info["parentID"].as_str()
+    {
+        ops.push(WriteOp::Sql {
+            sql: "UPDATE compaction SET summary_msg_id = ?2 WHERE user_msg_id = ?1 AND summary_msg_id IS NULL".into(),
+            params: vec![parent.into(), id.as_str().into()],
+        });
     }
     writer.write(ops).map(|_| ())
 }
@@ -144,6 +159,181 @@ pub fn part_search_upsert_ops(
     }
 }
 
+/// Compaction projection upsert (M6): one row per anchor part. `auto`/
+/// `overflow` come from the part JSON; tail/summary lifecycle fields are
+/// updated by separate ops (never clobbered here on conflict).
+pub fn compaction_upsert_ops(
+    part_id: &str,
+    session_id: &str,
+    user_msg_id: &str,
+    text: &str,
+) -> WriteOp {
+    let v: serde_json::Value = serde_json::from_str(text).unwrap_or(serde_json::Value::Null);
+    let auto = if v["auto"] == serde_json::Value::Bool(true) {
+        1
+    } else {
+        0
+    };
+    let overflow = if v["overflow"] == serde_json::Value::Bool(true) {
+        1
+    } else {
+        0
+    };
+    WriteOp::Sql {
+        sql: "INSERT INTO compaction (session_id, part_id, user_msg_id, auto, overflow, time_ms) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+              ON CONFLICT(part_id) DO UPDATE SET auto = excluded.auto, overflow = excluded.overflow"
+            .into(),
+        params: vec![
+            session_id.into(),
+            part_id.into(),
+            user_msg_id.into(),
+            auto.into(),
+            overflow.into(),
+            now_ms_i64().into(),
+        ],
+    }
+}
+
+/// tail_start_id update when the compaction part gains/changes its tail
+/// (upstream: compaction.ts:460-466 updatePart on selected tail change).
+pub fn compaction_tail_ops(part_id: &str, data: &serde_json::Value) -> WriteOp {
+    let tail = data
+        .get("tail_start_id")
+        .and_then(|t| t.as_str())
+        .map(|t| t.to_string());
+    WriteOp::Sql {
+        sql: "UPDATE compaction SET tail_start_id = ?2 WHERE part_id = ?1".into(),
+        params: vec![part_id.into(), tail.into()],
+    }
+}
+
+/// Projection rows for one session in creation order (last row = newest
+/// anchor — filterCompacted's findLastIndex equivalent, O(compactions)).
+pub struct CompactionRow {
+    pub part_id: String,
+    pub user_msg_id: String,
+    pub auto: bool,
+    pub overflow: bool,
+    pub tail_start_id: Option<String>,
+    pub summary_msg_id: Option<String>,
+}
+
+pub fn compaction_rows(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> anyhow::Result<Vec<CompactionRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT part_id, user_msg_id, auto, overflow, tail_start_id, summary_msg_id \
+         FROM compaction WHERE session_id = ?1 ORDER BY time_ms, rowid",
+    )?;
+    let rows = stmt
+        .query_map([session_id], |r| {
+            Ok(CompactionRow {
+                part_id: r.get(0)?,
+                user_msg_id: r.get(1)?,
+                auto: r.get::<_, i64>(2)? != 0,
+                overflow: r.get::<_, i64>(3)? != 0,
+                tail_start_id: r.get(4)?,
+                summary_msg_id: r.get(5)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+fn now_ms_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Boot backfill for pre-existing compaction anchors (M6): legacy imports
+/// may carry upstream compaction parts. Idempotent via NOT EXISTS; links
+/// summary assistants to their anchors. Returns (rows, links, ms).
+pub fn backfill_compaction(
+    writer: &Writer,
+    db: &std::path::Path,
+) -> anyhow::Result<(u64, u64, u64)> {
+    let t0 = std::time::Instant::now();
+    let conn = crate::pragma::open_reader(db)?;
+    let mut rows: Vec<(String, String, String, String, i64, i64)> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT p.id, p.message_id, p.session_id, COALESCE(p.inline, ''), m.info \
+             FROM msg_part p JOIN msg m ON m.id = p.message_id \
+             WHERE p.type = 'compaction' \
+               AND NOT EXISTS (SELECT 1 FROM compaction c WHERE c.part_id = p.id)",
+        )?;
+        let mapped = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        for row in mapped.flatten() {
+            let (part_id, msg_id, session_id, inline, info_json) = row;
+            let info: serde_json::Value = serde_json::from_str(&info_json).unwrap_or_default();
+            let _ = info;
+            rows.push((part_id, msg_id, session_id, inline, 0, 0));
+        }
+    }
+    let mut n = 0u64;
+    for (part_id, msg_id, session_id, inline, _, _) in &rows {
+        if inline.is_empty() {
+            continue; // blobbed anchor (never in practice) — counted below
+        }
+        let op = compaction_upsert_ops(part_id, session_id, msg_id, inline);
+        writer.write(vec![op])?;
+        n += 1;
+    }
+    // link summary assistants (info has summary:true + parentID)
+    let mut links = 0u64;
+    let mut link_ops: Vec<WriteOp> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, info FROM msg WHERE role = 'assistant' \
+             AND info LIKE '%\"summary\":true%' AND info LIKE '%parentID%'",
+        )?;
+        let ids: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for (sid, info_json) in ids {
+            let info: serde_json::Value = match serde_json::from_str(&info_json) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let Some(parent) = info["parentID"].as_str() else {
+                continue;
+            };
+            // only count ACTUAL links (a second run must report zero)
+            let pending: i64 = conn.query_row(
+                "SELECT count(*) FROM compaction WHERE user_msg_id = ?1 AND summary_msg_id IS NULL",
+                [parent],
+                |r| r.get(0),
+            )?;
+            if pending == 0 {
+                continue;
+            }
+            link_ops.push(WriteOp::Sql {
+                sql: "UPDATE compaction SET summary_msg_id = ?2 WHERE user_msg_id = ?1 AND summary_msg_id IS NULL".into(),
+                params: vec![parent.into(), sid.as_str().into()],
+            });
+            links += 1;
+        }
+    }
+    if !link_ops.is_empty() {
+        writer.write(link_ops)?;
+    }
+    Ok((n, links, t0.elapsed().as_millis() as u64))
+}
+
 /// One part row's write pair (msg_part INSERT with an EXPLICIT seq +
 /// part_search upsert). The only legal way for code OUTSIDE refine-store
 /// (importer, sync) to create parts — check-guards.sh rule 4 enforces it.
@@ -160,7 +350,7 @@ pub struct PartRow<'a> {
 }
 
 pub fn part_row_ops(row: &PartRow<'_>) -> Vec<WriteOp> {
-    vec![
+    let mut ops = vec![
         WriteOp::Sql {
             sql: "INSERT INTO msg_part (id, message_id, session_id, seq, type, byte_len, inline, blob_sha) \
                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
@@ -177,7 +367,16 @@ pub fn part_row_ops(row: &PartRow<'_>) -> Vec<WriteOp> {
             ],
         },
         part_search_upsert_ops(row.id, row.session_id, row.message_id, row.text),
-    ]
+    ];
+    if row.ptype == "compaction" {
+        ops.push(compaction_upsert_ops(
+            row.id,
+            row.session_id,
+            row.message_id,
+            row.text,
+        ));
+    }
+    ops
 }
 
 /// Load history for prompt assembly: (info, parts) ordered by msg.seq.
@@ -786,7 +985,7 @@ pub fn update_part(
     } else {
         (Some(text), None)
     };
-    let n = writer.write(vec![
+    let mut ops = vec![
         WriteOp::Sql {
             sql: "UPDATE msg_part SET byte_len = ?3, inline = ?4, blob_sha = ?5 WHERE id = ?1 AND message_id = ?2"
                 .into(),
@@ -799,7 +998,11 @@ pub fn update_part(
             ],
         },
         upsert,
-    ])?;
+    ];
+    if data["type"] == "compaction" {
+        ops.push(compaction_tail_ops(part_id, data));
+    }
+    let n = writer.write(ops)?;
     Ok(n > 0)
 }
 
@@ -1202,5 +1405,195 @@ mod finalize_tests {
         );
         assert_eq!(tin, 11);
         assert_eq!(tcache, 33);
+    }
+}
+
+#[cfg(test)]
+mod compaction_projection_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn session_op(id: &str) -> WriteOp {
+        WriteOp::Sql {
+            sql: "INSERT INTO session (id, project_id, directory, path, slug, title, version, time_created, time_updated) VALUES (?1, 'global', '/w', 's', 's', 't', '1', 1, 1)".into(),
+            params: vec![id.into()],
+        }
+    }
+
+    #[test]
+    fn anchor_part_populates_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::writer::db_path(dir.path());
+        let w = Writer::spawn(db.clone()).unwrap();
+        w.write(vec![session_op("ses_c1")]).unwrap();
+        insert_message(
+            &w,
+            None,
+            "ses_c1",
+            &json!({"id":"msg_anchor","sessionID":"ses_c1","role":"user","time":{"created":1}}),
+            &[
+                json!({"id":"prt_c1","sessionID":"ses_c1","messageID":"msg_anchor",
+                     "type":"compaction","auto":true,"overflow":false}),
+            ],
+        )
+        .unwrap();
+        drop(w);
+        let conn = crate::pragma::open_reader(&db).unwrap();
+        let rows = compaction_rows(&conn, "ses_c1").unwrap();
+        assert_eq!(rows.len(), 1, "projection row for the anchor part");
+        assert_eq!(rows[0].part_id, "prt_c1");
+        assert_eq!(rows[0].user_msg_id, "msg_anchor");
+        assert!(rows[0].auto, "auto parsed from part JSON");
+        assert!(!rows[0].overflow);
+        assert_eq!(rows[0].summary_msg_id, None);
+    }
+
+    #[test]
+    fn update_part_sets_tail_and_summary_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::writer::db_path(dir.path());
+        let w = Writer::spawn(db.clone()).unwrap();
+        let blobs = BlobStore::new(dir.path().join("blobs")).unwrap();
+        w.write(vec![session_op("ses_c2")]).unwrap();
+        insert_message(
+            &w,
+            None,
+            "ses_c2",
+            &json!({"id":"msg_a2","sessionID":"ses_c2","role":"user","time":{"created":1}}),
+            &[
+                json!({"id":"prt_a2","sessionID":"ses_c2","messageID":"msg_a2",
+                     "type":"compaction","auto":true}),
+            ],
+        )
+        .unwrap();
+        update_part(
+            &w,
+            &blobs,
+            "ses_c2",
+            "msg_a2",
+            "prt_a2",
+            &json!({"id":"prt_a2","sessionID":"ses_c2","messageID":"msg_a2",
+                    "type":"compaction","auto":true,"overflow":false,
+                    "tail_start_id":"msg_tail9"}),
+        )
+        .unwrap();
+        // summary assistant links via insert_message info
+        insert_message(
+            &w,
+            None,
+            "ses_c2",
+            &json!({"id":"msg_sum","sessionID":"ses_c2","role":"assistant",
+                    "summary":true,"parentID":"msg_a2","time":{"created":2}}),
+            &[],
+        )
+        .unwrap();
+        drop(w);
+        let conn = crate::pragma::open_reader(&db).unwrap();
+        let rows = compaction_rows(&conn, "ses_c2").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tail_start_id.as_deref(), Some("msg_tail9"));
+        assert_eq!(rows[0].summary_msg_id.as_deref(), Some("msg_sum"));
+    }
+
+    #[test]
+    fn session_delete_cascades_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::writer::db_path(dir.path());
+        let w = Writer::spawn(db.clone()).unwrap();
+        w.write(vec![session_op("ses_c3")]).unwrap();
+        insert_message(
+            &w,
+            None,
+            "ses_c3",
+            &json!({"id":"msg_a3","sessionID":"ses_c3","role":"user","time":{"created":1}}),
+            &[
+                json!({"id":"prt_a3","sessionID":"ses_c3","messageID":"msg_a3",
+                     "type":"compaction","auto":true}),
+            ],
+        )
+        .unwrap();
+        w.write(vec![WriteOp::Sql {
+            sql: "DELETE FROM session WHERE id = 'ses_c3'".into(),
+            params: vec![],
+        }])
+        .unwrap();
+        drop(w);
+        let conn = crate::pragma::open_reader(&db).unwrap();
+        let rows = compaction_rows(&conn, "ses_c3").unwrap();
+        assert!(rows.is_empty(), "FK cascade must remove projection rows");
+    }
+
+    #[test]
+    fn backfill_is_idempotent_and_links_summaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::writer::db_path(dir.path());
+        // migrate first (Writer::spawn runs the chain), then raw legacy rows
+        {
+            let w0 = Writer::spawn(db.clone()).unwrap();
+            drop(w0);
+        }
+        {
+            let conn = crate::pragma::open_writer(&db).unwrap();
+            conn.execute(
+                "INSERT INTO session (id, project_id, directory, path, slug, title, version, time_created, time_updated) VALUES ('ses_c4', 'global', '/w', 's', 's', 't', '1', 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO msg (id, session_id, role, seq, time_created, info) VALUES \
+                 ('msg_leg', 'ses_c4', 'user', 1, 1, '{\"id\":\"msg_leg\",\"role\":\"user\"}')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO msg (id, session_id, role, seq, time_created, info) VALUES \
+                 ('msg_leg_s', 'ses_c4', 'assistant', 2, 2, \
+                  '{\"id\":\"msg_leg_s\",\"role\":\"assistant\",\"summary\":true,\"parentID\":\"msg_leg\"}')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO msg_part (id, message_id, session_id, seq, type, byte_len, inline, blob_sha) VALUES \
+                 ('prt_leg', 'msg_leg', 'ses_c4', 1, 'compaction', 40, \
+                  '{\"id\":\"prt_leg\",\"type\":\"compaction\",\"auto\":true}', NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        let w = Writer::spawn(db.clone()).unwrap();
+        let (n1, l1, _ms) = backfill_compaction(&w, &db).unwrap();
+        assert_eq!(n1, 1, "backfilled the legacy anchor");
+        assert_eq!(l1, 1, "linked the legacy summary assistant");
+        let (n2, l2, _) = backfill_compaction(&w, &db).unwrap();
+        assert_eq!((n2, l2), (0, 0), "second backfill is a no-op");
+        let conn = crate::pragma::open_reader(&db).unwrap();
+        let rows = compaction_rows(&conn, "ses_c4").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].auto);
+        assert_eq!(rows[0].summary_msg_id.as_deref(), Some("msg_leg_s"));
+    }
+
+    #[test]
+    fn part_row_ops_carries_projection_only_for_compaction() {
+        let base = PartRow {
+            id: "p",
+            message_id: "m",
+            session_id: "s",
+            seq: 1,
+            ptype: "text",
+            byte_len: 2,
+            inline: Some("{}".into()),
+            blob_sha: None,
+            text: "{}",
+        };
+        assert_eq!(part_row_ops(&base).len(), 2, "text part: msg_part + search");
+        let mut comp = base;
+        comp.ptype = "compaction";
+        comp.text = r#"{"type":"compaction","auto":true,"overflow":false}"#;
+        assert_eq!(
+            part_row_ops(&comp).len(),
+            3,
+            "compaction part adds projection"
+        );
     }
 }
