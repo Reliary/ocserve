@@ -43,6 +43,22 @@ globalThis.Bun = Object.freeze({
     }
     return a * 65536 + (b >>> 16); // < 2^48: clean hex, exact in doubles
   },
+  // Bun.CryptoHasher surface (magic-context system.transform: md5+hex) —
+  // node:crypto is the host runtime's own hasher, so algorithms match Node's
+  // list rather than Bun's (md5/sha* covered; the only algorithms the real
+  // plugin set constructs — dist grep: Bun.CryptoHasher ×2, Bun.hash ×1).
+  CryptoHasher: class CryptoHasher {
+    constructor(algo) {
+      this.h = hostRequire("node:crypto").createHash(algo);
+    }
+    update(data) {
+      this.h.update(data);
+      return this;
+    }
+    digest(encoding) {
+      return this.h.digest(encoding || "hex");
+    }
+  },
 });
 
 // ---- stdout discipline: protocol only -------------------------------
