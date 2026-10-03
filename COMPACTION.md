@@ -209,6 +209,53 @@ to source truth (`dead_provider_persists_anchor_and_summary_shell_then_fails`).
 - **Negative control per fix** (TESTING §1) including planted mutant on the tail
   permutation order (§5 P1 obligation).
 
+## 9b. Cache interactions (audit 2026-10-03)
+
+**Provider prefix/KV cache** (vLLM APC / RadixAttention hashing: any changed
+byte invalidates from that block onward):
+- `filter_compacted` is the **identity function** until the first anchor
+  exists → pre-compaction request bytes are identical to pre-M6 → hit-rate
+  preserved (byte-golden request suites prove it).
+- Post-compaction prefix change is **one-time and by design**; the summary
+  request uses a separate prefix (system = hidden compaction agent prompt)
+  and never pollutes the main conversation cache.
+- Invariant: **no volatile bytes (timestamps, request IDs) in the system or
+  tools prefix.** `chat.system.transform` must emit *deterministic* content —
+  this is the plugin's responsibility (magic-context appends live memory; if
+  it ever timestamps, every request busts its own prefix). Divergence risk
+  documented, not suppressible from core.
+- `refine_llm_cache_tokens_total{provider,dir="read"}` exposes cache-read
+  token accrual per request (Usage.parsed `prompt_tokens_details.cached_tokens`).
+  Session rows already carried `tokens_cache_read` (finalize) — metrics close
+  the gap. Cache-**write** tokens are not parsed by our client (Usage has no
+  field) → honestly absent, not zero.
+
+**SQLite page caches:** M6 changed **zero pragmas** (role-scoped `cache_size`,
+mmap off untouched). Compaction table rows are tiny/inline; prune marks
+(`cfg.prune` default **false**) would churn `part_search` reindex — off.
+
+**Hot-path rule:** `compaction_preflight` = ONE reader per prompt answering
+seq+state (`Ready|Pending|SummaryExit`); the newest-message query runs only
+when projection rows exist. Round-1 opens = preflight + `load_messages` =
+**2 (pre-M6 parity)**. Engine rounds add their own readers (rare, bounded).
+Regression net: `refine-store` `preflight.rs` 4 tests incl. the row-gate
+control (a summary with no projection rows must stay `Ready`).
+
+**Governance decay (arXiv 2606.22528):** the paper's *Constraint Pinning*
+defense = re-inject the system constraint after compaction — our architecture
+does this by construction (system prompt re-sent verbatim every request,
+never compacted). Conversation-carried constraints survive only via the
+`SUMMARY_TEMPLATE` **Important Details** section; reassembly keeps
+anchor+summary+tail, not the raw oldest turn → residual gap named here,
+mitigation = template + system pinning. `refine_compaction_total{auto}`
+counts every completed compaction (success or overflow-stop) — closes the
+rate–distortion survey's "repeated compaction is almost never measured"
+gap (arXiv 2607.08032) for the soak to trend.
+
+**Parked (research, not built):** parallel/chunked blocking-compaction
+avoidance (arXiv 2605.23296 — tens-of-seconds stall bounded by our 120 s
+watchdog today); Acon-style compression-guideline optimization (ICML 2026).
+
 ## 10. Phases
 
 - **P1:** reviewed ✅. **P2 (2026-10-03):** DONE — §8 resolved; C1–C5 landed (store v8

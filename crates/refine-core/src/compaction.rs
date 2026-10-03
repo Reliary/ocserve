@@ -465,6 +465,11 @@ pub async fn process(
         ),
         Ok(Err(e)) => {
             if refine_llm::looks_like_context_overflow(&format!("{e:#}")) {
+                refine_metrics::labeled_counter(
+                    "refine_compaction_total",
+                    &format!("auto=\"{auto}\""),
+                    1,
+                );
                 return persist_overflow_error(
                     ctx,
                     writer,
@@ -717,6 +722,7 @@ pub async fn process(
         prune_tool_outputs(ctx, writer, session_id, &history, &mut seq)?;
     }
 
+    refine_metrics::labeled_counter("refine_compaction_total", &format!("auto=\"{auto}\""), 1);
     emit_live(ctx, "session.compacted", json!({"sessionID": session_id}));
     Ok(true)
 }

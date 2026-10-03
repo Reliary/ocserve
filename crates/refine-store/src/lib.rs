@@ -243,6 +243,73 @@ pub fn compaction_rows(
     Ok(rows)
 }
 
+/// Prompt-loop preflight (M6 audit fix, COMPACTION §11 hot-path rule):
+/// ONE reader answers the round-1 questions — event seq + compaction state —
+/// so a normal prompt opens exactly preflight+load_messages (pre-M6 parity).
+/// The newest-message query runs ONLY when compaction rows exist (sessions
+/// without compaction never pay it; each open_reader would otherwise build a
+/// cold page cache + full PRAGMA profile).
+pub enum PreflightState {
+    /// no pending anchor, last message is not a summary — generate
+    Ready,
+    /// newest unlinked anchor — run the engine before generation
+    Pending {
+        anchor: String,
+        auto: bool,
+        overflow: bool,
+    },
+    /// last message is a finished summary — manual-summarize exit
+    SummaryExit {
+        info: serde_json::Value,
+        parts: Vec<serde_json::Value>,
+    },
+}
+
+pub struct Preflight {
+    pub seq: i64,
+    pub state: PreflightState,
+}
+
+pub fn compaction_preflight(db: &std::path::Path, session_id: &str) -> anyhow::Result<Preflight> {
+    let conn = pragma::open_reader(db)?;
+    let seq: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(seq),0)+1 FROM event WHERE session_id = ?1",
+        [session_id],
+        |r| r.get(0),
+    )?;
+    let rows = compaction_rows(&conn, session_id)?;
+    if let Some(pending) = rows.iter().rev().find(|r| r.summary_msg_id.is_none()) {
+        return Ok(Preflight {
+            seq,
+            state: PreflightState::Pending {
+                anchor: pending.user_msg_id.clone(),
+                auto: pending.auto,
+                overflow: pending.overflow,
+            },
+        });
+    }
+    if !rows.is_empty() {
+        let blobs_root = db
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("db parent"))?
+            .join("blobs");
+        if let Some((info, parts)) = last_message_conn(&conn, session_id, &blobs_root)?
+            && info["role"] == "assistant"
+            && info["summary"] == serde_json::Value::Bool(true)
+            && info["finish"].is_string()
+        {
+            return Ok(Preflight {
+                seq,
+                state: PreflightState::SummaryExit { info, parts },
+            });
+        }
+    }
+    Ok(Preflight {
+        seq,
+        state: PreflightState::Ready,
+    })
+}
+
 /// Path-based projection reader (engine call sites — mirrors load_messages).
 pub fn compaction_rows_path(
     db: &std::path::Path,
@@ -260,6 +327,19 @@ pub fn last_message(
     session_id: &str,
 ) -> anyhow::Result<Option<(serde_json::Value, Vec<serde_json::Value>)>> {
     let conn = pragma::open_reader(db)?;
+    let blobs_root = db
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("db parent"))?
+        .join("blobs");
+    last_message_conn(&conn, session_id, &blobs_root)
+}
+
+/// `last_message` on an EXISTING connection (preflight: zero extra opens).
+pub fn last_message_conn(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    blobs_root: &std::path::Path,
+) -> anyhow::Result<Option<(serde_json::Value, Vec<serde_json::Value>)>> {
     let row: Option<(String, String)> = conn
         .query_row(
             "SELECT id, info FROM msg WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
@@ -272,11 +352,7 @@ pub fn last_message(
     };
     let info: serde_json::Value = serde_json::from_str(&info_txt)?;
     let info = merge_columns(info, &mid, session_id, None);
-    let blobs = crate::blob::BlobStore::new(
-        db.parent()
-            .ok_or_else(|| anyhow::anyhow!("db parent"))?
-            .join("blobs"),
-    )?;
+    let blobs = crate::blob::BlobStore::new(blobs_root)?;
     let mut pstmt = conn.prepare(
         "SELECT id, inline, blob_sha, byte_len FROM msg_part WHERE message_id = ?1 ORDER BY seq",
     )?;

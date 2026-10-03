@@ -17,7 +17,8 @@ const SSE_OVERFLOW: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r
                       data: {\"choices\":[{\"delta\":{\"content\":\"R\"}}]}\n\n\
                       data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
                       data: {\"choices\":[],\"usage\":{\"prompt_tokens\":900,\
-                      \"completion_tokens\":200,\"total_tokens\":1100}}\n\n\
+                      \"completion_tokens\":200,\"total_tokens\":1100,\
+                      \"prompt_tokens_details\":{\"cached_tokens\":500}}}\n\n\
                       data: [DONE]\n\n";
 
 /// Minimal multi-connection fake provider (every request gets SSE_OVERFLOW).
@@ -210,6 +211,54 @@ async fn forced_overflow_runs_three_compactions_then_caps() {
         last_info["finish"].is_string(),
         "finished normally (cap path)"
     );
+
+    // observability (audit A->C): compaction gauge counts every completed
+    // compaction (repeated-compaction measurement gap, arXiv 2607.08032)
+    // and provider cache-read tokens reach /metrics (K-METRICS extension).
+    let app = refine_http::router(st.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024 * 1024)
+        .await
+        .unwrap();
+    let exposition = String::from_utf8_lossy(&bytes).to_string();
+    let comp_line = exposition
+        .lines()
+        .find(|l| l.starts_with("refine_compaction_total{"))
+        .unwrap_or_else(|| panic!("compaction gauge missing:\n{exposition}"));
+    let comp_n: u64 = comp_line
+        .rsplit(' ')
+        .next()
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(comp_n >= 3, "expected >=3, got {comp_n}: {comp_line}");
+    assert!(
+        exposition.contains("refine_compaction_total{auto=\"true\"}"),
+        "auto label missing:\n{exposition}"
+    );
+    let cache_line = exposition
+        .lines()
+        .find(|l| l.starts_with("refine_llm_cache_tokens_total{"))
+        .unwrap_or_else(|| panic!("cache-read counter missing:\n{exposition}"));
+    let cache_n: u64 = cache_line
+        .rsplit(' ')
+        .next()
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(cache_n > 0, "cache-read not accumulated: {cache_line}");
 }
 
 /// Local true literal for `==` Value comparisons.

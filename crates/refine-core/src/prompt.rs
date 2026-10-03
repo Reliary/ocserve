@@ -260,7 +260,12 @@ pub async fn run_prompt_with(
     if !refine_store::session_exists(&ctx.db, session_id)? {
         anyhow::bail!("Session not found: {session_id}");
     }
-    let mut seq = refine_store::next_event_seq(&ctx.db, session_id)?;
+    // ONE reader answers seq + compaction state (audit fix: pre-M6 = two
+    // opens per prompt; without this the round checks added two MORE cold
+    // opens on the hottest path — COMPACTION §11 hot-path rule).
+    let mut pre = refine_store::compaction_preflight(&ctx.db, session_id)?;
+    let mut seq = pre.seq;
+    let mut pre_dirty = false;
 
     let model = payload
         .pointer("/model/modelID")
@@ -398,43 +403,58 @@ pub async fn run_prompt_with(
     let mut compaction_rounds: u32 = 0;
     let mut final_out: Option<(Value, Vec<Value>)> = None;
     'outer: loop {
-        seq = refine_store::next_event_seq(&ctx.db, session_id)?;
-        if let Some((aid, pa, po)) = pending_anchor(&ctx.db, session_id)? {
-            if compaction_rounds >= crate::compaction::AUTO_COMPACTION_MAX_ROUNDS {
-                emit_live(
+        // refresh ONLY after the engine/trigger wrote (round 1 keeps the
+        // locally-advanced seq — re-reading would be a redundant open)
+        // (no clear here: Pending re-sets dirty after process; Ready falls
+        // through to generation and exits — clearing was a dead assignment)
+        if pre_dirty {
+            pre = refine_store::compaction_preflight(&ctx.db, session_id)?;
+            seq = pre.seq;
+        }
+        match std::mem::replace(&mut pre.state, refine_store::PreflightState::Ready) {
+            refine_store::PreflightState::Pending {
+                anchor: aid,
+                auto: pa,
+                overflow: po,
+            } => {
+                if compaction_rounds >= crate::compaction::AUTO_COMPACTION_MAX_ROUNDS {
+                    emit_live(
+                        ctx,
+                        "session.error",
+                        json!({"sessionID": session_id, "error": {
+                            "type": "ContextOverflowError",
+                            "data": {"message": "compaction round cap reached (COMPACTION D1)"}
+                        }}),
+                    );
+                    break 'outer;
+                }
+                compaction_rounds += 1;
+                if !crate::compaction::process(
                     ctx,
-                    "session.error",
-                    json!({"sessionID": session_id, "error": {
-                        "type": "ContextOverflowError",
-                        "data": {"message": "compaction round cap reached (COMPACTION D1)"}
-                    }}),
-                );
+                    writer,
+                    session_id,
+                    &ctx.compaction,
+                    pa,
+                    po,
+                    &aid,
+                    &agent,
+                )
+                .await?
+                {
+                    break 'outer; // summarize-overflow persisted (Stopped)
+                }
+                pre_dirty = true;
+                continue 'outer;
+            }
+            // manual flow's anchor+summary are the newest pair (upstream
+            // loop breaks when summary.parentID == latest user,
+            // prompt.ts:1101-1115) — auto never trips this: replay/
+            // autocontinue append AFTER the summary.
+            refine_store::PreflightState::SummaryExit { info, parts } => {
+                final_out = Some((info, parts));
                 break 'outer;
             }
-            compaction_rounds += 1;
-            if !crate::compaction::process(
-                ctx,
-                writer,
-                session_id,
-                &ctx.compaction,
-                pa,
-                po,
-                &aid,
-                &agent,
-            )
-            .await?
-            {
-                break 'outer; // summarize-overflow persisted (engine returned Stopped)
-            }
-            continue 'outer;
-        }
-        // summary-exit: manual flow's anchor+summary are the newest pair
-        // (upstream loop breaks when summary.parentID == latest user,
-        // prompt.ts:1101-1115) — auto flow never trips this because the
-        // engine appends replay/autocontinue AFTER the summary.
-        if let Some((sinfo, sparts)) = last_message_if_summary(&ctx.db, session_id)? {
-            final_out = Some((sinfo, sparts));
-            break 'outer;
+            refine_store::PreflightState::Ready => {}
         }
 
         // ---- provider context ----
@@ -671,6 +691,7 @@ pub async fn run_prompt_with(
                             ctx, writer, session_id, &agent, true, true,
                         )
                         .await?;
+                        pre_dirty = true;
                         continue 'outer;
                     }
                     return Err(e).context("provider stream open");
@@ -761,6 +782,13 @@ pub async fn run_prompt_with(
             total_usage.completion_tokens += u.completion_tokens;
             total_usage.total_tokens += u.total_tokens;
             total_usage.cached_tokens += u.cached_tokens;
+            if u.cached_tokens > 0 {
+                refine_metrics::labeled_counter(
+                    "refine_llm_cache_tokens_total",
+                    &format!("provider=\"{}\",dir=\"read\"", ctx.provider_id),
+                    u.cached_tokens,
+                );
+            }
             let step_cost = compute_cost(&ctx.endpoint.pricing, &u);
             total_cost += step_cost;
             let assistant_id = msg_id();
@@ -1318,6 +1346,7 @@ pub async fn run_prompt_with(
                 } else {
                     crate::compaction::persist_anchor(ctx, writer, session_id, &agent, true, false)
                         .await?;
+                    pre_dirty = true;
                     continue 'outer;
                 }
             }
@@ -1359,38 +1388,6 @@ pub async fn run_prompt_with(
     )
     .context("finalize session prompt row")?;
     final_out.ok_or_else(|| anyhow::anyhow!("prompt produced no assistant message"))
-}
-
-/// Pending anchor = newest projection row without a summary link (engine
-/// retry semantics mirror upstream's derived compaction task).
-fn pending_anchor(
-    db: &std::path::Path,
-    session_id: &str,
-) -> anyhow::Result<Option<(String, bool, bool)>> {
-    let rows = refine_store::compaction_rows_path(db, session_id)?;
-    for r in rows.iter().rev() {
-        if r.summary_msg_id.is_none() {
-            return Ok(Some((r.user_msg_id.clone(), r.auto, r.overflow)));
-        }
-    }
-    Ok(None)
-}
-
-/// Newest message when it is a completed summary assistant (manual exit).
-fn last_message_if_summary(
-    db: &std::path::Path,
-    session_id: &str,
-) -> anyhow::Result<Option<(Value, Vec<Value>)>> {
-    let Some((info, parts)) = refine_store::last_message(db, session_id)? else {
-        return Ok(None);
-    };
-    if info["role"] == "assistant"
-        && info["summary"] == Value::Bool(true)
-        && info["finish"].is_string()
-    {
-        return Ok(Some((info, parts)));
-    }
-    Ok(None)
 }
 
 /// The `question` tool: register → `question.asked` → await bounded reply →
