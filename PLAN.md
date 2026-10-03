@@ -394,6 +394,22 @@ byte-golden capture of live `/global/event`; contentless-FTS retest under bundle
    (`refine.service` takes 4901, Homebrew opencode stays installed as instant rollback);
    gate on the migration-readiness checklist (T5) before scheduling.
 
+### 15.5 Migration readiness snapshot (2026-10-03 — gates BEFORE cutover)
+
+| Item | Status | Evidence |
+|---|---|---|
+| Legacy delta-sync lag | **green** | `refine_sync_last_age` = 33 s (≤1×60 s tick), 198 msgs adopted, error counter never emitted |
+| Route table (post-disposition pass) | **green** | replay vs live **26/0** (5 honest defers printed); §17 rows all evidence-linked; K-OCREMOTE green |
+| Plugin stack | **green** | P0 battery + post-fix live run (sidecar RSS 185 MB under CPU storm vs 121 MB calm baseline — watch, under 160 MB boundary) |
+|24 h soak gate | **pending** | fresh sampler started 2026-10-03 14:51 (systemd timer, `~/.local/state/refine/soak/soak.csv`); gate = `scripts/soak-gate.sh` after 24 h — earliest cutover decision +24 h |
+| Memory vs 750 M cap | **ok, tight high-water** | anon RSS 367 MB; cgroup current 632 MB / peak 740 MiB of 750 MiB — peak = page cache during the mutants+tests storm (reclaimable), zero swap |
+| Backup drill | **green** | nightly6/6 (VACUUM INTO integrity=ok, msg counts equal) |
+| oc-remote holes | **green** | none left unclassified; dead diff caller documented; SSE stub honest |
+| Armory (timers/watch) | **green** | soak/drift/nightly timers enabled (Persistent); pre-commit hook live; first mutants run grinding (529) |
+| Legacy untouched | **green** | :4901 untouched, forwarder active, refine = only writer of its own DB |
+
+**Cutover preconditions:** soak-gate PASS (+24 h) → then §15.5 re-run → your go on §15.5 cutover shape.
+
 ## 16. Immediate stopgap (independent)
 
 Live 33 GB DB reclaim while refine is built: `VACUUM` (~21 GB back), rotate 577 MB logs, WAL
