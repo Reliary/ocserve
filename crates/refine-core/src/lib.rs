@@ -9,6 +9,7 @@ pub mod compact;
 pub mod compaction;
 pub mod event;
 pub mod ids;
+pub mod loop_guard;
 pub mod permission;
 pub mod prompt;
 pub mod question;

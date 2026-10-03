@@ -96,6 +96,53 @@ pub(crate) fn emit_durable(
     Ok(())
 }
 
+/// Loop-guard permission rendezvous (D1/P1b): same durable event shape as
+/// the normal permission ask but `action="doom_loop"` (upstream's permission
+/// name, processor.ts:373) with additive metadata.class. Returns true when
+/// the user approved once/always.
+#[allow(clippy::too_many_arguments)]
+async fn loop_guard_ask(
+    ctx: &PromptContext,
+    writer: &refine_store::Writer,
+    session_id: &str,
+    class: crate::loop_guard::Class,
+    tool: &str,
+    input_key: &str,
+    message_id: &str,
+    call_id: &str,
+    seq: &mut i64,
+) -> Result<bool> {
+    let perm_id = crate::ids::evt_id();
+    // exact shape the live normal ask emits (permission/patterns/always/
+    // metadata/tool) — oc-remote's parser consumes this shape proven M2b;
+    // upstream's permission name for the doom case is `doom_loop`
+    let request = json!({
+        "id": perm_id,
+        "sessionID": session_id,
+        "permission": "doom_loop",
+        "patterns": [tool],
+        "always": [tool],
+        "metadata": {"class": class.as_str(), "tool": tool, "input": input_key},
+        "tool": {"messageID": message_id, "callID": call_id},
+    });
+    let (rx, _perm_guard) = ctx.gate.clone().register(&perm_id, request.clone());
+    emit_durable(ctx, writer, session_id, "permission.asked", request, seq)?;
+    let reply = ctx.gate.wait(&perm_id, rx).await;
+    emit_durable(
+        ctx,
+        writer,
+        session_id,
+        "permission.replied",
+        json!({"sessionID": session_id, "requestID": perm_id}),
+        seq,
+    )?;
+    if reply == "always" {
+        ctx.gate
+            .grant_always(session_id, &format!("doom_loop:{tool}"));
+    }
+    Ok(reply == "once" || reply == "always")
+}
+
 /// Trigger a plugin hook with v1 in-place mutation semantics: returns the
 /// (possibly mutated) `output`. Fail-open by construction — no sidecar or a
 /// hook error returns `output` unchanged (a broken plugin never breaks a
@@ -411,6 +458,9 @@ pub async fn run_prompt_with(
             pre = refine_store::compaction_preflight(&ctx.db, session_id)?;
             seq = pre.seq;
         }
+        // loop-guard window: resets per compaction round (each round is a
+        // fresh provider conversation) — DIFFERENTIATION D1
+        let mut loop_win: Vec<crate::loop_guard::Entry> = Vec::new();
         match std::mem::replace(&mut pre.state, refine_store::PreflightState::Ready) {
             refine_store::PreflightState::Pending {
                 anchor: aid,
@@ -968,6 +1018,47 @@ pub async fn run_prompt_with(
                         }
                     }
 
+                    // loop guard, pre-exec (D1/P1b): upstream parity asks
+                    // permission "doom_loop" on 3× identical tool+input
+                    // (processor.ts:29,356-383); oscillation rides the same
+                    // flow with additive metadata.class only.
+                    if allowed && crate::loop_guard::asks_enabled() {
+                        let input_key = crate::loop_guard::input_key(&call.arguments);
+                        if let Some(class) =
+                            crate::loop_guard::check_pre(&loop_win, &call.name, &input_key)
+                        {
+                            refine_metrics::labeled_counter(
+                                "refine_agent_health_total",
+                                &format!("class=\"{}\"", class.as_str()),
+                                1,
+                            );
+                            let ok = loop_guard_ask(
+                                ctx,
+                                writer,
+                                session_id,
+                                class,
+                                &call.name,
+                                &input_key,
+                                &assistant_id,
+                                &call.id,
+                                &mut seq,
+                            )
+                            .await?;
+                            refine_metrics::labeled_counter(
+                                "refine_agent_health_action_total",
+                                if ok {
+                                    "action=\"approved\""
+                                } else {
+                                    "action=\"denied\""
+                                },
+                                1,
+                            );
+                            if !ok {
+                                allowed = false;
+                            }
+                        }
+                    }
+
                     // ---- execute ----
                     let exec_start = now_ms();
                     let (output, meta, title, is_err) = if allowed {
@@ -1138,8 +1229,60 @@ pub async fn run_prompt_with(
                         json!({"sessionID": session_id, "part": running}),
                         &mut seq,
                     )?;
+                    {
+                        let out_str = running["state"]["output"].as_str().unwrap_or_default();
+                        loop_win.push(crate::loop_guard::entry(
+                            &call.name,
+                            &call.arguments,
+                            out_str,
+                            is_err,
+                        ));
+                    }
                     parts.push(running);
                     provider_tool_results.push((call.id.clone(), output));
+                    // loop guard, post-exec (D1/P1b): spiral asks (declined →
+                    // prompt aborts, session self-heals like the stall path);
+                    // error-storm is metric-only — iterating on a failing test
+                    // is legitimate work and asking would be fatigue.
+                    if let Some(class) = crate::loop_guard::check_post(&loop_win) {
+                        refine_metrics::labeled_counter(
+                            "refine_agent_health_total",
+                            &format!("class=\"{}\"", class.as_str()),
+                            1,
+                        );
+                        if class != crate::loop_guard::Class::ErrorStorm
+                            && crate::loop_guard::asks_enabled()
+                        {
+                            let input_key = crate::loop_guard::input_key(&call.arguments);
+                            let ok = loop_guard_ask(
+                                ctx,
+                                writer,
+                                session_id,
+                                class,
+                                &call.name,
+                                &input_key,
+                                &assistant_id,
+                                &call.id,
+                                &mut seq,
+                            )
+                            .await?;
+                            refine_metrics::labeled_counter(
+                                "refine_agent_health_action_total",
+                                if ok {
+                                    "action=\"approved\""
+                                } else {
+                                    "action=\"denied\""
+                                },
+                                1,
+                            );
+                            if !ok {
+                                anyhow::bail!(
+                                    "loop guard: {} detected and declined by user (set REFINE_LOOP_GUARD=0 to disable asks)",
+                                    class.as_str()
+                                );
+                            }
+                        }
+                    }
                 }
 
                 // persist the tool-step assistant message (parent = user message)
