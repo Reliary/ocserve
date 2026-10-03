@@ -977,6 +977,10 @@ pub async fn run_prompt_with(
                         refine_tools::evaluate(&call.name, &resource, &ctx.rules)
                     };
                     let mut allowed = effect == "allow";
+                    // hoisted so the trust observe below (post-branch) can see it
+                    let builtin = refine_tools::schemas()
+                        .iter()
+                        .any(|s| s["function"]["name"] == call.name);
                     if effect == "ask" {
                         let perm_id = crate::ids::evt_id(); // 26-char request id
                         let request = json!({
@@ -1089,9 +1093,6 @@ pub async fn run_prompt_with(
                         {
                             input = a.clone();
                         }
-                        let builtin = refine_tools::schemas()
-                            .iter()
-                            .any(|s| s["function"]["name"] == call.name);
                         let exec = if builtin {
                             refine_tools::execute(&call.name, &input, Path::new(&ctx.directory))
                         } else if let Some(hub) = &ctx.mcp {
@@ -1190,6 +1191,13 @@ pub async fn run_prompt_with(
                             json!({"sessionID": session_id, "todos": todos}),
                             &mut seq,
                         )?;
+                    }
+
+                    // P2: observe-only trust scan of MCP (non-builtin) responses —
+                    // the runtime channel connect-time review never sees
+                    // (OWASP MCP03). Metric + log only, never blocks.
+                    if !builtin {
+                        refine_mcp::McpHub::observe_output(&call.name, &output);
                     }
 
                     // v1 hook: tool.execute.after (sequential in-host; failures are

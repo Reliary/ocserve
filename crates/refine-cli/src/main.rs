@@ -265,6 +265,13 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
             .map(|o| o.values().filter(|v| v["status"] == "connected").count())
             .unwrap_or(0) as i64,
     );
+    // P2 connect-time: enumerate + scan + TOFU-pin every server's tools NOW
+    // (first-prompt laziness would defer the scan — the OWASP connect-time
+    // channel wants it observed at connect; listing failures stay warnings)
+    if !mcp_cfgs.is_empty() {
+        let listed = hub.tool_schemas().await;
+        tracing::info!("mcp trust: {} tool schemas scanned at boot", listed.len());
+    }
     let _ = state.mcp.set(std::sync::Arc::new(hub));
 
     // W4: PATCH /config rebuilds derived payloads through this closure
