@@ -189,6 +189,45 @@ recovery. **No savings percentages are claimed until the benchmark harness measu
 6. MCP OAuth: token store on disk (mode 600), refresh-before-expiry with skew, single-flight
    refresh; mock-server test with 6-minute tokens under 20-minute session.
 
+**Adoption posture on major upstream lines (recorded 2026-10-03, deep dive evidence below):**
+
+- **v1 freeze remains the contract.** `PLAN.md §3` wire/API/plugin surfaces are pinned to
+  1.18.31; upstream v1 patch/minor releases (1.18.32–34) are watched via the nightly byte-
+  golden container replay; any change to a live freeze artifact (§3 tables) is its own
+  `test(corpus): …` commit. This keeps the maintenance load at the "30–60 min per minor"
+  level already designed for.
+- **v2 is gated, not chased.** The v2 line (v2.0.*) is recorded as *pre-release* in our
+  workspace: intentionally breaks plugins, server API contracts, and TUI config (upstream's
+  own docs: "V1 plugin implementations do not run in V2"). Benefits v2 actually gives us —
+  domain-scoped hook registrations with per-provider scoping (`ModelHookOptions.providerID`),
+  native `http.request`/`http.response`/`experimental.ws.*` hooks, session request kinds
+  (`primary|compaction|title|generate`) including a native `compaction` hook slot, per-session
+  `title`/`generate` hooks — are tracked as the **future plugin-parity surface**, not an
+  emergency upgrade. Refine's oc-remote primary client is v1-contract; the v2 server API is a
+  deliberate divergence we will not mirror early.
+- **`compat-pluginsv2` adapter is the bridge strategy.** When a plugin we depend on ships
+  v2-only, refine implements upstream's own documented bridge shape: accept the v2
+  registration surface (`Plugin.define({id, setup(ctx)})` + `ctx.session.hook(...)` +
+  `ctx.tool.hook(...)` + `ctx.event.subscribe()` + `ctx.storage`/`options`) and map each
+  domain hook to our v1-style dispatch (`hook_mutate` sites). Adapter lives in one file
+  (`crates/refine-plugin/src/compat_v2.rs` conceptually) so v2 drift is triaged as a mapping
+  diff, not scattered edits. Maintenance cost = the shim + one nightly replay column; the
+  rest of the pipeline (freeze, matrix, guards) is unchanged.
+- **Explicit non-goals at the v2 boundary** (recorded so they don't creep): mirroring v2's
+  breaking route tree before a tagged stable release; adopting the Effect-native plugin host
+  architecture (our Node/Bun sidecar stays a v1-semantic pragmatic clone); writing v2 plugins
+  ourselves for the plugins we run (magic-context/codex-auth/context-mode must ship the v2
+  form; our adapter accepts it).
+- **Trigger for v2 adoption work**: a plugin in `{magic-context, codex-auth, context-mode}`
+  declares a minimum `@opencode/plugin` version with no v1 entrypoint preserved *and* a v2
+  stable tag exists on npm (not just the `v2` branch pre-release tags). Until then, the
+  nightly watch on `latest` (v1) + version-tagged replay on `v2` stays read-only triage.
+
+(Deep-dive evidence for the posture: `~/src/opencode-v1-v2-diff.md` at v1.18.34/v2.0.21;
+v2 migration guide at `opencode.ai/v2/docs/build/plugins/migrate-v1`; v2 hook surfaces from
+`packages/plugin/src/effect/session.ts` and provider plugins under `packages/core/src/plugin/
+provider/`.)
+
 ## 9. Import (20 sessions, original untouched)
 
 - Source opened read-only (`mode=ro`, `query_only`), never read-write; no `NO_MUTEX`
