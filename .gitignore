@@ -5,3 +5,5 @@ target/
 dist/
 *.log
 bench/drift/
+mutants.out/
+mutants.out.old/

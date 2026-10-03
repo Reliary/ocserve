@@ -99,11 +99,14 @@ step "binary size ceiling" bash -c "$(declare -f size_gate); size_gate"
 if [ "$WITH_MUTANTS" = "1" ]; then
   if command -v cargo-mutants >/dev/null 2>&1; then
     # skip the 50s fuzz (per-mutant cost) — mutants target store/core logic
-    # args after -- go to `cargo test` per mutant: skip the 50s fuzz and the
-    # SIGKILL harness (minutes each — they already run unmutated every gate/nightly)
+    # --cargo-test-arg (equals form): per-mutant `cargo test` skips the 50s
+    # fuzz + SIGKILL harness (both run unmutated every gate/nightly anyway).
+    # NOTE: `-- --skip` does NOT work — cargo-mutants joins trailing args
+    # WITHOUT inserting `--` (observed in run log; cargo test then rejects).
     step "cargo mutants (store+core)" \
       cargo mutants -p refine-store -p refine-core --timeout 120 \
-      -- --skip chunk_split --skip sigkill
+      --cargo-test-arg=--skip --cargo-test-arg=chunk_split \
+      --cargo-test-arg=--skip --cargo-test-arg=sigkill
   else
     echo "FAIL: --with-mutants but cargo-mutants not installed" | tee -a "$LOG"
     FAILS=$((FAILS + 1))
