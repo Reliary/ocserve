@@ -104,7 +104,10 @@ if [ "$WITH_MUTANTS" = "1" ]; then
     # mutants joins test args WITHOUT inserting `--`, and cargo test rejects
     # bare --skip — so the separator must be PASSED as the first test arg:
     #   ... -- -- --skip <name>   →  cargo test ... -- --skip <name>
-    step "cargo mutants (store+core)" \
+    # TMPDIR on REAL disk: default /tmp is tmpfs on some hosts — the first
+    #529-mutant run filled the16G ramdisk and died with ENOSPC mid-build
+    mkdir -p target/mutants-tmp
+    step "cargo mutants (store+core)" env TMPDIR="$PWD/target/mutants-tmp" \
       cargo mutants -p refine-store -p refine-core --timeout 120 \
       -- -- --skip chunk_split --skip sigkill
   else
