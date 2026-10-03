@@ -90,6 +90,47 @@ fn emit_durable(
     Ok(())
 }
 
+/// Trigger a plugin hook with v1 in-place mutation semantics: returns the
+/// (possibly mutated) `output`. Fail-open by construction — no sidecar or a
+/// hook error returns `output` unchanged (a broken plugin never breaks a
+/// prompt; M4b rule). Metrics: duration + error counter per hook name.
+pub(crate) async fn hook_mutate(
+    plugins: Option<&Arc<tokio::sync::Mutex<refine_plugin::Sidecar>>>,
+    name: &str,
+    input: Value,
+    output: Value,
+) -> Value {
+    let Some(plug) = plugins else {
+        return output;
+    };
+    let mut guard = plug.lock().await;
+    let t0 = std::time::Instant::now();
+    match guard.trigger(name, input, output.clone()).await {
+        Ok(v) => {
+            refine_metrics::observe(
+                "refine_plugin_hook_duration_seconds",
+                &format!("hook=\"{name}\",result=\"ok\""),
+                t0.elapsed().as_micros() as u64,
+            );
+            v
+        }
+        Err(e) => {
+            refine_metrics::observe(
+                "refine_plugin_hook_duration_seconds",
+                &format!("hook=\"{name}\",result=\"error\""),
+                t0.elapsed().as_micros() as u64,
+            );
+            refine_metrics::labeled_counter(
+                "refine_plugin_hook_errors_total",
+                &format!("hook=\"{name}\""),
+                1,
+            );
+            tracing::warn!("plugin {name}: {e:#}");
+            output
+        }
+    }
+}
+
 /// Emit a non-durable live event (delta/status/idle/diff — no sync twin, per capture).
 fn emit_live(ctx: &PromptContext, event_type: &str, properties: Value) {
     refine_metrics::labeled_counter(
@@ -252,7 +293,7 @@ pub async fn run_prompt_with(
         }
     }
     let t_created = now_ms();
-    let user_info = json!({
+    let mut user_info = json!({
         "id": user_msg_id,
         "sessionID": session_id,
         "role": "user",
@@ -261,6 +302,34 @@ pub async fn run_prompt_with(
         "agent": agent,
         "model": {"providerID": ctx.provider_id, "modelID": model},
     });
+    // v1 parity: chat.message (prompt.ts:1000) fires BEFORE persistence so
+    // plugins (magic-context) can mutate {message, parts} into history.
+    // Fidelity note: only the real user-prompt flow fires it — upstream's
+    // summarize path (compaction.ts) does not build a persisted user
+    // message here, so persist_user=false skips the trigger deliberately.
+    if opts.persist_user {
+        let out = hook_mutate(
+            ctx.plugins.as_ref(),
+            "chat.message",
+            json!({
+                "sessionID": session_id,
+                "agent": agent,
+                "model": model,
+                "messageID": user_msg_id,
+                "variant": payload.get("variant").cloned().unwrap_or(Value::Null),
+            }),
+            json!({"message": user_info, "parts": user_parts}),
+        )
+        .await;
+        if let Some(m) = out.get("message")
+            && m.is_object()
+        {
+            user_info = m.clone();
+        }
+        if let Some(p) = out.get("parts").and_then(|p| p.as_array()) {
+            user_parts = p.to_vec();
+        }
+    }
     if opts.persist_user {
         insert_message(
             writer,
@@ -364,6 +433,59 @@ pub async fn run_prompt_with(
             anyhow::bail!("prompt exceeded {MAX_STEPS} steps (bounded loop, AGENTS §2.3)");
         }
         let started = Instant::now();
+        // v1 parity: chat.params + chat.headers fire PER LLM request
+        // (llm/request.ts:115/135) — tool-loop steps re-trigger, matching
+        // upstream. Defaults = null/empty → body byte-identical when no
+        // plugins are loaded (Default ChatOpts).
+        let hook_in = json!({
+            "sessionID": session_id,
+            "agent": agent,
+            "model": model,
+            "provider": ctx.provider_id,
+            "message": user_info,
+        });
+        let params_out = hook_mutate(
+            ctx.plugins.as_ref(),
+            "chat.params",
+            hook_in.clone(),
+            json!({"temperature": Value::Null, "topP": Value::Null,
+                   "topK": Value::Null, "maxOutputTokens": Value::Null,
+                   "options": {}}),
+        )
+        .await;
+        let headers_out = hook_mutate(
+            ctx.plugins.as_ref(),
+            "chat.headers",
+            hook_in,
+            json!({"headers": {}}),
+        )
+        .await;
+        let copts = refine_llm::ChatOpts {
+            temperature: params_out.get("temperature").and_then(|v| v.as_f64()),
+            top_p: params_out.get("topP").and_then(|v| v.as_f64()),
+            top_k: params_out
+                .get("topK")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.min(u32::MAX as u64) as u32),
+            max_tokens: params_out
+                .get("maxOutputTokens")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.min(u32::MAX as u64) as u32),
+            options: params_out
+                .get("options")
+                .cloned()
+                .filter(Value::is_object)
+                .unwrap_or(Value::Null),
+            headers: headers_out
+                .get("headers")
+                .and_then(|h| h.as_object())
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
         let mut llm_ttft: Option<std::time::Duration> = None;
         let mut text = String::new();
         let mut reasoning = String::new();
@@ -379,7 +501,7 @@ pub async fn run_prompt_with(
             client.chat_stream(
                 &model,
                 &messages,
-                None,
+                &copts,
                 if opts.tools_enabled {
                     Some(&tools)
                 } else {

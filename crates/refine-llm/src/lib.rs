@@ -258,11 +258,29 @@ pub fn replay_fixture(raw: &[u8]) -> Result<Vec<StreamEvent>> {
     Ok(events)
 }
 
+/// Request shaping from the `chat.params` / `chat.headers` plugin hooks
+/// (v1 parity: session/llm/request.ts:115/135). `Default` reproduces the
+/// pre-hook behavior byte-for-byte (no temperature, no extra headers).
+#[derive(Clone, Debug, Default)]
+pub struct ChatOpts {
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<u32>,
+    pub max_tokens: Option<u32>,
+    /// `options` object from chat.params — merged into the body top-level
+    /// (v1 providerOptions semantics; OpenAI-compatible endpoints ignore
+    /// unknown keys). Explicit fields above override the same keys.
+    pub options: Value,
+    /// Extra headers from chat.headers. Invalid names/values are skipped
+    /// with a warning — a misbehaving plugin can never break the request.
+    pub headers: Vec<(String, String)>,
+}
+
 /// Build the OpenAI-compatible chat request body.
 pub fn build_request(
     model: &str,
     messages: &[ChatMessage],
-    max_tokens: Option<u32>,
+    opts: &ChatOpts,
     tools: Option<&[Value]>,
 ) -> Value {
     let mut body = json!({
@@ -271,7 +289,23 @@ pub fn build_request(
         "stream": true,
         "stream_options": {"include_usage": true},
     });
-    if let Some(mt) = max_tokens {
+    // options first, explicit params override (precedence matches the
+    // upstream mergeOptions chain feeding providerOptions + params).
+    if let Some(obj) = opts.options.as_object() {
+        for (k, v) in obj {
+            body[k.clone()] = v.clone();
+        }
+    }
+    if let Some(t) = opts.temperature {
+        body["temperature"] = json!(t);
+    }
+    if let Some(t) = opts.top_p {
+        body["top_p"] = json!(t);
+    }
+    if let Some(k) = opts.top_k {
+        body["top_k"] = json!(k);
+    }
+    if let Some(mt) = opts.max_tokens {
         body["max_tokens"] = json!(mt);
     }
     if let Some(t) = tools
@@ -304,17 +338,27 @@ impl Client {
         &self,
         model: &str,
         messages: &[ChatMessage],
-        max_tokens: Option<u32>,
+        opts: &ChatOpts,
         tools: Option<&[Value]>,
         session_id: Option<&str>,
     ) -> Result<futures_util::stream::BoxStream<'static, Result<StreamEvent>>> {
-        let body = build_request(model, messages, max_tokens, tools);
+        let body = build_request(model, messages, opts, tools);
         let mut req = self
             .http
             .post(format!("{}/chat/completions", self.base_url))
             .bearer_auth(&self.api_key)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream");
+        // plugin-injected headers (chat.headers) — validated, never fatal
+        for (k, v) in &opts.headers {
+            match reqwest::header::HeaderName::from_bytes(k.as_bytes()) {
+                Ok(name) => match reqwest::header::HeaderValue::from_str(v) {
+                    Ok(val) => req = req.header(name, val),
+                    Err(_) => tracing::warn!("chat.headers: invalid value for header {k:?}"),
+                },
+                Err(_) => tracing::warn!("chat.headers: invalid header name {k:?}"),
+            }
+        }
         // opencode-go gateway requires it for routing (live 400:
         // MissingSessionID — user's oc-remote send hit this 2026-10-02);
         // direct providers ignore unknown headers.
@@ -416,7 +460,7 @@ mod tests {
         let client = Client::new(format!("http://{addr}"), "key");
         let msgs = vec![ChatMessage::text("user", "hi")];
         let _ = client
-            .chat_stream("m", &msgs, None, None, Some("ses_hdr_test"))
+            .chat_stream("m", &msgs, &ChatOpts::default(), None, Some("ses_hdr_test"))
             .await;
         let req = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
             .await
@@ -429,6 +473,81 @@ mod tests {
         );
         // Authorization still present alongside it
         assert!(lower.contains("authorization: bearer"), "auth header gone");
+    }
+
+    /// chat.params → body mapping (v1 llm/request.ts:115 shape: topP/topK/
+    /// maxOutputTokens camelCase in, snake_case on the wire), options merge,
+    /// and explicit-field precedence over same-key options.
+    #[test]
+    fn build_request_applies_chat_params() {
+        let msgs = vec![ChatMessage::text("user", "hi")];
+        let opts = ChatOpts {
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            top_k: Some(40),
+            max_tokens: Some(123),
+            options: json!({"temperature": 0.1, "x_hook": true}),
+            headers: vec![],
+        };
+        let body = build_request("m", &msgs, &opts, None);
+        assert_eq!(body["temperature"], json!(0.7), "explicit beats options");
+        assert_eq!(body["top_p"], json!(0.9));
+        assert_eq!(body["top_k"], json!(40));
+        assert_eq!(body["max_tokens"], json!(123));
+        assert_eq!(body["x_hook"], json!(true), "options merged");
+        // default opts → body has none of the hook fields (pre-hook parity)
+        let plain = build_request("m", &msgs, &ChatOpts::default(), None);
+        for k in ["temperature", "top_p", "top_k", "max_tokens"] {
+            assert!(plain.get(k).is_none(), "{k} must be absent by default");
+        }
+    }
+
+    /// chat.headers → wire (positive) + invalid names/values skipped without
+    /// failing the request (a plugin can never break the call).
+    #[tokio::test]
+    async fn chat_stream_applies_plugin_headers_and_skips_invalid() {
+        use tokio::io::AsyncReadExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut got = String::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                got.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if got.contains("\r\n\r\n") || n == 0 {
+                    break;
+                }
+            }
+            let _ = tx.send(got);
+        });
+        let client = Client::new(format!("http://{addr}"), "key");
+        let msgs = vec![ChatMessage::text("user", "hi")];
+        let opts = ChatOpts {
+            temperature: Some(0.7),
+            headers: vec![
+                ("x-plugin".into(), "yes".into()),
+                ("bad\nname".into(), "skipped".into()),
+                ("x-bad-value".into(), "v\x7f".into()),
+            ],
+            ..ChatOpts::default()
+        };
+        let _ = client.chat_stream("m", &msgs, &opts, None, None).await;
+        let req = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("captured request")
+            .unwrap();
+        assert!(
+            req.to_ascii_lowercase().contains("x-plugin: yes"),
+            "plugin header missing:\n{req}"
+        );
+        assert!(
+            !req.to_ascii_lowercase().contains("bad\nname"),
+            "invalid header name must be skipped, not sent"
+        );
+        assert!(req.contains("0.7"), "temperature must reach the body");
     }
 
     /// Absent session → header absent (direct providers see no change).
@@ -453,7 +572,9 @@ mod tests {
         });
         let client = Client::new(format!("http://{addr}"), "key");
         let msgs = vec![ChatMessage::text("user", "hi")];
-        let _ = client.chat_stream("m", &msgs, None, None, None).await;
+        let _ = client
+            .chat_stream("m", &msgs, &ChatOpts::default(), None, None)
+            .await;
         let req = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
             .await
             .expect("captured request")
