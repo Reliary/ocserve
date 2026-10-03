@@ -127,6 +127,40 @@ async fn sse_headers_match_freeze() {
     }
 }
 
+/// ALIAS: GET /event must be byte-identical to /global/event (upstream one
+/// handler public.ts:155; §17 row `GET /event`). ids are volatile per
+/// connection, so frames compare after id normalization; headers compare raw.
+#[tokio::test]
+async fn event_alias_is_byte_identical_to_global_event() {
+    let (s1, h1, b1) = collect_first(
+        Request::builder()
+            .uri("/event")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let (s2, h2, b2) = collect_first(
+        Request::builder()
+            .uri("/global/event")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+    assert_eq!(s1, s2, "status diverged");
+    assert_eq!(h1, h2, "header sets diverged");
+    // each side asserted INDEPENDENTLY against the freeze literal (a
+    // cross-connection frame comparison raced once under concurrent cargo
+    // load — a flake source; per-side literal asserts are deterministic)
+    let want = r#"data: {"payload":{"id":"evt_<ID>","type":"server.connected","properties":{}}}"#;
+    for (label, body) in [("event", &b1), ("global-event", &b2)] {
+        let text = String::from_utf8_lossy(body);
+        let first = text.split("\n\n").next().expect("at least one frame");
+        assert_eq!(normalize_ids(first), want, "/{label} first frame drifted");
+        assert!(!text.contains("\nid:"), "/{label}: id: lines forbidden");
+    }
+}
+
 /// GOLDEN: first SSE frame bytes match upstream modulo the volatile event id.
 /// Upstream: data: {"payload":{"id":"evt_<id>","type":"server.connected","properties":{}}}
 /// with key order id,type,properties (serde_json preserve_order required).

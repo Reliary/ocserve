@@ -2826,6 +2826,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(get_messages).post(post_message),
         )
         .route("/global/event", get(global_event))
+        // upstream serves /event, /global/event and /api/event from ONE handler
+        // (public.ts:155) — same handler here; oc-remote uses /global/event, TUI/SDK
+        // probes hit /event (was a tolerated 404; now freeze-faithful)
+        .route("/event", get(global_event))
         .route("/metrics", get(metrics))
         // TUI-attach probes (captured live; PLAN §2 hit-set expansion)
         .route("/api/location", get(get_api_location))
