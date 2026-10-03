@@ -94,7 +94,7 @@ fn emit_durable(
 /// (possibly mutated) `output`. Fail-open by construction — no sidecar or a
 /// hook error returns `output` unchanged (a broken plugin never breaks a
 /// prompt; M4b rule). Metrics: duration + error counter per hook name.
-pub(crate) async fn hook_mutate(
+pub async fn hook_mutate(
     plugins: Option<&Arc<tokio::sync::Mutex<refine_plugin::Sidecar>>>,
     name: &str,
     input: Value,
@@ -423,6 +423,37 @@ pub async fn run_prompt_with(
     });
 
     let client = Client::new(ctx.endpoint.base_url.clone(), ctx.endpoint.api_key.clone());
+    // leading system messages in `messages` (starts with the single
+    // pre-built system message; system.transform may reshape the prefix)
+    let mut sys_count: usize = 1;
+    // v1 parity: experimental.chat.messages.transform — prompt.ts:1255 (main
+    // inference) AND compaction.ts:379 (summarize): refine funnels both
+    // flows through this builder, so ONE site covers both upstream sites.
+    // The system prefix is NOT exposed (upstream fires on the stored
+    // conversation; system is built separately there). Live-request only —
+    // DB history untouched by construction. Fail-open on shape mismatch.
+    // Shape note (§17): OpenAI messages (refine's wire), documented
+    // divergence from upstream's AI-SDK ModelMessage shape.
+    if ctx.plugins.is_some() {
+        let conv: Vec<ChatMessage> = messages.split_off(sys_count);
+        let mt_out = hook_mutate(
+            ctx.plugins.as_ref(),
+            "experimental.chat.messages.transform",
+            json!({}),
+            json!({
+                "messages": serde_json::to_value(&conv).unwrap_or(Value::Null)
+            }),
+        )
+        .await;
+        match mt_out
+            .get("messages")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<Vec<ChatMessage>>(v).ok())
+        {
+            Some(parsed) => messages.extend(parsed),
+            None => messages.extend(conv), // no/unparseable array → fail-open
+        }
+    }
     let mut total_usage = Usage::default();
     let mut total_cost = 0.0f64;
     let mut step = 0usize;
@@ -437,6 +468,42 @@ pub async fn run_prompt_with(
         // (llm/request.ts:115/135) — tool-loop steps re-trigger, matching
         // upstream. Defaults = null/empty → body byte-identical when no
         // plugins are loaded (Default ChatOpts).
+        // v1 parity order (llm/request.ts): system.transform (L70) runs
+        // BEFORE params (L115) and headers (L135) — per LLM request, so a
+        // tool-loop step re-fires with fresh system mutation. The system
+        // array is the messages PREFIX: splice replaces it each iteration
+        // (upstream rebuilds system per request).
+        let mut sys_vec = vec![ctx.system.clone()];
+        let sys_out = hook_mutate(
+            ctx.plugins.as_ref(),
+            "experimental.chat.system.transform",
+            json!({"sessionID": session_id, "model": model}),
+            json!({"system": sys_vec}),
+        )
+        .await;
+        if let Some(arr) = sys_out.get("system").and_then(|a| a.as_array()) {
+            let mut v: Vec<String> = arr
+                .iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect();
+            if v.is_empty() {
+                v.push(ctx.system.clone());
+            }
+            // upstream hoist (request.ts:73-77): hook appended >1 entries
+            // and kept [0] → collapse [1..] into a single entry
+            if v.len() > 2 && v[0] == ctx.system {
+                let rest = v[1..].join("\n");
+                v.truncate(1);
+                v.push(rest);
+            }
+            sys_vec = v;
+        }
+        let sys_msgs: Vec<ChatMessage> = sys_vec
+            .iter()
+            .map(|sc| ChatMessage::text("system", sc.clone()))
+            .collect();
+        messages.splice(0..sys_count, sys_msgs);
+        sys_count = sys_vec.len();
         let hook_in = json!({
             "sessionID": session_id,
             "agent": agent,
@@ -635,10 +702,29 @@ pub async fn run_prompt_with(
                 }));
             }
             if !text.is_empty() {
+                let text_part_id = prt_id();
+                // v1 parity: experimental.text.complete fires at text-end
+                // BEFORE the part persists (processor.ts:531); mutation
+                // flows into persistence AND the provider continuation below.
+                text = hook_mutate(
+                    ctx.plugins.as_ref(),
+                    "experimental.text.complete",
+                    json!({
+                        "sessionID": session_id,
+                        "messageID": assistant_id,
+                        "partID": text_part_id,
+                    }),
+                    json!({"text": text}),
+                )
+                .await
+                .get("text")
+                .and_then(|t| t.as_str())
+                .map(String::from)
+                .unwrap_or(text);
                 parts.push(json!({
                     "type": "text", "text": text,
                     "time": {"start": t_done - elapsed_ms, "end": t_done},
-                    "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
+                    "id": text_part_id, "sessionID": session_id, "messageID": assistant_id,
                 }));
             }
 
@@ -779,15 +865,36 @@ pub async fn run_prompt_with(
                 // ---- execute ----
                 let exec_start = now_ms();
                 let (output, meta, title, is_err) = if allowed {
-                    let input = serde_json::from_str::<Value>(&call.arguments)
+                    // v1 parity: tool.execute.before (tools.ts:107) — input
+                    // {tool, sessionID, callID} (upstream-exact, minimal),
+                    // output {args}; MUTATED args are what executes. The
+                    // part state keeps the original model args (upstream
+                    // builds part state pre-hook too).
+                    let mut input = serde_json::from_str::<Value>(&call.arguments)
                         .unwrap_or_else(|_| json!({}));
+                    let args_out = hook_mutate(
+                        ctx.plugins.as_ref(),
+                        "tool.execute.before",
+                        json!({
+                            "tool": call.name,
+                            "sessionID": session_id,
+                            "callID": call.id,
+                        }),
+                        json!({"args": input}),
+                    )
+                    .await;
+                    if let Some(a) = args_out.get("args")
+                        && a.is_object()
+                    {
+                        input = a.clone();
+                    }
                     let builtin = refine_tools::schemas()
                         .iter()
                         .any(|s| s["function"]["name"] == call.name);
                     let exec = if builtin {
                         refine_tools::execute(&call.name, &input, Path::new(&ctx.directory))
                     } else if let Some(hub) = &ctx.mcp {
-                        match hub.call(&call.name, input).await {
+                        match hub.call(&call.name, input.clone()).await {
                             Some(Ok(text)) => Ok(refine_tools::ToolResult {
                                 output: text,
                                 truncated: false,
@@ -797,20 +904,12 @@ pub async fn run_prompt_with(
                                 metadata: None,
                             }),
                             Some(Err(e)) => Err(e),
-                            None => refine_tools::execute(
-                                &call.name,
-                                &serde_json::from_str::<Value>(&call.arguments)
-                                    .unwrap_or_else(|_| json!({})),
-                                Path::new(&ctx.directory),
-                            ),
+                            None => {
+                                refine_tools::execute(&call.name, &input, Path::new(&ctx.directory))
+                            }
                         }
                     } else {
-                        refine_tools::execute(
-                            &call.name,
-                            &serde_json::from_str::<Value>(&call.arguments)
-                                .unwrap_or_else(|_| json!({})),
-                            Path::new(&ctx.directory),
-                        )
+                        refine_tools::execute(&call.name, &input, Path::new(&ctx.directory))
                     };
                     match exec {
                         Ok(r) => {
@@ -1022,10 +1121,33 @@ pub async fn run_prompt_with(
                 "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
             }));
         }
-        parts.push(json!({
-            "type": "text", "text": text, "time": {"start": t_done - elapsed_ms, "end": t_done},
-            "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
-        }));
+        if !text.is_empty() {
+            let text_part_id = prt_id();
+            text = hook_mutate(
+                ctx.plugins.as_ref(),
+                "experimental.text.complete",
+                json!({
+                    "sessionID": session_id,
+                    "messageID": assistant_id,
+                    "partID": text_part_id,
+                }),
+                json!({"text": text}),
+            )
+            .await
+            .get("text")
+            .and_then(|t| t.as_str())
+            .map(String::from)
+            .unwrap_or(text);
+            parts.push(json!({
+                "type": "text", "text": text, "time": {"start": t_done - elapsed_ms, "end": t_done},
+                "id": text_part_id, "sessionID": session_id, "messageID": assistant_id,
+            }));
+        } else {
+            parts.push(json!({
+                "type": "text", "text": text, "time": {"start": t_done - elapsed_ms, "end": t_done},
+                "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
+            }));
+        }
         let assistant_info = json!({
             "parentID": user_msg_id,
             "role": "assistant",

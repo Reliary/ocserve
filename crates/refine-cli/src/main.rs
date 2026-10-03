@@ -412,6 +412,8 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
         let _ = state
             .plugins
             .set(std::sync::Arc::new(tokio::sync::Mutex::new(sc)));
+        // P0e: bus → plugin `event` hook pump (v1 plugin/index.ts:255-259)
+        refine_http::start_plugin_event_pump(&state);
     }
     let app = refine_http::router(state.clone());
 

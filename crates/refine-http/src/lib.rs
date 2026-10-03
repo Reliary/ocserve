@@ -443,6 +443,58 @@ async fn get_api_reference(State(st): State<Arc<AppState>>) -> impl IntoResponse
 }
 
 /// Empty-shape routes captured live: {}, [].
+/// GET /experimental/tool?provider=&model= — v1 ToolList (groups/
+/// experimental.ts:50-61; handlers/experimental.ts:94-105): [{id,
+/// description, parameters}] = builtin + MCP tools. Effect validates the
+/// query (missing provider/model → BadRequest) — mirrored here. Denied
+/// tools excluded, matching what the model actually sees (W5).
+async fn get_experimental_tool(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let has = |k: &str| q.get(k).map(|s| !s.is_empty()).unwrap_or(false);
+    if !has("provider") || !has("model") {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            name: "BadRequest",
+            message: "Invalid query: provider, model required".into(),
+        });
+    }
+    let mut schemas = refine_tools::schemas();
+    if let Some(hub) = st.mcp.get() {
+        let mcp_tools =
+            tokio::time::timeout(std::time::Duration::from_secs(10), hub.tool_schemas())
+                .await
+                .unwrap_or_else(|_| {
+                    tracing::warn!("mcp tool schema fetch timed out (/experimental/tool)");
+                    Vec::new()
+                });
+        schemas.extend(mcp_tools);
+    }
+    let items: Vec<Value> = schemas
+        .iter()
+        .filter_map(|t| {
+            let f = t.get("function")?;
+            Some(json!({
+                "id": f.get("name")?,
+                "description": f.get("description")?,
+                "parameters": f.get("parameters")?,
+            }))
+        })
+        .collect();
+    Ok(Json(Value::Array(items)))
+}
+
+/// GET /experimental/tool/ids — registry.ids(): plain string array.
+async fn get_experimental_tool_ids() -> Json<Value> {
+    let ids: Vec<Value> = refine_tools::schemas()
+        .iter()
+        .filter_map(|t| t.pointer("/function/name").and_then(|n| n.as_str()))
+        .map(|n| json!(n))
+        .collect();
+    Json(Value::Array(ids))
+}
+
 async fn experimental_resource() -> Json<Value> {
     Json(json!({}))
 }
@@ -669,6 +721,43 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// P0e: forward bus frames to the plugin sidecar's `event` hook (v1
+/// plugin/index.ts:255-259). Lagged frames are skipped (upstream is
+/// fire-and-forget); a closed bus ends the pump. Never blocks publishers.
+pub fn start_plugin_event_pump(st: &Arc<AppState>) {
+    // Subscribe SYNCHRONOUSLY here: last_seq is captured at call time, so
+    // frames published between call and first recv are buffered (drain), not
+    // skipped. (Spawning first raced: sync route handlers can publish before
+    // the task ever ran — caught by the pump test.)
+    let mut rx = st.bus.subscribe();
+    let st = st.clone();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(frame_str) => {
+                    let Some(plug) = st.plugins.get() else {
+                        continue; // sidecar not loaded — frames still on SSE
+                    };
+                    let Ok(v) = serde_json::from_str::<Value>(&frame_str) else {
+                        continue;
+                    };
+                    let Some(payload) = v.get("payload").cloned() else {
+                        continue;
+                    };
+                    let mut guard = plug.lock().await;
+                    if let Err(e) = guard.emit_event(payload).await {
+                        tracing::debug!("plugin event pump: {e:#}");
+                    }
+                }
+                Err(refine_core::event::RecvError::Lagged(n)) => {
+                    tracing::warn!("plugin event pump lagged {n} frames (skipped)");
+                }
+                Err(refine_core::event::RecvError::Closed) => break,
+            }
+        }
+    });
 }
 
 /// POST /session — create (wire shape from captured fixture: cost, directory,
@@ -990,6 +1079,12 @@ async fn post_summarize(
     )
     .await
     .map_err(prompt_err)?;
+    // P0e: session.compacted (magic-context consumes it after a summary)
+    st.bus.publish(refine_core::event::frame(
+        st.paths["directory"].as_str().unwrap_or("/"),
+        "session.compacted",
+        json!({"sessionID": sid}),
+    ));
     Ok(Json(json!(true)))
 }
 
@@ -1621,14 +1716,22 @@ async fn delete_session_route(
     if let Some((_, handle)) = st.prompt_tasks.lock().remove(&id) {
         handle.abort();
     }
-    refine_store::delete_session(&st.writer, &st.db, &id)
-        .map_err(|e| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            name: "InternalError",
-            message: format!("{e:#}"),
-        })?
-        .then_some(Json(json!(true)))
-        .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))
+    let found = refine_store::delete_session(&st.writer, &st.db, &id).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })?;
+    if !found {
+        return Err(ApiError::not_found(format!("Session not found: {id}")));
+    }
+    // P0e: magic-context consumes session.deleted (live publish — the
+    // durable rows cascade away with the session).
+    st.bus.publish(refine_core::event::frame(
+        st.paths["directory"].as_str().unwrap_or("/"),
+        "session.deleted",
+        json!({"sessionID": id}),
+    ));
+    Ok(Json(json!(true)))
 }
 
 /// POST /session/{id}/abort → true (idempotent: no active task = still true).
@@ -1647,14 +1750,23 @@ async fn delete_message_route(
     State(st): State<Arc<AppState>>,
     axum::extract::Path((sid, mid)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    refine_store::delete_message(&st.writer, &st.db, &sid, &mid)
-        .map_err(|e| ApiError {
+    let found =
+        refine_store::delete_message(&st.writer, &st.db, &sid, &mid).map_err(|e| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             name: "InternalError",
             message: format!("{e:#}"),
-        })?
-        .then_some(Json(json!(true)))
-        .ok_or_else(|| ApiError::not_found(format!("Message not found: {mid}")))
+        })?;
+    if !found {
+        return Err(ApiError::not_found(format!("Message not found: {mid}")));
+    }
+    // P0e: magic-context consumes message.removed (live publish — durable
+    // rows cascade away with the message).
+    st.bus.publish(refine_core::event::frame(
+        st.paths["directory"].as_str().unwrap_or("/"),
+        "message.removed",
+        json!({"sessionID": sid, "messageID": mid}),
+    ));
+    Ok(Json(json!(true)))
 }
 
 async fn delete_part_route(
@@ -2228,6 +2340,23 @@ async fn post_command(
     if let Some(mid) = payload.get("messageID").and_then(|m| m.as_str()) {
         cmd_payload["messageId"] = json!(mid);
     }
+    // v1 parity: command.execute.before (prompt.ts:1461) — input
+    // {command, sessionID, arguments}, output {parts} mutated before the
+    // prompt runs. Fail-open (no sidecar/hook error → parts unchanged).
+    let parts_out = refine_core::prompt::hook_mutate(
+        st.plugins.get(),
+        "command.execute.before",
+        json!({
+            "command": name,
+            "sessionID": id,
+            "arguments": arguments,
+        }),
+        json!({"parts": cmd_payload["parts"].clone()}),
+    )
+    .await;
+    if let Some(p) = parts_out.get("parts").and_then(|p| p.as_array()) {
+        cmd_payload["parts"] = Value::Array(p.clone());
+    }
 
     let ctx = build_prompt_context(&st, &cmd_payload, &id)?;
     let _release = lock_session(&st, &id).await?;
@@ -2630,6 +2759,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/agent", get(get_agent))
         .route("/command", get(get_command))
         .route("/experimental/console", get(get_console))
+        .route("/experimental/tool", get(get_experimental_tool))
+        .route("/experimental/tool/ids", get(get_experimental_tool_ids))
         .route("/experimental/capabilities", get(get_capabilities))
         .route("/path", get(get_path))
         .route("/project", get(get_projects))

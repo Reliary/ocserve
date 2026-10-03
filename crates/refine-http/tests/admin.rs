@@ -259,3 +259,50 @@ async fn global_dispose_emits_event_and_returns_true() {
         "reloader ran"
     );
 }
+
+/// P0f: /experimental/tool(/ids) — v1 shapes (ToolList + ToolIDs), query
+/// validation mirroring Effect's BadRequest, ids ⊇ builtins.
+#[tokio::test]
+async fn experimental_tool_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path(), Payloads::default());
+    let app = refine_http::router(st);
+
+    // ids: plain string array containing every builtin
+    let (status, bytes) = call(&app, "GET", "/experimental/tool/ids", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<String> = serde_json::from_slice(&bytes).unwrap();
+    for want in ["bash", "read", "write", "edit", "glob", "grep"] {
+        assert!(
+            ids.contains(&want.to_string()),
+            "ids missing {want}: {ids:?}"
+        );
+    }
+
+    // full list: [{id, description, parameters}] keyed to the same catalog
+    let (status, bytes) = call(
+        &app,
+        "GET",
+        "/experimental/tool?provider=fake&model=m",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(items.len(), ids.len(), "list and ids must align");
+    let bash = items
+        .iter()
+        .find(|i| i["id"] == "bash")
+        .expect("bash in list");
+    assert_eq!(
+        bash["description"],
+        "Run a shell command and return its output."
+    );
+    assert_eq!(bash["parameters"]["type"], "object");
+
+    // missing query params → 400 BadRequest (Effect query validation parity)
+    let (status, bytes) = call(&app, "GET", "/experimental/tool", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let err: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(err["name"], "BadRequest");
+}

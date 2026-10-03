@@ -286,6 +286,12 @@ impl Sidecar {
         Ok(output)
     }
 
+    /// v1 event delivery (plugin/index.ts:255-259): per-plugin
+    /// `hooks["event"]({event})`. Returns host delivery count.
+    pub async fn emit_event(&mut self, event: Value) -> Result<Value> {
+        self.request("event", json!({"event": event})).await
+    }
+
     pub async fn config(&mut self, cfg: Value) -> Result<Value> {
         self.request("config", json!({"config": cfg})).await
     }
@@ -364,6 +370,10 @@ export const PluginModule = {
   server: async () => ({
     "tool.execute.after": async (input, output) => { output.seen = input.tool; },
     "chat.message": async (input, output) => { output.touched = true; },
+    "event": async (payload) => {
+      if (!payload.event || !payload.event.type) throw new Error("bad event shape");
+      if (payload.event.type === "boom.type") throw new Error("event boom");
+    },
   }),
 };
 export default PluginModule.server;
@@ -385,7 +395,11 @@ export default PluginModule.server;
             .expect("load");
         assert_eq!(
             hooks,
-            vec!["tool.execute.after".to_string(), "chat.message".to_string()],
+            vec![
+                "tool.execute.after".to_string(),
+                "chat.message".to_string(),
+                "event".to_string()
+            ],
             "hook names registered in declaration order"
         );
 
@@ -408,6 +422,21 @@ export default PluginModule.server;
             .await
             .expect("trigger2");
         assert_eq!(out2["keep"], 1);
+
+        // v1 event delivery (plugin/index.ts:255-259): hooks["event"]
+        // receives {event:{id,type,properties}}; shape-asserting fixture
+        // only succeeds if the wrapper is exact (delivered counts non-
+        // throwing hooks), and a throwing event hook fails open.
+        let ev = sc
+            .emit_event(json!({"id": "e1", "type": "session.created", "properties": {}}))
+            .await
+            .expect("emit_event");
+        assert_eq!(ev["delivered"], 1, "event hook must receive exact shape");
+        let ev2 = sc
+            .emit_event(json!({"id": "e2", "type": "boom.type", "properties": {}}))
+            .await
+            .expect("emit_event fail-open");
+        assert_eq!(ev2["delivered"], 0, "throwing event hook must not count");
 
         let st = sc.statuses();
         assert_eq!(st["synthetic"]["ok"], true);

@@ -162,6 +162,22 @@ process.stdin.on("data", (chunk) => {
   }
 });
 
+/** Forward one bus event to every plugin's `event` hook (v1 shape). */
+async function deliverEvent(ev) {
+  let delivered = 0;
+  for (const p of loaded) {
+    const fn = p.hooks["event"];
+    if (typeof fn !== "function") continue;
+    try {
+      await fn({ event: ev });
+      delivered++;
+    } catch (e) {
+      process.stderr.write(`[plugin:${p.spec}] event hook failed: ${e?.stack ?? e}\n`);
+    }
+  }
+  return { delivered };
+}
+
 async function handle(line) {
   let msg;
   try { msg = JSON.parse(line); } catch { return; }
@@ -173,7 +189,10 @@ async function handle(line) {
       case "load": reply(await loadPlugin(msg.params)); break;
       case "trigger": reply(await trigger(msg.params.name, msg.params.input, msg.params.output)); break;
       case "config": reply("ok"); break; // config() hooks: invoked at load-time parity, M4b
-      case "event": reply("ok"); break;  // non-durable, matches upstream fire-and-forget
+      // v1 parity (plugin/index.ts:255-259): per-plugin hooks["event"]
+      // called with {event:{id,type,properties}}; each failure logged and
+      // skipped (upstream: void fire-and-forget, fail-open).
+      case "event": reply(await deliverEvent(msg.params.event)); break;
       case "dispose": {
         for (const p of loaded) { try { await p.hooks?.dispose?.(); } catch { /* documented: dispose errors logged, not fatal */ } }
         reply("ok");
