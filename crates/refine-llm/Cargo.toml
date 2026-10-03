@@ -3,6 +3,7 @@ name = "refine-llm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 description = "Provider clients: openai-compatible first; stream assembly + fuzz corpus"
 

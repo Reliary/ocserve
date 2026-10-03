@@ -96,15 +96,28 @@ only with a before/after number on the bench gate.
   `Environment=MIMALLOC_PURGE_DELAY=500 RUST_LOG=refine=info`, hardening
   (`ProtectSystem=strict`, `ReadWritePaths` on data dir, `NoNewPrivileges`).
 - **Release profile** (matches reliary8/stria): `lto="fat"`, `codegen-units=1`,
-  `opt-level=3`, `panic="abort"`, `strip=true`; binary-size budget gate in CI (reliary8
-  pattern: fail > size ceiling, established at first release build).
-- **CI gates (every PR):** clippy `-D warnings`, `cargo audit`, `cargo deny bans/licenses`,
-  fmt; storage gates from `STORAGE.md §7`; memory gate from `MEMORY.md §5`; SSE byte-golden
-  replay (0 diff); binary size ceiling.
-- **Nightly:** 24 h soak, upstream-latest drift report (triage adopt/ignore — never auto),
-  provider stream fuzz (10 k seeded chunk splits of recorded streams), SIGKILL blob/DB fuzz,
-  backup/restore drill.
-- **Pre-commit hooks** (reliary8 pattern): clippy, audit, deny, stale `*.perf` guard.
+  `opt-level=3`, `panic="abort"`, `strip=true`; **binary size ceiling 10,485,760 B
+  (10.0 MiB)** — established from the measured 2026-10-03 release build (9,279,528 B);
+  raise only with a measured reason recorded here. Enforced by `scripts/nightly.sh`.
+- **Per-commit gates (AGENTS §3, run by hand before every commit):** clippy `-D warnings`,
+  fmt, full workspace tests, `scripts/check-guards.sh`, `scripts/check-matrix.sh`
+  (+ area gate: storage `STORAGE.md §7`, memory `MEMORY.md §5`, wire differential replay).
+- **Pre-commit hook (`.git/hooks/pre-commit`, installed 2026-10-03):** banned-string
+  check (login name / absolute home paths) + docs-required (staged `crates/*.rs` must
+  stage `TRACEABILITY.md`). Fast checks only — no network, no builds.
+- **Nightly (wired: systemd user timers, 2026-10-03 — repo is local, so these are the
+  "CI" until a remote exists):**
+  - `refine-nightly.timer` 06:30 → `scripts/nightly.sh`: `cargo audit`, `cargo deny check`
+    (`deny.toml`), SIGKILL blob/DB crash fuzz, provider stream fuzz (10 k seeded
+    chunk-boundary splits vs whole-buffer parse), backup drill (live `VACUUM INTO` +
+    integrity + row counts), binary size ceiling; `--with-mutants` = manual/weekly
+    (never during benchmark sessions).
+  - `refine-drift-watch.timer` 06:00 → `scripts/drift-watch.sh` (upstream release
+    triage — adopt/ignore, never auto).
+  - `refine-soak.timer` daily → fresh 24 h soak CSV at
+    `~/.local/state/refine/soak/soak.csv`; `scripts/soak-gate.sh <csv>` machine-checks
+    slope/health (replaces eyeballing). Restart manually after every deploy.
+  All timers `Persistent=true` (missed runs catch up on boot).
 - **Runbook:** `refine doctor` = boot checks + storage health + FTS integrity + blob GC dry-run
   + version/contract info; `refine import`, `refine bench {--http,--blob,--replay}`.
 

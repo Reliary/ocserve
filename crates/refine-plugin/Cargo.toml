@@ -3,6 +3,7 @@ name = "refine-plugin"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 description = "opencode plugin host: hook dispatcher with full upstream name table"
 

@@ -380,14 +380,19 @@ byte-golden capture of live `/global/event`; contentless-FTS retest under bundle
 | 4 | Plugins (quickjs) + MCP + OAuth | 3+3 pass; restart preserves state; sidecar gate decided; OAuth expiry test green |
 | 5 | Soak + hardening | every §7 row green over 24 h; systemd hardening live; fault + security suites green; rollback drill done |
 
-## 15. Open questions (decide before M1)
+## 15. Open questions (originally "decide before M1" — statuses updated 2026-10-03)
 
-1. Plugin fallback boundary (B3): accept "300 MB refine / ~380 MB with sidecar"?
-2. Snapshot/revert for imported sessions: reimplement git engine at P1 or disabled-until-then?
-3. Network: keep socat tailnet forwarder or bind refine to tailnet interface directly?
-4. `native` CPU profile: ship as the default for your laptop build, or keep portable default?
-5. Service cutover: `refine.service` takes port 4901 with Homebrew opencode kept installed as
-   instant rollback (recommended), or a separate port + forwarder swap?
+1. Plugin fallback boundary (B3): **ANSWERED** — sidecar RSS measured 121–151 MB under a
+   160 MB cap (MEMORY provenance; heap default 128 via `REFINE_PLUGIN_HEAP_MB`).
+2. Snapshot/revert for imported sessions: **OUT** — snapshot/git-revert engine is out of
+   MVP (§2/§17); re-affirmed with evidence 2026-10-03 (session diff depends on it;
+   oc-remote's REST diff caller is dead code). Reopen only as its own project.
+3. Network: **ANSWERED** — socat tailnet forwarder shipped (`refine-tailscale-forward.service`).
+4. `native` CPU profile: **STILL OPEN** — portable default ships; decide if a native-tuned
+   laptop build is worth the artifact matrix.
+5. Service cutover: **STILL OPEN, pending readiness report** — recommended shape unchanged
+   (`refine.service` takes 4901, Homebrew opencode stays installed as instant rollback);
+   gate on the migration-readiness checklist (T5) before scheduling.
 
 ## 16. Immediate stopgap (independent)
 

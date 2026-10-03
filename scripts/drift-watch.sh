@@ -22,7 +22,8 @@
 #   --freeze-only control arm only (validate the harness; no npm/docker build)
 # Env: FROZEN (default 1.18.31 = PLAN §3 freeze), REFINE_BIN, DRIFT_PORT_F
 #      (4923), DRIFT_PORT_L (4924), FREEZE_RUNS (2), DRIFT_REPORT_DIR
-# cron: 0 6 * * * cd <repo> && scripts/drift-watch.sh >> bench/drift/cron.log 2>&1
+# schedule: this host uses `refine-drift-watch.timer` (systemd --user, 06:00,
+# Persistent); elsewhere: cron `0 6 * * * cd <repo> && scripts/drift-watch.sh >> bench/drift/cron.log 2>&1`
 # Env vars are operator-trusted inputs (set them like PATH — only from your own
 # shell/cron): REFINE_BIN executes a binary, DRIFT_REPORT_DIR writes files.
 # Exit: 0 = report written (drift found is INFORMATION, not failure)

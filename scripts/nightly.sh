@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Nightly verification program (SRE §CI/nightly — wired LOCALLY; promoted to
+# PR CI when a remote exists, per PLAN §6). Companion to drift-watch.sh
+# (upstream release triage — own cron line, flock-isolated).
+#
+# Every step FAIL-VISIBLE: a step that cannot run (network down for audit,
+# missing binary) is a non-zero step, never a silent skip.
+#
+# Usage: scripts/nightly.sh [--with-mutants]
+#   --with-mutants  also run cargo-mutants on refine-store/refine-core
+#                   (hours of CPU — manual/weekly; NEVER during benchmark
+#                   sessions: interleaved-comparison rule)
+# Log:  bench/drift/nightly-<ts>.log (gitignored)  Exit: 0 all steps ok
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+WITH_MUTANTS=0
+[ "${1:-}" = "--with-mutants" ] && WITH_MUTANTS=1
+
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+LOG="bench/drift/nightly-${STAMP}.log"
+mkdir -p bench/drift
+: >"$LOG"
+FAILS=0
+
+step() { # $1 = label, rest = command
+  local label="$1"; shift
+  echo "== ${label} ==" | tee -a "$LOG"
+  if "$@" >>"$LOG" 2>&1; then
+    echo "ok" | tee -a "$LOG"
+  else
+    echo "FAIL: ${label}" | tee -a "$LOG"
+    FAILS=$((FAILS + 1))
+  fi
+}
+
+# 1. supply chain: vulnerabilities + licenses/bans/sources (deny.toml)
+step "cargo audit" cargo audit
+step "cargo deny" cargo deny check
+
+# 2. crash protocol: SIGKILL fuzz on the blob/DB writer (M0 decisive test)
+step "crash fuzz (SIGKILL blob/DB)" cargo test -p refine-store --test crash_fuzz
+
+# 3. provider stream fuzz: 10k seeded chunk-boundary splits vs whole-buffer
+step "stream chunk-split fuzz" cargo test -p refine-llm chunk_split_fuzz
+
+# 4. backup drill: online VACUUM INTO while serving, then integrity +
+#    row-count check on the COPY (live service never written)
+drill() {
+  local tmp bin
+  tmp="$(mktemp -d)"
+  bin="target/release/refine"
+  [ -x "$bin" ] || bin="$(command -v refine || true)"
+  if [ -z "$bin" ]; then echo "no refine binary"; return 1; fi
+  local db="${REFINE_DATA_DIR:-$HOME/.local/share/refine}/refine.db"
+  [ -f "$db" ] || { echo "no db at $db"; return 1; }
+  # live count FIRST (backup may only grow, never lose, committed rows)
+  local live
+  live="$(python3 - "$db" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+print(c.execute("select count(*) from msg").fetchone()[0])
+PY
+)" || return 1
+  "$bin" backup --dest "$tmp/b.db" || { rm -rf "$tmp"; return 1; }
+  python3 - "$tmp/b.db" "$live" <<'PY'
+import sqlite3, sys
+conn, live = sys.argv[1], int(sys.argv[2])
+c = sqlite3.connect(conn)
+ok = c.execute("pragma integrity_check").fetchone()[0]
+n = c.execute("select count(*) from msg").fetchone()[0]
+print(f"integrity={ok} msgs={n} (live-at-start={live})")
+assert ok == "ok", "integrity_check failed"
+assert n >= live, f"backup lost rows: {n} < {live}"
+PY
+  local rc=$?
+  rm -rf "$tmp"
+  return $rc
+}
+step "backup drill (VACUUM INTO + integrity + counts)" bash -c "$(declare -f drill); drill"
+
+# 5. binary size ceiling (number established at first release build + gate):
+#    release binary 9,279,528 B measured 2026-10-03 → ceiling 10,485,760 B
+#    (10.0 MiB, ~13% headroom; raise ONLY with a measured reason in SRE)
+size_gate() {
+  local bin="target/release/refine"
+  if [ ! -x "$bin" ]; then
+    echo "release binary missing — building"
+    cargo build --release || return 1
+  fi
+  local sz ceiling=10485760
+  sz="$(stat -c%s "$bin")"
+  echo "size=${sz} ceiling=${ceiling}"
+  [ "$sz" -le "$ceiling" ] || { echo "OVER SIZE CEILING"; return 1; }
+}
+step "binary size ceiling" bash -c "$(declare -f size_gate); size_gate"
+
+# 6. mutants (opt-in): survivor report is triaged like a defect (TESTING §9)
+if [ "$WITH_MUTANTS" = "1" ]; then
+  if command -v cargo-mutants >/dev/null 2>&1; then
+    # skip the 50s fuzz (per-mutant cost) — mutants target store/core logic
+    # args after -- go to `cargo test` per mutant: skip the 50s fuzz and the
+    # SIGKILL harness (minutes each — they already run unmutated every gate/nightly)
+    step "cargo mutants (store+core)" \
+      cargo mutants -p refine-store -p refine-core --timeout 120 \
+      -- --skip chunk_split --skip sigkill
+  else
+    echo "FAIL: --with-mutants but cargo-mutants not installed" | tee -a "$LOG"
+    FAILS=$((FAILS + 1))
+  fi
+fi
+
+echo "== nightly summary: ${FAILS} failed ==" | tee -a "$LOG"
+echo "log: $LOG"
+[ "$FAILS" -eq 0 ]

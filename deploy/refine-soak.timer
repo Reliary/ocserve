@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily refine soak restart (workflow: fresh sampler after every deploy)
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

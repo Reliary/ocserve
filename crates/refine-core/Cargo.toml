@@ -3,6 +3,7 @@ name = "refine-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 description = "Session domain: inbox admission, agent loop, event bus, permissions"
 

@@ -8,6 +8,7 @@ URL="${1:?url (e.g. http://127.0.0.1:4911)}"
 INTERVAL="${2:-60}"
 HOURS="${3:-24}"
 OUT="${SOAK_OUT:-/tmp/opencode/refine-soak-$(date +%s).csv}"
+mkdir -p "$(dirname "$OUT")"
 echo "ts,rss,peak,sidecar,wal,sse,queue,locks,tasks,health" > "$OUT"
 end=$(( $(date +%s) + HOURS * 3600 ))
 while [ "$(date +%s)" -lt "$end" ]; do

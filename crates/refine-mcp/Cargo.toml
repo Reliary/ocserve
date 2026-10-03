@@ -3,6 +3,7 @@ name = "refine-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 description = "MCP client: stdio + StreamableHTTP + legacy SSE; OAuth token store"
 

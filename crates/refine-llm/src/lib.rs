@@ -51,7 +51,7 @@ impl ChatMessage {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -60,7 +60,7 @@ pub struct Usage {
 }
 
 /// Provider stream events (parsed from OpenAI-compatible SSE `data:` lines).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
     ReasoningDelta(String),
     TextDelta(String),
@@ -258,6 +258,67 @@ pub fn replay_fixture(raw: &[u8]) -> Result<Vec<StreamEvent>> {
     Ok(events)
 }
 
+/// Incremental SSE line parser — the LIVE chat_stream path (M2c: a `data:`
+/// line can span TCP chunks). Extracted verbatim from the stream unfold so
+/// chunk-boundary splits are fuzzable: the seeded split test proves any
+/// TCP chunking yields the identical event sequence (SRE nightly claim).
+#[derive(Default)]
+pub struct SseLineParser {
+    buf: Vec<u8>,
+    pending: std::collections::VecDeque<anyhow::Result<StreamEvent>>,
+    eof: bool,
+}
+
+impl SseLineParser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one network chunk; completed lines parse immediately, in order.
+    pub fn push(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+        while let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line);
+            let line = line.trim_end_matches('\r').trim_end_matches('\n');
+            if let Some(payload) = line.strip_prefix("data:") {
+                match parse_sse_data(payload.trim()) {
+                    Ok(Some(ev)) => self.pending.push_back(Ok(ev)),
+                    Ok(None) => continue, // keep-alive/blank → skip
+                    Err(e) => self.pending.push_back(Err(e)),
+                }
+            }
+            // non-data line: skip
+        }
+    }
+
+    /// EOF: a trailing line without newline parses once (original semantics).
+    pub fn finish(&mut self) {
+        self.eof = true;
+        if !self.buf.is_empty() {
+            let rest = String::from_utf8_lossy(&self.buf).trim_end().to_string();
+            self.buf.clear();
+            if let Some(payload) = rest.strip_prefix("data:") {
+                match parse_sse_data(payload.trim()) {
+                    Ok(Some(ev)) => self.pending.push_back(Ok(ev)),
+                    Ok(None) => {}
+                    Err(e) => self.pending.push_back(Err(e)),
+                }
+            }
+        }
+    }
+
+    /// Next completed event in stream order.
+    pub fn pop(&mut self) -> Option<anyhow::Result<StreamEvent>> {
+        self.pending.pop_front()
+    }
+
+    /// True when EOF seen and nothing pending — the stream ends here.
+    pub fn is_done(&self) -> bool {
+        self.eof && self.pending.is_empty()
+    }
+}
+
 /// Request shaping from the `chat.params` / `chat.headers` plugin hooks
 /// (v1 parity: session/llm/request.ts:115/135). `Default` reproduces the
 /// pre-hook behavior byte-for-byte (no temperature, no extra headers).
@@ -378,48 +439,27 @@ impl Client {
         let src = resp.bytes_stream();
         // Buffered line parser: a `data:` line can span TCP chunks (live 500s
         // proved it — M2c). Buffer until complete lines; keep remainder.
+        // SseLineParser = the exact prior inline loop (M2c line buffering),
+        // extracted so the chunk-split fuzz exercises production code.
         let parsed = futures_util::stream::unfold(
-            (src, Vec::<u8>::new()),
-            |(mut src, mut buf)| async move {
+            (src, SseLineParser::new()),
+            |(mut src, mut parser)| async move {
                 loop {
-                    // complete line available?
-                    if let Some(pos) = buf.iter().position(|b| *b == b'\n') {
-                        let line: Vec<u8> = buf.drain(..=pos).collect();
-                        let line = String::from_utf8_lossy(&line);
-                        let line = line.trim_end_matches('\r').trim_end_matches('\n');
-                        if let Some(payload) = line.strip_prefix("data:") {
-                            match parse_sse_data(payload.trim()) {
-                                Ok(Some(ev)) => return Some((Ok(ev), (src, buf))),
-                                Ok(None) => continue, // keep-alive/blank → next line
-                                Err(e) => return Some((Err(e), (src, buf))),
-                            }
-                        }
-                        continue; // non-data line (blank separator etc.)
+                    if let Some(ev) = parser.pop() {
+                        return Some((ev, (src, parser)));
                     }
-                    // need more bytes
+                    if parser.is_done() {
+                        return None;
+                    }
                     match src.next().await {
-                        Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                        Some(Ok(chunk)) => parser.push(&chunk),
                         Some(Err(e)) => {
                             return Some((
                                 Err(anyhow::anyhow!("provider stream: {e}")),
-                                (src, buf),
+                                (src, parser),
                             ));
                         }
-                        None => {
-                            // EOF: parse a trailing line without newline if present
-                            if !buf.is_empty() {
-                                let rest = String::from_utf8_lossy(&buf).trim_end().to_string();
-                                buf.clear();
-                                if let Some(payload) = rest.strip_prefix("data:") {
-                                    match parse_sse_data(payload.trim()) {
-                                        Ok(Some(ev)) => return Some((Ok(ev), (src, buf))),
-                                        Ok(None) => {}
-                                        Err(e) => return Some((Err(e), (src, buf))),
-                                    }
-                                }
-                            }
-                            return None;
-                        }
+                        None => parser.finish(),
                     }
                 }
             },
@@ -679,5 +719,65 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(ev, Some(StreamEvent::Done { usage: Some(_), .. })));
+    }
+
+    /// K-PROVIDER stream fuzz (SRE nightly claim, now enforced): 10,000
+    /// seeded chunk-boundary splits of each recorded fixture through the
+    /// LIVE line parser must yield the identical event sequence as the
+    /// whole-buffer parse — TCP chunking can never change results.
+    #[test]
+    fn chunk_split_fuzz_matches_whole_buffer_parse() {
+        for fixture in [STOP_FIXTURE, REASONING_FIXTURE] {
+            // whole-buffer reference through the SAME parser
+            let mut whole = SseLineParser::new();
+            whole.push(fixture);
+            whole.finish();
+            let expected: Vec<StreamEvent> =
+                std::iter::from_fn(|| whole.pop().map(|ev| ev.expect("whole parse"))).collect();
+            assert!(!expected.is_empty(), "fixture produced no events");
+            let is_stop = std::ptr::eq(fixture.as_ptr(), STOP_FIXTURE.as_ptr());
+
+            let mut seed: u32 = 0x9E37_79B9;
+            let mut stop_text = String::new();
+            for _ in 0..10_000 {
+                // xorshift32 + LCG — deterministic, no rng dependency
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                let mut parser = SseLineParser::new();
+                let mut off = 0usize;
+                let mut s = seed as u64;
+                while off < fixture.len() {
+                    s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                    let step = 1 + (s as usize % 512);
+                    let end = (off + step).min(fixture.len());
+                    parser.push(&fixture[off..end]);
+                    off = end;
+                }
+                parser.finish();
+                let mut got: Vec<StreamEvent> = Vec::new();
+                let mut text = String::new();
+                while let Some(ev) = parser.pop() {
+                    let ev =
+                        ev.unwrap_or_else(|e| panic!("chunked parse error at seed {seed}: {e}"));
+                    if let StreamEvent::TextDelta(t) = &ev {
+                        text.push_str(t);
+                    }
+                    got.push(ev);
+                }
+                assert_eq!(
+                    got,
+                    expected,
+                    "chunk-split divergence at seed {seed} (fixture {}B)",
+                    fixture.len()
+                );
+                if is_stop {
+                    stop_text = text;
+                }
+            }
+            if is_stop {
+                assert_eq!(stop_text, "HELLO_REFINE", "assembled text drifted");
+            }
+        }
     }
 }
