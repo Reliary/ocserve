@@ -80,8 +80,11 @@ stria/relay guard+risk+dead via MCP (D6 exclusion), harness contract/ellipsis fo
 
 **Status 2026-10-03: P0–P2 shipped** (c697c76 P0 docs, 71f0e10 P1a replay-check,
 3b8b496 P1b loop intelligence, cc0cc9d P1c sift default-off, b7b45a5 P2 MCP trust).
-Open: Arc49 sift gate (default stays OFF until it runs), D2 evidence, TOFU
-cross-restart persistence, MCP trust enforcement mode.
+Arc49 sift gate **RAN and FAILED** (engagement 4/8 < 2/3; cost −58.9% and
+score non-regression passed) → `REFINE_SIFT` default stays OFF, results
+committed at `bench/sift-gate/results/` with forensics (models self-pipe
+below threshold; high-entropy output does not shrink). Still open: D2
+evidence, TOFU cross-restart persistence, MCP trust enforcement mode.
 
 `P0` this doc → `P1a` `scripts/replay-check.sh` (boot → wire-corpus replay → exit code;
 self-test proves both exits) → `P1b` loop intelligence → `P1c` sift-at-boundary
