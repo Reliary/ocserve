@@ -58,7 +58,7 @@
   "status": 200
  },
  "api_integration": {
-  "defer": "M2",
+  "defer": "out",
   "keys": [
    "$.data",
    "$.data[].connections",
@@ -89,7 +89,7 @@
   "status": 200
  },
  "api_model": {
-  "defer": "M2",
+  "defer": "out",
   "keys": [
    "$.data",
    "$.data[].api",
@@ -135,7 +135,7 @@
   "status": 200
  },
  "api_provider": {
-  "defer": "M2",
+  "defer": "out",
   "keys": [
    "$.data",
    "$.data[].api",
@@ -173,7 +173,7 @@
   "status": 200
  },
  "api_skill": {
-  "defer": "M2",
+  "defer": "out",
   "keys": [
    "$.data",
    "$.data[].content",
@@ -1681,18 +1681,12 @@
   "status": 200
  },
  "mcp": {
-  "defer": "M4",
   "keys": [
-   "$.browser-harness",
-   "$.browser-harness.error",
    "$.browser-harness.status",
-   "$.context-mode",
-   "$.context-mode.error",
    "$.context-mode.status",
-   "$.context7",
    "$.context7.status"
   ],
-  "mode": "keys",
+  "mode": "keys_subset",
   "path": "/mcp",
   "status": 200
  },
@@ -2058,7 +2052,6 @@
   "truncated": true
  },
  "provider_auth": {
-  "defer": "M2",
   "keys": [
    "$.azure",
    "$.azure[].label",
@@ -2129,7 +2122,8 @@
   ],
   "mode": "keys",
   "path": "/provider/auth",
-  "status": 200
+  "status": 200,
+  "defer": "divergence:K-ADMIN-api-key-only"
  },
  "session_list": {
   "keys": [
