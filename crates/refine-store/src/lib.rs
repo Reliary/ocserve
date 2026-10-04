@@ -6,11 +6,13 @@
 //! - payloads via `blob::BlobStore`, never as SQLite row payloads > metadata
 
 pub mod blob;
+pub mod fork;
 pub mod pragma;
 pub mod schema;
 pub mod writer;
 
 pub use blob::BlobStore;
+pub use fork::{ForkStats, fork_session};
 pub use writer::{WriteOp, Writer, apply_ops};
 
 /// Upstream wire shape of a session list entry (PLAN F1; keys verified against

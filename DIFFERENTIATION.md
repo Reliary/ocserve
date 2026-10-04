@@ -83,8 +83,15 @@ stria/relay guard+risk+dead via MCP (D6 exclusion), harness contract/ellipsis fo
 Arc49 sift gate **RAN and FAILED** (engagement 4/8 < 2/3; cost −58.9% and
 score non-regression passed) → `REFINE_SIFT` default stays OFF, results
 committed at `bench/sift-gate/results/` with forensics (models self-pipe
-below threshold; high-entropy output does not shrink). Still open: D2
-evidence, TOFU cross-restart persistence, MCP trust enforcement mode.
+below threshold; high-entropy output does not shrink).
+
+**Status 2026-10-04: P2b + evidence gates closed** (d376c11: TOFU pins
+persisted cross-restart + `REFINE_MCP_TRUST=enforce`; D2 mined → stays parked,
+0/4 mirage signal at n=4). **K-FORK shipped**: upstream `session.fork` ported
+(exclusive cut, remaps, zero-copy blob share) — the inversion memo's
+"prefix-frozen forking" primitive turned out to be freeze parity oc-remote
+already calls (3 UI sites), so the Time-Machine branch primitive arrived as a
+compat fix. Still open: D2 (needs corpus), Arc49 sift flip, MCP pin re-anchor UX.
 
 `P0` this doc → `P1a` `scripts/replay-check.sh` (boot → wire-corpus replay → exit code;
 self-test proves both exits) → `P1b` loop intelligence → `P1c` sift-at-boundary

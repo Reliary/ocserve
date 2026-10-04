@@ -727,6 +727,24 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Freeze `getForkedTitle` (session.ts): `/^(.+) \(fork #(\d+)\)$/` →
+/// `base (fork #(n+1))`, otherwise `title (fork #1)`. Ported with string ops
+/// (regex `.+` needs ≥1 char before the suffix → `idx > 0`, greedy match →
+/// last occurrence → `rfind`).
+pub fn forked_title(title: &str) -> String {
+    const PAT: &str = " (fork #";
+    if let Some(idx) = title.rfind(PAT)
+        && idx > 0
+        && let Some(num) = title[idx + PAT.len()..].strip_suffix(')')
+        && !num.is_empty()
+        && num.bytes().all(|b| b.is_ascii_digit())
+        && let Ok(n) = num.parse::<u64>()
+    {
+        return format!("{} (fork #{})", &title[..idx], n + 1);
+    }
+    format!("{title} (fork #1)")
+}
+
 /// P0e: forward bus frames to the plugin sidecar's `event` hook (v1
 /// plugin/index.ts:255-259). Lagged frames are skipped (upstream is
 /// fire-and-forget); a closed bus ends the pump. Never blocks publishers.
@@ -800,6 +818,100 @@ async fn post_session(
         st.paths["directory"].as_str().unwrap_or("/"),
         "session.created",
         json!({"sessionID": id, "info": info}),
+    ));
+    Ok(Json(info))
+}
+
+/// POST /session/{id}/fork — freeze session.fork (groups/session.ts:248,
+/// session.ts:691). Effect decodes the payload BEFORE the handler runs, so
+/// payload errors precede the 404: bad JSON / non-object / non-string
+/// `messageID` → 400 `{"_tag":"BadRequest"}`; empty or whitespace body is
+/// the NoContent arm (copy all). Returns the NEW Session.Info; messages are
+/// copied strictly before `messageID` (freeze `slice(0, findIndex)`; unknown
+/// id → findIndex -1 → copy all).
+async fn post_fork(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, HttpError> {
+    let upto: Option<String> = {
+        let text = String::from_utf8_lossy(&body);
+        if text.trim().is_empty() {
+            None // NoContent arm
+        } else {
+            let v: Value = serde_json::from_str(&text).map_err(|_| tagged_bad_request())?;
+            if !v.is_object() {
+                return Err(tagged_bad_request()); // [] / "x" / 42 / null
+            }
+            match v.get("messageID") {
+                None => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(tagged_bad_request()), // non-string / null
+            }
+        }
+    };
+    let src = refine_store::load_session_wire(&st.db, &id)
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("{e:#}"),
+        })?
+        .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))?;
+
+    let new_id = refine_core::ids::ses_id();
+    let now = now_ms();
+    let worktree = st.paths["worktree"].as_str().unwrap_or("/").to_string();
+    // createNext shape (session.ts): fresh id/slug, FORKED title, cost/tokens
+    // zeroed (fork does not inherit usage), request-ctx directory/path —
+    // workspaceID/metadata are not modeled by refine's schema (pre-existing).
+    let info = json!({
+        "id": new_id,
+        "projectID": "global",
+        "directory": worktree,
+        "path": worktree.trim_start_matches('/'),
+        "slug": slug_for(&new_id),
+        "title": forked_title(src["title"].as_str().unwrap_or("")),
+        "version": FREEZE_VERSION,
+        "time": {"created": now, "updated": now},
+        "cost": 0,
+        "tokens": {"input": 0, "output": 0, "reasoning": 0,
+                   "cache": {"read": 0, "write": 0}},
+    });
+    let env = refine_store::fork::ForkEnv {
+        writer: &st.writer,
+        blobs: Some(&*st.blobs),
+        db: &st.db,
+    };
+    let stats = refine_store::fork_session(
+        &env,
+        &info,
+        &id,
+        upto.as_deref(),
+        refine_core::ids::msg_id,
+        refine_core::ids::prt_id,
+    )
+    .map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })?;
+    refine_metrics::counter("refine_session_fork_total", 1);
+    tracing::info!(
+        fork = %new_id,
+        source = %id,
+        upto = ?upto,
+        messages = stats.messages,
+        parts = stats.parts,
+        "session forked"
+    );
+    // session.created AFTER the copy (D-FORK-1): upstream publishes at
+    // createNext BEFORE cloning — a client reacting to the event can read a
+    // partial session; ours fires when the history is complete. Every known
+    // consumer (dialog-fork, ACP, oc-remote) REST-loads after this response.
+    st.bus.publish(refine_core::event::frame(
+        st.paths["directory"].as_str().unwrap_or("/"),
+        "session.created",
+        json!({"sessionID": new_id, "info": info}),
     ));
     Ok(Json(info))
 }
@@ -2793,6 +2905,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/project", get(get_projects))
         .route("/project/current", get(get_project_current))
         .route("/session", get(get_sessions).post(post_session))
+        .route("/session/{id}/fork", axum::routing::post(post_fork))
         .route("/session/status", get(session_status))
         .route("/session/search", axum::routing::post(search_messages))
         .route("/mcp/{name}/{action}", axum::routing::post(mcp_action))
