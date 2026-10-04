@@ -293,11 +293,15 @@ fn expand_pattern(p: &str) -> String {
 /// "no endpoint configured for provider …" and poisoned the currentModel
 /// route the app echoes back (live repro 2026-10-04: state recent[0] =
 /// opencode/big-pickle with no `opencode` endpoint in the registry).
+/// Endpoint-ful but UNCATHALOGUED picks fail later at the provider (the
+/// first fix landed on openrouter/stealth/ox-alpha — known-dead model, W6
+/// warned in the same boot), so candidates must ALSO be in the catalog.
 /// Deterministic final fallback: lexicographically-first endpoint + its
-/// first config model (was HashMap iteration order — nondeterministic).
+/// first catalog model (was HashMap iteration order — nondeterministic).
 pub(crate) fn pick_default_model(
     state: &Value,
     cfg: &Value,
+    config_providers: &Value,
     endpoints: &std::collections::HashMap<String, (String, String)>,
 ) -> (String, String) {
     let mut candidates: Vec<(String, String)> = Vec::new();
@@ -312,19 +316,81 @@ pub(crate) fn pick_default_model(
             }
         }
     }
-    if let Some(hit) = candidates.iter().find(|(p, _)| endpoints.contains_key(p)) {
+    if let Some(hit) = candidates
+        .iter()
+        .find(|(p, m)| endpoints.contains_key(p) && catalog_contains(config_providers, cfg, p, m))
+    {
         return hit.clone();
     }
     let Some(pid) = endpoints.keys().min() else {
         return (String::new(), String::new());
     };
-    let model = cfg
-        .pointer(&format!("/provider/{pid}/models"))
+    let model = first_catalog_model(config_providers, cfg, pid);
+    (pid.clone(), model)
+}
+
+/// Provider catalog membership (W6's `known` rule, factored shared):
+/// `config_providers.providers` LIST of {id, models} (cache-derived) OR the
+/// config-file dict `provider.<pid>.models` — both consulted (W6 finding).
+pub(crate) fn catalog_contains(
+    config_providers: &Value,
+    cfg: &Value,
+    pid: &str,
+    mid: &str,
+) -> bool {
+    if let Some(list) = config_providers
+        .pointer("/providers")
+        .and_then(|v| v.as_array())
+        && let Some(entry) = list
+            .iter()
+            .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(pid))
+        && let Some(models) = entry.get("models")
+    {
+        let in_models = models.as_object().is_some_and(|o| o.contains_key(mid))
+            || models.as_array().is_some_and(|a| {
+                a.iter().any(|m| {
+                    m.as_str() == Some(mid) || m.get("id").and_then(|v| v.as_str()) == Some(mid)
+                })
+            });
+        if in_models {
+            return true;
+        }
+    }
+    cfg.pointer(&format!("/provider/{pid}/models"))
+        .and_then(|v| v.as_object())
+        .is_some_and(|o| o.contains_key(mid))
+}
+
+/// First catalog model for a provider (config order, deterministic):
+/// cache-derived providers list first, then the config-file dict.
+pub(crate) fn first_catalog_model(config_providers: &Value, cfg: &Value, pid: &str) -> String {
+    if let Some(list) = config_providers
+        .pointer("/providers")
+        .and_then(|v| v.as_array())
+        && let Some(entry) = list
+            .iter()
+            .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(pid))
+    {
+        if let Some(o) = entry.pointer("/models").and_then(|v| v.as_object())
+            && let Some(k) = o.keys().next()
+        {
+            return k.clone();
+        }
+        if let Some(a) = entry.pointer("/models").and_then(|v| v.as_array())
+            && let Some(first) = a.first()
+        {
+            return first
+                .as_str()
+                .map(String::from)
+                .or_else(|| first.get("id").and_then(|v| v.as_str()).map(String::from))
+                .unwrap_or_default();
+        }
+    }
+    cfg.pointer(&format!("/provider/{pid}/models"))
         .and_then(|v| v.as_object())
         .and_then(|o| o.keys().next())
         .cloned()
-        .unwrap_or_default();
-    (pid.clone(), model)
+        .unwrap_or_default()
 }
 
 impl Runtime {
@@ -895,7 +961,10 @@ impl Runtime {
         // endpoint-aware state default (pick_default_model): a state entry
         // whose provider has no endpoint 400s every model-less prompt and
         // poisons the currentModel route the app sends back
-        let default_model = pick_default_model(&state_model, &cfg, &endpoints);
+        // catalog source for default-pick filtering (same inputs load_for
+        // uses — cheap JSON assembly, no I/O)
+        let (config_providers, _provider) = build_providers(&cfg, &auth, &cache);
+        let default_model = pick_default_model(&state_model, &cfg, &config_providers, &endpoints);
         if let Some(r0) = state_model.pointer("/recent/0") {
             let rp = r0.get("providerID").and_then(|v| v.as_str()).unwrap_or("");
             let rm = r0.get("modelID").and_then(|v| v.as_str()).unwrap_or("");
@@ -978,10 +1047,37 @@ mod tests {
             ]
         });
         let eps = endpoints(&["opencode-go"]);
+        let cp = serde_json::json!({
+            "providers": [{"id": "opencode-go", "models": {"mimo-v2.6-flash": {}}}]
+        });
         assert_eq!(
-            pick_default_model(&state, &serde_json::json!({}), &eps),
+            pick_default_model(&state, &serde_json::json!({}), &cp, &eps),
             ("opencode-go".to_string(), "mimo-v2.6-flash".to_string()),
             "first SERVABLE state entry wins"
+        );
+    }
+
+    #[test]
+    fn default_model_skips_uncatalogued_state_entries() {
+        // the first fix's miss: openrouter HAS an endpoint but
+        // stealth/ox-alpha is a known-dead model absent from the catalog
+        // (W6 warned in the same boot) — must be skipped for the next
+        // endpoint+catalog hit.
+        let state = serde_json::json!({
+            "recent": [
+                {"providerID": "opencode", "modelID": "big-pickle"},
+                {"providerID": "openrouter", "modelID": "stealth/ox-alpha"},
+                {"providerID": "google", "modelID": "gemini-3.1-pro-preview"}
+            ]
+        });
+        let eps = endpoints(&["openrouter", "google"]);
+        let cp = serde_json::json!({
+            "providers": [{"id": "google", "models": {"gemini-3.1-pro-preview": {}}}]
+        });
+        assert_eq!(
+            pick_default_model(&state, &serde_json::json!({}), &cp, &eps),
+            ("google".to_string(), "gemini-3.1-pro-preview".to_string()),
+            "endpoint-ful but uncatalogued entries are skipped"
         );
     }
 
@@ -995,7 +1091,7 @@ mod tests {
         });
         let eps = endpoints(&["zeta", "alpha"]); // HashMap order would be random
         assert_eq!(
-            pick_default_model(&state, &cfg, &eps),
+            pick_default_model(&state, &cfg, &serde_json::json!({}), &eps),
             ("alpha".to_string(), "a-1".to_string()),
             "lexicographically-first endpoint + its first config model"
         );
@@ -1005,7 +1101,12 @@ mod tests {
     fn default_model_empty_without_endpoints() {
         let state = serde_json::json!({"recent": [{"providerID": "x", "modelID": "y"}]});
         assert_eq!(
-            pick_default_model(&state, &serde_json::json!({}), &endpoints(&[])),
+            pick_default_model(
+                &state,
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                &endpoints(&[])
+            ),
             (String::new(), String::new())
         );
     }
