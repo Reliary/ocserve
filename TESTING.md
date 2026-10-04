@@ -57,6 +57,20 @@ traceable test, every test has a traceable requirement.
    file keeps the old state serving and retries — boot remains fail-fast). MCP section
    changes connect/disconnect live. No shape change; replay unaffected.
 
+   **D-TITLE-1 (auto-title):** upstream v1 never generates titles — `New session - <ISO>`
+   defaults only, manual rename via PATCH; oc-remote likewise only renames from user
+   dialogs. refine additionally renames a *still-default* session from its first user
+   message after the first successful turn (partial `session.updated {id,title}`; SQL
+   gate = empty or freeze-default prefix, so user-named sessions are never touched;
+   command flows excluded via `RunOpts.auto_title=false`). Default-title creation itself
+   is freeze-parity, not a divergence.
+
+   **K-AUTONOMY failure class (silent stop):** background prompt failures were log-only
+   (`prompt_async` logs + returns nothing downstream) — the run "just stopped". Every run
+   error now finalizes state and emits durable `session.error` + a `[turn stopped]` text
+   part; `autonomy.rs::round_cap_fails_loud…` is the behavioral proof with a planted
+   negative control.
+
    **Named divergences (K-SUMMARIZE):** refine's summarize does NOT create
    compaction-state/history filtering (upstream `filterCompacted` hides pre-compaction
    messages from later prompts — refine keeps full history and appends the summary as an

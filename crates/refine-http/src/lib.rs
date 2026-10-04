@@ -210,6 +210,10 @@ pub struct AppState {
     /// Serializes reconcile across PATCH/auth/watcher callers (tokio Mutex —
     /// held across reload + MCP awaits; never a parking_lot guard over await).
     pub reconcile_lock: tokio::sync::Mutex<()>,
+    /// K-AUTONOMY knobs — read from env ONCE at construction (changing
+    /// REFINE_PROMPT_MAX_ROUNDS / REFINE_PROMPT_MAX_COST_USD = restart).
+    pub max_rounds: usize,
+    pub cost_ceiling: f64,
     /// Permission rendezvous shared by runner + reply routes.
     pub gate: std::sync::Arc<refine_core::PermissionGate>,
     /// MCP hub probed at serve boot (OnceLock: tests run without probing).
@@ -337,6 +341,14 @@ impl AppState {
             llm: parking_lot::RwLock::new(w.llm),
             watch: parking_lot::RwLock::new(watch::WatchState::default()),
             reconcile_lock: tokio::sync::Mutex::new(()),
+            max_rounds: std::env::var("REFINE_PROMPT_MAX_ROUNDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            cost_ceiling: std::env::var("REFINE_PROMPT_MAX_COST_USD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0),
         })
     }
 }
@@ -740,6 +752,34 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// ISO-8601 UTC with milliseconds (freeze `Date.prototype.toISOString`
+/// shape) — days-from-civil, no time-crate dependency.
+fn iso8601_z(ms: i64) -> String {
+    let ms = ms.rem_euclid(86_400_000_000_000);
+    let (days, rem) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000));
+    let (h, rem) = (rem.div_euclid(3_600_000), rem.rem_euclid(3_600_000));
+    let (mi, rem) = (rem.div_euclid(60_000), rem.rem_euclid(60_000));
+    let (sec, milli) = (rem.div_euclid(1_000), rem.rem_euclid(1_000));
+    // civil_from_days (Howard Hinnant)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{sec:02}.{milli:03}Z")
+}
+
+/// Freeze default session title (session.ts `parentTitlePrefix + ISO`) —
+/// empty titles would render "untitled" in clients (K-TITLE).
+fn default_session_title(now_ms: i64) -> String {
+    format!("New session - {}", iso8601_z(now_ms))
+}
+
 /// Freeze `getForkedTitle` (session.ts): `/^(.+) \(fork #(\d+)\)$/` →
 /// `base (fork #(n+1))`, otherwise `title (fork #1)`. Ported with string ops
 /// (regex `.+` needs ≥1 char before the suffix → `idx > 0`, greedy match →
@@ -809,6 +849,13 @@ async fn post_session(
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .to_string();
+    // K-TITLE: freeze default when the client sends none/empty — an empty
+    // title renders as "untitled" everywhere (upstream: parentTitlePrefix).
+    let title = if title.trim().is_empty() {
+        default_session_title(now)
+    } else {
+        title
+    };
     let info = json!({
         "id": id,
         "projectID": "global",
@@ -1204,6 +1251,7 @@ async fn post_summarize(
             skip_history: false,
             prelude: None,
             tools_enabled: false,
+            ..Default::default()
         },
     )
     .await
@@ -1611,6 +1659,8 @@ fn build_prompt_context(
         plugins: st.plugins.get().cloned(),
         questions: st.question_gate.clone(),
         model_limit,
+        max_rounds: st.max_rounds,
+        cost_ceiling: st.cost_ceiling,
         compaction,
         compaction_system,
     };
@@ -2516,9 +2566,19 @@ async fn post_command(
         return Err(session_busy(&id));
     };
     let writer = st.writer.clone();
-    let (info, parts) = refine_core::prompt::run_prompt(&ctx, &writer, &id, &cmd_payload)
-        .await
-        .map_err(prompt_err)?;
+    let (info, parts) = refine_core::prompt::run_prompt_with(
+        &ctx,
+        &writer,
+        &id,
+        &cmd_payload,
+        refine_core::prompt::RunOpts {
+            // K-TITLE: a command must never name the session after itself
+            auto_title: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(prompt_err)?;
     drop(_guard);
     Ok(Json(json!({"info": info, "parts": parts})))
 }

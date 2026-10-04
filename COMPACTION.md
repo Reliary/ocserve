@@ -162,7 +162,7 @@ post-hoc only; a preflight changes failure modes — §6 D5).
 
 | ID | Divergence | Rationale |
 |---|---|---|
-| D1 | consecutive-auto cap = 3 → `session.error` (`ContextOverflowError` payload) then stop compacting — the current answer is kept if one exists; pending-cap with no answer errors the prompt | upstream has no hard counter (only the summarize-overflow fail-hard); safety + stall-watchdog precedent |
+| D1 | **doom-window** (amended K-AUTONOMY): more than 3 automatic compactions *within 30 minutes* → `session.error` (`ContextOverflowError`) then stop compacting — the current answer is kept if one exists; pending-check with no answer errors the prompt. Compactions spaced outside the window (hours-apart overnight refills) NEVER trip. The original flat per-prompt count of 3 killed healthy long turns — the real doom signature is *frequency*, not lifetime | upstream has no hard counter (only the summarize-overflow fail-hard); safety + stall-watchdog precedent; overnight-run requirement |
 | D2 | conversation byte cap + tail-weighted truncation (P2) | AGENTS bounded-by-construction; upstream unbounded |
 | D3 | overflow classifier = our own unit with fixtures | upstream classifies inside provider SDKs; refine has no typed error map — false± each get tests |
 | D4 | config trust: your models declare `limit.context = 1_000_000` (A9) → triggers land late, mostly on the error path — **same as upstream on the same config** | freeze-faithful; optional doctor warning parked, not in M6 |
@@ -198,7 +198,8 @@ to source truth (`dead_provider_persists_anchor_and_summary_shell_then_fails`).
 ## 9. Test plan (draft; K-COMPACTION row lands with Phase 2 code)
 
 - **Stub e2e**: provider model with `"limit": {"context": 1000}` (fixture exists,
-  runtime.rs:926) → forced overflow → assert: single compaction per prompt, cap-3 →
+  runtime.rs:926) → forced overflow → assert: single compaction per prompt, doom-window
+  (3 clustered compactions trip, hours-apart never — `doom_tests`) →
   honest error, `auto:false` → hard error, replay rows + summary assistant shape,
   autocontinue text + metadata, `session.compacted` + part events, prune marks only,
   P1/P7 equivalence vs reference walk, P3 atomicity (injected failure), classifier

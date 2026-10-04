@@ -43,6 +43,7 @@ behind the same auth as the rest:
 | `writer_queue_depth` | gauge | backpressure trigger |
 | `plugin_hook_duration_seconds{hook,result}` | histogram | 30 s deadline monitoring |
 | `refine_config_reload_total{result}` | counter | hot-reload health: `ok`/`mcp` per applied reload; sustained `error` = broken config file (fail-safe keeps old state serving) |
+| `refine_prompt_rounds_total{bucket,finish}` | counter | uncensored rounds-per-turn distribution: `bucket` = 0-9/10-19/20-39/40-79/80-159/160+, `finish` = `done`/`error`/`capped` — the K-AUTONOMY telemetry the old flat cap made unmeasurable (right-censored at 25) |
 | `rss_bytes`, `rss_peak_bytes`, `mcp_*` | gauge | 300 MB budget |
 | `blob_orphans`, `blob_missing_total` | gauge/counter | storage integrity |
 | `llm_request_duration_seconds{provider,model}`, `llm_ttft_seconds`, `llm_stream_errors_total` | histogram/counter | provider health (S6) |
@@ -75,6 +76,13 @@ Config reload: SIGHUP re-reads safe subset (metrics, log level, ring limits); st
 hot-reload via poller: `REFINE_CONFIG_WATCH=0` disables, `REFINE_CONFIG_POLL_MS`
 (default 2000, min 100 — clamped so 0 can never busy-loop); fail-safe at runtime
 (broken file keeps old state, retries; boot stays fail-fast).
+
+Runaway/autonomy knobs — read **once at process start** (restart to change, like
+`REFINE_PROVIDER_STALL_SECS`): `REFINE_PROMPT_MAX_ROUNDS` (default 0 = unlimited;
+hard cap only — failure is surfaced, never silent) and `REFINE_PROMPT_MAX_COST_USD`
+(default 0 = off; hard USD ceiling per prompt). Declared here, not guessed: both
+have kill-criteria tests (`autonomy.rs`) and the bound lives on dollars/visibility,
+not on a magic round count.
 
 ## 4. CPU: measure first, specialize second
 

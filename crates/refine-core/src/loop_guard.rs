@@ -82,6 +82,17 @@ pub fn output_hash(output: &str) -> u64 {
     h.finish()
 }
 
+/// Self-throttling step: the CALL ITSELF waits (sleep/tail -f/watch), so
+/// identical repeats are rate-limited by construction — a throttled step
+/// cannot be a hot loop. K-ALWAYS/overnight fix: corpus triage showed
+/// `sleep 570; …` polls tripping repeat×3 and asking a sleeping user.
+/// Contained-match on the raw arguments JSON (no parse — hot path); the
+/// false-positive direction (hot loop whose args merely mention sleep) is
+/// accepted: such a loop is slow by definition of its own command.
+pub fn self_throttled(arguments: &str) -> bool {
+    arguments.contains("sleep ") || arguments.contains("tail -f") || arguments.contains("watch -")
+}
+
 pub fn entry(tool: &str, arguments: &str, output: &str, err: bool) -> Entry {
     Entry {
         tool: tool.to_string(),
@@ -274,5 +285,38 @@ mod tests {
         unsafe {
             std::env::remove_var("REFINE_LOOP_GUARD");
         }
+    }
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use super::*;
+
+    #[test]
+    fn self_throttled_detects_sleeping_polls() {
+        assert!(self_throttled(r#"{"command":"sleep 570; tail -n 50 log"}"#));
+        assert!(self_throttled(r#"{"command":"tail -f /var/log/x.log"}"#));
+        assert!(self_throttled(r#"{"command":"watch -n10 df -h"}"#));
+        assert!(!self_throttled(r#"{"command":"cargo test --workspace"}"#));
+        assert!(!self_throttled(r#"{"command":"grep -rn TODO src"}"#));
+        // a HOT loop must never be exempted just for mentioning sleep output
+        assert!(!self_throttled(
+            r#"{"command":"while true; do date; done"}"#
+        ));
+    }
+
+    #[test]
+    fn throttled_entries_are_excluded_from_repeat_windows() {
+        // the prompt.rs push-site filter skips self-throttled calls; model
+        // the effect: a window built without polls still trips on hot repeats
+        let hot = entry("bash", r#"{"command":"cargo test"}"#, "ok", false);
+        let win = vec![hot.clone(), hot.clone()];
+        assert_eq!(
+            check_pre(&win, "bash", &input_key(r#"{"command":"cargo test"}"#)),
+            Some(Class::Repeat),
+            "hot repeat still detected"
+        );
+        // polls simply never enter the window (filter), so nothing to fire
+        assert!(self_throttled(r#"{"command":"sleep 60"}"#));
     }
 }

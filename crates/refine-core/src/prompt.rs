@@ -18,9 +18,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Bound on provider↔tool round trips per prompt (AGENTS §2.3: bounded).
-pub const MAX_STEPS: usize = 25;
-
 #[derive(Clone)]
 pub struct LlmEndpoint {
     pub base_url: String,
@@ -53,6 +50,12 @@ pub struct PromptContext {
     pub questions: Arc<crate::question::QuestionGate>,
     /// model limit block from the catalog (M6: compaction trigger math).
     pub model_limit: serde_json::Value,
+    /// K-AUTONOMY: hard round cap for this run (0 = unlimited). Resolved
+    /// ONCE from env at AppState construction (sound for parallel tests;
+    /// changing it needs a restart, like provider_stall).
+    pub max_rounds: usize,
+    /// K-AUTONOMY: hard USD ceiling for this run (0.0 = off).
+    pub cost_ceiling: f64,
     /// compaction config (shared opencode.json `compaction` section).
     pub compaction: crate::compact::CompactionCfg,
     /// system prompt for compaction requests (hidden `compaction` agent).
@@ -137,8 +140,12 @@ async fn loop_guard_ask(
         seq,
     )?;
     if reply == "always" {
-        ctx.gate
-            .grant_always(session_id, &format!("doom_loop:{tool}"));
+        let key = format!("doom_loop:{tool}");
+        ctx.gate.grant_always(session_id, &key);
+        // K-ALWAYS: persist past restart (memory stays the fast path)
+        if let Err(e) = refine_store::session_grant_always(writer, &ctx.db, session_id, &key) {
+            tracing::error!("persist always grant {key}: {e:#}");
+        }
     }
     Ok(reply == "once" || reply == "always")
 }
@@ -276,6 +283,16 @@ pub struct RunOpts {
     pub prelude: Option<String>,
     /// send tools to the provider (false: summarization is text-only)
     pub tools_enabled: bool,
+    /// hard cap on provider↔tool rounds this run (None → env
+    /// REFINE_PROMPT_MAX_ROUNDS; 0/absent = unlimited — K-AUTONOMY:
+    /// sessions must run as long as they need, including overnight)
+    pub max_rounds: Option<usize>,
+    /// hard USD ceiling for this run (None → env REFINE_PROMPT_MAX_COST_USD;
+    /// 0.0/absent = off — the bound on DOLLARS, not rounds)
+    pub cost_ceiling: Option<f64>,
+    /// auto-title default-titled sessions from the first user message
+    /// (false: command/shell flows must not name sessions after a command)
+    pub auto_title: bool,
 }
 
 impl Default for RunOpts {
@@ -288,6 +305,9 @@ impl Default for RunOpts {
             skip_history: false,
             prelude: None,
             tools_enabled: true,
+            max_rounds: None,
+            cost_ceiling: None,
+            auto_title: true,
         }
     }
 }
@@ -298,7 +318,25 @@ pub async fn run_prompt(
     session_id: &str,
     payload: &Value,
 ) -> Result<(Value, Vec<Value>)> {
-    run_prompt_with(ctx, writer, session_id, payload, RunOpts::default()).await
+    let res = run_prompt_with(ctx, writer, session_id, payload, RunOpts::default()).await;
+    match res {
+        Ok(out) => {
+            // K-TITLE: first turn on a default-titled session names it from
+            // the first user message (D-TITLE-1). run_prompt_with callers
+            // with auto_title=false (commands) bypass this wrapper entirely.
+            if RunOpts::default().auto_title {
+                auto_retag(ctx, writer, session_id);
+            }
+            Ok(out)
+        }
+        Err(e) => {
+            // K-AUTONOMY: no silent stops — durable session.error + a
+            // [turn stopped] part + finalize + idle (any run failure: cap,
+            // doom-window, stall, provider, cost).
+            surface_run_failure(ctx, writer, session_id, &e).await;
+            Err(e)
+        }
+    }
 }
 
 pub async fn run_prompt_with(
@@ -311,6 +349,9 @@ pub async fn run_prompt_with(
     if !refine_store::session_exists(&ctx.db, session_id)? {
         anyhow::bail!("Session not found: {session_id}");
     }
+    // K-ALWAYS: one DB read pulls this session's persisted always-grants
+    // into the gate (memory-first consult afterwards).
+    ctx.gate.hydrate(&ctx.db, session_id)?;
     // ONE reader answers seq + compaction state (audit fix: pre-M6 = two
     // opens per prompt; without this the round checks added two MORE cold
     // opens on the hottest path — COMPACTION §11 hot-path rule).
@@ -451,7 +492,14 @@ pub async fn run_prompt_with(
     // messages; D1 cap counts engine rounds (COMPACTION §6).
     let mut total_usage = Usage::default();
     let mut total_cost = 0.0f64;
-    let mut compaction_rounds: u32 = 0;
+    let mut auto_doom = crate::compaction::AutoCompactionDoom::default();
+    // fatal-death reason (D1/cost); None = generic at the final_out check
+    let mut death: Option<String> = None;
+    // cumulative provider↔tool rounds for THIS prompt (K-AUTONOMY: cap is
+    // opt-in via env/opts — default OFF, sessions run as long as needed)
+    let mut step = 0usize;
+    let max_rounds = resolve_max_rounds(&opts, ctx.max_rounds);
+    let cost_ceiling = resolve_cost_ceiling(&opts, ctx.cost_ceiling);
     let mut final_out: Option<(Value, Vec<Value>)> = None;
     'outer: loop {
         // refresh ONLY after the engine/trigger wrote (round 1 keeps the
@@ -471,18 +519,14 @@ pub async fn run_prompt_with(
                 auto: pa,
                 overflow: po,
             } => {
-                if compaction_rounds >= crate::compaction::AUTO_COMPACTION_MAX_ROUNDS {
-                    emit_live(
-                        ctx,
-                        "session.error",
-                        json!({"sessionID": session_id, "error": {
-                            "type": "ContextOverflowError",
-                            "data": {"message": "compaction round cap reached (COMPACTION D1)"}
-                        }}),
+                if auto_doom.note() {
+                    death = Some(
+                        "automatic compaction doom-window (COMPACTION D1: more than 3 \
+                         auto-compactions within 30 minutes — summarize is not working)"
+                            .to_string(),
                     );
                     break 'outer;
                 }
-                compaction_rounds += 1;
                 if !crate::compaction::process(
                     ctx,
                     writer,
@@ -583,12 +627,13 @@ pub async fn run_prompt_with(
                 None => messages.extend(conv), // no/unparseable array → fail-open
             }
         }
-        let mut step = 0usize;
-
         loop {
             step += 1;
-            if step > MAX_STEPS {
-                anyhow::bail!("prompt exceeded {MAX_STEPS} steps (bounded loop, AGENTS §2.3)");
+            if max_rounds > 0 && step > max_rounds {
+                record_rounds("capped", step);
+                anyhow::bail!(
+                    "turn exceeded {max_rounds} rounds (REFINE_PROMPT_MAX_ROUNDS — raise it or unset to disable)"
+                );
             }
             let started = Instant::now();
             // v1 parity: chat.params + chat.headers fire PER LLM request
@@ -735,9 +780,9 @@ pub async fn run_prompt_with(
                                 "type": "ContextOverflowError", "data": {"message": emsg}
                             }}),
                         );
-                        if compaction_rounds >= crate::compaction::AUTO_COMPACTION_MAX_ROUNDS {
+                        if auto_doom.over() {
                             anyhow::bail!(
-                                "context overflow at compaction round cap (COMPACTION D1)"
+                                "context overflow inside the compaction doom-window (COMPACTION D1)"
                             );
                         }
                         // no increment: the PENDING step counts compactions (cap = N processed)
@@ -845,6 +890,12 @@ pub async fn run_prompt_with(
             }
             let step_cost = compute_cost(&ctx.endpoint.pricing, &u);
             total_cost += step_cost;
+            if cost_ceiling > 0.0 && total_cost >= cost_ceiling {
+                death = Some(format!(
+                    "prompt reached the cost ceiling ${cost_ceiling:.4} (REFINE_PROMPT_MAX_COST_USD)"
+                ));
+                break 'outer;
+            }
             let assistant_id = msg_id();
 
             // ---- tool-call turn ----
@@ -1023,6 +1074,12 @@ pub async fn run_prompt_with(
                         allowed = reply == "once" || reply == "always";
                         if reply == "always" {
                             ctx.gate.grant_always(session_id, &key);
+                            // K-ALWAYS: persist past restart
+                            if let Err(e) = refine_store::session_grant_always(
+                                writer, &ctx.db, session_id, &key,
+                            ) {
+                                tracing::error!("persist always grant {key}: {e:#}");
+                            }
                         }
                     }
 
@@ -1032,8 +1089,11 @@ pub async fn run_prompt_with(
                     // flow with additive metadata.class only.
                     if allowed && crate::loop_guard::asks_enabled() {
                         let input_key = crate::loop_guard::input_key(&call.arguments);
-                        if let Some(class) =
-                            crate::loop_guard::check_pre(&loop_win, &call.name, &input_key)
+                        // K4: self-throttling steps (sleep/tail -f) can't be a
+                        // hot loop — never trip repeat on them overnight.
+                        if !crate::loop_guard::self_throttled(&call.arguments)
+                            && let Some(class) =
+                                crate::loop_guard::check_pre(&loop_win, &call.name, &input_key)
                         {
                             refine_metrics::labeled_counter(
                                 "refine_agent_health_total",
@@ -1245,12 +1305,16 @@ pub async fn run_prompt_with(
                     )?;
                     {
                         let out_str = running["state"]["output"].as_str().unwrap_or_default();
-                        loop_win.push(crate::loop_guard::entry(
-                            &call.name,
-                            &call.arguments,
-                            out_str,
-                            is_err,
-                        ));
+                        // K4: throttled steps stay OUT of the window (their
+                        // repetition is rate-limited by their own sleep).
+                        if !crate::loop_guard::self_throttled(&call.arguments) {
+                            loop_win.push(crate::loop_guard::entry(
+                                &call.name,
+                                &call.arguments,
+                                out_str,
+                                is_err,
+                            ));
+                        }
                     }
                     parts.push(running);
                     // live-site sift: same fn + same raw bytes as the history
@@ -1494,13 +1558,13 @@ pub async fn run_prompt_with(
                 ctx.model_limit["output"].as_i64().unwrap_or(0),
             );
             if ctx.compaction.auto && crate::compact::is_overflow(a_total, usable_t) {
-                if compaction_rounds >= crate::compaction::AUTO_COMPACTION_MAX_ROUNDS {
+                if auto_doom.over() {
                     emit_live(
                         ctx,
                         "session.error",
                         json!({"sessionID": session_id, "error": {
                             "type": "ContextOverflowError",
-                            "data": {"message": "compaction round cap reached (COMPACTION D1)"}
+                            "data": {"message": "automatic compaction doom-window reached (COMPACTION D1) — answer kept"}
                         }}),
                     );
                 } else {
@@ -1514,6 +1578,10 @@ pub async fn run_prompt_with(
             break 'outer;
         } // inner step loop
     } // 'outer compaction loop
+
+    // K-AUTONOMY telemetry: uncensored rounds/turn distribution (the old
+    // flat cap made this unmeasurable — right-censored at 25).
+    record_rounds(if final_out.is_some() { "done" } else { "error" }, step);
 
     // ---- finalize ONCE after any outer exit (idle trio + session row) ----
     let t_end = now_ms();
@@ -1547,7 +1615,146 @@ pub async fn run_prompt_with(
         },
     )
     .context("finalize session prompt row")?;
-    final_out.ok_or_else(|| anyhow::anyhow!("prompt produced no assistant message"))
+    let death_msg = death.unwrap_or_else(|| "prompt produced no assistant message".to_string());
+    final_out.ok_or_else(|| anyhow::anyhow!("{death_msg}"))
+}
+
+// ---- K-AUTONOMY / K-TITLE helpers (pure where possible — unit-tested) ----
+
+/// RunOpts (per-call) beats the ambient AppState knob (env-at-boot;
+/// REFINE_PROMPT_MAX_ROUNDS, 0 = unlimited). Pure — unit-tested without
+/// touching the process env (edition 2024 set_var would race parallel tests).
+pub(crate) fn resolve_max_rounds(opts: &RunOpts, ambient: usize) -> usize {
+    opts.max_rounds.unwrap_or(ambient)
+}
+
+pub(crate) fn resolve_cost_ceiling(opts: &RunOpts, ambient: f64) -> f64 {
+    opts.cost_ceiling.unwrap_or(ambient)
+}
+
+/// K-AUTONOMY telemetry: pre-bucketed labeled counters (the metrics crate
+/// has duration histograms only — rounds are counts, so buckets are labels).
+fn record_rounds(finish: &str, rounds: usize) {
+    let bucket = match rounds {
+        0..=9 => "0-9",
+        10..=19 => "10-19",
+        20..=39 => "20-39",
+        40..=79 => "40-79",
+        80..=159 => "80-159",
+        _ => "160+",
+    };
+    refine_metrics::labeled_counter(
+        "refine_prompt_rounds_total",
+        &format!("bucket=\"{bucket}\",finish=\"{finish}\""),
+        1,
+    );
+}
+
+/// D-TITLE-1 (refine-only): derive a session title from its first user
+/// message — collapse whitespace, cap at 48 BYTES on a char boundary,
+/// trim a mid-word cut, ellipsis when truncated. None = nothing usable.
+pub(crate) fn auto_title_from(text: &str) -> Option<String> {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    let mut cut = false;
+    for (i, ch) in flat.char_indices() {
+        if i >= 48 {
+            cut = true;
+            break;
+        }
+        out.push(ch);
+    }
+    if cut {
+        if let Some(sp) = out.rfind(' ')
+            && sp > 24
+        {
+            out.truncate(sp);
+        }
+        out.push('…');
+    }
+    Some(out)
+}
+
+/// K-TITLE: name a still-default session from its first user message.
+/// Retag is conditional in SQL (empty or `New session - %` only) and the
+/// event mirrors prompt's partial session.updated shape ({id, title}).
+fn auto_retag(ctx: &PromptContext, writer: &refine_store::Writer, sid: &str) {
+    let text = match refine_store::first_user_text(&ctx.db, sid, Some(&*ctx.blobs)) {
+        Ok(Some(t)) => t,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("auto-title read failed: {e:#}");
+            return;
+        }
+    };
+    let Some(title) = auto_title_from(&text) else {
+        return;
+    };
+    match refine_store::retag_default_title(writer, sid, &title) {
+        Ok(true) => {
+            ctx.bus.publish(frame(
+                &ctx.directory,
+                "session.updated",
+                json!({"sessionID": sid, "info": {"id": sid, "title": title}}),
+            ));
+        }
+        Ok(false) => {} // named by the user already — never overwrite
+        Err(e) => tracing::warn!("auto-title retag failed: {e:#}"),
+    }
+}
+
+/// K-AUTONOMY surfacing for EVERY async/sync run failure (the "just
+/// stopped, no error" class): durable `[turn stopped]` part on the last
+/// assistant message (+ finalize when it was incomplete), durable
+/// session.error (oc-remote toast — shape matches the proven
+/// emit_session_error_event: name + message + data.message), live idle trio
+/// so status consumers settle (may repeat the post-loop emits on
+/// break-path deaths — idempotent events).
+async fn surface_run_failure(
+    ctx: &PromptContext,
+    writer: &refine_store::Writer,
+    sid: &str,
+    err: &anyhow::Error,
+) {
+    let full = format!("{err:#}");
+    let short: String = full.chars().take(2000).collect();
+    let pid = crate::ids::prt_id();
+    match refine_store::mark_turn_stopped(writer, &ctx.db, sid, &pid, &short) {
+        Ok(Some(part)) => {
+            ctx.bus.publish(frame(
+                &ctx.directory,
+                "message.part.updated",
+                json!({"sessionID": sid, "part": part}),
+            ));
+        }
+        Ok(None) => {} // died before any assistant message — event below is the trace
+        Err(e) => tracing::error!("surface_run_failure part: {e:#}"),
+    }
+    let mut eseq = refine_store::next_event_seq(&ctx.db, sid).unwrap_or(1);
+    if let Err(e) = emit_durable(
+        ctx,
+        writer,
+        sid,
+        "session.error",
+        json!({
+            "sessionID": sid,
+            "error": {"name": "UnknownError", "message": short,
+                      "data": {"message": short}}
+        }),
+        &mut eseq,
+    ) {
+        tracing::error!("surface_run_failure session.error: {e:#}");
+    }
+    emit_live(
+        ctx,
+        "session.status",
+        json!({"sessionID": sid, "status": {"type": "idle"}}),
+    );
+    emit_live(ctx, "session.diff", json!({"sessionID": sid, "diff": []}));
+    emit_live(ctx, "session.idle", json!({"sessionID": sid}));
 }
 
 /// The `question` tool: register → `question.asked` → await bounded reply →
@@ -1716,5 +1923,68 @@ mod sift_wiring_tests {
         assert!(bash_out.len() <= big.len(), "never inflate");
         assert_eq!(read_out, big, "whitelist fence: read stays raw");
         unsafe { std::env::remove_var("REFINE_SIFT") };
+    }
+}
+
+#[cfg(test)]
+mod autonomy_tests {
+    use super::*;
+
+    #[test]
+    fn auto_title_collapses_whitespace_and_caps_at_48() {
+        let t =
+            auto_title_from("  hello\n\t overnight   world this is a much longer first message  ")
+                .unwrap();
+        // byte 48 lands inside "first" → cut + trim to last space + ellipsis
+        assert_eq!(t, "hello overnight world this is a much longer…");
+    }
+
+    #[test]
+    fn auto_title_trims_mid_word_cuts() {
+        let t = auto_title_from(&"word ".repeat(30)).unwrap();
+        assert!(t.ends_with('…'), "{t:?}");
+        let stem = t.strip_suffix('…').expect("ellipsis");
+        assert!(!stem.ends_with(' '), "no dangling space: {t:?}");
+        assert!(stem.ends_with("word"), "cut lands on a word: {t:?}");
+    }
+
+    #[test]
+    fn auto_title_rejects_empty_and_whitespace() {
+        assert!(auto_title_from("").is_none());
+        assert!(auto_title_from("   \n\t ").is_none());
+    }
+
+    #[test]
+    fn auto_title_multibyte_never_splits_a_char() {
+        let t = auto_title_from(&"é".repeat(60)).unwrap();
+        assert!(t.ends_with('…'), "{t:?}");
+        assert!(t.contains('é'), "chars intact: {t:?}");
+        // 24×2-byte chars fill exactly 48 bytes (no space → no word trim)
+        assert_eq!(t.chars().filter(|c| *c == 'é').count(), 24, "{t:?}");
+    }
+
+    #[test]
+    fn resolve_prefers_runopts_over_ambient() {
+        let o = RunOpts {
+            max_rounds: Some(7),
+            cost_ceiling: Some(1.5),
+            ..Default::default()
+        };
+        assert_eq!(resolve_max_rounds(&o, 99), 7);
+        assert_eq!(resolve_cost_ceiling(&o, 99.0), 1.5);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_ambient_and_zero_is_unlimited() {
+        let o = RunOpts::default();
+        assert_eq!(resolve_max_rounds(&o, 25), 25, "ambient boot knob");
+        assert_eq!(resolve_max_rounds(&o, 0), 0, "0 = unlimited (default)");
+        assert_eq!(resolve_cost_ceiling(&o, 0.0), 0.0, "0 = ceiling off");
+        // explicit Some(0) disables even a nonzero ambient
+        let o2 = RunOpts {
+            max_rounds: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(resolve_max_rounds(&o2, 50), 0);
     }
 }

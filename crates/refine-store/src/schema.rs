@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -32,7 +32,8 @@ CREATE TABLE session (
     tokens_cache_write INTEGER NOT NULL DEFAULT 0,
     time_created  INTEGER NOT NULL,
     time_updated  INTEGER NOT NULL,
-    version_dirt  INTEGER NOT NULL DEFAULT 0
+    version_dirt  INTEGER NOT NULL DEFAULT 0,
+    permission    TEXT
 ) STRICT;
 
 CREATE INDEX idx_session_updated ON session(time_updated DESC);
@@ -300,6 +301,11 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                     ) STRICT;
                     CREATE INDEX idx_compaction_session ON compaction(session_id, time_ms);",
                 )?;
+            }
+            8 => {
+                // v8→v9: persisted per-session "always" permission keys
+                // (K-ALWAYS — was in-memory only; lost on restart).
+                conn.execute_batch("ALTER TABLE session ADD COLUMN permission TEXT;")?;
             }
             other => {
                 bail!(

@@ -15,6 +15,9 @@ pub struct PermissionGate {
     pending: parking_lot::Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
     /// session → "<permission>:<resource>" keys granted "always" this session
     always: parking_lot::Mutex<HashMap<String, Vec<String>>>,
+    /// sessions whose persisted grants were loaded (one DB read per prompt,
+    /// not per ask — K-ALWAYS persistence)
+    hydrated: parking_lot::Mutex<std::collections::HashSet<String>>,
     /// snapshots for GET /permission
     requests: parking_lot::Mutex<HashMap<String, Value>>,
 }
@@ -55,6 +58,27 @@ impl PermissionGate {
             id: id.to_string(),
         };
         (rx, guard)
+    }
+
+    /// K-ALWAYS: load the session's persisted always-grants into memory
+    /// (once per session per process; prompt lock serializes prompts so the
+    /// read-then-insert cannot race itself).
+    pub fn hydrate(&self, db: &std::path::Path, session_id: &str) -> anyhow::Result<()> {
+        if self.hydrated.lock().contains(session_id) {
+            return Ok(());
+        }
+        let keys = refine_store::session_always_keys(db, session_id)?;
+        if !keys.is_empty() {
+            let mut always = self.always.lock();
+            let entry = always.entry(session_id.to_string()).or_default();
+            for k in keys {
+                if !entry.contains(&k) {
+                    entry.push(k);
+                }
+            }
+        }
+        self.hydrated.lock().insert(session_id.to_string());
+        Ok(())
     }
 
     /// Gauge support: number of asks awaiting a reply.

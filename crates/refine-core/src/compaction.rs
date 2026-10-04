@@ -22,10 +22,56 @@ use serde_json::{Value, json};
 /// (drop OLDEST entries, keep a truncation marker). Divergence D2.
 pub const COMPACTION_CONVERSATION_MAX_BYTES: usize = 8 * 1024 * 1024;
 
-/// D1 safety divergence: consecutive automatic compaction rounds per prompt
-/// call; beyond this we fail honestly instead of looping (upstream has no
-/// hard counter — only the summarize-overflow fail-hard).
+/// D1 safety divergence (K-AUTONOMY amendment): more than this many
+/// AUTOMATIC compactions inside `AUTO_COMPACTION_WINDOW` = summarize isn't
+/// working (the actual doom signature) → fail honestly. Compactions spaced
+/// outside the window never trip — the old flat per-prompt count of 3
+/// killed healthy long/overnight turns after three hours-apart refills
+/// (user requirement: sessions run as long as they need to).
 pub const AUTO_COMPACTION_MAX_ROUNDS: u32 = 3;
+
+/// Doom window: 3 auto-compactions within 30 minutes = broken summarize.
+/// Hours-apart refills (overnight runs) never accumulate here.
+pub const AUTO_COMPACTION_WINDOW: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Rolling window counter for the D1 doom check (K2). `note()` records one
+/// automatic compaction and reports whether MAX+1 landed inside WINDOW.
+#[derive(Default)]
+pub struct AutoCompactionDoom {
+    times: std::collections::VecDeque<std::time::Instant>,
+}
+
+impl AutoCompactionDoom {
+    /// True when MAX rounds have ALREADY landed inside the window (the
+    /// check-only sites: mid-stream overflow + post-turn trigger).
+    pub fn over(&self) -> bool {
+        self.over_at(std::time::Instant::now())
+    }
+
+    fn over_at(&self, now: std::time::Instant) -> bool {
+        self.times.len() as u32 >= AUTO_COMPACTION_MAX_ROUNDS
+            && self
+                .times
+                .front()
+                .is_some_and(|f| now.duration_since(*f) < AUTO_COMPACTION_WINDOW)
+    }
+
+    pub fn note(&mut self) -> bool {
+        self.note_at(std::time::Instant::now())
+    }
+
+    fn note_at(&mut self, now: std::time::Instant) -> bool {
+        self.times.push_back(now);
+        while self.times.len() > AUTO_COMPACTION_MAX_ROUNDS as usize {
+            if now.duration_since(*self.times.front().expect("non-empty")) < AUTO_COMPACTION_WINDOW
+            {
+                return true; // more than MAX within the window
+            }
+            self.times.pop_front();
+        }
+        false
+    }
+}
 
 /// Persist the compaction ANCHOR (v1 create, compaction.ts:559-585): a user
 /// message whose only part is `{type:"compaction", auto, overflow}`.
@@ -861,3 +907,63 @@ fn prune_tool_outputs(
 
 // re-export for trigger math at prompt sites
 pub use crate::compact::is_overflow as overflow_at;
+
+#[cfg(test)]
+mod doom_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn clustered_compactions_trip_the_window() {
+        let t0 = Instant::now();
+        let mut d = AutoCompactionDoom::default();
+        assert!(!d.note_at(t0), "first is never doom");
+        assert!(!d.note_at(t0 + Duration::from_secs(60)));
+        assert!(!d.note_at(t0 + Duration::from_secs(120)));
+        assert!(
+            d.note_at(t0 + Duration::from_secs(180)),
+            "4th inside the window = summarize is not working"
+        );
+    }
+
+    #[test]
+    fn overnight_refills_never_trip() {
+        // hours-apart compactions: the OLD flat count-of-3 killed these runs
+        let t0 = Instant::now();
+        let mut d = AutoCompactionDoom::default();
+        for i in 0..20u64 {
+            assert!(
+                !d.note_at(t0 + Duration::from_secs(i * 4 * 3600)),
+                "healthy refill #{} must never trip",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn rolling_window_forgets_old_clusters() {
+        let t0 = Instant::now();
+        let mut d = AutoCompactionDoom::default();
+        d.note_at(t0);
+        d.note_at(t0 + Duration::from_secs(60));
+        d.note_at(t0 + Duration::from_secs(120));
+        // 4th LONG after the window closed: pops the stale cluster, no trip
+        assert!(!d.note_at(t0 + Duration::from_secs(4 * 3600)));
+        assert!(!d.over_at(t0 + Duration::from_secs(5 * 3600)));
+    }
+
+    #[test]
+    fn over_reports_only_when_recent() {
+        let t0 = Instant::now();
+        let mut d = AutoCompactionDoom::default();
+        d.note_at(t0);
+        d.note_at(t0 + Duration::from_secs(30));
+        assert!(!d.over_at(t0 + Duration::from_secs(60)), "only 2 done");
+        d.note_at(t0 + Duration::from_secs(90));
+        assert!(d.over_at(t0 + Duration::from_secs(120)), "3 done in-window");
+        assert!(
+            !d.over_at(t0 + Duration::from_secs(4 * 3600)),
+            "window expired"
+        );
+    }
+}

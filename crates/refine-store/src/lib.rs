@@ -5,6 +5,8 @@
 //! - no connection held across `.await` (enforced by the scoped `Writer` API)
 //! - payloads via `blob::BlobStore`, never as SQLite row payloads > metadata
 
+use rusqlite::OptionalExtension;
+
 pub mod blob;
 pub mod fork;
 pub mod pragma;
@@ -1002,6 +1004,160 @@ pub fn update_session_title(
         sql: "UPDATE session SET title = ?2, time_updated = ?3 WHERE id = ?1".into(),
         params: vec![session_id.into(), title.into(), now.into()],
     }])
+}
+
+// ---- K-ALWAYS / K-TITLE / K-AUTONOMY: session permission persistence,
+// default-title retag, first-user-text extraction, turn-stop surfacing ----
+
+/// Persisted "always" permission keys for a session (column `permission`,
+/// JSON array of the gate's `"<permission>:<resource>"` keys). Missing row
+/// or column → empty (callers treat missing session as "no grants").
+pub fn session_always_keys(db: &std::path::Path, session_id: &str) -> anyhow::Result<Vec<String>> {
+    let conn = pragma::open_reader(db)?;
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT permission FROM session WHERE id = ?1",
+            [session_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    match raw.flatten() {
+        Some(t) if !t.is_empty() => Ok(serde_json::from_str(&t).unwrap_or_default()),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Append a granted-always key (idempotent; prompt lock serializes writers).
+pub fn session_grant_always(
+    writer: &Writer,
+    db: &std::path::Path,
+    session_id: &str,
+    key: &str,
+) -> anyhow::Result<()> {
+    let mut keys = session_always_keys(db, session_id)?;
+    if keys.iter().any(|k| k == key) {
+        return Ok(());
+    }
+    keys.push(key.to_string());
+    writer.write(vec![WriteOp::Sql {
+        sql: "UPDATE session SET permission = ?2 WHERE id = ?1".into(),
+        params: vec![session_id.into(), serde_json::to_string(&keys)?.into()],
+    }])?;
+    Ok(())
+}
+
+/// Retag only DEFAULT-titled sessions (freeze default `New session - …` or
+/// the pre-fix empty title); named sessions are never touched (row count 0).
+/// Bumps time_updated like update_session_title (list re-sorts on rename).
+pub fn retag_default_title(writer: &Writer, session_id: &str, title: &str) -> anyhow::Result<bool> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let n = writer.write(vec![WriteOp::Sql {
+        sql: "UPDATE session SET title = ?2, time_updated = ?3 \
+              WHERE id = ?1 AND (title = '' OR title LIKE 'New session - %')"
+            .into(),
+        params: vec![session_id.into(), title.into(), now.into()],
+    }])?;
+    Ok(n > 0)
+}
+
+/// First user message's first text part (auto-title source). Blobbed texts
+/// are materialized via the blob store; unresolvable → None.
+pub fn first_user_text(
+    db: &std::path::Path,
+    session_id: &str,
+    blobs: Option<&BlobStore>,
+) -> anyhow::Result<Option<String>> {
+    let conn = pragma::open_reader(db)?;
+    let row: Option<(Option<String>, Option<String>, i64)> = conn
+        .query_row(
+            "SELECT p.inline, p.blob_sha, p.byte_len FROM msg m \
+             JOIN msg_part p ON p.message_id = m.id \
+             WHERE m.session_id = ?1 AND m.role = 'user' AND p.type = 'text' \
+             ORDER BY m.seq, p.seq LIMIT 1",
+            [session_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((inline, sha, byte_len)) = row else {
+        return Ok(None);
+    };
+    let raw = match (inline, sha) {
+        (Some(t), _) => t,
+        (None, Some(sha)) => {
+            let Some(store) = blobs else { return Ok(None) };
+            let bytes = store.get(&sha, byte_len as u64)?;
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+        (None, None) => return Ok(None),
+    };
+    let v: serde_json::Value = serde_json::from_str(&raw)?;
+    Ok(v.get("text").and_then(|t| t.as_str()).map(String::from))
+}
+
+/// K-AUTONOMY surfacing: append a durable `[turn stopped] …` text part to
+/// the run's LAST assistant message (and mark it completed when it wasn't).
+/// Returns the built part for the SSE fan-out, or None when the run died
+/// before any assistant message existed (session.error still fires).
+/// All msg_part writes stay here with their part_search companion (rule 4).
+pub fn mark_turn_stopped(
+    writer: &Writer,
+    db: &std::path::Path,
+    session_id: &str,
+    part_id: &str,
+    reason: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let last: Option<(String, Option<i64>)> = {
+        let conn = pragma::open_reader(db)?;
+        conn.query_row(
+            "SELECT id, json_extract(info, '$.time.completed') FROM msg \
+             WHERE session_id = ?1 AND role = 'assistant' ORDER BY seq DESC LIMIT 1",
+            [session_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?
+    };
+    let Some((mid, completed)) = last else {
+        return Ok(None);
+    };
+    let part = serde_json::json!({
+        "id": part_id,
+        "sessionID": session_id,
+        "messageID": mid,
+        "type": "text",
+        "text": format!("[turn stopped] {reason}"),
+    });
+    let text = part.to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let mut ops = Vec::new();
+    if completed.is_none() {
+        ops.push(WriteOp::Sql {
+            sql: "UPDATE msg SET info = json_set(info, '$.time.completed', ?2) \
+                  WHERE id = ?1 AND json_extract(info, '$.time.completed') IS NULL"
+                .into(),
+            params: vec![mid.clone().into(), now.into()],
+        });
+    }
+    ops.push(WriteOp::Sql {
+        sql: "INSERT OR REPLACE INTO msg_part (id, message_id, session_id, seq, type, byte_len, inline, blob_sha) \
+              VALUES (?1, ?2, ?3, (SELECT COALESCE(MAX(seq),0)+1 FROM msg_part WHERE message_id=?2), 'text', ?4, ?5, NULL)"
+            .into(),
+        params: vec![
+            part_id.into(),
+            mid.clone().into(),
+            session_id.into(),
+            (text.len() as i64).into(),
+            text.clone().into(),
+        ],
+    });
+    ops.push(part_search_upsert_ops(part_id, session_id, &mid, &text));
+    writer.write(ops)?;
+    Ok(Some(part))
 }
 
 /// DELETE /session/{id} — cascade messages/parts/todo (FKs), plus events
