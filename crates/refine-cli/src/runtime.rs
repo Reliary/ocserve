@@ -287,6 +287,46 @@ fn expand_pattern(p: &str) -> String {
     p.to_string()
 }
 
+/// Effective default model: state `recent[]` then `favorite[]` entries,
+/// but ONLY ones whose provider has an endpoint (registry-built map).
+/// Endpoint-less state picks made every model-less prompt return 400
+/// "no endpoint configured for provider …" and poisoned the currentModel
+/// route the app echoes back (live repro 2026-10-04: state recent[0] =
+/// opencode/big-pickle with no `opencode` endpoint in the registry).
+/// Deterministic final fallback: lexicographically-first endpoint + its
+/// first config model (was HashMap iteration order — nondeterministic).
+pub(crate) fn pick_default_model(
+    state: &Value,
+    cfg: &Value,
+    endpoints: &std::collections::HashMap<String, (String, String)>,
+) -> (String, String) {
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    for pointer in ["/recent", "/favorite"] {
+        if let Some(arr) = state.pointer(pointer).and_then(|v| v.as_array()) {
+            for m in arr {
+                let p = m.get("providerID").and_then(|v| v.as_str()).unwrap_or("");
+                let mid = m.get("modelID").and_then(|v| v.as_str()).unwrap_or("");
+                if !p.is_empty() && !mid.is_empty() {
+                    candidates.push((p.to_string(), mid.to_string()));
+                }
+            }
+        }
+    }
+    if let Some(hit) = candidates.iter().find(|(p, _)| endpoints.contains_key(p)) {
+        return hit.clone();
+    }
+    let Some(pid) = endpoints.keys().min() else {
+        return (String::new(), String::new());
+    };
+    let model = cfg
+        .pointer(&format!("/provider/{pid}/models"))
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.keys().next())
+        .cloned()
+        .unwrap_or_default();
+    (pid.clone(), model)
+}
+
 impl Runtime {
     /// CONSUMING variant for the reload path: a live OOM was measured at
     /// three reloads (clone-all payloads() + mimalloc retention ratcheted
@@ -852,44 +892,22 @@ impl Runtime {
             }
         }
 
-        // default model from opencode state (recent[0] → favorite[0] → first endpoint)
-        let default_model = state_model
-            .pointer("/recent/0")
-            .map(|m| {
-                (
-                    m.get("providerID")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    m.get("modelID")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                )
-            })
-            .filter(|(p, m)| !p.is_empty() && !m.is_empty())
-            .or_else(|| {
-                state_model.pointer("/favorite/0").map(|m| {
-                    (
-                        m.get("providerID")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        m.get("modelID")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                    )
-                })
-            })
-            .filter(|(p, m)| !p.is_empty() && !m.is_empty())
-            .unwrap_or_else(|| {
-                endpoints
-                    .keys()
-                    .next()
-                    .map(|p| (p.clone(), String::new()))
-                    .unwrap_or_default()
-            });
+        // endpoint-aware state default (pick_default_model): a state entry
+        // whose provider has no endpoint 400s every model-less prompt and
+        // poisons the currentModel route the app sends back
+        let default_model = pick_default_model(&state_model, &cfg, &endpoints);
+        if let Some(r0) = state_model.pointer("/recent/0") {
+            let rp = r0.get("providerID").and_then(|v| v.as_str()).unwrap_or("");
+            let rm = r0.get("modelID").and_then(|v| v.as_str()).unwrap_or("");
+            if !rp.is_empty() && !endpoints.contains_key(rp) {
+                tracing::warn!(
+                    "state default model {rp}/{rm} has no configured endpoint — \
+                     effective default falls back to {}/{}",
+                    default_model.0,
+                    default_model.1
+                );
+            }
+        }
 
         // agent systems from the assembled agent list
         let mut systems = std::collections::HashMap::new();
@@ -940,6 +958,56 @@ mod tests {
         assert_eq!(out["added"]["key"], "k", "overlay-only entry added");
         assert_eq!(out["deep"]["a"], "1", "deep legacy survives");
         assert_eq!(out["deep"]["b"], "9", "overlay wins deep");
+    }
+
+    fn endpoints(ids: &[&str]) -> std::collections::HashMap<String, (String, String)> {
+        ids.iter()
+            .map(|i| (i.to_string(), ("http://x".into(), "k".into())))
+            .collect()
+    }
+
+    #[test]
+    fn default_model_skips_endpointless_state_entries() {
+        // THE bug (live 2026-10-04): state recent[0] = opencode/big-pickle
+        // with no `opencode` endpoint → every model-less prompt 400'd and
+        // currentModel fed the app the same dead model.
+        let state = serde_json::json!({
+            "recent": [
+                {"providerID": "opencode", "modelID": "big-pickle"},
+                {"providerID": "opencode-go", "modelID": "mimo-v2.6-flash"}
+            ]
+        });
+        let eps = endpoints(&["opencode-go"]);
+        assert_eq!(
+            pick_default_model(&state, &serde_json::json!({}), &eps),
+            ("opencode-go".to_string(), "mimo-v2.6-flash".to_string()),
+            "first SERVABLE state entry wins"
+        );
+    }
+
+    #[test]
+    fn default_model_falls_back_deterministically() {
+        let state = serde_json::json!({
+            "recent": [{"providerID": "opencode", "modelID": "big-pickle"}]
+        });
+        let cfg = serde_json::json!({
+            "provider": {"zed": {"models": {"z-1": {}, "z-2": {}}}, "alpha": {"models": {"a-1": {}}}}
+        });
+        let eps = endpoints(&["zeta", "alpha"]); // HashMap order would be random
+        assert_eq!(
+            pick_default_model(&state, &cfg, &eps),
+            ("alpha".to_string(), "a-1".to_string()),
+            "lexicographically-first endpoint + its first config model"
+        );
+    }
+
+    #[test]
+    fn default_model_empty_without_endpoints() {
+        let state = serde_json::json!({"recent": [{"providerID": "x", "modelID": "y"}]});
+        assert_eq!(
+            pick_default_model(&state, &serde_json::json!({}), &endpoints(&[])),
+            (String::new(), String::new())
+        );
     }
 
     #[test]
