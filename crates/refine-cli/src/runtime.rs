@@ -338,6 +338,13 @@ pub(crate) fn opencode_public_endpoint(
     auth: &Value,
     cache: &Value,
 ) -> Option<(String, String)> {
+    // REAL key only: the freeze-era public tier is dead — live-tested
+    // 2026-10-04, zen answers 403 FreeTierError ("free tier can only be
+    // used from within OpenCode") for `Bearer public` on big-pickle AND
+    // *-free models. A keyless endpoint here would make the DEFAULT a 403;
+    // without it pick_default_model falls through to the next servable
+    // state-recent entry (honest WARN included). A real OPENCODE_API_KEY
+    // (env/config/auth) restores the big-pickle default by construction.
     let key = std::env::var("OPENCODE_API_KEY")
         .ok()
         .filter(|v| !v.is_empty())
@@ -352,12 +359,12 @@ pub(crate) fn opencode_public_endpoint(
                 .and_then(|v| v.as_str())
                 .filter(|v| !v.is_empty())
                 .map(String::from)
-        });
+        })?;
     let base = cache
         .pointer("/opencode/api")
         .and_then(|v| v.as_str())
         .map(String::from)?;
-    Some((base, key.unwrap_or_else(|| "public".into())))
+    Some((base, key))
 }
 
 /// B2 (freeze provider.ts:196-201): keyless opencode keeps ONLY free
@@ -1282,14 +1289,21 @@ mod b2_public_tier_tests {
     use super::*;
 
     #[test]
-    fn opencode_endpoint_defaults_to_public_with_cache_base() {
+    fn opencode_endpoint_requires_a_real_key_keyless_is_none() {
         let cfg = json!({});
         let auth = json!({});
         let cache = json!({"opencode": {"api": "https://opencode.ai/zen/v1"}});
         assert_eq!(
             opencode_public_endpoint(&cfg, &auth, &cache),
-            Some(("https://opencode.ai/zen/v1".into(), "public".into())),
-            "keyless public tier — freeze apiKey:\"public\""
+            None,
+            "keyless zen = 403 FreeTierError live-tested 2026-10-04 — \
+             a keyless endpoint would make the DEFAULT a 403"
+        );
+        let cfg_key = json!({"provider": {"opencode": {"options": {"apiKey": "real-key"}}}});
+        assert_eq!(
+            opencode_public_endpoint(&cfg_key, &auth, &cache),
+            Some(("https://opencode.ai/zen/v1".into(), "real-key".into())),
+            "real key → endpoint (big-pickle default by construction)"
         );
     }
 
