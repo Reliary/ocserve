@@ -184,6 +184,34 @@ Usage notes:
 - Answers are returned as arrays of labels; set `multiple: true` to allow selecting more than one
 - If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label";
 
+/// Read up to `quota` bytes, then KEEP DRAINING (discarding) until EOF so
+/// the child never blocks on a full pipe. Memory bound = quota + slack.
+/// Both streams get MAX_BYTES: byte-parity with full-capture+head-truncate
+/// (the final truncate cuts the concatenated head to MAX_BYTES anyway).
+fn drain_limited<R: std::io::Read + Send + 'static>(reader: Option<R>, quota: usize) -> Vec<u8> {
+    let Some(mut r) = reader else {
+        return Vec::new();
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(quota.min(64 * 1024));
+    let mut total = 0usize;
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if total < quota {
+                    let take = n.min(quota - total);
+                    out.extend_from_slice(&buf[..take]);
+                    total += take;
+                }
+                // past quota: these bytes are discarded on the next read
+            }
+            Err(_) => break,
+        }
+    }
+    out
+}
+
 fn truncate(mut output: String) -> (String, bool) {
     let mut truncated = false;
     if output.len() > MAX_BYTES {
@@ -242,6 +270,15 @@ fn bash(input: &Value, cwd: &Path) -> Result<ToolResult> {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| format!("spawn: {command}"))?;
+    // K-EFFICIENCY: start the bounded drain BEFORE waiting — otherwise a
+    // >pipe-buffer child stalls until the timeout kill (and full-capture
+    // ratcheted unbounded bytes into RSS — the OOM chain).
+    let so = child.stdout.take();
+    let se = child.stderr.take();
+    // +1 past MAX_BYTES so the post-concat head-truncate still fires and
+    // sets `truncated` exactly like full-capture did
+    let h_out = std::thread::spawn(move || drain_limited(so, MAX_BYTES + 1));
+    let h_err = std::thread::spawn(move || drain_limited(se, MAX_BYTES + 1));
     // bounded wait (AGENTS §2.3): poll to deadline, kill on overrun
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let mut timed_out = false;
@@ -264,15 +301,8 @@ fn bash(input: &Value, cwd: &Path) -> Result<ToolResult> {
             Err(e) => bail!("wait: {e}"),
         }
     }
-    use std::io::Read;
-    let mut stdout_bytes = Vec::new();
-    if let Some(mut so) = child.stdout.take() {
-        let _ = so.read_to_end(&mut stdout_bytes);
-    }
-    let mut stderr_bytes = Vec::new();
-    if let Some(mut se) = child.stderr.take() {
-        let _ = se.read_to_end(&mut stderr_bytes);
-    }
+    let stdout_bytes = h_out.join().unwrap_or_default();
+    let stderr_bytes = h_err.join().unwrap_or_default();
     let mut stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
     let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
     if timed_out {
@@ -722,5 +752,48 @@ mod tests {
                 .unwrap()
                 .contains("Type your own answer")
         );
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// The OOM/timeout double-bug: the old code read the pipes only AFTER
+    /// the child exited, so any output beyond the pipe buffer (~64KB)
+    /// stalled the child until the timeout killed it — AND capturing
+    /// unbounded bytes first (truncate ran after read_to_end) ratcheted
+    /// the transient spike into RSS (16:0x OOM kills, anon 520MB).
+    /// Inherent negative control: on the old code this command NEVER
+    /// completes (timeout-kill → exit 124 + "[timeout after...]").
+    #[test]
+    fn huge_output_completes_unblocked_and_stays_bounded() {
+        let input = json!({
+            "command": "head -c 2000000 /dev/zero | tr '\\0' 'a'",
+            "timeout": 5000,
+        });
+        let r = bash(&input, Path::new("/tmp")).expect("run");
+        assert_eq!(
+            r.exit,
+            Some(0),
+            "child must complete — pipes drained concurrently (old code: stall → timeout kill)"
+        );
+        assert!(
+            !r.output.contains("[timeout"),
+            "no timeout marker: {:?}",
+            &r.output[..80.min(r.output.len())]
+        );
+        assert!(r.truncated, "output capped");
+        assert!(r.output.len() <= MAX_BYTES, "bounded: {}", r.output.len());
+    }
+
+    /// small outputs unaffected (byte-parity path)
+    #[test]
+    fn small_output_untouched() {
+        let r = bash(&json!({"command": "printf 'hello\n'"}), Path::new("/tmp")).unwrap();
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(r.output.trim(), "hello");
+        assert!(!r.truncated);
     }
 }

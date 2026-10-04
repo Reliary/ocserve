@@ -2815,12 +2815,21 @@ async fn post_shell(
     )?;
 
     // execute directly (bash executor: stderr merged, output bounded,
-    // default 120s cap — ShellInput carries no timeout)
-    let exec = refine_tools::execute(
-        "bash",
-        &json!({"command": command}),
-        std::path::Path::new(&dir),
-    );
+    // default 120s cap — ShellInput carries no timeout). Off-worker: a long
+    // shell command must not pin a tokio worker (K-EFFICIENCY).
+    let exec = {
+        let cmd = json!({"command": command});
+        let d = dir.clone();
+        tokio::task::spawn_blocking(move || {
+            refine_tools::execute("bash", &cmd, std::path::Path::new(&d))
+        })
+        .await
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("tool join: {e}"),
+        })?
+    };
     let (status, output) = match exec {
         Ok(r) => ("completed", r.output),
         Err(e) => ("error", format!("Error: {e:#}")),

@@ -307,6 +307,16 @@ impl Drop for PhaseProbe {
     }
 }
 
+/// Run a builtin tool on the blocking pool (K-EFFICIENCY: never pin an
+/// async worker with sync process I/O).
+async fn spawn_tool(name: &str, input: Value, directory: &str) -> Result<refine_tools::ToolResult> {
+    let name = name.to_string();
+    let dir = directory.to_string();
+    tokio::task::spawn_blocking(move || refine_tools::execute(&name, &input, Path::new(&dir)))
+        .await
+        .map_err(|e| anyhow::anyhow!("tool join: {e}"))?
+}
+
 /// Execution knobs for `run_prompt_with`. Defaults = every existing caller's
 /// behavior (prompt/message/command/shell/abort paths unchanged).
 #[derive(Clone)]
@@ -1199,8 +1209,13 @@ pub async fn run_prompt_with(
                         {
                             input = a.clone();
                         }
+                        // K-EFFICIENCY: tool execution runs OFF the async
+                        // workers (spawn_blocking) — a blocking `sleep 570`
+                        // or a stalled child previously pinned one of the 8
+                        // tokio workers and starved EVERY route (the observed
+                        // multi-minute "server hung" windows).
                         let exec = if builtin {
-                            refine_tools::execute(&call.name, &input, Path::new(&ctx.directory))
+                            spawn_tool(&call.name, input, &ctx.directory).await
                         } else if let Some(hub) = &ctx.mcp {
                             match hub.call(&call.name, input.clone()).await {
                                 Some(Ok(text)) => Ok(refine_tools::ToolResult {
@@ -1212,14 +1227,10 @@ pub async fn run_prompt_with(
                                     metadata: None,
                                 }),
                                 Some(Err(e)) => Err(e),
-                                None => refine_tools::execute(
-                                    &call.name,
-                                    &input,
-                                    Path::new(&ctx.directory),
-                                ),
+                                None => spawn_tool(&call.name, input, &ctx.directory).await,
                             }
                         } else {
-                            refine_tools::execute(&call.name, &input, Path::new(&ctx.directory))
+                            spawn_tool(&call.name, input, &ctx.directory).await
                         };
                         match exec {
                             Ok(r) => {

@@ -9,14 +9,16 @@ INTERVAL="${2:-60}"
 HOURS="${3:-24}"
 OUT="${SOAK_OUT:-/tmp/opencode/refine-soak-$(date +%s).csv}"
 mkdir -p "$(dirname "$OUT")"
-echo "ts,rss,peak,sidecar,wal,sse,queue,locks,tasks,health" > "$OUT"
+echo "ts,rss,peak,sidecar,wal,sse,queue,locks,tasks,health,rss_delta,db_opens,sync_us" > "$OUT"
 end=$(( $(date +%s) + HOURS * 3600 ))
 while [ "$(date +%s)" -lt "$end" ]; do
   ts=$(date +%s)
   m=$(curl -fsS --max-time 5 "$URL/metrics" || true)
   health=$(curl -fss -o /dev/null -w '%{http_code}' --max-time 5 "$URL/global/health" || echo 000)
   get() { echo "$m" | awk -v k="$1" '$1==k {print $2; exit}'; }
-  echo "$ts,$(get refine_rss_bytes),$(get refine_rss_peak_bytes),$(get refine_sidecar_rss_bytes),$(get refine_wal_bytes),$(get refine_sse_clients),$(get refine_writer_queue_depth),$(get refine_prompt_locks),$(get refine_prompt_tasks),$health" >> "$OUT"
+  # labeled series (durations render name_sum{label}) — prefix match
+  getp() { echo "$m" | awk -v k="$1" 'index($1, k) == 1 {print $2; exit}'; }
+  echo "$ts,$(get refine_rss_bytes),$(get refine_rss_peak_bytes),$(get refine_sidecar_rss_bytes),$(get refine_wal_bytes),$(get refine_sse_clients),$(get refine_writer_queue_depth),$(get refine_prompt_locks),$(get refine_prompt_tasks),$health,$(get refine_prompt_rss_delta_bytes),$(get refine_db_opens_total),$(getp refine_sync_tick_sum)" >> "$OUT"
   sleep "$INTERVAL"
 done
 echo "soak done: $OUT"
