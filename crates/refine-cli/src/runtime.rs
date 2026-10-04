@@ -24,6 +24,9 @@ use std::collections::BTreeMap;
 const MODEL_PRIORITY: &[&str] = &["gpt-5", "claude-sonnet-4", "big-pickle", "gemini-3-pro"];
 
 pub struct Runtime {
+    /// Data dir (auth-overlay lives here) — kept so llm_registry layers the
+    /// same auth as load_for (W5 read-precedence rule).
+    pub data_dir: std::path::PathBuf,
     pub config: Value,
     /// Default-agent-first order (GET /agent, v1 wire).
     pub agent: Vec<Value>,
@@ -39,6 +42,50 @@ pub struct Runtime {
 fn read_json(path: &Path) -> Result<Value> {
     let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
+}
+
+/// Layered auth: legacy auth.json with refine's auth-overlay merged over it
+/// (W5 read-precedence: overlay wins; refine NEVER writes the legacy file).
+/// load_for AND llm_registry read auth through this — one layering rule, so
+/// keys added via PUT /auth reach actual prompts, not just the display routes
+/// (was a real gap: registry read legacy-only).
+fn load_auth(data_dir: &Path) -> Result<Value> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let auth_path = Path::new(&home).join(".local/share/opencode/auth.json");
+    let auth = if auth_path.exists() {
+        read_json(&auth_path)?
+    } else {
+        json!({})
+    };
+    let overlay_path = data_dir.join("auth-overlay.json");
+    if overlay_path.exists() {
+        let overlay = read_json(&overlay_path)?;
+        Ok(layer_auth(auth, overlay))
+    } else {
+        Ok(auth)
+    }
+}
+
+/// Pure layering rule (unit-tested): overlay patches OVER legacy — overlay
+/// wins on scalars, legacy-only entries survive (deep_merge semantics).
+fn layer_auth(mut legacy: Value, overlay: Value) -> Value {
+    refine_http::deep_merge(&mut legacy, overlay);
+    legacy
+}
+
+/// The exact files Runtime reads (load_for + llm_registry) — the hot-reload
+/// watch set (H1). Keep in sync when load_for gains a read.
+pub fn watch_paths(data_dir: &Path) -> Vec<std::path::PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let h = Path::new(&home);
+    vec![
+        h.join(".config/opencode/opencode.json"),
+        h.join(".config/refine/config.json"),
+        h.join(".local/share/opencode/auth.json"),
+        data_dir.join("auth-overlay.json"),
+        h.join(".cache/opencode/models.json"),
+        h.join(".local/state/opencode/model.json"),
+    ]
 }
 
 use std::path::Path;
@@ -270,7 +317,6 @@ impl Runtime {
     pub fn load_for(data_dir: &std::path::Path) -> Result<Self> {
         let home = std::env::var("HOME").unwrap_or_default();
         let config_path = Path::new(&home).join(".config/opencode/opencode.json");
-        let auth_path = Path::new(&home).join(".local/share/opencode/auth.json");
         let cache_path = Path::new(&home).join(".cache/opencode/models.json");
 
         let mut raw_config = read_json(&config_path)?;
@@ -282,18 +328,7 @@ impl Runtime {
             let overlay = read_json(&overlay_path)?;
             refine_http::deep_merge(&mut raw_config, overlay);
         }
-        let mut auth = if auth_path.exists() {
-            read_json(&auth_path)?
-        } else {
-            json!({})
-        };
-        // W5 auth overlay: refine-owned PUT /auth writes here; layers over
-        // the legacy auth refine never mutates.
-        let auth_overlay_path = data_dir.join("auth-overlay.json");
-        if auth_overlay_path.exists() {
-            let overlay = read_json(&auth_overlay_path)?;
-            refine_http::deep_merge(&mut auth, overlay);
-        }
+        let auth = load_auth(data_dir)?;
         let cache = if cache_path.exists() {
             read_json(&cache_path)?
         } else {
@@ -306,6 +341,7 @@ impl Runtime {
         let (config_providers, provider) = build_providers(&raw_config, &auth, &cache);
 
         Ok(Self {
+            data_dir: data_dir.to_path_buf(),
             config,
             agent,
             api_agent,
@@ -706,15 +742,16 @@ fn build_commands(cfg: &Value) -> Result<Vec<Value>> {
 impl Runtime {
     /// Assemble the LLM registry from auth/config/models-cache/state
     /// (endpoints, pricing, default model, agent systems).
-    pub fn llm_registry(&self) -> LlmRegistry {
+    pub fn llm_registry(&self) -> Result<LlmRegistry> {
         let home = std::env::var("HOME").unwrap_or_default();
         let read_json = |p: &str| -> Option<Value> {
             std::fs::read_to_string(p)
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
         };
-        let auth = read_json(&format!("{home}/.local/share/opencode/auth.json"))
-            .unwrap_or_else(|| json!({}));
+        // layered (legacy + overlay) — same rule as load_for; Result so a
+        // broken overlay fails the whole reload (fail-safe: keep old registry)
+        let auth = load_auth(&self.data_dir)?;
         let cfg = read_json(&format!("{home}/.config/opencode/opencode.json"))
             .unwrap_or_else(|| json!({}));
         let cache =
@@ -870,20 +907,62 @@ impl Runtime {
             .and_then(|v| v.as_str())
             .unwrap_or("build")
             .to_string();
-        LlmRegistry {
+        Ok(LlmRegistry {
             endpoints,
             pricing,
             limits,
             default_model,
             systems,
             default_agent,
-        }
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layer_auth_overlay_wins_and_legacy_survives() {
+        let legacy = serde_json::json!({
+            "keep": "legacy",
+            "override": "old",
+            "deep": {"a": "1", "b": "2"}
+        });
+        let overlay = serde_json::json!({
+            "override": "new",
+            "added": {"key": "k"},
+            "deep": {"b": "9"}
+        });
+        let out = layer_auth(legacy, overlay);
+        assert_eq!(out["keep"], "legacy", "legacy-only entry survives");
+        assert_eq!(out["override"], "new", "overlay wins on conflict");
+        assert_eq!(out["added"]["key"], "k", "overlay-only entry added");
+        assert_eq!(out["deep"]["a"], "1", "deep legacy survives");
+        assert_eq!(out["deep"]["b"], "9", "overlay wins deep");
+    }
+
+    #[test]
+    fn watch_paths_cover_every_runtime_read() {
+        let dp = std::path::Path::new("/tmp/refine-data");
+        let paths = watch_paths(dp);
+        assert_eq!(
+            paths.len(),
+            6,
+            "opencode.json, overlay, auth, auth-overlay, models cache, state model"
+        );
+        assert!(
+            paths[0].ends_with(".config/opencode/opencode.json"),
+            "shared config first: {:?}",
+            paths[0]
+        );
+        assert_eq!(paths[3], dp.join("auth-overlay.json"), "data-dir overlay");
+        assert!(
+            paths[5].ends_with(".local/state/opencode/model.json"),
+            "state model (default-model hot-swap): {:?}",
+            paths[5]
+        );
+    }
 
     #[test]
     fn default_model_priority_rules() {

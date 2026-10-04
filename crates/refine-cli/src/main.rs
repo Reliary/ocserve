@@ -164,7 +164,7 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
                 .collect()
         })
         .unwrap_or_default();
-    let llm = rt.llm_registry();
+    let llm = rt.llm_registry()?;
     // W6: warn only about the EFFECTIVE default (what an unset prompt
     // actually resolves to — llm_registry's state→config precedence), not
     // every per-provider default-map entry: the first version flagged three
@@ -279,18 +279,31 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     }
     let _ = state.mcp.set(std::sync::Arc::new(hub));
 
-    // W4: PATCH /config rebuilds derived payloads through this closure
-    // (Runtime::load reads opencode.json + the refine overlay layer)
+    // W4: PATCH /config rebuilds derived payloads + LLM registry through
+    // this closure (Runtime::load reads opencode.json + overlay; registry
+    // layers legacy auth + auth-overlay — H2 hot-swaps endpoints/keys too)
     {
         let data_dir_for_reload = data_dir.clone();
         let reloader: std::sync::Arc<
-            dyn Fn() -> anyhow::Result<refine_http::Payloads> + Send + Sync,
+            dyn Fn() -> anyhow::Result<(refine_http::Payloads, refine_http::LlmRegistry)>
+                + Send
+                + Sync,
         > = std::sync::Arc::new(move || {
             let rt = crate::runtime::Runtime::load_for(&data_dir_for_reload)?;
-            Ok(rt.into_payloads()) // move, not clone (measured OOM: see runtime.rs)
+            let registry = rt.llm_registry()?; // borrow first — into_payloads moves
+            Ok((rt.into_payloads(), registry)) // move, not clone (measured OOM)
         });
         *state.reloader.write() = Some(reloader);
     }
+
+    // H1: external-edit hot-reload — poll the exact files Runtime reads,
+    // reconcile on change (fail-safe: broken config keeps old state serving)
+    state.watch.write().paths = crate::runtime::watch_paths(&data_dir);
+    refine_http::watch::observe(&state);
+    tokio::spawn(refine_http::watch::watch_loop(
+        state.clone(),
+        refine_http::watch::WatchOpts::from_env(),
+    ));
 
     // Legacy→refine delta sync (development bridge; kill switch
     // REFINE_LEGACY_SYNC=0). 60s cadence after a 5s settle, fail-soft: any

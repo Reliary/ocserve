@@ -41,7 +41,7 @@ pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_LIST_PAGES: usize = 1_000;
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Kind {
     Local {
         command: Vec<String>,
@@ -53,7 +53,7 @@ pub enum Kind {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServerCfg {
     pub name: String,
     pub enabled: bool,
@@ -505,6 +505,21 @@ impl McpHub {
             }
             None => anyhow::bail!("MCP server not found: {name}"),
         }
+    }
+
+    /// Reconcile support (config hot-reload): replace a server's retained
+    /// cfg so a subsequent connect uses the NEW definition (added or changed
+    /// server). Pure data — no connect side effect here.
+    pub fn upsert_cfg(&self, cfg: ServerCfg) {
+        let mut cfgs = self.cfgs.lock();
+        cfgs.retain(|c| c.name != cfg.name);
+        cfgs.push(cfg);
+    }
+
+    /// Reconcile support: forget a removed/disabled server so `connect`
+    /// cannot resurrect it from a stale definition.
+    pub fn drop_cfg(&self, name: &str) {
+        self.cfgs.lock().retain(|c| c.name != name);
     }
 
     /// W5: POST /mcp/{name}/connect — (re)spawn + handshake.

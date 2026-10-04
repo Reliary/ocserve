@@ -53,8 +53,11 @@ pub fn config_write_path() -> std::path::PathBuf {
 }
 
 /// Boot-injected config reloader (W4): Runtime::load lives in refine-cli —
-/// the closure avoids a crate cycle; None in tests.
-pub type ConfigReloader = std::sync::Arc<dyn Fn() -> anyhow::Result<Payloads> + Send + Sync>;
+/// the closure avoids a crate cycle; None in tests. Returns derived payloads
+/// AND a rebuilt LLM registry (H2 — auth/provider/default-model edits apply
+/// without restart). Callers go through `watch::reconcile`, never the raw fn.
+pub type ConfigReloader =
+    std::sync::Arc<dyn Fn() -> anyhow::Result<(Payloads, LlmRegistry)> + Send + Sync>;
 
 #[derive(Default)]
 pub struct Payloads {
@@ -97,6 +100,7 @@ impl IntoResponse for ApiError {
 /// Handler error: normal envelopes + Effect HttpApi tagged decode errors
 /// (freeze parity: `?before=` → body exactly {"_tag":"BadRequest"} §1090).
 pub mod sync;
+pub mod watch;
 
 pub enum HttpError {
     Api(ApiError),
@@ -198,7 +202,14 @@ pub struct AppState {
     pub blobs: std::sync::Arc<refine_store::BlobStore>,
     pub writer: std::sync::Arc<refine_store::Writer>,
     /// Provider registry + default model + agent systems (from Runtime).
-    pub llm: LlmRegistry,
+    /// RwLock since H2: rebuilds on config hot-reload (watch::reconcile);
+    /// in-flight prompts keep the values they resolved at build time.
+    pub llm: parking_lot::RwLock<LlmRegistry>,
+    /// Config hot-reload watch state (H1): polled paths + observed tuples.
+    pub watch: parking_lot::RwLock<watch::WatchState>,
+    /// Serializes reconcile across PATCH/auth/watcher callers (tokio Mutex —
+    /// held across reload + MCP awaits; never a parking_lot guard over await).
+    pub reconcile_lock: tokio::sync::Mutex<()>,
     /// Permission rendezvous shared by runner + reply routes.
     pub gate: std::sync::Arc<refine_core::PermissionGate>,
     /// MCP hub probed at serve boot (OnceLock: tests run without probing).
@@ -323,7 +334,9 @@ impl AppState {
             db: w.db,
             blobs: w.blobs,
             writer: w.writer,
-            llm: w.llm,
+            llm: parking_lot::RwLock::new(w.llm),
+            watch: parking_lot::RwLock::new(watch::WatchState::default()),
+            reconcile_lock: tokio::sync::Mutex::new(()),
         })
     }
 }
@@ -1094,15 +1107,11 @@ async fn patch_config(
         name: "InternalError",
         message: format!("rename {}: {e}", path.display()),
     })?;
-    // instance disposal analog: rebuild derived payloads (v1 marks for
-    // disposal and serves fresh config afterwards)
-    let reload = st.reloader.read().clone();
-    match &reload {
-        Some(f) => match f() {
-            Ok(p) => *st.payloads.write() = p,
-            Err(e) => tracing::warn!("config reload failed (restart to apply): {e:#}"),
-        },
-        None => tracing::warn!("config written; reloader unset (tests/boot) — restart to apply"),
+    // instance disposal analog: rebuild derived payloads + registry AND
+    // reconcile MCP (a PATCH that adds a server now connects it — H1
+    // unifies every reload path through watch::reconcile)
+    if let Err(e) = watch::reconcile(&st).await {
+        tracing::warn!("config reload failed (restart to apply): {e:#}");
     }
     tracing::info!("config patched: {}", path.display());
     Ok(Json(payload))
@@ -1312,17 +1321,6 @@ fn write_json_atomic(path: &std::path::Path, value: &Value) -> Result<(), ApiErr
     Ok(())
 }
 
-fn reload_payloads(st: &AppState) {
-    let reload = st.reloader.read().clone();
-    match &reload {
-        Some(f) => match f() {
-            Ok(p) => *st.payloads.write() = p,
-            Err(e) => tracing::warn!("payload reload failed: {e:#}"),
-        },
-        None => tracing::warn!("reloader unset — restart to apply"),
-    }
-}
-
 async fn auth_put(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(pid): axum::extract::Path<String>,
@@ -1346,7 +1344,9 @@ async fn auth_put(
     };
     overlay[&pid] = body; // Auth.Info union stored verbatim (discriminator "type")
     write_json_atomic(&path, &overlay)?;
-    reload_payloads(&st);
+    if let Err(e) = watch::reconcile(&st).await {
+        tracing::warn!("payload reload failed: {e:#}");
+    }
     tracing::info!("auth overlay set provider={pid}");
     Ok(Json(json!(true)))
 }
@@ -1365,7 +1365,9 @@ async fn auth_delete(
             obj.remove(&pid);
         }
         write_json_atomic(&path, &overlay)?;
-        reload_payloads(&st);
+        if let Err(e) = watch::reconcile(&st).await {
+            tracing::warn!("payload reload failed: {e:#}");
+        }
     }
     tracing::info!("auth overlay remove provider={pid}");
     Ok(Json(json!(true)))
@@ -1415,7 +1417,9 @@ async fn global_dispose(State(st): State<Arc<AppState>>) -> Result<Json<Value>, 
         "server.instance.disposed",
         json!({}),
     ));
-    reload_payloads(&st);
+    if let Err(e) = watch::reconcile(&st).await {
+        tracing::warn!("payload reload failed: {e:#}");
+    }
     tracing::info!("global dispose: emitted + payloads reloaded");
     Ok(Json(json!(true)))
 }
@@ -1508,7 +1512,7 @@ fn resolve_model(st: &Arc<AppState>, payload: &Value, session_id: &str) -> (Stri
             }
         }
     }
-    st.llm.default_model.clone()
+    st.llm.read().default_model.clone()
 }
 
 /// Resolve agent/model/system/endpoint/rules into a runnable prompt context.
@@ -1523,25 +1527,32 @@ fn build_prompt_context(
         .and_then(|a| a.as_str())
         .filter(|a| !a.is_empty())
         .map(String::from)
-        .unwrap_or_else(|| st.llm.default_agent.clone());
+        .unwrap_or_else(|| st.llm.read().default_agent.clone());
     let system = st
         .llm
+        .read()
         .systems
         .get(&agent)
         .cloned()
         .unwrap_or_else(|| crate::BUILD_SYSTEM_BLURB.to_string());
     let (pid, mid) = resolve_model(st, payload, session_id);
-    let (base_url, api_key) = st
+    let (base_url, api_key) =
+        st.llm
+            .read()
+            .endpoints
+            .get(&pid)
+            .cloned()
+            .ok_or_else(|| ApiError {
+                status: StatusCode::BAD_REQUEST,
+                name: "BadRequest",
+                message: format!("no endpoint configured for provider {pid}"),
+            })?;
+    let pricing = st
         .llm
-        .endpoints
-        .get(&pid)
-        .cloned()
-        .ok_or_else(|| ApiError {
-            status: StatusCode::BAD_REQUEST,
-            name: "BadRequest",
-            message: format!("no endpoint configured for provider {pid}"),
-        })?;
-    let pricing = st.llm.pricing.get(&(pid.clone(), mid.clone())).copied();
+        .read()
+        .pricing
+        .get(&(pid.clone(), mid.clone()))
+        .copied();
     // agent permission rules (v1 wire shape → evaluator)
     let rules: Vec<refine_tools::Rule> = st
         .payloads
@@ -1564,6 +1575,7 @@ fn build_prompt_context(
         .unwrap_or_default();
     let model_limit = st
         .llm
+        .read()
         .limits
         .get(&(pid.clone(), mid.clone()))
         .cloned()
@@ -1574,6 +1586,7 @@ fn build_prompt_context(
     };
     let compaction_system = st
         .llm
+        .read()
         .systems
         .get("compaction")
         .cloned()

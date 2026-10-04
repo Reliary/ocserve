@@ -65,15 +65,16 @@ async fn patch_merges_writes_atomically_and_reloads() {
     // boot-injected reloader analog: serve the merged FILE content as config
     let cfg_path = home.path().join(".config/refine/config.json");
     let cfg_path2 = cfg_path.clone();
-    let reloader: std::sync::Arc<dyn Fn() -> anyhow::Result<refine_http::Payloads> + Send + Sync> =
-        std::sync::Arc::new(move || {
-            let mut p = Payloads::default();
-            if cfg_path2.exists() {
-                let raw = std::fs::read_to_string(&cfg_path2)?;
-                p.config = serde_json::from_str(&raw)?;
-            }
-            Ok(p)
-        });
+    let reloader: std::sync::Arc<
+        dyn Fn() -> anyhow::Result<(Payloads, refine_http::LlmRegistry)> + Send + Sync,
+    > = std::sync::Arc::new(move || {
+        let mut p = Payloads::default();
+        if cfg_path2.exists() {
+            let raw = std::fs::read_to_string(&cfg_path2)?;
+            p.config = serde_json::from_str(&raw)?;
+        }
+        Ok((p, refine_http::LlmRegistry::default()))
+    });
     *st.reloader.write() = Some(reloader);
     let app = refine_http::router(st.clone());
 

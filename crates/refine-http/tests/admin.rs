@@ -168,10 +168,13 @@ async fn auth_overlay_crud_and_provider_methods() {
     let cp = cp_seed;
     *st.reloader.write() = Some(std::sync::Arc::new(move || {
         h2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Payloads {
-            config_providers: cp.clone(),
-            ..Default::default()
-        })
+        Ok((
+            Payloads {
+                config_providers: cp.clone(),
+                ..Default::default()
+            },
+            refine_http::LlmRegistry::default(),
+        ))
     }));
     let app = refine_http::router(st.clone());
 
@@ -229,7 +232,7 @@ async fn global_dispose_emits_event_and_returns_true() {
     let h2 = hits.clone();
     *st.reloader.write() = Some(std::sync::Arc::new(move || {
         h2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Payloads::default())
+        Ok((Payloads::default(), refine_http::LlmRegistry::default()))
     }));
     let mut rx = st.bus.subscribe();
     let app = refine_http::router(st.clone());

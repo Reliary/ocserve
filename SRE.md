@@ -42,6 +42,7 @@ behind the same auth as the rest:
 | `checkpoint_duration_seconds{result}` | histogram | stall <250 ms |
 | `writer_queue_depth` | gauge | backpressure trigger |
 | `plugin_hook_duration_seconds{hook,result}` | histogram | 30 s deadline monitoring |
+| `refine_config_reload_total{result}` | counter | hot-reload health: `ok`/`mcp` per applied reload; sustained `error` = broken config file (fail-safe keeps old state serving) |
 | `rss_bytes`, `rss_peak_bytes`, `mcp_*` | gauge | 300 MB budget |
 | `blob_orphans`, `blob_missing_total` | gauge/counter | storage integrity |
 | `llm_request_duration_seconds{provider,model}`, `llm_ttft_seconds`, `llm_stream_errors_total` | histogram/counter | provider health (S6) |
@@ -69,7 +70,11 @@ Single source: `refine.toml` (validated at boot, `deny_unknown_fields`) with env
 [metrics]  enabled=true, bind="127.0.0.1:9099"
 ```
 Config reload: SIGHUP re-reads safe subset (metrics, log level, ring limits); structural keys
-(store, port) require restart — declared, not guessed.
+(store, port) require restart — declared, not guessed. External config-file edits
+(opencode.json / refine overlay / auth.json / auth-overlay / models cache / state model)
+hot-reload via poller: `REFINE_CONFIG_WATCH=0` disables, `REFINE_CONFIG_POLL_MS`
+(default 2000, min 100 — clamped so 0 can never busy-loop); fail-safe at runtime
+(broken file keeps old state, retries; boot stays fail-fast).
 
 ## 4. CPU: measure first, specialize second
 

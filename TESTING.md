@@ -46,9 +46,16 @@ traceable test, every test has a traceable requirement.
    value (v1 corpus captured connected/failed only).
 
    **Named divergences (K-CONFIG):** refine serves ONE config (global==user file;
-   `PATCH /config` and `PATCH /global/config` share a handler/target); live-swap covers
-   the derived route payloads only — provider endpoint registries (LLM routing) rebuild
-   on restart, not on PATCH (v1's instance disposal rebuilds everything).
+   `PATCH /config` and `PATCH /global/config` share a handler/target). Live-swap covers
+   derived route payloads AND the LLM registry (endpoints/keys/limits/default model —
+   rebuilt on every reconcile; v1's instance disposal rebuilds everything on write).
+   **D-CONFIG-1 (hot-reload):** upstream has NO file watcher — config is
+   `Effect.cachedInvalidateWithTTL(Duration.infinity)` invalidated only on its own write
+   (v1 config/config.ts:295,302,678), so an external edit needs a restart there; refine
+   applies external edits within one poll interval (`REFINE_CONFIG_POLL_MS`, default
+   2000, min 100; `REFINE_CONFIG_WATCH=0` disables) via fail-safe reconcile (a broken
+   file keeps the old state serving and retries — boot remains fail-fast). MCP section
+   changes connect/disconnect live. No shape change; replay unaffected.
 
    **Named divergences (K-SUMMARIZE):** refine's summarize does NOT create
    compaction-state/history filtering (upstream `filterCompacted` hides pre-compaction
