@@ -130,17 +130,25 @@ build, 40 s mixed load — **4.48M allocs / 99.5% churn**, top groups =
 per-fetch SQLite pcache in `get_messages` + `serde_json::to_string` frame
 building). Ordered by measured leverage:
 
-1. **Reused serialization buffers** — `/message` frames + prompt request
-   bodies via `to_writer` into per-thread `Vec<u8>` (kills the #2 group;
-   no new deps).
-2. **Reader-connection reuse** (thread-local) — kills per-fetch pcache
-   alloc churn (group #1); allocation argument, not a latency guess.
-3. **History byte budget** at prompt build (tail-weighted like compaction's
-   `COMPACTION_CONVERSATION_MAX_BYTES`; `to_provider_messages` is currently
-   UNBOUNDED and messages are never pruned — the real scale hole for
-   thousands-of-sessions × tens-concurrent).
-4. **Service-side plugin-host reap-on-exit** (tooling-side group-kill already
-   shipped; systemd cgroup covers OOM; this covers clean exits everywhere).
+1. ~~Reused serialization buffers~~ **SHIPPED** — `/message` frames serialize
+   into one reused `Vec<u8>` per fetch (+ blob `from_slice`, no lossy copy);
+   prompt request bodies pre-sized via `estimate_request_bytes` (one exact
+   alloc instead of doubling-growth per round). Tests: `estimate_tests`.
+2. ~~Reader-connection reuse~~ **SHIPPED** — `pragma::Reader` parks the
+   connection thread-locally (Deref-transparent: zero call-site churn);
+   fresh-open accounting proves checkout-vs-open. Test:
+   `reader_reuses_parked_connection_per_thread`. Budget note: parked readers
+   are per-thread (cache_size unchanged, page residency lazy — pages, not
+   4 MB × threads, actually touch).
+3. ~~History byte budget~~ **SHIPPED** — `PROMPT_HISTORY_MAX_BYTES = 8 MB`,
+   tail-weighted (oldest dropped first, newest exchange always kept),
+   `refine_history_truncated_total{dropped}` + warn log; under-budget =
+   byte-identical. Tests: `history_budget_tests` ×3. Divergence: TESTING §1.6
+   D-PROMPT-BUDGET.
+4. **Service-side plugin-host reap** — re-verified COVERED without new code:
+   `kill_on_drop(true)` already set at spawn; systemd cgroup covers OOM/stop;
+   non-systemd exits swept by the tooling fixes. Residual = SIGKILL-embedded
+   (swept next run). **Item closed.**
 5. **Allocator decision** — glibc adopted honestly (§2); wire mimalloc ONLY
    if the post-fix soak still shows step-retention (pre-fix morning soak
    had +76/+58 MB steps — unproven after the drain fix).

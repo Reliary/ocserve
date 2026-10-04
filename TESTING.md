@@ -72,6 +72,15 @@ traceable test, every test has a traceable requirement.
    but a real divergence for pinned-agent configs. Parked with evidence; the
    compaction-model *selection* itself (session model) already matches.
 
+   **D-PROMPT-BUDGET (history byte cap):** upstream streams the entire
+   session history into every provider request with no bound; refine drops the
+   OLDEST history first once `PROMPT_HISTORY_MAX_BYTES` (8 MB) is exceeded,
+   always keeping the newest exchange, with `refine_history_truncated_total`
+   + a warn log (measurable, not silent). Under-budget sessions are
+   byte-identical. Rationale: unbounded history × concurrent prompts is the
+   anon-memory hole at the stated scale target (thousands of sessions, tens
+   concurrent); real overflow still routes through M6 compaction.
+
    **K-AUTONOMY failure class (silent stop):** background prompt failures were log-only
    (`prompt_async` logs + returns nothing downstream) — the run "just stopped". Every run
    error now finalizes state and emits durable `session.error` + a `[turn stopped]` text

@@ -693,15 +693,24 @@ pub fn for_each_message_json(
     let mut pstmt = conn.prepare(
         "SELECT id, inline, blob_sha, byte_len FROM msg_part WHERE message_id = ?1 ORDER BY seq",
     )?;
+    // K-EFFICIENCY (bytehound group #2): ONE reusable serializer buffer per
+    // fetch — Value::to_string grew a fresh String per message/part (top
+    // churn group in the profile). The frame itself is still an owned
+    // String (it crosses the channel); everything nested is append-only.
+    let mut ser: Vec<u8> = Vec::with_capacity(64 * 1024);
     for (mid, info_txt) in msgs {
         // string-only assembly: parse→merge→serialize per row, never a
         // json!-wrapper Value tree (the wrapper roughly doubled transient
         // churn during the 101MB stream — measured RSS 599/600MB)
         let info: serde_json::Value = serde_json::from_str(&info_txt)?;
         let info = merge_columns(info, &mid, session_id, None);
-        let mut chunk = String::with_capacity(info_txt.len() + 1024);
+        // capacity estimate: info + parts (inline lens known after query —
+        // fixed floor avoids the doubling-growth pattern on big messages)
+        let mut chunk = String::with_capacity(info_txt.len() + 8192);
         chunk.push_str("{\"info\":");
-        chunk.push_str(&info.to_string());
+        ser.clear();
+        serde_json::to_writer(&mut ser, &info)?;
+        chunk.push_str(std::str::from_utf8(&ser)?);
         chunk.push_str(",\"parts\":[");
         let mut rows = pstmt.query([&mid])?;
         let mut first_part = true;
@@ -710,22 +719,27 @@ pub fn for_each_message_json(
             let inline: Option<String> = row.get(1)?;
             let sha: Option<String> = row.get(2)?;
             let byte_len: i64 = row.get(3)?;
-            let txt = match inline {
-                Some(t) => t,
+            // blob parts: parse straight from bytes (skips a full
+            // lossy-String copy per blob — phase-1 churn cut)
+            let parsed = match inline {
+                Some(t) => serde_json::from_str::<serde_json::Value>(&t),
                 None => match (&sha, byte_len) {
                     (Some(sha), len) => {
-                        String::from_utf8_lossy(&blobs.get(sha, len as u64)?).into_owned()
+                        let raw = blobs.get(sha, len as u64)?;
+                        serde_json::from_slice::<serde_json::Value>(&raw)
                     }
                     (None, _) => continue,
                 },
             };
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+            if let Ok(v) = parsed {
                 let merged = merge_columns(v, &part_id, session_id, Some(&mid));
                 if !first_part {
                     chunk.push(',');
                 }
                 first_part = false;
-                chunk.push_str(&merged.to_string());
+                ser.clear();
+                serde_json::to_writer(&mut ser, &merged)?;
+                chunk.push_str(std::str::from_utf8(&ser)?);
             }
         }
         chunk.push_str("]}");

@@ -378,6 +378,15 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
                     .map(|m| m.len() as i64)
                     .unwrap_or(0);
                 refine_metrics::gauge("refine_wal_bytes", wal);
+                // MEMORY §7.6: DB growth KPI (thousands-of-sessions target —
+                // gauged now, policy at ≥5 GB / ≥1k sessions).
+                if let Some(db) = wal_path
+                    .to_str()
+                    .and_then(|w| w.strip_suffix("-wal"))
+                    .and_then(|d| std::fs::metadata(d).ok())
+                {
+                    refine_metrics::gauge("refine_db_bytes", db.len() as i64);
+                }
                 if let Some(rss) = sidecar_rss(std::process::id()) {
                     refine_metrics::gauge("refine_sidecar_rss_bytes", rss);
                 }

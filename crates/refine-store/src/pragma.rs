@@ -117,7 +117,59 @@ pub fn reader_opens() -> u64 {
     READER_OPENS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-pub fn open_reader(path: &std::path::Path) -> Result<Connection> {
+/// K-EFFICIENCY (phase 1, bytehound group #1): a reader connection is
+/// PARKED in thread-local storage on drop and checked out again for the
+/// same path — kills the per-query fresh-open + page-cache reallocation
+/// churn (profile: pcache1Alloc via get_messages was the largest byte
+/// group). Reentrancy is safe: an open while parked is checked out falls
+/// back to a fresh transient connection (dropped, never parked).
+pub struct Reader {
+    conn: Option<Connection>,
+    db: std::path::PathBuf,
+}
+
+impl std::ops::Deref for Reader {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().expect("Reader.conn taken exactly once")
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        let Some(conn) = self.conn.take() else {
+            return;
+        };
+        let db = std::mem::take(&mut self.db);
+        TLS_SLOT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some((db, conn));
+            }
+            // slot already holds another path's conn → drop this one
+        });
+    }
+}
+
+std::thread_local! {
+    static TLS_SLOT: std::cell::RefCell<Option<(std::path::PathBuf, Connection)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub fn open_reader(path: &std::path::Path) -> Result<Reader> {
+    let parked = TLS_SLOT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.as_ref() {
+            Some((db, _)) if db == path => slot.take().map(|(_, c)| c),
+            _ => None,
+        }
+    });
+    if let Some(conn) = parked {
+        return Ok(Reader {
+            conn: Some(conn),
+            db: path.to_path_buf(),
+        });
+    }
     READER_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     assert_version_ok()?;
     let uri = format!(
@@ -134,12 +186,52 @@ pub fn open_reader(path: &std::path::Path) -> Result<Connection> {
         .context("query_only")?;
     conn.pragma_update(None, "cache_size", READER_CACHE_KB)
         .context("reader cache_size")?;
-    Ok(conn)
+    Ok(Reader {
+        conn: Some(conn),
+        db: path.to_path_buf(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// K-EFFICIENCY: same-path reopen on one thread returns the PARKED
+    /// connection (fresh-open accounting does not grow); a nested open
+    /// while checked out falls back to a transient (never aliases).
+    #[test]
+    fn reader_reuses_parked_connection_per_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let conn = create_new(&db).unwrap();
+            drop(conn);
+        }
+        let before = reader_opens();
+        {
+            let a = open_reader(&db).unwrap();
+            assert_eq!(reader_opens(), before + 1, "first open is fresh");
+            drop(a);
+            let b = open_reader(&db).unwrap();
+            assert_eq!(
+                reader_opens(),
+                before + 1,
+                "same-path reopen must CHECK OUT the parked conn (no new open)"
+            );
+            // reentrant open while checked out → fresh transient (no aliasing)
+            let inner = open_reader(&db).unwrap();
+            assert_eq!(reader_opens(), before + 2, "nested open falls back fresh");
+            drop(inner);
+            drop(b);
+        }
+        let c = open_reader(&db).unwrap();
+        assert_eq!(
+            reader_opens(),
+            before + 2,
+            "parked conn still reusable after the scope"
+        );
+        drop(c);
+    }
 
     #[test]
     fn version_gate_passes_on_bundled() {

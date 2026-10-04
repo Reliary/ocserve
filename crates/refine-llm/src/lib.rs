@@ -465,11 +465,14 @@ impl Client {
         if let Some(sid) = session_id {
             req = req.header("x-opencode-session", sid);
         }
-        let resp = req
-            .body(serde_json::to_vec(&body)?)
-            .send()
-            .await
-            .context("provider request")?;
+        // K-EFFICIENCY (bytehound phase 1): pre-size the serialization
+        // buffer — serde_json::to_vec grows by doubling (≈log2(N) reallocs
+        // + memcpy of the whole multi-MB history, every round, every
+        // concurrent prompt). One exact alloc instead.
+        let est = estimate_request_bytes(messages, tools);
+        let mut buf = Vec::with_capacity(est);
+        serde_json::to_writer(&mut buf, &body)?;
+        let resp = req.body(buf).send().await.context("provider request")?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -860,5 +863,66 @@ mod overflow_classifier_tests {
         assert!(!looks_like_context_overflow(
             "provider 400: model 'nope' not found"
         ));
+    }
+}
+
+/// Conservative request-size estimate for buffer pre-sizing (K-EFFICIENCY).
+/// Over-estimates are fine (one exact alloc); under-estimates cost at most
+/// one extra doubling — content + tool args dominate either way.
+pub(crate) fn estimate_request_bytes(messages: &[ChatMessage], tools: Option<&[Value]>) -> usize {
+    let mut n = 4096;
+    for m in messages {
+        n += m.content.len() + m.role.len() + 64;
+        if let Some(id) = &m.tool_call_id {
+            n += id.len();
+        }
+        if let Some(tcs) = &m.tool_calls {
+            for tc in tcs {
+                n += 256;
+                if let Some(args) = tc.pointer("/function/arguments").and_then(|v| v.as_str()) {
+                    n += args.len();
+                }
+            }
+        }
+    }
+    if let Some(t) = tools {
+        n += t.len() * 1024; // schemas: rough floor, covered by the slack below
+    }
+    n + n / 4
+}
+
+#[cfg(test)]
+mod estimate_tests {
+    use super::*;
+
+    /// The pre-size must never pathologically under-estimate (a bad floor
+    /// would silently restore the doubling-growth we just removed).
+    #[test]
+    fn estimate_is_not_pathologically_small() {
+        let msgs = vec![
+            ChatMessage::text("user", "hello world"),
+            ChatMessage::assistant_with_tools(
+                "thinking",
+                vec![serde_json::json!({
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "x".repeat(40_000)},
+                })],
+            ),
+            ChatMessage::tool_result("call_1", "y".repeat(80_000)),
+        ];
+        let est = estimate_request_bytes(&msgs, None);
+        let actual = serde_json::to_vec(&crate::build_request(
+            "m",
+            &msgs,
+            &ChatOpts::default(),
+            None,
+        ))
+        .unwrap()
+        .len();
+        assert!(
+            est >= actual,
+            "estimate {est} < actual {actual} — would re-grow"
+        );
     }
 }

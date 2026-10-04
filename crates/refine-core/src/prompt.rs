@@ -203,9 +203,61 @@ pub(crate) fn emit_live(ctx: &PromptContext, event_type: &str, properties: Value
 }
 
 /// Reconstruct provider messages from stored history (text + tool parts).
+/// History byte budget (K-AUTONOMY scale hole, MEMORY §7.3): the live prompt
+/// build was UNBOUNDED by session size — giant sessions × concurrent prompts
+/// = the anon risk at thousands-of-sessions scale. Tail-weighted like
+/// compaction's D2/COMPACTION_CONVERSATION_MAX_BYTES: drop OLDEST first,
+/// always keep at least the newest exchange. Under-budget sessions are
+/// byte-identical (no wire/behavior change; the common case). Dropped
+/// rounds are counted (metric) so silent context loss is measurable.
+pub(crate) const PROMPT_HISTORY_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+fn history_message_bytes(info: &Value, parts: &[Value]) -> usize {
+    let mut n = 64; // per-message envelope slack
+    for p in parts {
+        n += 96;
+        for k in ["text", "arguments"] {
+            if let Some(s) = p.get(k).and_then(|v| v.as_str()) {
+                n += s.len();
+            }
+        }
+        if let Some(s) = p.pointer("/state/output").and_then(|v| v.as_str()) {
+            n += s.len();
+        }
+        if let Some(s) = p.pointer("/state/input").and_then(|v| v.as_str()) {
+            n += s.len();
+        }
+    }
+    n += info.to_string().len().min(2048);
+    n
+}
+
 pub(crate) fn to_provider_messages(history: &[(Value, Vec<Value>)]) -> Vec<ChatMessage> {
+    // tail-weighted budget: find the oldest message we can afford to keep
+    let mut total: usize = history
+        .iter()
+        .map(|(i, p)| history_message_bytes(i, p))
+        .sum();
+    let mut start = 0usize;
+    while total > PROMPT_HISTORY_MAX_BYTES && start + 1 < history.len() {
+        let (i, p) = &history[start];
+        total -= history_message_bytes(i, p);
+        start += 1;
+    }
+    if start > 0 {
+        refine_metrics::labeled_counter(
+            "refine_history_truncated_total",
+            &format!("dropped=\"{}\"", start),
+            1,
+        );
+        tracing::warn!(
+            "prompt history budget: dropped {start}/{} oldest message(s) (>{} bytes)",
+            history.len(),
+            PROMPT_HISTORY_MAX_BYTES
+        );
+    }
     let mut out = Vec::new();
-    for (info, parts) in history {
+    for (info, parts) in &history[start..] {
         let role = info["role"].as_str().unwrap_or("user");
         let text: String = parts
             .iter()
@@ -2056,5 +2108,55 @@ mod autonomy_tests {
             ..Default::default()
         };
         assert_eq!(resolve_max_rounds(&o2, 50), 0);
+    }
+}
+
+#[cfg(test)]
+mod history_budget_tests {
+    use super::*;
+
+    fn entry(i: usize, text: String) -> (Value, Vec<Value>) {
+        (
+            json!({"id": format!("m{i}"), "role": if i.is_multiple_of(2) { "user" } else { "assistant" }}),
+            vec![json!({"id": format!("p{i}"), "type": "text", "text": text})],
+        )
+    }
+
+    #[test]
+    fn small_history_is_byte_identical() {
+        let h = vec![entry(0, "hello".into()), entry(1, "world".into())];
+        let msgs = to_provider_messages(&h);
+        assert_eq!(msgs.len(), 2, "no truncation under budget");
+        assert_eq!(msgs[0].content, "hello");
+        assert_eq!(msgs[1].content, "world");
+    }
+
+    #[test]
+    fn over_budget_drops_oldest_first_and_keeps_newest() {
+        // 9 × ~1MB > 8MB budget → oldest must go, newest must stay
+        let h: Vec<_> = (0..9)
+            .map(|i| entry(i, format!("msg{i} {}", "x".repeat(1024 * 1024))))
+            .collect();
+        let msgs = to_provider_messages(&h);
+        assert!(msgs.len() < 9, "must drop oldest: kept {}", msgs.len());
+        assert!(
+            msgs.last().unwrap().content.starts_with("msg8 "),
+            "newest exchange must survive"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.content.starts_with("msg0 ")),
+            "oldest must be dropped first"
+        );
+        // everything kept fits the budget (slack = per-message envelope slack)
+        let kept: usize = msgs.iter().map(|m| m.content.len()).sum();
+        assert!(kept <= PROMPT_HISTORY_MAX_BYTES + 1024, "kept {kept} bytes");
+    }
+
+    #[test]
+    fn single_oversized_message_is_always_kept() {
+        // never starve the model of its only exchange
+        let h = vec![entry(0, "y".repeat(PROMPT_HISTORY_MAX_BYTES + 1))];
+        let msgs = to_provider_messages(&h);
+        assert_eq!(msgs.len(), 1, "keep at least the newest exchange");
     }
 }

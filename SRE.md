@@ -46,6 +46,9 @@ behind the same auth as the rest:
 | `refine_prompt_rss_start_bytes` / `refine_prompt_rss_delta_bytes` | gauge | OOM phase attribution: RSS at prompt start and peak−delta during the run (Drop-emitted — every exit path incl. bails; last-prompt semantics; paired with the 15s serve sampler for continuous history) |
 | `refine_db_opens_total` | counter | reader-open cost per prompt (delta over the run; KPI ≤3/prompt; approximate under parallel sessions) |
 | `refine_sync_tick` | duration | legacy-sync tick cost (the idle-jump suspect until measured — 11 msgs total says likely tiny) |
+| `refine_db_bytes` | gauge | DB file growth (MEMORY §7.6 KPI; policy trigger at ≥5 GB / ≥1k sessions) |
+| `refine_history_truncated_total{dropped}` | counter | prompt-history budget trips (8 MB, tail-weighted) — silent context loss made measurable |
+| soak CSV `oc_rss` column | sample | native opencode RSS = the future-usage ceiling model (MEMORY §7.6) |
 | `refine_prompt_rounds_total{bucket,finish}` | counter | uncensored rounds-per-turn distribution: `bucket` = 0-9/10-19/20-39/40-79/80-159/160+, `finish` = `done`/`error`/`capped` — the K-AUTONOMY telemetry the old flat cap made unmeasurable (right-censored at 25) |
 | `rss_bytes`, `rss_peak_bytes`, `mcp_*` | gauge | 300 MB budget |
 | `blob_orphans`, `blob_missing_total` | gauge/counter | storage integrity |
