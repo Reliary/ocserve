@@ -329,6 +329,54 @@ pub(crate) fn pick_default_model(
     (pid.clone(), model)
 }
 
+/// B2 (K-MODEL-STATE): opencode public-tier endpoint — freeze
+/// provider.ts:185-240. Key precedence: env OPENCODE_API_KEY → config
+/// options.apiKey → auth.json key → literal "public". Base URL = the
+/// models-cache `api` field (models.dev: https://opencode.ai/zen/v1).
+pub(crate) fn opencode_public_endpoint(
+    cfg: &Value,
+    auth: &Value,
+    cache: &Value,
+) -> Option<(String, String)> {
+    let key = std::env::var("OPENCODE_API_KEY")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            cfg.pointer("/provider/opencode/options/apiKey")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(String::from)
+        })
+        .or_else(|| {
+            auth.pointer("/opencode/key")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(String::from)
+        });
+    let base = cache
+        .pointer("/opencode/api")
+        .and_then(|v| v.as_str())
+        .map(String::from)?;
+    Some((base, key.unwrap_or_else(|| "public".into())))
+}
+
+/// B2 (freeze provider.ts:196-201): keyless opencode keeps ONLY free
+/// models — paid ones would 401 with the public key.
+pub(crate) fn apply_public_tier_filter(
+    pid: &str,
+    has_key: bool,
+    models: &mut BTreeMap<String, Value>,
+) {
+    if pid == "opencode" && !has_key {
+        models.retain(|_, m| {
+            m.get("cost")
+                .and_then(|c| c.get("input"))
+                .and_then(|v| v.as_u64())
+                == Some(0)
+        });
+    }
+}
+
 /// Provider catalog membership (W6's `known` rule, factored shared):
 /// `config_providers.providers` LIST of {id, models} (cache-derived) OR the
 /// config-file dict `provider.<pid>.models` — both consulted (W6 finding).
@@ -524,6 +572,18 @@ fn build_providers(cfg: &Value, auth: &Value, cache: &Value) -> (Value, Value) {
                 models.insert(mid.clone(), transform_config_model(pid, mid, mval));
             }
         }
+        // B2: single site covers /config/providers + /provider routes.
+        let has_key = std::env::var("OPENCODE_API_KEY").is_ok_and(|v| !v.is_empty())
+            || auth_obj
+                .and_then(|a| a.get(pid))
+                .and_then(|v| v.get("key"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| !v.is_empty())
+            || cb
+                .and_then(|b| b.pointer("/options/apiKey"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| !v.is_empty());
+        apply_public_tier_filter(pid, has_key, &mut models);
         // re-transform cache models into wire shape (config inserts already transformed)
         let mut wire: serde_json::Map<String, Value> = serde_json::Map::new();
         for (mid, mval) in &models {
@@ -910,6 +970,11 @@ impl Runtime {
             }
         }
 
+        // B2 (K-MODEL-STATE): opencode public-tier endpoint (pure fn below).
+        if let Some(pair) = opencode_public_endpoint(&cfg, &auth, &cache) {
+            endpoints.insert("opencode".into(), pair);
+        }
+
         // pricing from models cache: (in, out, cache_read) USD per MTok
         let mut pricing = std::collections::HashMap::new();
         let mut limits = std::collections::HashMap::new();
@@ -1209,5 +1274,68 @@ mod tests {
         assert_eq!(w["capabilities"]["toolcall"], true);
         assert_eq!(w["cost"]["cache"]["read"], 0.5);
         assert_eq!(w["api"]["npm"], "npm");
+    }
+}
+
+#[cfg(test)]
+mod b2_public_tier_tests {
+    use super::*;
+
+    #[test]
+    fn opencode_endpoint_defaults_to_public_with_cache_base() {
+        let cfg = json!({});
+        let auth = json!({});
+        let cache = json!({"opencode": {"api": "https://opencode.ai/zen/v1"}});
+        assert_eq!(
+            opencode_public_endpoint(&cfg, &auth, &cache),
+            Some(("https://opencode.ai/zen/v1".into(), "public".into())),
+            "keyless public tier — freeze apiKey:\"public\""
+        );
+    }
+
+    #[test]
+    fn opencode_endpoint_prefers_config_then_auth_key() {
+        let cache = json!({"opencode": {"api": "https://opencode.ai/zen/v1"}});
+        let cfg = json!({"provider": {"opencode": {"options": {"apiKey": "cfg-key"}}}});
+        let auth = json!({"opencode": {"key": "auth-key"}});
+        assert_eq!(
+            opencode_public_endpoint(&cfg, &auth, &cache).unwrap().1,
+            "cfg-key",
+            "config key beats auth"
+        );
+        let cfg2 = json!({});
+        assert_eq!(
+            opencode_public_endpoint(&cfg2, &auth, &cache).unwrap().1,
+            "auth-key"
+        );
+        // no cache api → no endpoint (nothing invented)
+        assert_eq!(opencode_public_endpoint(&cfg2, &auth, &json!({})), None);
+    }
+
+    #[test]
+    fn public_tier_filter_drops_paid_models_only_when_keyless() {
+        let mut models: BTreeMap<String, Value> = BTreeMap::new();
+        models.insert(
+            "big-pickle".into(),
+            json!({"cost": {"input": 0, "output": 0}}),
+        );
+        models.insert(
+            "ling-pro".into(),
+            json!({"cost": {"input": 3.0, "output": 12.0}}),
+        );
+        apply_public_tier_filter("opencode", false, &mut models);
+        assert_eq!(models.len(), 1, "paid dropped keyless: {models:?}");
+        assert!(models.contains_key("big-pickle"));
+
+        // auth'd → both kept; other pids never filtered
+        let mut models: BTreeMap<String, Value> = BTreeMap::new();
+        models.insert("big-pickle".into(), json!({"cost": {"input": 0}}));
+        models.insert("ling-pro".into(), json!({"cost": {"input": 3.0}}));
+        apply_public_tier_filter("opencode", true, &mut models);
+        assert_eq!(models.len(), 2, "auth'd keeps paid");
+        let mut other: BTreeMap<String, Value> = BTreeMap::new();
+        other.insert("paid".into(), json!({"cost": {"input": 9.0}}));
+        apply_public_tier_filter("deepseek", false, &mut other);
+        assert_eq!(other.len(), 1, "non-opencode providers never filtered");
     }
 }

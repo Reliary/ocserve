@@ -528,6 +528,19 @@ async fn round_cap_fails_loud_session_error_stopped_part_metric_and_persisted_gr
         )
         .unwrap();
     assert_eq!(ghosts, 0, "cap must never leave an unfinished assistant");
+    // K-MODEL-STATE: resolved model was persisted at PROMPT START — the cap
+    // death never reaches finalize, yet the column must hold the run's model
+    // (the exact "model reverts to deepseek" regression).
+    let pm: Option<String> = conn
+        .query_row(
+            "SELECT model FROM session WHERE id='ses_cap000000000001'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let pm = pm.expect("start-persist wrote model despite the cap death");
+    assert!(pm.contains("fake"), "run used the fake provider: {pm}");
+
     // K-ALWAYS: the 'always' reply persisted past-process (restart proof:
     // a FRESH gate hydrating from the row sees the grant)
     let keys = refine_store::session_always_keys(&st.db, "ses_cap000000000001").unwrap();
@@ -554,4 +567,147 @@ async fn round_cap_fails_loud_session_error_stopped_part_metric_and_persisted_gr
         ),
         "refine_prompt_rounds_total{{finish=\"capped\"}} missing:\n{exposition}"
     );
+    // K-EFFICIENCY: prompt-phase RSS + reader-open accounting landed
+    assert!(
+        exposition
+            .lines()
+            .any(|l| l.starts_with("refine_prompt_rss_start_bytes")),
+        "refine_prompt_rss_start_bytes missing:\n{exposition}"
+    );
+    assert!(
+        exposition
+            .lines()
+            .any(|l| l.starts_with("refine_db_opens_total")),
+        "refine_db_opens_total missing:\n{exposition}"
+    );
+}
+
+// ---------- B1: prompt-start model persistence + PATCH model/agent ----------
+
+#[test]
+fn persist_prompt_model_writes_once_then_churns_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = refine_store::writer::db_path(dir.path());
+    let writer = refine_store::Writer::spawn(db.clone()).unwrap();
+    refine_store::insert_session(
+        &writer,
+        &json!({"id": "ses_pm", "projectID": "global", "directory": "/w",
+                 "path": "s", "slug": "s", "title": "t", "version": "1",
+                 "time": {"created": 1, "updated": 2}}),
+    )
+    .unwrap();
+    let mj = |p: &str, m: &str| json!({"id": m, "providerID": p, "variant": "default"}).to_string();
+
+    assert_eq!(
+        refine_store::persist_prompt_model(
+            &writer,
+            "ses_pm",
+            "build",
+            &mj("opencode-go", "mimo-v2.6-flash")
+        )
+        .unwrap(),
+        1,
+        "first persist writes"
+    );
+    assert_eq!(
+        refine_store::persist_prompt_model(
+            &writer,
+            "ses_pm",
+            "build",
+            &mj("opencode-go", "mimo-v2.6-flash")
+        )
+        .unwrap(),
+        0,
+        "identical values are churn-free"
+    );
+    assert_eq!(
+        refine_store::persist_prompt_model(
+            &writer,
+            "ses_pm",
+            "plan",
+            &mj("opencode", "big-pickle")
+        )
+        .unwrap(),
+        1,
+        "changed model writes"
+    );
+    let (model, agent): (String, String) = {
+        let conn = refine_store::pragma::open_reader(&db).unwrap();
+        conn.query_row(
+            "SELECT model, agent FROM session WHERE id='ses_pm'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(agent, "plan");
+    assert!(model.contains("big-pickle"), "{model}");
+}
+
+#[tokio::test]
+async fn patch_session_model_and_agent_roundtrip_with_validation() {
+    let addr = spawn_final_provider();
+    let st = setup(addr, "ses_patch00000001", "patch me");
+    let app = refine_http::router(st.clone());
+
+    let patch = |body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/session/ses_patch00000001")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    // freeze-ish model patch → row + wire carry it
+    let resp = patch(json!({"model": {"id": "mimo-v2.6-flash", "providerID": "opencode-go", "variant": "default"}})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let info = body_json(resp).await;
+    assert_eq!(info["model"]["id"], "mimo-v2.6-flash");
+    assert_eq!(info["model"]["providerID"], "opencode-go");
+
+    // agent patch
+    let resp = patch(json!({"agent": "plan"})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let info = body_json(resp).await;
+    assert_eq!(info["agent"], "plan");
+
+    // invalid model shape → 400 BadRequest envelope
+    let resp = patch(json!({"model": {"nope": 1}})).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // null clears model (resolve falls back to default)
+    let resp = patch(json!({"model": null})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let model: Option<String> = {
+        let conn = refine_store::pragma::open_reader(&st.db).unwrap();
+        conn.query_row(
+            "SELECT model FROM session WHERE id='ses_patch00000001'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert!(model.is_none(), "null clears: {model:?}");
+
+    // unknown session → 404 (PATCH path; POST /session/{id} is not a route)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/session/ses_nope000000000000")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"title": "x"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

@@ -1892,21 +1892,120 @@ async fn patch_session(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    if !refine_store::session_exists(&st.db, &id).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })? {
+        return Err(ApiError::not_found(format!("Session not found: {id}")));
+    }
+    let mut dirty = false;
     if let Some(title) = payload.get("title").and_then(|t| t.as_str()) {
         refine_store::update_session_title(&st.writer, &id, title).map_err(|e| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             name: "InternalError",
             message: format!("{e:#}"),
         })?;
+        dirty = true;
     }
-    refine_store::load_session_wire(&st.db, &id)
+    // K-MODEL-STATE: freeze Patch semantics for model/agent (oc-remote only
+    // calls title; TUI/other clients patch model+agent). permission is
+    // deliberately NOT patchable (no caller in evidence — refine's internal
+    // key format differs from upstream's ruleset; divergence noted K row).
+    if payload.get("model").is_some() {
+        let raw = payload.get("model").cloned().unwrap_or(Value::Null);
+        let model_json: Value = match raw {
+            Value::Null => Value::Null, // clear → SQL NULL → resolve falls to default
+            Value::Object(ref m) => {
+                let ok = m
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|v| !v.is_empty())
+                    && m.get("providerID")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|v| !v.is_empty());
+                if !ok {
+                    return Err(ApiError {
+                        status: StatusCode::BAD_REQUEST,
+                        name: "BadRequest",
+                        message: "model must be {id, providerID, variant?} or null".into(),
+                    });
+                }
+                Value::String(
+                    serde_json::to_string(&json!({
+                        "id": m["id"],
+                        "providerID": m["providerID"],
+                        "variant": m.get("variant").cloned().unwrap_or(json!("default")),
+                    }))
+                    .map_err(|e| ApiError {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        name: "InternalError",
+                        message: format!("{e:#}"),
+                    })?,
+                )
+            }
+            _ => {
+                return Err(ApiError {
+                    status: StatusCode::BAD_REQUEST,
+                    name: "BadRequest",
+                    message: "model must be {id, providerID, variant?} or null".into(),
+                });
+            }
+        };
+        st.writer
+            .write(vec![refine_store::WriteOp::Sql {
+                sql: "UPDATE session SET model = ?2 WHERE id = ?1".into(),
+                params: vec![id.clone().into(), model_json],
+            }])
+            .map_err(|e| ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                name: "InternalError",
+                message: format!("{e:#}"),
+            })?;
+        dirty = true;
+    }
+    if payload.get("agent").is_some() {
+        let agent = match payload.get("agent") {
+            Some(Value::Null) => String::new(),
+            Some(Value::String(a)) if !a.is_empty() => a.clone(),
+            _ => {
+                return Err(ApiError {
+                    status: StatusCode::BAD_REQUEST,
+                    name: "BadRequest",
+                    message: "agent must be a non-empty string or null".into(),
+                });
+            }
+        };
+        st.writer
+            .write(vec![refine_store::WriteOp::Sql {
+                sql: "UPDATE session SET agent = ?2 WHERE id = ?1".into(),
+                params: vec![id.clone().into(), agent.into()],
+            }])
+            .map_err(|e| ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                name: "InternalError",
+                message: format!("{e:#}"),
+            })?;
+        dirty = true;
+    }
+    let info = refine_store::load_session_wire(&st.db, &id)
         .map_err(|e| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             name: "InternalError",
             message: format!("{e:#}"),
         })?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))
+        .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))?;
+    if dirty {
+        // partial session.updated (prompt's own partial shape) so other
+        // clients re-sort/re-render without a refetch
+        st.bus.publish(refine_core::event::frame(
+            st.paths["directory"].as_str().unwrap_or("/"),
+            "session.updated",
+            json!({"sessionID": id, "info": {"id": id, "title": info["title"],
+                                              "model": info["model"], "agent": info["agent"]}}),
+        ));
+    }
+    Ok(Json(info))
 }
 
 /// DELETE /session/{id} → true (v1 Schema.Boolean). Aborts any in-flight

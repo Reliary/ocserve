@@ -316,7 +316,20 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                match refine_http::sync::sync_tick(&st) {
+                // K-EFFICIENCY: tick cost visibility (the idle-jump suspect
+                // until measured otherwise — 11 msgs total, so likely tiny).
+                let sync_t0 = std::time::Instant::now();
+                let tick_result = refine_http::sync::sync_tick(&st);
+                refine_metrics::observe(
+                    "refine_sync_tick",
+                    if tick_result.is_ok() {
+                        "result=\"ok\""
+                    } else {
+                        "result=\"error\""
+                    },
+                    sync_t0.elapsed().as_micros() as u64,
+                );
+                match tick_result {
                     Ok(s) => {
                         if s.messages > 0 || s.backlog {
                             tracing::info!(

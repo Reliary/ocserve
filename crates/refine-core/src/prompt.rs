@@ -270,6 +270,43 @@ pub(crate) fn provider_stall() -> std::time::Duration {
     })
 }
 
+/// K-EFFICIENCY: per-prompt RSS + reader-open accounting. Emission lives in
+/// Drop so bail paths (cap, provider errors, `?`) report too — tail-only
+/// emission was proven wrong by the cap e2e going red.
+struct PhaseProbe {
+    rss0: Option<i64>,
+    peak: Option<i64>,
+    opens0: u64,
+}
+
+impl PhaseProbe {
+    fn start() -> Self {
+        Self {
+            rss0: refine_metrics::rss_bytes(),
+            peak: refine_metrics::rss_bytes(),
+            opens0: refine_store::pragma::reader_opens(),
+        }
+    }
+    fn sample_round(&mut self) {
+        if let Some(now) = refine_metrics::rss_bytes() {
+            self.peak = Some(self.peak.map_or(now, |p: i64| p.max(now)));
+        }
+    }
+}
+
+impl Drop for PhaseProbe {
+    fn drop(&mut self) {
+        refine_metrics::counter(
+            "refine_db_opens_total",
+            refine_store::pragma::reader_opens().saturating_sub(self.opens0),
+        );
+        if let (Some(start), Some(peak)) = (self.rss0, self.peak) {
+            refine_metrics::gauge("refine_prompt_rss_start_bytes", start);
+            refine_metrics::gauge("refine_prompt_rss_delta_bytes", (peak - start).max(0));
+        }
+    }
+}
+
 /// Execution knobs for `run_prompt_with`. Defaults = every existing caller's
 /// behavior (prompt/message/command/shell/abort paths unchanged).
 #[derive(Clone)]
@@ -320,15 +357,7 @@ pub async fn run_prompt(
 ) -> Result<(Value, Vec<Value>)> {
     let res = run_prompt_with(ctx, writer, session_id, payload, RunOpts::default()).await;
     match res {
-        Ok(out) => {
-            // K-TITLE: first turn on a default-titled session names it from
-            // the first user message (D-TITLE-1). run_prompt_with callers
-            // with auto_title=false (commands) bypass this wrapper entirely.
-            if RunOpts::default().auto_title {
-                auto_retag(ctx, writer, session_id);
-            }
-            Ok(out)
-        }
+        Ok(out) => Ok(out),
         Err(e) => {
             // K-AUTONOMY: no silent stops — durable session.error + a
             // [turn stopped] part + finalize + idle (any run failure: cap,
@@ -352,6 +381,20 @@ pub async fn run_prompt_with(
     // K-ALWAYS: one DB read pulls this session's persisted always-grants
     // into the gate (memory-first consult afterwards).
     ctx.gate.hydrate(&ctx.db, session_id)?;
+    // K-MODEL-STATE: resolved model+agent land at START (not finalize) —
+    // cap/OOM/abort deaths keep the selection sticky for the next
+    // payload-less send. Churn-free UPDATE (0 rows when unchanged).
+    refine_store::persist_prompt_model(
+        writer,
+        session_id,
+        &ctx.agent,
+        &json!({"id": ctx.model_id, "providerID": ctx.provider_id, "variant": "default"})
+            .to_string(),
+    )?;
+    // K-EFFICIENCY: RSS + reader-open probe — Drop-based so BAIL exits
+    // (cap/provider errors) emit too (tail-only emission missed them:
+    // proven by the cap e2e going red the first time).
+    let mut probe = PhaseProbe::start();
     // ONE reader answers seq + compaction state (audit fix: pre-M6 = two
     // opens per prompt; without this the round checks added two MORE cold
     // opens on the hottest path — COMPACTION §11 hot-path rule).
@@ -635,6 +678,9 @@ pub async fn run_prompt_with(
                     "turn exceeded {max_rounds} rounds (REFINE_PROMPT_MAX_ROUNDS — raise it or unset to disable)"
                 );
             }
+            // K-EFFICIENCY: one /proc read per LLM round finds WHICH phase
+            // of the turn grows (turn-spike attribution).
+            probe.sample_round();
             let started = Instant::now();
             // v1 parity: chat.params + chat.headers fire PER LLM request
             // (llm/request.ts:115/135) — tool-loop steps re-trigger, matching
@@ -1615,6 +1661,13 @@ pub async fn run_prompt_with(
         },
     )
     .context("finalize session prompt row")?;
+    // (rss/opens gauges emit from PhaseProbe::Drop — every exit path.)
+    // K-TITLE: auto-title only reached on success, and only for sessions
+    // STILL carrying a default title (preflight rides title — named
+    // sessions skip the first_user_text read entirely).
+    if opts.auto_title && final_out.is_some() && is_default_title(&pre.title) {
+        auto_retag(ctx, writer, session_id);
+    }
     let death_msg = death.unwrap_or_else(|| "prompt produced no assistant message".to_string());
     final_out.ok_or_else(|| anyhow::anyhow!("{death_msg}"))
 }
@@ -1676,6 +1729,12 @@ pub(crate) fn auto_title_from(text: &str) -> Option<String> {
         out.push('…');
     }
     Some(out)
+}
+
+/// Freeze default-title shapes (session.ts parentTitlePrefix + ISO, or the
+/// pre-fix empty title) — everything else is user-named (never retagged).
+pub(crate) fn is_default_title(title: &str) -> bool {
+    title.is_empty() || title.starts_with("New session - ")
 }
 
 /// K-TITLE: name a still-default session from its first user message.

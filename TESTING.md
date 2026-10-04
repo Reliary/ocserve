@@ -65,6 +65,13 @@ traceable test, every test has a traceable requirement.
    command flows excluded via `RunOpts.auto_title=false`). Default-title creation itself
    is freeze-parity, not a divergence.
 
+   **D-AGENT-MODEL (parked):** freeze resolves the compaction model as
+   `agent.model ?? userMessage.model` (compaction.ts:359-361); upstream prompts
+   also honor an agent's pinned `model`. refine never consults `agent.model` —
+   harmless while no configured agent pins a model (all current ones don't),
+   but a real divergence for pinned-agent configs. Parked with evidence; the
+   compaction-model *selection* itself (session model) already matches.
+
    **K-AUTONOMY failure class (silent stop):** background prompt failures were log-only
    (`prompt_async` logs + returns nothing downstream) — the run "just stopped". Every run
    error now finalizes state and emits durable `session.error` + a `[turn stopped]` text

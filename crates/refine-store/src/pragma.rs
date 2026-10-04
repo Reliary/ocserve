@@ -110,7 +110,15 @@ pub fn open_writer(path: &std::path::Path) -> Result<Connection> {
 }
 
 /// Open a read-only reader connection (STORAGE.md §2): ro URI + query_only + small cache.
+/// K-EFFICIENCY: reader-open accounting (core snapshots this per prompt).
+pub static READER_OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn reader_opens() -> u64 {
+    READER_OPENS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn open_reader(path: &std::path::Path) -> Result<Connection> {
+    READER_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     assert_version_ok()?;
     let uri = format!(
         "file:{}?mode=ro",

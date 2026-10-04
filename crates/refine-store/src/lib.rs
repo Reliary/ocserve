@@ -272,6 +272,9 @@ pub enum PreflightState {
 pub struct Preflight {
     pub seq: i64,
     pub state: PreflightState,
+    /// session title (K-TITLE efficiency: retag gate rides this read —
+    /// named sessions pay ZERO extra queries per prompt).
+    pub title: String,
 }
 
 pub fn compaction_preflight(db: &std::path::Path, session_id: &str) -> anyhow::Result<Preflight> {
@@ -281,6 +284,13 @@ pub fn compaction_preflight(db: &std::path::Path, session_id: &str) -> anyhow::R
         [session_id],
         |r| r.get(0),
     )?;
+    let title: String = conn
+        .query_row(
+            "SELECT title FROM session WHERE id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
     let rows = compaction_rows(&conn, session_id)?;
     if let Some(pending) = rows.iter().rev().find(|r| r.summary_msg_id.is_none()) {
         return Ok(Preflight {
@@ -290,6 +300,7 @@ pub fn compaction_preflight(db: &std::path::Path, session_id: &str) -> anyhow::R
                 auto: pending.auto,
                 overflow: pending.overflow,
             },
+            title,
         });
     }
     if !rows.is_empty() {
@@ -305,12 +316,14 @@ pub fn compaction_preflight(db: &std::path::Path, session_id: &str) -> anyhow::R
             return Ok(Preflight {
                 seq,
                 state: PreflightState::SummaryExit { info, parts },
+                title,
             });
         }
     }
     Ok(Preflight {
         seq,
         state: PreflightState::Ready,
+        title,
     })
 }
 
@@ -1008,6 +1021,23 @@ pub fn update_session_title(
 
 // ---- K-ALWAYS / K-TITLE / K-AUTONOMY: session permission persistence,
 // default-title retag, first-user-text extraction, turn-stop surfacing ----
+
+/// K-MODEL-STATE: persist resolved (agent, model) at PROMPT START —
+/// survives cap/OOM/abort deaths that never reach finalize (the "model
+/// reverts" bug). Churn-free: identical values affect 0 rows.
+pub fn persist_prompt_model(
+    writer: &Writer,
+    session_id: &str,
+    agent: &str,
+    model_json: &str,
+) -> anyhow::Result<usize> {
+    writer.write(vec![WriteOp::Sql {
+        sql: "UPDATE session SET agent = ?2, model = ?3 \
+              WHERE id = ?1 AND (agent IS NOT ?2 OR model IS NOT ?3)"
+            .into(),
+        params: vec![session_id.into(), agent.into(), model_json.into()],
+    }])
+}
 
 /// Persisted "always" permission keys for a session (column `permission`,
 /// JSON array of the gate's `"<permission>:<resource>"` keys). Missing row
