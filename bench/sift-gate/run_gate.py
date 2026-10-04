@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import statistics
+import signal
 import subprocess
 import sys
 import threading
@@ -122,6 +123,7 @@ def boot(port: int, cwd: str, data_dir: str, sift: bool):
     proc = subprocess.Popen(
         [REFINE, "serve", "--port", str(port)],
         cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT,
+        start_new_session=True,  # own group → stop() can killpg the tree
     )
     return proc, log
 
@@ -141,11 +143,19 @@ def wait_health(port: int, proc, timeout=25.0) -> bool:
 
 def stop(proc, log):
     if proc.poll() is None:
-        proc.terminate()
+        # kill the whole GROUP — terminate() alone left refine's plugin-host
+        # node child orphaned (census 2026-10-04: 34 hosts / 717MB wasted).
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.terminate()
         try:
             proc.wait(timeout=5)
         except Exception:
-            proc.kill()
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.kill()
     try:
         log.close()
     except Exception:

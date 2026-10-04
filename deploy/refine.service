@@ -14,9 +14,8 @@ ExecStart=%h/src/refine/target/release/refine serve --port 4912
 WorkingDirectory=%h/src/refine
 Environment=REFINE_DATA_DIR=%h/.local/share/refine
 Environment=RUST_LOG=refine=info
-Environment=MIMALLOC_PURGE_DELAY=100
-Environment=MIMALLOC_PAGE_RESET=1
-Environment=MIMALLOC_ARENA_EAGER_COMMIT=0
+# MIMALLOC_* env removed 2026-10-04: no allocator is linked (dead config).
+# Re-add with real allocator wiring if/when profiling justifies it.
 Restart=on-failure
 RestartSec=5
 # Combined cgroup budget: refine ≤300MB + node plugin sidecar ≤160MB +

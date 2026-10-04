@@ -23,14 +23,24 @@ SELF_TEST=0
 DATA="$(mktemp -d "${TMPDIR:-/tmp}/refine-replay-check.XXXXXX")"
 CORPUS_COPY=""
 cleanup() {
-  [ -n "${PID:-}" ] && kill "$PID" 2>/dev/null || true
+  # Kill the PROCESS GROUP (spawned via setsid) — refine's plugin-host node
+  # child dies with it. Plain $PID kill orphaned 34 node hosts / 717MB over
+  # repeated runs (census 2026-10-04).
+  if [ -n "${PID:-}" ]; then
+    kill -- "-$PID" 2>/dev/null || kill "$PID" 2>/dev/null || true
+    wait "$PID" 2>/dev/null || true
+  fi
   [ -n "${CORPUS_COPY:-}" ] && rm -rf "$CORPUS_COPY"
   rm -rf "$DATA"
 }
 trap cleanup EXIT
+# Hygiene: sweep stale replay plugin-hosts from prior crashed runs (the
+# /tmp/refine-repl prefix is refine-plugin's throwaway host dir — never a
+# production path).
+pkill -f "/tmp/refine-repl" 2>/dev/null || true
 
-REFINE_DATA_DIR="$DATA" REFINE_LEGACY_SYNC=0 "$BIN" serve --port "$PORT" \
-  >/dev/null 2>&1 &
+setsid env REFINE_DATA_DIR="$DATA" REFINE_LEGACY_SYNC=0 "$BIN" serve \
+  --port "$PORT" >/dev/null 2>&1 &
 PID=$!
 
 ready() {

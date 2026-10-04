@@ -16,9 +16,9 @@ that alone exceeds the entire budget. Corrected line items:
 | tokio: 8 workers × 1 MB stacks + blocking pool 8 × 1 MB | 16 MB | `thread_stack_size(1MB)`, `max_blocking_threads(8)` |
 | hyper/reqwest/rustls: ≤16 pooled conns | 12 MB | `pool_max_idle_per_host(4)`, `pool_idle_timeout`, global conn semaphore |
 | SSE fanout: bounded per-subscriber ring (4096 events × ~300 B avg) + disk spill pointer | 2 MB | `broadcast` capacity bound; overflow policy below |
-| ~~rquickjs isolates~~ → **rejected at gate** (PLAN §10 gate result); Node sidecar lives *outside* this budget | 0 MB | child RSS scraped via `rss_bytes{component="sidecar"}` (≤80 MB target) |
+| ~~rquickjs isolates~~ → **rejected at gate** (PLAN §10 gate result); Node sidecar lives *outside* this budget | 0 MB | child RSS scraped via `refine_sidecar_rss_bytes` (160 MB hard cap; measured 106 MB live 2026-10-04) |
 | zstd/sha256/import chunk buffers (≤1 MB × 2 concurrent) | 12 MB | fixed-size buffer pool, `BytesMut` reuse |
-| Allocator retention headroom (mimalloc purge) | 25 MB | `MIMALLOC_PURGE_DELAY=500` |
+| Allocator retention headroom | (unmeasured) | **glibc/system allocator — the old "mimalloc purge / MIMALLOC_PURGE_DELAY=500" row was FALSE (no `#[global_allocator]` exists in any crate; corrected 2026-10-04).** Wiring-vs-adopt decision deferred to bytehound profiling (phase 1); retention watched via soak `rss_delta` columns |
 | **Unallocated headroom** | **~146 MB** | absorbs spikes; soak asserts the *slope*, not the peak |
 | **Total** | **300 MB** | |
 
@@ -31,7 +31,11 @@ baseline 40 MB (`--max-old-space-size=64 --max-semi-space-size=2`, isolated prob
 context-mode 59 MB, reliary8 54 MB alone) → **146 MB combined sidecar steady-state**,
 uncapped same configuration was 148 MB (the heap cap contains growth, not baseline).
 Live cgroup series under load (release build, systemd unit): **steady 341-347 MB**
-(refine + sidecar together). A first-run long generation burst tripped a 480M cap →
+(refine + sidecar together). **Orphan incident (2026-10-04): replay/gate tooling left 34
+plugin-host nodes / 717 MB orphaned when the parent refine exited without reaping —
+fixed in the tooling (setsid + group-kill in `replay-check.sh`, `start_new_session` +
+killpg in `run_gate.py`); service-side reap-on-exit ships with phase 1.**
+A first-run long generation burst tripped a 480M cap →
 systemd oom-kill → clean restart; the unit cap was raised to **600M** with the
 margin documented in `deploy/refine.service` (fail-fast worked; the cap was tight
 for allocator page retention during delta bursts).
@@ -54,12 +58,21 @@ loads lazily).
 
 ## 2. Global allocator
 
-- **mimalloc** (`#[global_allocator] mimalloc::MiMalloc`) — matches both tuned repos
-  (`reliary8/main.rs:5-6`, `stria/main.rs:1-2`), eager page purge is the point: freed pages
-  return to the OS on a timer instead of arena hoarding (glibc default: never).
-- `MIMALLOC_PURGE_DELAY=500`, `MIMALLOC_ARENA_EAGER_COMMIT=0` set in the systemd unit.
-- Never rely on `malloc_trim` / glibc returning memory; if profiling is ever needed, the
-  jemalloc profile build is an opt-in feature flag, not the default.
+- **glibc/system allocator (FACT, 2026-10-04)** — `grep -rn "global_allocator|mimalloc"`
+  across every crate: **no `#[global_allocator]` exists**. The previous claim that mimalloc
+  was wired "like reliary8/stria" was a false status label (their main.rs lines are real;
+  ours never landed). Behavior today = glibc malloc (arena hoarding possible; the
+  step-function RSS retention seen in the 2026-10-04 morning soak predates the drain fix
+  and must be re-measured before any allocator choice). **Decision deferred to bytehound
+  profiling (phase 1): wire mimalloc as designed, or adopt glibc honestly and delete the
+  aspiration.** Either way the unit's dead `MIMALLOC_*` env is removed until then.
+- ~~`MIMALLOC_*` env lines in the unit~~ — **dead config until an allocator is
+  actually linked**: no `#[global_allocator]` exists, so the unit's env never
+  reached an allocator (corrected 2026-10-04; lines removed from the unit,
+  allocator wiring decision = phase 1 profiling output).
+- Never rely on `malloc_trim` / glibc returning memory. Profiling = bytehound via
+  LD_PRELOAD against glibc (works today, no code change); a jemalloc-profile build
+  feature does NOT exist yet — do not reference it as if it does.
 
 ## 3. Tokio runtime (explicit, not defaults)
 
@@ -94,7 +107,7 @@ tokio::runtime::Builder::new_multi_thread()
 
 - `/proc/self/status` VmRSS polled every 10 s into `rss_bytes` gauge; per-phase markers
   (`boot`, `import`, `steady`, `soak`).
-- Import KPI measured as: import → idle 10 min → RSS ≤ steady budget (mimalloc purge has run;
+- Import KPI measured as: import → idle 10 min → RSS ≤ steady budget (allocator purge/decay observed;
   raw peak during import may transiently exceed — reported separately as `rss_peak_bytes`).
 - CI soak gate (10 min accelerated per PR; 24 h nightly):
   - every sample < 300 MB; `VmSwap` == 0; slope after hour 1 < 1 MB/h;
@@ -109,3 +122,30 @@ tokio::runtime::Builder::new_multi_thread()
 3. No `SELECT *` on parts/events; range reads only (`substr` windows / `blob_open`).
 4. Every channel bounded; every cache capped; every pool sized; documented in code next to
    the bound (a bound that isn't named is a bug waiting to happen).
+
+## 7. Phase-1 backlog (after the 24 h soak gate) + phase-0 profile
+
+Phase-0 evidence: `bench/profiling/REPORT.md` (bytehound over glibc, debug
+build, 40 s mixed load — **4.48M allocs / 99.5% churn**, top groups =
+per-fetch SQLite pcache in `get_messages` + `serde_json::to_string` frame
+building). Ordered by measured leverage:
+
+1. **Reused serialization buffers** — `/message` frames + prompt request
+   bodies via `to_writer` into per-thread `Vec<u8>` (kills the #2 group;
+   no new deps).
+2. **Reader-connection reuse** (thread-local) — kills per-fetch pcache
+   alloc churn (group #1); allocation argument, not a latency guess.
+3. **History byte budget** at prompt build (tail-weighted like compaction's
+   `COMPACTION_CONVERSATION_MAX_BYTES`; `to_provider_messages` is currently
+   UNBOUNDED and messages are never pruned — the real scale hole for
+   thousands-of-sessions × tens-concurrent).
+4. **Service-side plugin-host reap-on-exit** (tooling-side group-kill already
+   shipped; systemd cgroup covers OOM; this covers clean exits everywhere).
+5. **Allocator decision** — glibc adopted honestly (§2); wire mimalloc ONLY
+   if the post-fix soak still shows step-retention (pre-fix morning soak
+   had +76/+58 MB steps — unproven after the drain fix).
+6. Gauges: `refine_db_bytes`, opencode-mirror RSS column in soak (native
+   opencode = the future-usage ceiling model, currently ~1.7 GB RSS).
+7. Per-prompt rss_delta stays last-prompt-honest (concurrent prompts
+   contaminate it — documented, not "fixed" by bucketing).
+

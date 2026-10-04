@@ -109,7 +109,9 @@ only with a before/after number on the bench gate.
 
 - **systemd unit** (`~/.config/systemd/user/refine.service`): `MemoryMax=300M`,
   `MemorySwapMax=0` (fail-fast over swap), `Restart=on-failure`, `RestartSec=5`,
-  `Environment=MIMALLOC_PURGE_DELAY=500 RUST_LOG=refine=info`, hardening
+  `Environment=RUST_LOG=refine=info` (MIMALLOC_* lines removed 2026-10-04 —
+  dead without a linked allocator; re-added only if profiling justifies wiring
+  one), hardening
   (`ProtectSystem=strict`, `ReadWritePaths` on data dir, `NoNewPrivileges`).
 - **Release profile** (matches reliary8/stria): `lto="fat"`, `codegen-units=1`,
   `opt-level=3`, `panic="abort"`, `strip=true`; **binary size ceiling 10,485,760 B
