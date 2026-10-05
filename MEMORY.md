@@ -43,6 +43,17 @@ The original ≤80 MB target is **not achievable with these artifacts** on any s
 node process; boundary set to measured + headroom: sidecar **hard cap 160 MB** (systemd
 `MemoryMax` in the unit), combined refine+sidecar budget **460 MB**.
 
+**Bun runtime (2026-10-05, TI-86 pass):** the plugin host now prefers **bun**
+(`~/.bun/bin/bun --smol`; upstream's own plugin runtime — real `bun:sqlite`, native
+hash/crypto, TS plugins load without the Node loader shim). `REFINE_PLUGIN_RUNTIME=node`
+forces the old path (lab A/B control); Node remains the fallback when bun is absent.
+**Live A/B with the same 3 configured plugins, same box:** sidecar RSS bun **87 MB**
+vs node **138 MB**; cgroup **241 MB** vs **378 MB**. Hook dispatch verified under bun
+end-to-end (chat.message ×2, messages/system transform, text.complete ×2; live prompt
+answered). The 160 MB cap and 460 MB combined budget stand; the measured bun steady
+state is the new boundary datum. Node 128 MB heap cap no longer applies under bun
+(`--smol` instead); `REFINE_PLUGIN_HEAP_MB` is the Node-fallback knob.
+
 **OOM postmortem (2026-10-05, kernel memcg kills ×6: 10:36/11:16/12:20/14:12/15:12/16:05):**
 the *unit* cap is what binds (main + ALL children), and the measured warm daytime
 composition blew past the old budget: **main ≈ 487 MB (flat plateau) + plugin host ≈

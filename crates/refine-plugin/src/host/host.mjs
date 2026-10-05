@@ -9,22 +9,27 @@
  * redirected to stderr so a chatty plugin cannot corrupt framing.
  */
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { register, createRequire } from "node:module";
-import Module from "node:module";
+import { createRequire } from "node:module";
 
-register("./bun-sqlite-loader.mjs", import.meta.url);
-
-// CJS path for `require("bun:sqlite")` (context-mode does this when
-// globalThis.Bun exists) + truthy Bun so plugins take their bun branches
-// (they were written for the Bun runtime upstream runs under).
+// Runtime detection: under real Bun (upstream's runtime, preferred) the
+// native surface exists — no shims needed. Under Node we install the Bun
+// emulation: module hooks for `bun:sqlite` (node:sqlite-backed) and a
+// truthy `globalThis.Bun` marker so plugins take their bun branches.
+const IS_BUN = typeof globalThis.Bun !== "undefined" && typeof Bun.version === "string";
 const hostRequire = createRequire(import.meta.url);
-const shimCjs = fileURLToPath(new URL("./shim-bun-sqlite.cjs", import.meta.url));
-const origResolve = Module._resolveFilename;
-Module._resolveFilename = function (request, ...rest) {
-  if (request === "bun:sqlite") return shimCjs;
-  return origResolve.call(this, request, ...rest);
-};
-globalThis.Bun = Object.freeze({
+
+if (!IS_BUN) {
+  const { register } = await import("node:module");
+  const Module = (await import("node:module")).default;
+  register("./bun-sqlite-loader.mjs", import.meta.url);
+  const shimCjs = fileURLToPath(new URL("./shim-bun-sqlite.cjs", import.meta.url));
+  const origResolve = Module._resolveFilename;
+  Module._resolveFilename = function (request, ...rest) {
+    if (request === "bun:sqlite") return shimCjs;
+    return origResolve.call(this, request, ...rest);
+  };
+}
+if (!IS_BUN) globalThis.Bun = Object.freeze({
   // Minimal marker: plugins branch on truthiness. Deliberately NO $ / sqlite /
   // filesystem surface — divergence documented in refine-plugin docs.
   // `hash`: real Bun.hash surface used by plugins (magic-context

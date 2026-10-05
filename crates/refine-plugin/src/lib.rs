@@ -153,6 +153,57 @@ pub struct Sidecar {
 /// Kept identical in refine-mcp + refine-plugin (no shared dep) — A3.
 pub const OOM_CHILD_WRAPPER: &str = r#"echo 500 >/proc/self/oom_score_adj 2>/dev/null; exec "$@""#;
 
+/// Plugin-host runtime: Bun preferred (upstream runs plugins under Bun; real
+/// `bun:sqlite`, TS plugins load, lower RSS floor), Node fallback.
+/// `REFINE_PLUGIN_RUNTIME=node|bun` forces one (lab A/B control).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginRuntime {
+    Bun,
+    Node,
+}
+
+impl PluginRuntime {
+    pub fn program(self) -> &'static str {
+        match self {
+            PluginRuntime::Bun => "bun",
+            PluginRuntime::Node => "node",
+        }
+    }
+}
+
+/// Resolve an executable on PATH plus `~/.bun/bin` (the common user-local
+/// bun install location — systemd units do not see shell PATH extras).
+pub(crate) fn which(prog: &str) -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let cand = dir.join(prog);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let cand = Path::new(&home).join(".bun/bin").join(prog);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+pub fn plugin_runtime() -> PluginRuntime {
+    match std::env::var("REFINE_PLUGIN_RUNTIME").as_deref() {
+        Ok("node") => return PluginRuntime::Node,
+        Ok("bun") => return PluginRuntime::Bun,
+        _ => {}
+    }
+    if which("bun").is_some() {
+        PluginRuntime::Bun
+    } else {
+        PluginRuntime::Node
+    }
+}
+
 #[derive(Clone)]
 struct SpawnArgs {
     host_path: PathBuf,
@@ -165,32 +216,49 @@ impl Sidecar {
         // A3 (OOM-resilience): same wrapper as refine-mcp — the plugin host
         // dies first on memcg pressure (ensure_alive respawns it) instead
         // of the main service.
-        let mut child = Command::new("sh")
-            .arg("-c")
+        let runtime = crate::plugin_runtime();
+        // absolute path (systemd PATH may lack ~/.bun/bin); fall back to the
+        // bare name so a PATH-only environment still resolves
+        let program = which(runtime.program())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| runtime.program().to_string());
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
             .arg(crate::OOM_CHILD_WRAPPER)
             .arg("sh")
-            .arg("node")
-            // MEMORY.md sidecar boundary: V8 heap cap (env-tunable). Default
-            // raised64→128 after the LIVE battery (2026-10-03): with the real
-            // plugin set the sidecar OOM-killed at64 (observed boot death →
-            // hooks broken-piped until restart). Measured 64/128/192/256:
-            // RSS flat ~145-148MB either way (native dominates; heap cap
-            // only binds when heap actually grows).
-            .arg(format!(
-                "--max-old-space-size={}",
-                std::env::var("REFINE_PLUGIN_HEAP_MB")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(128)
-            ))
-            .arg("--max-semi-space-size=2")
-            .arg(host_path)
+            .arg(&program);
+        match runtime {
+            // Bun (upstream's own plugin runtime): real bun:sqlite + TS
+            // plugins load; `--smol` trades GC frequency for a lower RSS
+            // floor. No V8 --max-old-space knobs exist here.
+            PluginRuntime::Bun => {
+                cmd.arg("--smol");
+            }
+            // Node (fallback when bun is absent): V8 heap cap (env-tunable).
+            // Default raised64→128 after the LIVE battery (2026-10-03): with
+            // the real plugin set the sidecar OOM-killed at64 (observed boot
+            // death → hooks broken-piped until restart). Measured
+            // 64/128/192/256: RSS flat ~145-148MB either way (native
+            // dominates; heap cap only binds when heap actually grows).
+            PluginRuntime::Node => {
+                cmd.arg(format!(
+                    "--max-old-space-size={}",
+                    std::env::var("REFINE_PLUGIN_HEAP_MB")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(128)
+                ));
+                cmd.arg("--max-semi-space-size=2");
+            }
+        }
+        cmd.arg(host_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        let mut child = cmd
             .spawn()
-            .context("spawn node plugin host")?;
+            .with_context(|| format!("spawn {} plugin host", runtime.program()))?;
         let stdin = child.stdin.take().context("host stdin")?;
         let stdout = child.stdout.take().context("host stdout")?;
         let pending = Arc::new(parking_lot::Mutex::new(HashMap::<i64, Pending>::new()));
@@ -439,8 +507,11 @@ mod tests {
 
     #[tokio::test]
     async fn sidecar_load_trigger_roundtrip() -> anyhow::Result<()> {
-        if which_node().is_none() {
-            panic!("node binary required for plugin-host tests (M4b environment gate)");
+        if !runtime_available() {
+            panic!(
+                "plugin-runtime binary ({}) required for plugin-host tests (M4b environment gate)",
+                crate::plugin_runtime().program()
+            );
         }
         let dir = tempfile::tempdir().unwrap();
         // synthetic v1 plugin: PluginModule.server factory + mutating hook
@@ -530,8 +601,11 @@ export default PluginModule.server;
 
     #[tokio::test]
     async fn sidecar_respawns_after_death_and_reloads_plugins() -> anyhow::Result<()> {
-        if which_node().is_none() {
-            panic!("node binary required for plugin-host tests (M4b environment gate)");
+        if !runtime_available() {
+            panic!(
+                "plugin-runtime binary ({}) required for plugin-host tests (M4b environment gate)",
+                crate::plugin_runtime().program()
+            );
         }
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -578,13 +652,47 @@ export default PluginModule.server;
         Ok(())
     }
 
-    fn which_node() -> Option<()> {
-        std::process::Command::new("node")
-            .arg("--version")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|_| ())
+    /// Test environment gate: the ACTUAL runtime (bun preferred) must exist.
+    fn runtime_available() -> bool {
+        crate::which(crate::plugin_runtime().program()).is_some()
+    }
+}
+
+#[cfg(test)]
+mod runtime_selection_tests {
+    /// `REFINE_PLUGIN_RUNTIME` forces the runtime (lab A/B control);
+    /// unset/unknown → bun-if-present else node. Env is process-local and
+    /// restored (this file is the only env mutator in its own process).
+    #[test]
+    fn runtime_override_and_default_preference() {
+        let has_bun = crate::which("bun").is_some();
+        let has_node = crate::which("node").is_some();
+        if !has_node {
+            panic!("node required for the fallback leg (test environment gate)");
+        }
+
+        // SAFETY: single-threaded env mutation, restored below.
+        unsafe { std::env::set_var("REFINE_PLUGIN_RUNTIME", "node") };
+        assert_eq!(crate::plugin_runtime(), crate::PluginRuntime::Node);
+
+        if has_bun {
+            unsafe { std::env::set_var("REFINE_PLUGIN_RUNTIME", "bun") };
+            assert_eq!(crate::plugin_runtime(), crate::PluginRuntime::Bun);
+            unsafe { std::env::remove_var("REFINE_PLUGIN_RUNTIME") };
+            assert_eq!(
+                crate::plugin_runtime(),
+                crate::PluginRuntime::Bun,
+                "bun present + no override → bun preferred (upstream fidelity)"
+            );
+        } else {
+            unsafe { std::env::remove_var("REFINE_PLUGIN_RUNTIME") };
+            assert_eq!(crate::plugin_runtime(), crate::PluginRuntime::Node);
+        }
+
+        // unknown value falls through to preference, never panics
+        unsafe { std::env::set_var("REFINE_PLUGIN_RUNTIME", "deno") };
+        let _ = crate::plugin_runtime();
+        unsafe { std::env::remove_var("REFINE_PLUGIN_RUNTIME") };
     }
 }
 
