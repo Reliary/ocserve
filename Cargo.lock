@@ -1175,6 +1175,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
+ "refine-metrics",
  "reqwest",
  "serde",
  "serde_json",

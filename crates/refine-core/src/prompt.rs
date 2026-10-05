@@ -832,6 +832,17 @@ pub async fn run_prompt_with(
                             .collect()
                     })
                     .unwrap_or_default(),
+                tool_choice: crate::zen::tool_choice_for(client.is_zen(), opts.tools_enabled),
+            };
+            // zen gate: text-only rounds still send a tools array (P6 fails
+            // without it), with tool_choice none (P8) — see zen.rs.
+            let zen_fallback_tools =
+                crate::zen::needs_fallback_tools(client.is_zen(), opts.tools_enabled)
+                    .then(refine_tools::schemas);
+            let tools_arg = if opts.tools_enabled {
+                Some(&tools[..])
+            } else {
+                zen_fallback_tools.as_deref()
             };
             let mut llm_ttft: Option<std::time::Duration> = None;
             let mut text = String::new();
@@ -845,17 +856,7 @@ pub async fn run_prompt_with(
             // stage must fail, never hang busy (A3).
             let mut stream = match tokio::time::timeout(
                 provider_stall(),
-                client.chat_stream(
-                    &model,
-                    &messages,
-                    &copts,
-                    if opts.tools_enabled {
-                        Some(&tools)
-                    } else {
-                        None
-                    },
-                    Some(session_id),
-                ),
+                client.chat_stream(&model, &messages, &copts, tools_arg, Some(session_id)),
             )
             .await
             {

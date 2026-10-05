@@ -331,20 +331,33 @@ pub(crate) fn pick_default_model(
 
 /// B2 (K-MODEL-STATE): opencode public-tier endpoint — freeze
 /// provider.ts:185-240. Key precedence: env OPENCODE_API_KEY → config
-/// options.apiKey → auth.json key → literal "public". Base URL = the
-/// models-cache `api` field (models.dev: https://opencode.ai/zen/v1).
+/// options.apiKey → auth.json key → **literal "public" (keyless)**.
+/// Base URL = the models-cache `api` field (models.dev:
+/// https://opencode.ai/zen/v1).
+///
+/// The 2026-10-04 "public tier is dead" verdict was WRONG — our probe was
+/// malformed (missing composite UA + tools array). Proven 2026-10-05 by
+/// `bench/zen-probe` (FINDINGS: P5 = exact refine wire completes 200;
+/// P7 = same minus UA fails; P6 = no tools fails; P8 = tools+none passes).
+/// Keyless now installs with `Bearer public`; `REFINE_ZEN_KEYLESS=0`
+/// restores the pre-port behavior (no keyless endpoint → deepseek default).
 pub(crate) fn opencode_public_endpoint(
     cfg: &Value,
     auth: &Value,
     cache: &Value,
 ) -> Option<(String, String)> {
-    // REAL key only: the freeze-era public tier is dead — live-tested
-    // 2026-10-04, zen answers 403 FreeTierError ("free tier can only be
-    // used from within OpenCode") for `Bearer public` on big-pickle AND
-    // *-free models. A keyless endpoint here would make the DEFAULT a 403;
-    // without it pick_default_model falls through to the next servable
-    // state-recent entry (honest WARN included). A real OPENCODE_API_KEY
-    // (env/config/auth) restores the big-pickle default by construction.
+    let keyless = !matches!(std::env::var("REFINE_ZEN_KEYLESS").as_deref(), Ok("0"));
+    opencode_public_endpoint_inner(cfg, auth, cache, keyless)
+}
+
+/// Pure core (no env — unit tests pass the kill-switch state directly so
+/// parallel tests never race on process env).
+pub(crate) fn opencode_public_endpoint_inner(
+    cfg: &Value,
+    auth: &Value,
+    cache: &Value,
+    keyless_enabled: bool,
+) -> Option<(String, String)> {
     let key = std::env::var("OPENCODE_API_KEY")
         .ok()
         .filter(|v| !v.is_empty())
@@ -359,12 +372,18 @@ pub(crate) fn opencode_public_endpoint(
                 .and_then(|v| v.as_str())
                 .filter(|v| !v.is_empty())
                 .map(String::from)
-        })?;
+        });
     let base = cache
         .pointer("/opencode/api")
         .and_then(|v| v.as_str())
         .map(String::from)?;
-    Some((base, key))
+    match key {
+        Some(k) => Some((base, k)),
+        // keyless free tier: discriminator headers ride in refine-llm
+        // (composite UA) and refine-core (tools array) — FINDINGS P5/P8.
+        None if keyless_enabled => Some((base, "public".to_string())),
+        None => None,
+    }
 }
 
 /// B2 (freeze provider.ts:196-201): keyless opencode keeps ONLY free
@@ -1129,6 +1148,36 @@ mod tests {
         );
     }
 
+    /// The port's payoff (K-MODEL-STATE): keyless zen endpoint installs →
+    /// state recent[0] = opencode/big-pickle is SERVABLE → default by
+    /// construction (user-confirmed target). Companion to the skip test
+    /// above: same state, endpoint present instead of absent.
+    #[test]
+    fn keyless_zen_endpoint_makes_big_pickle_servable_default() {
+        let state = serde_json::json!({
+            "recent": [{"providerID": "opencode", "modelID": "big-pickle"}]
+        });
+        let cache = serde_json::json!({"opencode": {"api": "https://opencode.ai/zen/v1"}});
+        let (base, key) = opencode_public_endpoint_inner(
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            &cache,
+            true,
+        )
+        .expect("keyless zen installs");
+        assert_eq!(key, "public");
+        let mut eps = endpoints(&["opencode"]);
+        eps.insert("opencode".to_string(), (base, key));
+        let cp = serde_json::json!({
+            "providers": [{"id": "opencode", "models": {"big-pickle": {}}}]
+        });
+        assert_eq!(
+            pick_default_model(&state, &serde_json::json!({}), &cp, &eps),
+            ("opencode".to_string(), "big-pickle".to_string()),
+            "keyless endpoint present → recent[0] big-pickle is the default"
+        );
+    }
+
     #[test]
     fn default_model_skips_uncatalogued_state_entries() {
         // the first fix's miss: openrouter HAS an endpoint but
@@ -1289,21 +1338,25 @@ mod b2_public_tier_tests {
     use super::*;
 
     #[test]
-    fn opencode_endpoint_requires_a_real_key_keyless_is_none() {
+    fn opencode_endpoint_keyless_public_by_default_and_kill_switch_reverts() {
         let cfg = json!({});
         let auth = json!({});
         let cache = json!({"opencode": {"api": "https://opencode.ai/zen/v1"}});
         assert_eq!(
-            opencode_public_endpoint(&cfg, &auth, &cache),
+            opencode_public_endpoint_inner(&cfg, &auth, &cache, true),
+            Some(("https://opencode.ai/zen/v1".into(), "public".into())),
+            "keyless zen installs (FINDINGS P5: exact refine wire completes 200)"
+        );
+        assert_eq!(
+            opencode_public_endpoint_inner(&cfg, &auth, &cache, false),
             None,
-            "keyless zen = 403 FreeTierError live-tested 2026-10-04 — \
-             a keyless endpoint would make the DEFAULT a 403"
+            "REFINE_ZEN_KEYLESS=0 restores the pre-port no-endpoint behavior"
         );
         let cfg_key = json!({"provider": {"opencode": {"options": {"apiKey": "real-key"}}}});
         assert_eq!(
-            opencode_public_endpoint(&cfg_key, &auth, &cache),
+            opencode_public_endpoint_inner(&cfg_key, &auth, &cache, true),
             Some(("https://opencode.ai/zen/v1".into(), "real-key".into())),
-            "real key → endpoint (big-pickle default by construction)"
+            "real key still wins over keyless"
         );
     }
 

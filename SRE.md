@@ -90,6 +90,15 @@ hard cap only — failure is surfaced, never silent) and `REFINE_PROMPT_MAX_COST
 have kill-criteria tests (`autonomy.rs`) and the bound lives on dollars/visibility,
 not on a magic round count.
 
+Provider knob — `REFINE_ZEN_KEYLESS` (default **on**): keyless opencode zen
+endpoint (`Bearer public` + the proven discriminator wire — composite UA,
+native session id, ≥2 known tool names; evidence ledger
+`bench/zen-probe/FINDINGS.md` P5/P7/P8 + B1–B7). `REFINE_ZEN_KEYLESS=0`
+restores the pre-port behavior (no keyless endpoint → deepseek fallback
+default). Gate flips increment `refine_zen_freetier_total` and are checked
+nightly by the live trio (`crates/refine-llm/tests/zen_live.rs`: positive /
+text-only / negative — the negative proves the wall still exists).
+
 ## 4. CPU: measure first, specialize second
 
 **Justified per-arch work:**

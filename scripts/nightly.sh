@@ -95,7 +95,14 @@ size_gate() {
 }
 step "binary size ceiling" bash -c "$(declare -f size_gate); size_gate"
 
-# 6. mutants (opt-in): survivor report is triaged like a defect (TESTING §9)
+# 6. zen free-tier gate (live trio, 3 requests): positive + text-only
+#    (compaction shape) + negative (malformed session id — proves the wall
+#    still exists). Evidence ledger: bench/zen-probe/FINDINGS.md; production
+#    counts flips via refine_zen_freetier_total (K-MODEL-STATE).
+step "zen free-tier gate (live trio)" \
+  cargo test -p refine-llm --test zen_live -- --ignored
+
+# 7. mutants (opt-in): survivor report is triaged like a defect (TESTING §9)
 if [ "$WITH_MUTANTS" = "1" ]; then
   if command -v cargo-mutants >/dev/null 2>&1; then
     # skip the 50s fuzz (per-mutant cost) — mutants target store/core logic

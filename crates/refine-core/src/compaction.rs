@@ -248,6 +248,7 @@ async fn request_hooks(
                     .collect()
             })
             .unwrap_or_default(),
+        tool_choice: None, // set at the call site — needs client.is_zen()
     }
 }
 
@@ -498,10 +499,25 @@ pub async fn process(
     )
     .await;
     let client = Client::new(ctx.endpoint.base_url.clone(), ctx.endpoint.api_key.clone());
+    // zen gate: summaries are text-only but the free-tier wall still
+    // requires a tools array (P6 fails without it; P8 = tools + none) —
+    // see zen.rs.
+    let mut copts = copts;
+    if let Some(tc) = crate::zen::tool_choice_for(client.is_zen(), false) {
+        copts.tool_choice = Some(tc);
+    }
+    let zen_fallback_tools =
+        crate::zen::needs_fallback_tools(client.is_zen(), false).then(refine_tools::schemas);
     let started = std::time::Instant::now();
     let stream_res = tokio::time::timeout(
         provider_stall(),
-        client.chat_stream(&ctx.model_id, &messages, &copts, None, Some(session_id)),
+        client.chat_stream(
+            &ctx.model_id,
+            &messages,
+            &copts,
+            zen_fallback_tools.as_deref(),
+            Some(session_id),
+        ),
     )
     .await;
     let mut stream = match stream_res {

@@ -374,6 +374,11 @@ pub struct ChatOpts {
     /// Extra headers from chat.headers. Invalid names/values are skipped
     /// with a warning — a misbehaving plugin can never break the request.
     pub headers: Vec<(String, String)>,
+    /// Explicit `tool_choice` for requests that carry tools (default
+    /// "auto"). Zen text-only calls (compaction, tools-off rounds) set
+    /// "none": the free-tier gate requires a tools array (probe P8) but
+    /// summarization must never emit tool calls (bench/zen-probe FINDINGS).
+    pub tool_choice: Option<String>,
 }
 
 /// Build the OpenAI-compatible chat request body.
@@ -412,7 +417,10 @@ pub fn build_request(
         && !t.is_empty()
     {
         body["tools"] = serde_json::to_value(t).expect("tools serialize");
-        body["tool_choice"] = json!("auto");
+        body["tool_choice"] = match &opts.tool_choice {
+            Some(tc) => Value::String(tc.clone()),
+            None => json!("auto"),
+        };
     }
     body
 }
@@ -424,6 +432,12 @@ pub struct Client {
     api_key: String,
 }
 
+/// Free-tier zen gate (bench/zen-probe/FINDINGS: probes P5 vs P7 — the
+/// composite UA is load-bearing; the client/project/request headers are not).
+/// Sent ONLY on `opencode.ai` bases; other providers keep reqwest's default.
+pub const ZEN_FREE_TIER_UA: &str =
+    "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
+
 impl Client {
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
@@ -431,6 +445,14 @@ impl Client {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
         }
+    }
+
+    /// opencode.ai endpoint (zen free tier or opencode-go gateway).
+    /// The free-tier gate requires the composite UA on every request and a
+    /// `tools` array in the body (FINDINGS: P5/P6/P7/P8) — callers shape
+    /// text-only requests (compaction / tools-off rounds) with this.
+    pub fn is_zen(&self) -> bool {
+        self.base_url.contains("opencode.ai")
     }
 
     /// POST /chat/completions (stream) → boxed stream of parsed events.
@@ -459,6 +481,16 @@ impl Client {
                 Err(_) => tracing::warn!("chat.headers: invalid header name {k:?}"),
             }
         }
+        // zen free-tier gate: composite UA is load-bearing (P5 passes with
+        // it, P7 fails without — FINDINGS). Plugin-set UA wins if present.
+        if self.is_zen()
+            && !opts
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+        {
+            req = req.header("user-agent", ZEN_FREE_TIER_UA);
+        }
         // opencode-go gateway requires it for routing (live 400:
         // MissingSessionID — user's oc-remote send hit this 2026-10-02);
         // direct providers ignore unknown headers.
@@ -476,6 +508,15 @@ impl Client {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
+            // Gate-change visibility (K-MODEL-STATE): opencode can flip the
+            // free-tier wall anytime — count it, the prompt error still
+            // surfaces via session.error.
+            if status == reqwest::StatusCode::FORBIDDEN
+                && self.is_zen()
+                && text.contains("FreeTierError")
+            {
+                refine_metrics::labeled_counter("refine_zen_freetier_total", "result=\"gate\"", 1);
+            }
             anyhow::bail!("provider {status}: {}", &text[..text.len().min(400)]);
         }
         let src = resp.bytes_stream();
@@ -570,6 +611,7 @@ mod tests {
             max_tokens: Some(123),
             options: json!({"temperature": 0.1, "x_hook": true}),
             headers: vec![],
+            tool_choice: None,
         };
         let body = build_request("m", &msgs, &opts, None);
         assert_eq!(body["temperature"], json!(0.7), "explicit beats options");
@@ -924,5 +966,97 @@ mod estimate_tests {
             est >= actual,
             "estimate {est} < actual {actual} — would re-grow"
         );
+    }
+
+    /// Zen free-tier gate (FINDINGS P5 vs P7): the composite UA rides on
+    /// opencode.ai bases ONLY — other providers keep reqwest's default.
+    /// Path trick: base `/opencode.ai/...` flips the substring predicate
+    /// while still connecting to the local mock.
+    #[tokio::test]
+    async fn chat_stream_sends_composite_ua_only_on_zen_bases() {
+        use tokio::io::AsyncReadExt as _;
+        async fn capture(path_suffix: &str) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+            tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut got = String::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    got.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if got.contains("\r\n\r\n") || n == 0 {
+                        break;
+                    }
+                }
+                let _ = tx.send(got);
+            });
+            let client = Client::new(format!("http://{addr}{path_suffix}"), "public");
+            assert_eq!(
+                client.is_zen(),
+                path_suffix.contains("opencode.ai"),
+                "fixture must exercise the right predicate branch"
+            );
+            let msgs = vec![ChatMessage::text("user", "hi")];
+            let _ = client
+                .chat_stream(
+                    "m",
+                    &msgs,
+                    &ChatOpts::default(),
+                    None,
+                    Some("ses_0123456789abcdef01234567"),
+                )
+                .await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+                .await
+                .expect("captured request")
+                .unwrap()
+        }
+
+        let zen = capture("/opencode.ai/zen/v1").await.to_ascii_lowercase();
+        let ua = ZEN_FREE_TIER_UA.to_ascii_lowercase();
+        assert!(
+            zen.contains(&format!("user-agent: {ua}")),
+            "zen base must carry the composite UA (P5/P7 — gate rejects plain UA): {zen}"
+        );
+        let other = capture("/v1").await.to_ascii_lowercase();
+        assert!(
+            !other.contains("opencode/1.18.31"),
+            "non-zen base must NOT carry the composite UA: {other}"
+        );
+    }
+
+    /// tool_choice: default "auto" with tools; explicit override honored
+    /// (zen text-only calls pin "none" — FINDINGS P8); no tools → no key.
+    #[test]
+    fn build_request_tool_choice_defaults_auto_and_honors_override() {
+        let msgs = vec![ChatMessage::text("user", "hi")];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {"name": "bash", "description": "d", "parameters": {"type": "object"}}
+        })];
+        let auto = build_request("m", &msgs, &ChatOpts::default(), Some(&tools));
+        assert_eq!(auto["tool_choice"], json!("auto"));
+        let opts = ChatOpts {
+            tool_choice: Some("none".into()),
+            ..Default::default()
+        };
+        let none = build_request("m", &msgs, &opts, Some(&tools));
+        assert_eq!(none["tool_choice"], json!("none"), "override honored");
+        assert!(none["tools"].is_array(), "tools still present for the gate");
+        let no_tools = build_request("m", &msgs, &opts, None);
+        assert!(
+            no_tools.get("tool_choice").is_none(),
+            "no tools → no tool_choice key"
+        );
+    }
+
+    #[test]
+    fn is_zen_only_on_opencode_bases() {
+        assert!(Client::new("https://opencode.ai/zen/v1", "public").is_zen());
+        assert!(Client::new("https://opencode.ai/zen/go/v1", "k").is_zen());
+        assert!(!Client::new("https://api.deepseek.com/v1", "k").is_zen());
+        assert!(!Client::new("http://127.0.0.1:9", "k").is_zen());
     }
 }
