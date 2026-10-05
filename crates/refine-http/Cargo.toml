@@ -19,6 +19,7 @@ axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 bytes.workspace = true
+libc.workspace = true
 refine-store.workspace = true
 refine-core.workspace = true
 refine-llm.workspace = true

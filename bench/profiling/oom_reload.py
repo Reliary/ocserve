@@ -76,7 +76,15 @@ json.dump(
 # differ or watch's hash-skip correctly refuses to reload).
 with open(REAL_CATALOG, "rb") as f:
     cat_a = f.read()
-cat_b = cat_a.replace(b'"Big Pickle"', b'"Big PickleX"', 1)
+if VARIANT == "emptycat":
+    cat_a = b"{}"
+    cat_b = b'{"x":1}'
+elif VARIANT == "smallcat":
+    # both sides SMALL — isolates allocator behavior from catalog size
+    cat_a = b'{"opencode":{"id":"opencode","name":"OpenCode","models":{"big-pickle":{"id":"big-pickle"}}}}'
+    cat_b = b'{"opencode":{"id":"opencode","name":"OpenCode","models":{"big-pickle":{"id":"big-pickle","name":"BP"}}}}'
+else:
+    cat_b = cat_a.replace(b'"Big Pickle"', b'"Big PickleX"', 1)
 if cat_a == cat_b:
     raise SystemExit("fixture mutation failed (Big Pickle not found)")
 fixture = os.path.join(home, ".cache/opencode/models.json")
@@ -95,10 +103,27 @@ env.update(
 )
 if PROFILE:
     env["LD_PRELOAD"] = BH_SO
+TRIM_SO = os.environ.get("TRIM_SO", "")
+if TRIM_SO:
+    _pre = env.get("LD_PRELOAD", "")
+    env["LD_PRELOAD"] = (TRIM_SO + ":" + _pre).rstrip(":")
 if VARIANT == "arena2":
     env["MALLOC_ARENA_MAX"] = "2"
 elif VARIANT == "arena1":
     env["MALLOC_ARENA_MAX"] = "1"
+elif VARIANT == "trim":  # glibc dynamic trim threshold
+    env["MALLOC_TRIM_THRESHOLD_"] = "131072"
+elif VARIANT == "mmap":  # force large allocs to mmap (freed to OS)
+    env["MALLOC_MMAP_THRESHOLD_"] = "131072"
+elif VARIANT == "a1trim":  # both belts
+    env["MALLOC_ARENA_MAX"] = "1"
+    env["MALLOC_TRIM_THRESHOLD_"] = "131072"
+elif VARIANT == "a1mmap":
+    env["MALLOC_ARENA_MAX"] = "1"
+    env["MALLOC_MMAP_THRESHOLD_"] = "131072"
+elif VARIANT == "notrim":  # negative control for the trim fix
+    env["MALLOC_ARENA_MAX"] = "1"
+    env["REFINE_TRIM"] = "0"
 
 log_path = os.path.join(work, "lab.log")
 logf = open(log_path, "w")
@@ -148,6 +173,10 @@ def force_reload(i):
     return False
 
 
+SETTLE = int(os.environ.get("SETTLE_S", "0"))
+if SETTLE:
+    time.sleep(SETTLE)
+    print(f"settled (no reloads) rss={rss_mb(proc.pid)}MB after {SETTLE}s", flush=True)
 time.sleep(3)  # settle post-boot
 steps = []
 for i in range(RELOADS):

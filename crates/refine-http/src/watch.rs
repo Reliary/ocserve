@@ -38,6 +38,37 @@ use std::time::{Duration, SystemTime};
 /// (mtime, len) of one watched file; (None, 0) = missing at stat time.
 type Observed = (Option<SystemTime>, u64);
 
+/// Return freed-but-retained glibc heap pages to the OS (`malloc_trim(0)`).
+///
+/// Measured 2026-10-05 (`bench/profiling/OOM-RELOAD-REPORT.md` §Tier-0): the
+/// full-catalog build pipeline leaves ~218 MB of FREED pages in the arena —
+/// a tiny-catalog control settles at 19 MB RSS while the full 5.3 MB catalog
+/// settles at 237 MB, and an LD_PRELOAD trim shim collapses that to 91 MB
+/// with reload deltas +3/0/−1 MB. `MALLOC_ARENA_MAX=1` (unit) removed the
+/// per-reload *step*; trim removes the high-water *retention*.
+///
+/// Called at boot, after every reconcile swap, and on a periodic task
+/// (`REFINE_TRIM_SECS`, default 300 s, 0 disables). `REFINE_TRIM=0` turns
+/// every call into a no-op (lab A/B knob). No-op on non-glibc targets.
+pub fn trim_heap() -> bool {
+    if std::env::var("REFINE_TRIM").is_ok_and(|v| v == "0") {
+        return false;
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // Safety: `malloc_trim` is MT-Safe (glibc); it releases free heap
+        // pages and takes no pointers from us. Arena lock is held briefly.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+        true
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        false
+    }
+}
+
 /// Watched-file state. `paths` set once at boot (≤6 files — bounded by the
 /// set `Runtime::load_for` reads); `observed` tracks last-seen
 /// (mtime,len)+content-hash so the watcher fires only on real CONTENT
@@ -167,6 +198,8 @@ pub async fn reconcile(st: &Arc<AppState>) -> anyhow::Result<()> {
     *st.payloads.write() = payloads;
     *st.llm.write() = registry;
     observe(st); // only after success (retry semantics above)
+    // hand the build pipeline's freed pages back (measured ~218 MB high-water)
+    trim_heap();
     let rss1 = refine_metrics::rss_bytes().unwrap_or(0);
     tracing::info!(
         "config hot-reload ok in {}ms: [{}] rss {:.1} → {:.1} MB",

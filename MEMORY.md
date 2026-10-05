@@ -152,6 +152,10 @@ tokio::runtime::Builder::new_multi_thread()
 - CI soak gate (10 min accelerated per PR; 24 h nightly):
   - every sample < 300 MB; `VmSwap` == 0; slope after hour 1 < 1 MB/h;
   - `sum(sqlite cache_size) ≤ 32 MB` asserted at boot.
+- Reload gate (`bench/profiling/oom_reload.py`, run on allocator/reload
+  changes): full-catalog boot settle ≤ 120 MB; `REFINE_TRIM=0` control must
+  show the unfixed behavior (boot ≥ 230 MB) — a control that stops stepping
+  means the lab lost its trigger, not that the bug vanished.
 - Weekly `dhat` profile run attributes any growth to a call site (advisory, then gate).
 
 ## 6. Streaming invariants (what makes the budget possible)

@@ -323,6 +323,25 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     // reconcile on change (fail-safe: broken config keeps old state serving)
     state.watch.write().paths = crate::runtime::watch_paths(&data_dir);
     refine_http::watch::observe(&state);
+    // boot: hand the initial load pipeline's freed pages back (Tier-0 lab:
+    // full catalog settles 237→91 MB with trim; tiny-catalog control = 19 MB)
+    refine_http::watch::trim_heap();
+    // periodic safety net: slow churn (sessions, searches) between reloads
+    // still accumulates free-list pages; REFINE_TRIM_SECS=0 disables.
+    if std::env::var("REFINE_TRIM").is_err() || std::env::var("REFINE_TRIM").as_deref() != Ok("0") {
+        let trim_secs: u64 = std::env::var("REFINE_TRIM_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        if trim_secs > 0 {
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(trim_secs)).await;
+                    refine_http::watch::trim_heap();
+                }
+            });
+        }
+    }
     tokio::spawn(refine_http::watch::watch_loop(
         state.clone(),
         refine_http::watch::WatchOpts::from_env(),
