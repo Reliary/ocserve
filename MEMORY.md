@@ -47,12 +47,18 @@ node process; boundary set to measured + headroom: sidecar **hard cap 160 MB** (
 (`~/.bun/bin/bun --smol`; upstream's own plugin runtime — real `bun:sqlite`, native
 hash/crypto, TS plugins load without the Node loader shim). `REFINE_PLUGIN_RUNTIME=node`
 forces the old path (lab A/B control); Node remains the fallback when bun is absent.
-**Live A/B with the same 3 configured plugins, same box:** sidecar RSS bun **87 MB**
-vs node **138 MB**; cgroup **241 MB** vs **378 MB**. Hook dispatch verified under bun
-end-to-end (chat.message ×2, messages/system transform, text.complete ×2; live prompt
-answered). The 160 MB cap and 460 MB combined budget stand; the measured bun steady
-state is the new boundary datum. Node 128 MB heap cap no longer applies under bun
-(`--smol` instead); `REFINE_PLUGIN_HEAP_MB` is the Node-fallback knob.
+**Live A/B, same 3 plugins, same box — honest settled numbers (30 s snapshots lie):**
+steady state is a **wash** — bun and node both settle ≈97–101 MB (3–5 min). The
+difference is WARM-UP: bun peaks ~260 MB vs node ~137 MB while magic-context lazily
+initializes its embedding stack (@huggingface/transformers + onnxruntime + sharp,
+87 MB Xenova model on disk), then returns to baseline. The original short-settle
+"87 vs 138" was a mirage and is retracted. Bun remains the default on fidelity
+grounds (upstream runtime; gemini-plugin class loads without the Node TS limitation).
+Hook dispatch verified under bun end-to-end (chat.message ×2, transform ×2,
+text.complete ×2; live prompt answered). `MemoryMax` headroom absorbs the warm-up
+peak; cold-start budget note: first 3–5 min after boot may sit ~260 MB sidecar.
+Node 128 MB heap cap no longer applies under bun (`--smol` instead);
+`REFINE_PLUGIN_HEAP_MB` is the Node-fallback knob.
 
 **OOM postmortem (2026-10-05, kernel memcg kills ×6: 10:36/11:16/12:20/14:12/15:12/16:05):**
 the *unit* cap is what binds (main + ALL children), and the measured warm daytime
