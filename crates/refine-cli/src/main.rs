@@ -58,6 +58,18 @@ enum Cmd {
         #[arg(long)]
         allow_missing: bool,
     },
+    /// Model catalog maintenance (K-MODELS — upstream `opencode models refresh`)
+    Models {
+        #[command(subcommand)]
+        action: ModelsCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelsCmd {
+    /// Fetch {OPENCODE_MODELS_URL||models.opencode.ai}/api.json NOW
+    /// (freshness bypassed — upstream refresh(force))
+    Refresh,
 }
 
 fn default_data_dir() -> std::path::PathBuf {
@@ -71,6 +83,7 @@ fn default_data_dir() -> std::path::PathBuf {
         })
 }
 
+mod models_dev;
 mod replay;
 mod runtime;
 
@@ -123,6 +136,16 @@ fn main() -> Result<()> {
             }
             Ok(())
         }),
+        Cmd::Models { action } => match action {
+            ModelsCmd::Refresh => {
+                let out = models_dev::refresh(true);
+                println!("models refresh: {:?}", out);
+                if out == models_dev::Outcome::Failed {
+                    anyhow::bail!("models refresh failed (stale cache kept — see log)");
+                }
+                Ok(())
+            }
+        },
     }
 }
 
@@ -304,6 +327,23 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
         state.clone(),
         refine_http::watch::WatchOpts::from_env(),
     ));
+
+    // K-MODELS: same-as-upstream catalog refresh — immediate-if-stale then
+    // every 60 minutes (models-dev.ts Schedule.spaced). Blocking fetch runs
+    // off the async workers; fail-soft loop (stale cache keeps serving).
+    tokio::spawn(async move {
+        loop {
+            let res = tokio::task::spawn_blocking(|| models_dev::refresh(false)).await;
+            match res {
+                Ok(outcome) => tracing::debug!("models catalog refresh: {outcome:?}"),
+                Err(e) => tracing::warn!("models refresh task join error: {e}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(
+                models_dev::REFRESH_INTERVAL_SECS,
+            ))
+            .await;
+        }
+    });
 
     // Legacy→refine delta sync (development bridge; kill switch
     // REFINE_LEGACY_SYNC=0). 60s cadence after a 5s settle, fail-soft: any

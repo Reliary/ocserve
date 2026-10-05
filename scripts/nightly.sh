@@ -101,6 +101,8 @@ step "binary size ceiling" bash -c "$(declare -f size_gate); size_gate"
 #    counts flips via refine_zen_freetier_total (K-MODEL-STATE).
 step "zen free-tier gate (live trio)" \
   cargo test -p refine-llm --test zen_live -- --ignored
+step "models.dev live fetch" \
+  cargo test -p refine-cli live_fetch_contains_big_pickle -- --ignored
 
 # 7. mutants (opt-in): survivor report is triaged like a defect (TESTING §9)
 if [ "$WITH_MUTANTS" = "1" ]; then

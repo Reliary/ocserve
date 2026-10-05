@@ -44,6 +44,29 @@ fn read_json(path: &Path) -> Result<Value> {
     serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
 }
 
+/// models catalog read with upstream self-heal semantics (models-dev.ts
+/// loadFromDisk): unreadable/corrupt → remove best-effort + treat missing
+/// so the hourly refresh refetches. NEVER fails the caller — a broken cache
+/// file must not fail boot (the old `read_json(cache)?` did exactly that,
+/// where upstream deletes and refetches).
+fn read_catalog(path: &Path) -> Value {
+    if !path.exists() {
+        return json!({});
+    }
+    match read_json(path) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "models catalog unreadable ({e:#}) — removing for refetch (models-dev parity)"
+            );
+            if let Err(de) = std::fs::remove_file(path) {
+                tracing::warn!("models catalog removal failed: {de:#}");
+            }
+            json!({})
+        }
+    }
+}
+
 /// Layered auth: legacy auth.json with refine's auth-overlay merged over it
 /// (W5 read-precedence: overlay wins; refine NEVER writes the legacy file).
 /// load_for AND llm_registry read auth through this — one layering rule, so
@@ -83,7 +106,8 @@ pub fn watch_paths(data_dir: &Path) -> Vec<std::path::PathBuf> {
         h.join(".config/refine/config.json"),
         h.join(".local/share/opencode/auth.json"),
         data_dir.join("auth-overlay.json"),
-        h.join(".cache/opencode/models.json"),
+        // K-MODELS: the catalog refine READS (source-aware + fixture flag)
+        crate::models_dev::read_path(),
         h.join(".local/state/opencode/model.json"),
     ]
 }
@@ -497,7 +521,8 @@ impl Runtime {
     pub fn load_for(data_dir: &std::path::Path) -> Result<Self> {
         let home = std::env::var("HOME").unwrap_or_default();
         let config_path = Path::new(&home).join(".config/opencode/opencode.json");
-        let cache_path = Path::new(&home).join(".cache/opencode/models.json");
+        // K-MODELS: OPENCODE_MODELS_URL/_PATH aware (upstream read precedence)
+        let cache_path = crate::models_dev::read_path();
 
         let mut raw_config = read_json(&config_path)?;
         // W4 overlay: a refine-owned patch file (REFINE_CONFIG_WRITE=overlay
@@ -509,11 +534,7 @@ impl Runtime {
             refine_http::deep_merge(&mut raw_config, overlay);
         }
         let auth = load_auth(data_dir)?;
-        let cache = if cache_path.exists() {
-            read_json(&cache_path)?
-        } else {
-            json!({})
-        };
+        let cache = read_catalog(&cache_path);
 
         let config = raw_config.clone(); // raw file until M4 plugins add agents (keys_subset)
         let (agent, api_agent) = build_agents(&raw_config);
@@ -946,8 +967,7 @@ impl Runtime {
         let auth = load_auth(&self.data_dir)?;
         let cfg = read_json(&format!("{home}/.config/opencode/opencode.json"))
             .unwrap_or_else(|| json!({}));
-        let cache =
-            read_json(&format!("{home}/.cache/opencode/models.json")).unwrap_or_else(|| json!({}));
+        let cache = read_catalog(&crate::models_dev::read_path());
         let state_model = read_json(&format!("{home}/.local/state/opencode/model.json"))
             .unwrap_or_else(|| json!({}));
 
@@ -1404,5 +1424,41 @@ mod b2_public_tier_tests {
         other.insert("paid".into(), json!({"cost": {"input": 9.0}}));
         apply_public_tier_filter("deepseek", false, &mut other);
         assert_eq!(other.len(), 1, "non-opencode providers never filtered");
+    }
+}
+
+#[cfg(test)]
+mod catalog_selfheal_tests {
+    use super::*;
+
+    /// TESTING §1.6 class (2026-10-05): load_for did `read_json(cache)?` —
+    /// a corrupt/unreadable models catalog FAILED BOOT, where upstream's
+    /// models-dev.ts loadFromDisk deletes the file and refetches. The read
+    /// must be fail-open + self-healing, never fatal.
+    #[test]
+    fn corrupt_models_catalog_self_heals_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("models.json");
+        std::fs::write(&corrupt, "{ definitely not json").unwrap();
+        let v = read_catalog(&corrupt);
+        assert_eq!(v, json!({}), "corrupt catalog reads as empty, not Err");
+        assert!(
+            !corrupt.exists(),
+            "corrupt file removed so the hourly refresh refetches (upstream parity)"
+        );
+
+        // valid file: parsed and KEPT (no over-eager deletion)
+        let valid = dir.path().join("models2.json");
+        std::fs::write(&valid, r#"{"deepseek": {"name": "DeepSeek"}}"#).unwrap();
+        let v2 = read_catalog(&valid);
+        assert_eq!(
+            v2.pointer("/deepseek/name").and_then(|x| x.as_str()),
+            Some("DeepSeek")
+        );
+        assert!(valid.exists(), "healthy catalog must survive");
+
+        // missing file: empty, no error, nothing to remove
+        let missing = dir.path().join("nope.json");
+        assert_eq!(read_catalog(&missing), json!({}));
     }
 }

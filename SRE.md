@@ -99,6 +99,20 @@ default). Gate flips increment `refine_zen_freetier_total` and are checked
 nightly by the live trio (`crates/refine-llm/tests/zen_live.rs`: positive /
 text-only / negative — the negative proves the wall still exists).
 
+Model catalog (K-MODELS) — same-as-upstream refresh, no operator action
+needed: honors `OPENCODE_MODELS_URL` / `OPENCODE_MODELS_PATH` /
+`OPENCODE_DISABLE_MODELS_FETCH` (upstream truthy: `"1"`/`"true"`); source
+default `https://models.opencode.ai/api.json`; fresh TTL 5 min; the serve
+loop refreshes immediately-if-stale then every 60 min; `refine models
+refresh` forces (upstream `opencode models refresh` parity). Shared cache
+`~/.cache/opencode/models.json` (their opencode writes the same file —
+coordination via the same lease under `~/.local/state/opencode/locks/`,
+heartbeat 20 s / stale 60 s); UA mirrors
+`opencode/{channel||latest}/{version||1.18.31}/{client||cli}` (env
+overridable). Corrupt catalog self-heals (remove + refetch) — it never
+fails boot. Visibility: `refine_models_refresh_total{result}` + nightly
+`live_fetch_contains_big_pickle`.
+
 ## 4. CPU: measure first, specialize second
 
 **Justified per-arch work:**
