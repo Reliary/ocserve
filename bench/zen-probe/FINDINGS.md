@@ -103,6 +103,24 @@ in-container MITM did.
 | R5c E8/E9 (field attribution) | E8 session-format ok → 200; E9 session-bad → 403 ⇒ **session format gated** |
 | R5d E10/E12/E13 (body attribution) | no-tools → 403 (stream flags don't help); +tools → **200** ⇒ **tools gated** |
 
+## Free-model sweep (follow-up — E13 recipe, model swapped, fresh ids)
+
+Catalog: `opencode` provider holds 116 models — 36 zero-cost ("free"), 80 paid.
+Swept 9 free + 1 paid control (one request each):
+
+| model | status | reading |
+|---|---|---|
+| `mimo-v2.6-flash-free` | **200** | second model completes keyless with the same recipe |
+| `fledge-alpha-free` | 403 `FreeTierError: not available in your country` | **cleared** the within-OpenCode gate → geo wall (yet their own client completed fledge at 00:17 IST the same day — geo verdict is not purely IP) |
+| `deepseek-v4-flash-free` | 400 `Upstream request failed: Model is unavailable` | **cleared** the gate → upstream dead |
+| `glm-5-free`, `kimi-k2.5-free`, `minimax-m3-free`, `qwen3.6-plus-free`, `ling-3.0-flash-free`, `grok-code` | 401 `ModelError: not supported` | rejected before our gate — likely stale catalog vs backend's live set |
+| `claude-3-5-haiku` (paid control) | 401 `not supported` | no keyless credit path, as expected |
+
+Conclusion: the discriminator (session-id format + `tools` in body) is **not
+big-pickle-specific** — it gates the whole within-OpenCode check; per-model
+availability then layers on top (geo, upstream, model whitelist). Two of nine
+free models actually complete; two more pass the gate and fail elsewhere.
+
 ## Not bisected (honest residuals)
 
 - `tools` vs `tool_choice` (both present in E13; one could be the actual check).

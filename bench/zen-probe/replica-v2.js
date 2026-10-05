@@ -80,7 +80,22 @@ const toolsBody = (() => {
 })();
 
 let body;
-if (USE_BUN_BODY) body = fs.readFileSync("/probe/runs/real-body.json");
+if (stage === "SWEEP") {
+  // E13 recipe with the model swapped — one request per model, fresh ids.
+  const real = JSON.parse(fs.readFileSync("/probe/runs/real-body.json", "utf8"));
+  body = Buffer.from(
+    JSON.stringify({
+      model: process.argv[3],
+      max_tokens: 8,
+      stream: true,
+      stream_options: { include_usage: true },
+      messages: [{ role: "user", content: "Reply with exactly: SWEEP_OK" }],
+      tool_choice: "auto",
+      tools: real.tools,
+    }),
+    "utf8"
+  );
+} else if (USE_BUN_BODY) body = fs.readFileSync("/probe/runs/real-body.json");
 else if (stage === "E12") body = Buffer.from(streamBody, "utf8");
 else if (stage === "E13") body = Buffer.from(toolsBody, "utf8");
 else body = Buffer.from(tinyBody, "utf8");
@@ -94,7 +109,8 @@ else body = Buffer.from(tinyBody, "utf8");
     });
     const text = await resp.text();
     const runtime = USE_BUN ? "bun" : "node";
-    console.log(`[${stage}/${runtime}] ${resp.status} ${text.slice(0, 180)}`);
+    const label = stage === "SWEEP" ? `SWEEP:${process.argv[3]}` : `${stage}/${runtime}`;
+    console.log(`[${label}] ${resp.status} ${text.slice(0, 160)}`);
     if (resp.status === 200) console.log(`${stage}_HIT`);
     else console.log(`${stage}_MISS`);
   } catch (e) {

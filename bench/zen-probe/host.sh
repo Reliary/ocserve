@@ -61,10 +61,11 @@ if [ "${1:-}" = "r2" ]; then
   docker run -d --name zenprobe-mitm --network zenprobe \
     -v "$PWD/runs:/dump" mitmproxy/mitmproxy \
     mitmdump --listen-port 8080 --set confdir=/tmp/conf -w /dump/r2.flows >/dev/null
-  for i in $(seq 1 30); do
-    docker exec zenprobe-mitm true 2>/dev/null && break; sleep 0.5
+  # Poll for the CA itself — cold-start mitmdump can take >2s to create confdir.
+  for i in $(seq 1 60); do
+    docker exec zenprobe-mitm test -f /tmp/conf/mitmproxy-ca.pem 2>/dev/null && break
+    sleep 0.5
   done
-  sleep 2
   docker exec zenprobe-mitm cat /tmp/conf/mitmproxy-ca.pem > runs/mitm-ca.pem 2>/dev/null || true
   if ! grep -q "BEGIN CERTIFICATE" runs/mitm-ca.pem 2>/dev/null; then
     echo "R2_FAIL no-ca"
