@@ -66,6 +66,16 @@ identical fetch) advance the tuple with `result="skipped"` and never reload (pla
 and `MemoryMax` raised **750M → 1024M** as a measured interim (predicted peak ≈951 MB =
 warm 500 + reload build 237 + children 214; both live and repo units). Phase B re-measures
 and may lower it again.
+**Phase B verdict (same night): FRAGMENTATION, not a leak** — lab A/B
+(`bench/profiling/oom_reload.py`, full-size fixtures): plain arenas step
++220/+68/+1 to a 526 MB plateau; `MALLOC_ARENA_MAX=1` collapses it to
++69/0/+1 at **308 MB** (bytehound: 24.3M of 25M allocs = temporary churn;
+leaked-at-exit = the live payload `build_providers` Value, by design).
+Wired as `Environment=MALLOC_ARENA_MAX=1` in the unit (zero-code; children
+inherit — reload wall-time unchanged); **cap returned to 750M** (measured:
+idle main 231 / cgroup 402 ≤460 budget; production reloads +90 cold then
++0.2 warm). 8 kernel kills total that day (last 21:13, before the fix).
+Full evidence: `bench/profiling/OOM-RELOAD-REPORT.md`.
 
 **V8 heap cap (2026-10-03, P0 battery):** at `--max-old-space-size=64` the real
 5-plugin set OOM-killed the sidecar once at boot (observed: `FATAL ERROR: Reached
@@ -81,6 +91,12 @@ addition must re-measure (gate: sidecar ≤160 MB after load, else a plugin is d
 loads lazily).
 
 ## 2. Global allocator
+
+**Declared runtime setting (2026-10-05): glibc with `MALLOC_ARENA_MAX=1`**
+(single arena — unit `Environment`). Justification + A/B numbers:
+`bench/profiling/OOM-RELOAD-REPORT.md`. glibc stays the allocator; mimalloc
+remains a contingency only if single-arena contention shows up in soak CPU
+(lab showed no wall-time regression).
 
 - **glibc/system allocator (FACT, 2026-10-04)** — `grep -rn "global_allocator|mimalloc"`
   across every crate: **no `#[global_allocator]` exists**. The previous claim that mimalloc
