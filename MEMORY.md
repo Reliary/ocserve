@@ -43,6 +43,23 @@ The original ≤80 MB target is **not achievable with these artifacts** on any s
 node process; boundary set to measured + headroom: sidecar **hard cap 160 MB** (systemd
 `MemoryMax` in the unit), combined refine+sidecar budget **460 MB**.
 
+**OOM postmortem (2026-10-05, kernel memcg kills ×6: 10:36/11:16/12:20/14:12/15:12/16:05):**
+the *unit* cap is what binds (main + ALL children), and the measured warm daytime
+composition blew past the old budget: **main ≈ 487 MB (flat plateau) + plugin host ≈
+145 MB + browser-harness python ×2 ≈ 78 MB ≈ 680 MB against `MemoryMax=750M`** —
+~118 MB headroom, and `refine_sidecar_rss_bytes` counts the plugin host only (bh/shim
+invisible to the old soak). Spike classes: catalog reload (their opencode writes
+`models.json` ~hourly; write → kill +6 s — the reload parsed the 5.3 MB file **twice**,
+now once via `Runtime.catalog`) and activity-composite crossings (morning kills; node
+allocating at 16:05). Equal `oom_score` meant the kernel always killed MAIN (full
+service death) even when a child allocated — children now raise their own
+`oom_score_adj=500` at spawn (A3 wrapper) so a future kill takes a respawnable child.
+Reconcile is now INFO-logged (files + duration + RSS delta), soak gained
+`cgroup`/`cgroup_peak`/`kids` columns, and journald retention was pruned to ~3 h by
+the root fs sitting at 6.8% free (< default `SystemKeepFree`10%) — retention floor
+staged at `deploy/journald-retention.conf` (500M cap, keep-free override). The
++146 MB main-vs-341 delta is plateau-stable and attributed AFTER the A-data (Phase B).
+
 **V8 heap cap (2026-10-03, P0 battery):** at `--max-old-space-size=64` the real
 5-plugin set OOM-killed the sidecar once at boot (observed: `FATAL ERROR: Reached
 heap limit`, child zombie, every subsequent hook `Broken pipe` — fail-open hid it

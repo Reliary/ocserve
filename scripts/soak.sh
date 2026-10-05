@@ -9,7 +9,7 @@ INTERVAL="${2:-60}"
 HOURS="${3:-24}"
 OUT="${SOAK_OUT:-/tmp/opencode/refine-soak-$(date +%s).csv}"
 mkdir -p "$(dirname "$OUT")"
-echo "ts,rss,peak,sidecar,wal,sse,queue,locks,tasks,health,rss_delta,db_opens,sync_us,oc_rss" > "$OUT"
+echo "ts,rss,peak,sidecar,wal,sse,queue,locks,tasks,health,rss_delta,db_opens,sync_us,oc_rss,cgroup,cgroup_peak,kids" > "$OUT"
 end=$(( $(date +%s) + HOURS * 3600 ))
 while [ "$(date +%s)" -lt "$end" ]; do
   ts=$(date +%s)
@@ -24,7 +24,20 @@ while [ "$(date +%s)" -lt "$end" ]; do
   if [ -n "$oc_pid" ] && [ -r "/proc/$oc_pid/status" ]; then
     oc_rss=$(awk '/^VmRSS:/ {print $2*1024}' "/proc/$oc_pid/status" 2>/dev/null || echo 0)
   fi
-  echo "$ts,$(get refine_rss_bytes),$(get refine_rss_peak_bytes),$(get refine_sidecar_rss_bytes),$(get refine_wal_bytes),$(get refine_sse_clients),$(get refine_writer_queue_depth),$(get refine_prompt_locks),$(get refine_prompt_tasks),$health,$(get refine_prompt_rss_delta_bytes),$(get refine_db_opens_total),$(getp refine_sync_tick_sum),$(get oc_rss)" >> "$OUT"
+  # cgroup view (2026-10-05 OOM postmortem): the unit cap bounds main+sidecars
+  # together; soak's sidecar metric tracks the plugin host only — cgroup/
+  # kids close that visibility gap (kids = cgroup current − main rss).
+  cg=""; cgp=""; kids=""
+  cg_dir="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/refine.service"
+  if [ -r "$cg_dir/memory.current" ]; then
+    cg=$(cat "$cg_dir/memory.current" 2>/dev/null || true)
+    cgp=$(cat "$cg_dir/memory.peak" 2>/dev/null || true)
+    main_rss=$(get refine_rss_bytes)
+    if [ -n "$cg" ] && [ -n "$main_rss" ] && [ "$main_rss" -gt 0 ] 2>/dev/null; then
+      kids=$((cg - main_rss))
+    fi
+  fi
+  echo "$ts,$(get refine_rss_bytes),$(get refine_rss_peak_bytes),$(get refine_sidecar_rss_bytes),$(get refine_wal_bytes),$(get refine_sse_clients),$(get refine_writer_queue_depth),$(get refine_prompt_locks),$(get refine_prompt_tasks),$health,$(get refine_prompt_rss_delta_bytes),$(get refine_db_opens_total),$(getp refine_sync_tick_sum),$(get oc_rss),$cg,$cgp,$kids" >> "$OUT"
   sleep "$INTERVAL"
 done
 echo "soak done: $OUT"

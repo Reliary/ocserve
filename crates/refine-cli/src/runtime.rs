@@ -28,6 +28,10 @@ pub struct Runtime {
     /// same auth as load_for (W5 read-precedence rule).
     pub data_dir: std::path::PathBuf,
     pub config: Value,
+    /// Parsed models catalog — read ONCE in load_for and reused by
+    /// llm_registry (A1: the old re-read double-parsed the 5.3 MB file per
+    /// reload and was the proven OOM-spike class, 2026-10-05 14:12 kill).
+    pub catalog: Value,
     /// Default-agent-first order (GET /agent, v1 wire).
     pub agent: Vec<Value>,
     /// Declaration order: natives then config agents (GET /api/agent, v2 wire).
@@ -544,6 +548,7 @@ impl Runtime {
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             config,
+            catalog: cache,
             agent,
             api_agent,
             command,
@@ -967,7 +972,9 @@ impl Runtime {
         let auth = load_auth(&self.data_dir)?;
         let cfg = read_json(&format!("{home}/.config/opencode/opencode.json"))
             .unwrap_or_else(|| json!({}));
-        let cache = read_catalog(&crate::models_dev::read_path());
+        // A1: reuse the catalog load_for already parsed (never re-read —
+        // double-parsing the 5.3 MB file per reload was the proven spike).
+        let cache = &self.catalog;
         let state_model = read_json(&format!("{home}/.local/state/opencode/model.json"))
             .unwrap_or_else(|| json!({}));
 
@@ -1017,7 +1024,7 @@ impl Runtime {
         }
 
         // B2 (K-MODEL-STATE): opencode public-tier endpoint (pure fn below).
-        if let Some(pair) = opencode_public_endpoint(&cfg, &auth, &cache) {
+        if let Some(pair) = opencode_public_endpoint(&cfg, &auth, cache) {
             endpoints.insert("opencode".into(), pair);
         }
 
@@ -1074,7 +1081,7 @@ impl Runtime {
         // poisons the currentModel route the app sends back
         // catalog source for default-pick filtering (same inputs load_for
         // uses — cheap JSON assembly, no I/O)
-        let (config_providers, _provider) = build_providers(&cfg, &auth, &cache);
+        let (config_providers, _provider) = build_providers(&cfg, &auth, cache);
         let default_model = pick_default_model(&state_model, &cfg, &config_providers, &endpoints);
         if let Some(r0) = state_model.pointer("/recent/0") {
             let rp = r0.get("providerID").and_then(|v| v.as_str()).unwrap_or("");
@@ -1460,5 +1467,38 @@ mod catalog_selfheal_tests {
         // missing file: empty, no error, nothing to remove
         let missing = dir.path().join("nope.json");
         assert_eq!(read_catalog(&missing), json!({}));
+    }
+}
+
+#[cfg(test)]
+mod registry_catalog_tests {
+    use super::*;
+
+    /// A1 (2026-10-05 OOM postmortem): llm_registry must reuse the catalog
+    /// load_for already parsed. The fixture API differs from disk on purpose
+    /// — if registry re-read models.json it would return models.opencode.ai
+    /// and this test goes red.
+    #[test]
+    fn llm_registry_uses_stored_catalog_not_a_second_disk_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = Runtime {
+            data_dir: dir.path().to_path_buf(),
+            config: json!({}),
+            catalog: json!({"opencode": {"api": "https://from-stored.invalid"}}),
+            agent: vec![],
+            api_agent: vec![],
+            command: vec![],
+            config_providers: json!({}),
+            provider: json!({}),
+            console: json!({}),
+            capabilities: json!({}),
+        };
+        let reg = rt.llm_registry().expect("registry builds");
+        let ep = reg
+            .endpoints
+            .get("opencode")
+            .expect("keyless endpoint installs");
+        assert_eq!(ep.0, "https://from-stored.invalid", "stored catalog wins");
+        assert_eq!(ep.1, "public", "keyless default");
     }
 }

@@ -86,6 +86,11 @@ pub async fn reconcile(st: &Arc<AppState>) -> anyhow::Result<()> {
         tracing::warn!("config reload: reloader unset (tests/boot) — restart to apply");
         return Ok(());
     };
+    // A2 (2026-10-05 OOM postmortem): every reload is now attributable —
+    // which files changed, how long it took, and the RSS delta. The old
+    // silent reloads hid the catalog-reconcile kill (14:12:21 write → :27).
+    let reload_t0 = std::time::Instant::now();
+    let rss0 = refine_metrics::rss_bytes().unwrap_or(0);
     // capture the previously SERVED mcp section for the diff (before swap)
     let old_mcp = st
         .payloads
@@ -102,9 +107,26 @@ pub async fn reconcile(st: &Arc<AppState>) -> anyhow::Result<()> {
             return Err(e.context("config reload"));
         }
     };
+    // capture the changed-file set BEFORE observe() advances the tuples
+    let changed_files: Vec<String> = {
+        let w = st.watch.read();
+        w.paths
+            .iter()
+            .filter(|p| w.observed.get(*p) != Some(&stat_one(p)))
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect()
+    };
     *st.payloads.write() = payloads;
     *st.llm.write() = registry;
     observe(st); // only after success (retry semantics above)
+    let rss1 = refine_metrics::rss_bytes().unwrap_or(0);
+    tracing::info!(
+        "config hot-reload ok in {}ms: [{}] rss {:.1} → {:.1} MB",
+        reload_t0.elapsed().as_millis(),
+        changed_files.join(", "),
+        rss0 as f64 / 1_048_576.0,
+        rss1 as f64 / 1_048_576.0,
+    );
 
     let new_mcp = st
         .payloads

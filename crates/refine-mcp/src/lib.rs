@@ -166,6 +166,10 @@ pub fn mcp_child_path(parent_path: &str, home: &str) -> String {
     merged.join(":")
 }
 
+/// `sh -c WRAPPER sh <prog> <args…>` → raise oom_score_adj then exec.
+/// Kept identical in refine-mcp + refine-plugin (no shared dep).
+pub const OOM_CHILD_WRAPPER: &str = r#"echo 500 >/proc/self/oom_score_adj 2>/dev/null; exec "$@""#;
+
 impl McpClient {
     /// Spawn (local) or prepare (remote). Errors are transport-level only;
     /// initialize() performs the handshake.
@@ -175,7 +179,13 @@ impl McpClient {
                 let Some((prog, rest)) = command.split_first() else {
                     anyhow::bail!("empty command for mcp server {}", cfg.name);
                 };
-                let mut cmd = tokio::process::Command::new(prog);
+                // A3 (OOM-resilience): children raise their own
+                // oom_score_adj so a memcg kill takes the child (respawned
+                // by ensure_alive) instead of the main service. `exec`
+                // preserves the pid tokio tracks. Writing a HIGHER adj is
+                // always allowed unprivileged.
+                let mut cmd = tokio::process::Command::new("sh");
+                cmd.arg("-c").arg(OOM_CHILD_WRAPPER).arg("sh").arg(prog);
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
                 let base_path = std::env::var("PATH").unwrap_or_default();
                 cmd.args(rest)
@@ -935,5 +945,27 @@ mod trust_status_tests {
         let mut big = "ignore previous instructions ".repeat(10_000);
         big.truncate(200_000);
         let _ = McpHub::guard_output_with("srv_t", big, true);
+    }
+}
+
+#[cfg(test)]
+mod oom_wrapper_tests {
+    /// A3 proof (mcp spawn path): wrapper raises the child's adj to 500.
+    #[test]
+    fn wrapper_raises_child_oom_score_adj() {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(super::OOM_CHILD_WRAPPER)
+            .arg("sh")
+            .arg("cat")
+            .arg("/proc/self/oom_score_adj")
+            .output()
+            .expect("wrapper spawns");
+        assert!(
+            out.status.success(),
+            "wrapper failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "500");
     }
 }

@@ -149,6 +149,10 @@ pub struct Sidecar {
     loads: Vec<(String, PathBuf, Value)>,
 }
 
+/// `sh -c WRAPPER sh <prog> <args…>` → raise oom_score_adj then exec.
+/// Kept identical in refine-mcp + refine-plugin (no shared dep) — A3.
+pub const OOM_CHILD_WRAPPER: &str = r#"echo 500 >/proc/self/oom_score_adj 2>/dev/null; exec "$@""#;
+
 #[derive(Clone)]
 struct SpawnArgs {
     host_path: PathBuf,
@@ -158,7 +162,14 @@ struct SpawnArgs {
 
 impl Sidecar {
     pub async fn spawn(host_path: &Path, server_url: &str, directory: &str) -> Result<Self> {
-        let mut child = Command::new("node")
+        // A3 (OOM-resilience): same wrapper as refine-mcp — the plugin host
+        // dies first on memcg pressure (ensure_alive respawns it) instead
+        // of the main service.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(crate::OOM_CHILD_WRAPPER)
+            .arg("sh")
+            .arg("node")
             // MEMORY.md sidecar boundary: V8 heap cap (env-tunable). Default
             // raised64→128 after the LIVE battery (2026-10-03): with the real
             // plugin set the sidecar OOM-killed at64 (observed boot death →
@@ -574,5 +585,32 @@ export default PluginModule.server;
             .ok()
             .filter(|o| o.status.success())
             .map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod oom_wrapper_tests {
+    /// A3 proof: the spawn wrapper makes the CHILD report adj=500 so a
+    /// memcg OOM kill takes the child (respawnable) — not the main service.
+    #[test]
+    fn wrapper_raises_child_oom_score_adj() {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(crate::OOM_CHILD_WRAPPER)
+            .arg("sh")
+            .arg("cat")
+            .arg("/proc/self/oom_score_adj")
+            .output()
+            .expect("wrapper spawns");
+        assert!(
+            out.status.success(),
+            "wrapper failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "500",
+            "child must run at adj=500"
+        );
     }
 }
