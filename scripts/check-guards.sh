@@ -13,6 +13,9 @@
 #   6. non-refine systemd units mutated from repo scripts (drop-ins/restarts —
 #      the 2026-10-05 incident class; only refine* units are mutable, see
 #      TESTING §1.6)
+#   7. exact assertions on process-global counters inside src/ (in-crate unit
+#      tests run in one parallel process and race — the reader_opens flake of
+#      2026-10-05; such tests belong in tests/ where they own the process)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -65,6 +68,16 @@ if out=$(grep -rnE 'systemd/user/[A-Za-z0-9@._-]*service\.d|systemctl --user (ed
     scripts bench --include='*.sh' --include='*.py' 2>/dev/null \
     | grep -v 'check-guards\.sh' | grep -v refine); then
   echo "$out"; echo "FAIL: repo script mutates a non-refine systemd unit (2026-10-05 incident class) — experiments belong in disposable containers (TESTING §1.6)"; fail=1
+else
+  echo "ok"
+fi
+
+echo "== guard: global-counter exact assertions stay out of src/ =="
+# In-crate unit tests run in one parallel process; exact deltas on the
+# process-global reader-opens counter raced (flaked 2026-10-05). Such
+# assertions belong in tests/ where they own the process (TESTING §1.6).
+if out=$(grep -rnE 'assert(_eq|_ne)?!\([^)]*reader_opens' crates/*/src 2>/dev/null); then
+  echo "$out"; echo "FAIL: exact reader_opens assertion in src/ races parallel tests — move it to crates/*/tests/ (process-isolated)"; fail=1
 else
   echo "ok"
 fi

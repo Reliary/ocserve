@@ -121,6 +121,30 @@ big-pickle-specific** — it gates the whole within-OpenCode check; per-model
 availability then layers on top (geo, upstream, model whitelist). Two of nine
 free models actually complete; two more pass the gate and fail elsewhere.
 
+## Screenshot sweep — the currently-free set (user-confirmed, follow-up 2)
+
+The user's model picker shows the free models that are *currently* offered
+(9 total; display names mapped to catalog ids via the `name` field). E13
+recipe, one request each, upstream failures retried once:
+
+| model (display) | catalog id | status | reading |
+|---|---|---|---|
+| MiMo-V2.6-Flash Free | `mimo-v2.6-flash-free` | **200** | completes |
+| LongCat 2.5 Preview Free | `longcat-2.5-preview-free` | **200** | completes |
+| Nemotron 3 Ultra Free | `nemotron-3-ultra-free` | **200** | completes (SSE keep-alive first) |
+| Nemotron 3.5 Lightning Free | `nemotron-3.5-lightning-free` | **200** | completes (SSE keep-alive first) |
+| Space Bunny Free | `space-bunny-free` | **200** | completes |
+| Fledge Alpha Free | `fledge-alpha-free` | 403 geo | **cleared our gate** — "not available in your country" (persistent; their own client completed fledge 00:17 IST same day — geo verdict is not purely IP) |
+| Ling 3.0 Flash Fin Free | `ling-3.0-flash-fin-free` | 400 upstream | **cleared our gate** — "Endpoint is unavailable" (identical on retry) |
+| Ling 3.1 Flash Free | `ling-3.1-flash-free` | 429 upstream | **cleared our gate** — "Endpoint is unavailable" (identical on retry) |
+| Muse Spark 1.3 Free | `muse-spark-1.3-contributor-free` | 500 internal | **cleared our gate** — backend error (identical on retry) |
+
+**Result: 9/9 cleared the within-OpenCode discriminator; 5/9 complete end to
+end.** Zero `FreeTierError: within OpenCode` responses in this sweep — the
+session-id-format + tools recipe fully neutralizes the gate for the whole
+currently-free set. The other four walls are opencode-side (geo, upstream
+endpoints, backend errors), not ours to fix.
+
 ## Not bisected (honest residuals)
 
 - `tools` vs `tool_choice` (both present in E13; one could be the actual check).

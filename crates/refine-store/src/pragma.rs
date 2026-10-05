@@ -196,42 +196,9 @@ pub fn open_reader(path: &std::path::Path) -> Result<Reader> {
 mod tests {
     use super::*;
 
-    /// K-EFFICIENCY: same-path reopen on one thread returns the PARKED
-    /// connection (fresh-open accounting does not grow); a nested open
-    /// while checked out falls back to a transient (never aliases).
-    #[test]
-    fn reader_reuses_parked_connection_per_thread() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.db");
-        {
-            let conn = create_new(&db).unwrap();
-            drop(conn);
-        }
-        let before = reader_opens();
-        {
-            let a = open_reader(&db).unwrap();
-            assert_eq!(reader_opens(), before + 1, "first open is fresh");
-            drop(a);
-            let b = open_reader(&db).unwrap();
-            assert_eq!(
-                reader_opens(),
-                before + 1,
-                "same-path reopen must CHECK OUT the parked conn (no new open)"
-            );
-            // reentrant open while checked out → fresh transient (no aliasing)
-            let inner = open_reader(&db).unwrap();
-            assert_eq!(reader_opens(), before + 2, "nested open falls back fresh");
-            drop(inner);
-            drop(b);
-        }
-        let c = open_reader(&db).unwrap();
-        assert_eq!(
-            reader_opens(),
-            before + 2,
-            "parked conn still reusable after the scope"
-        );
-        drop(c);
-    }
+    // K-EFFICIENCY reader accounting moved to tests/reader_accounting.rs:
+    // exact deltas on the process-global READER_OPENS counter are unsound
+    // under the in-src parallel test runner (flaked 2026-10-05 — TESTING §1.6).
 
     #[test]
     fn version_gate_passes_on_bundled() {
