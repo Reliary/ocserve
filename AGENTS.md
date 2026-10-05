@@ -56,6 +56,11 @@ are the bar — "mostly passing" does not exit.
    banned-string check runs pre-commit.
 10. **Unsafe**: `forbid(unsafe_code)` per crate unless a crate explicitly opts into a
     reviewed `unsafe` module (justify in the crate README; blob/zstd interop likely candidates).
+11. **Non-refine services are read-only**: agents and scripts may *inspect* any host service
+    (`status`/`cat`/`show`/`is-active`/health) but only ever mutate `refine*` units — no
+    drop-ins, env changes, starts/stops/restarts of other units (opencode included).
+    Experiments against other services run in disposable containers (`check-guards.sh`
+    rule 6 enforces the script side; incident 2026-10-05, TESTING §1.6).
 
 ## 3. Commit strategy
 

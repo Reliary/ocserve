@@ -10,6 +10,9 @@
 #   5. upstream drift watch broken (version compare / replay-output parse /
 #      set-difference / report writer) — the nightly watch would go silently
 #      wrong (PLAN §6/§8, K-DRIFT)
+#   6. non-refine systemd units mutated from repo scripts (drop-ins/restarts —
+#      the 2026-10-05 incident class; only refine* units are mutable, see
+#      TESTING §1.6)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -52,6 +55,18 @@ if ./scripts/drift-watch.sh --selftest >/dev/null 2>&1; then
   echo "ok"
 else
   echo "FAIL: drift-watch --selftest (upstream drift watcher broken — PLAN §6/§8 watch)"; fail=1
+fi
+
+echo "== guard: non-refine systemd units are read-only in scripts =="
+# Named exception: lines carrying 'refine' (refine.service, refine-*.service,
+# refine-tailscale-forward) — refine's own deploy/restart is legitimate.
+# Read-only inspect (status/cat/show/is-active) is intentionally not matched.
+if out=$(grep -rnE 'systemd/user/[A-Za-z0-9@._-]*service\.d|systemctl --user (edit|restart|stop|start|mask|kill)\b' \
+    scripts bench --include='*.sh' --include='*.py' 2>/dev/null \
+    | grep -v 'check-guards\.sh' | grep -v refine); then
+  echo "$out"; echo "FAIL: repo script mutates a non-refine systemd unit (2026-10-05 incident class) — experiments belong in disposable containers (TESTING §1.6)"; fail=1
+else
+  echo "ok"
 fi
 
 exit $fail
