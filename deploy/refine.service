@@ -28,7 +28,13 @@ RestartSec=5
 # PUT/DELETE reloads + search + sidecar + embedding model) hit the 600M
 # cap exactly (systemd: kernel OOM kill, peak 600M; steady post-restart
 # is ~412MB cgroup). Provenance: journal 19:20:09 oom-kill.
-MemoryMax=750M
+# 2026-10-05 (measured, interim): 7 kernel memcg kills in one day at 750M.
+# Measured composition: warm main ~500MB + reload build ~237MB transient
+# (A2 log: 301→538 on one reload; warm reload = kill — journal 17:01:33)
+# + children ~214MB (plugin host 145 + bh 78) → predicted peak ~951MB.
+# 1024M buys measured margin; Phase-B attribution (K-OOM-RESILIENCE) may
+# shrink the baseline and justify lowering again.
+MemoryMax=1024M
 MemorySwapMax=0
 ProtectSystem=strict
 ReadWritePaths=%h/.local/share/refine %h/.local/share/opencode %h/.cache/opencode %h/.config/opencode %h/src/reliary8

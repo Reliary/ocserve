@@ -110,6 +110,41 @@ async fn external_edit_is_detected_and_reconciled() {
     );
 }
 
+/// A5/K-OOM-RESILIENCE (2026-10-05): their opencode rewrites models.json
+/// ~hourly with IDENTICAL bytes — mtime churn must NOT reload (the warm
+/// reload spike was lethal at 750M: journal kill 17:01:33). Only content
+/// changes may fire reconcile.
+#[tokio::test]
+async fn same_content_rewrite_is_skipped_content_change_fires() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.json");
+    std::fs::write(&cfg, r#"{"theme":"dark"}"#).unwrap();
+    let st = state(dir.path(), Payloads::default());
+    *st.reloader.write() = Some(file_reloader(cfg.clone()));
+    st.watch.write().paths = vec![cfg.clone()];
+    observe(&st);
+    assert!(!refine_http::watch::changed(&st), "boot parity: no change");
+
+    // identical bytes, new mtime (their hourly catalog rewrite shape)
+    std::fs::write(&cfg, r#"{"theme":"dark"}"#).unwrap();
+    assert!(
+        !refine_http::watch::changed(&st),
+        "mtime-only churn must not fire a reload"
+    );
+    // and the tuple advanced: a second check stays quiet too
+    assert!(
+        !refine_http::watch::changed(&st),
+        "advanced tuple is stable"
+    );
+
+    // real content change fires
+    std::fs::write(&cfg, r#"{"theme":"oled"}"#).unwrap();
+    assert!(refine_http::watch::changed(&st), "content change fires");
+    refine_http::watch::reconcile(&st).await.expect("reconcile");
+    let v = get_config(&refine_http::router(st.clone())).await;
+    assert_eq!(v["theme"], "oled");
+}
+
 #[tokio::test]
 async fn corrupt_edit_keeps_old_state_then_recovers() {
     let dir = tempfile::tempdir().unwrap();

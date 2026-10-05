@@ -59,6 +59,13 @@ Reconcile is now INFO-logged (files + duration + RSS delta), soak gained
 the root fs sitting at 6.8% free (< default `SystemKeepFree`10%) — retention floor
 staged at `deploy/journald-retention.conf` (500M cap, keep-free override). The
 +146 MB main-vs-341 delta is plateau-stable and attributed AFTER the A-data (Phase B).
+**Same-day outcome:** warm reload proved lethal — a forced catalog refresh OOM-killed the
+service 2 s later (kill #7, journal 17:01:33, +237 MB measured by the new A2 log) →
+(A5) `watch` now content-hashes on tuple-diff: identical-bytes rewrites (their hourly
+identical fetch) advance the tuple with `result="skipped"` and never reload (plant-proven);
+and `MemoryMax` raised **750M → 1024M** as a measured interim (predicted peak ≈951 MB =
+warm 500 + reload build 237 + children 214; both live and repo units). Phase B re-measures
+and may lower it again.
 
 **V8 heap cap (2026-10-03, P0 battery):** at `--max-old-space-size=64` the real
 5-plugin set OOM-killed the sidecar once at boot (observed: `FATAL ERROR: Reached

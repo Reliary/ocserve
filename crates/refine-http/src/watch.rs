@@ -39,12 +39,16 @@ use std::time::{Duration, SystemTime};
 type Observed = (Option<SystemTime>, u64);
 
 /// Watched-file state. `paths` set once at boot (≤6 files — bounded by the
-/// set `Runtime::load_for` reads); `observed` tracks last-seen tuples so the
-/// watcher fires only on real changes (idempotent reloads otherwise).
+/// set `Runtime::load_for` reads); `observed` tracks last-seen
+/// (mtime,len)+content-hash so the watcher fires only on real CONTENT
+/// changes. The hash matters: their opencode rewrites `models.json`
+/// ~hourly with IDENTICAL bytes (fresh-TTL fetch) — mtime churn without a
+/// content change used to trigger a full reload (the proven warm-kill
+/// spike: 7 OOM kills on 2026-10-05, journal 17:01:33) for zero benefit.
 #[derive(Default)]
 pub struct WatchState {
     pub paths: Vec<PathBuf>,
-    observed: HashMap<PathBuf, Observed>,
+    observed: HashMap<PathBuf, (Observed, u64)>,
 }
 
 fn stat_one(p: &std::path::Path) -> Observed {
@@ -54,24 +58,68 @@ fn stat_one(p: &std::path::Path) -> Observed {
     }
 }
 
+/// Content hash for change detection (only computed when the fast
+/// (mtime,len) tuple already differs — never on the steady poll path).
+fn content_hash(p: &std::path::Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let Ok(bytes) = std::fs::read(p) else {
+        return 0;
+    };
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
 /// Record current tuples for every watched path (call after each successful
 /// load AND once at boot so the first poll tick doesn't re-load fresh state).
 pub fn observe(st: &AppState) {
     let paths = st.watch.read().paths.clone();
     let mut w = st.watch.write();
-    w.observed = paths.iter().map(|p| (p.clone(), stat_one(p))).collect();
+    w.observed = paths
+        .iter()
+        .map(|p| (p.clone(), (stat_one(p), content_hash(p))))
+        .collect();
 }
 
-/// True when any watched path's (mtime, len) differs from the last observed
-/// tuple (or was never observed). Empty watch set → false (no-op).
+/// True when any watched path's CONTENT differs from the last observed
+/// state. (mtime,len) is the fast path; when only mtime churned (same
+/// bytes — their hourly identical catalog rewrite) the tuple is advanced
+/// in place, `result="skipped"` is counted, and NO reload is requested.
+/// Empty watch set → false (no-op).
 pub fn changed(st: &AppState) -> bool {
-    let w = st.watch.read();
+    let mut w = st.watch.write();
     if w.paths.is_empty() {
         return false;
     }
-    w.paths
-        .iter()
-        .any(|p| w.observed.get(p) != Some(&stat_one(p)))
+    let paths = w.paths.clone();
+    let mut any = false;
+    for p in &paths {
+        let tuple = stat_one(p);
+        match w.observed.get(p) {
+            Some((last, _)) if *last == tuple => {}
+            Some((_, hash)) => {
+                let h = content_hash(p);
+                if h == *hash {
+                    w.observed.insert(p.clone(), (tuple, h));
+                    tracing::info!(
+                        "watch: {} mtime changed, content identical — reload skipped",
+                        p.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    );
+                    refine_metrics::labeled_counter(
+                        "refine_config_reload_total",
+                        "result=\"skipped\"",
+                        1,
+                    );
+                } else {
+                    any = true;
+                }
+            }
+            None => any = true,
+        }
+    }
+    any
 }
 
 /// Rebuild payloads + LLM registry from disk and (re)apply both, then diff
@@ -112,7 +160,7 @@ pub async fn reconcile(st: &Arc<AppState>) -> anyhow::Result<()> {
         let w = st.watch.read();
         w.paths
             .iter()
-            .filter(|p| w.observed.get(*p) != Some(&stat_one(p)))
+            .filter(|p| w.observed.get(*p).map(|(t, _)| *t) != Some(stat_one(p)))
             .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .collect()
     };
