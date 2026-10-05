@@ -69,3 +69,34 @@ Unit: `Environment=MALLOC_ARENA_MAX=1` + `MemoryMax=750M` (both live and
   re-check boot margin if it does.
 - bytehound `.dat` lives in `/tmp/opencode/oom-lab/work/` (ephemeral);
   key numbers are extracted above.
+
+
+## Tier 1 (same night): where the *size* comes from — and the trim fix
+
+The arena1 fix removed the per-reload *step*, but a fresh lab run showed the
+full catalog still settles at **237 MB** vs a 92-byte-catalog control at
+**19 MB** — so ~218 MB of freed-but-retained glibc heap comes from the
+build_providers/transform/parse pipeline itself, not from live data.
+
+| lab variant (full 5.3 MB catalog) | boot settle | 3 reloads | final |
+|---|---|---|---|
+| arena1 only | 237 MB | +70/0/0 | 307 MB |
+| arena1 + LD_PRELOAD `malloc_trim(0)` shim | 91 MB | +3/0/−1 | 91 MB |
+| **arena1 + `watch::trim_heap()` (shipped)** | **89 MB** | **+3/0/+2** | **94 MB** |
+| control: `REFINE_TRIM=0` (killswitch) | 237 MB | +70/0/0 | 307 MB |
+| control: 92-byte catalog | 18–19 MB | — | 19 MB |
+
+Fix shipped in commit `31b90c1`: `malloc_trim(0)` at boot, after every
+reconcile swap, and every `REFINE_TRIM_SECS` (default 300 s); `REFINE_TRIM=0`
+is the killswitch the lab control uses. `tests/trim_contract.rs` pins the
+killswitch contract in its own process (env-race rule, TESTING §1).
+
+**Production confirmation after deploy (22:32):** main **98 MB**, cgroup
+**312 MB** (budget ≤460; was 321/517 before, 774/1000+ at the worst),
+and the first production reload logged `rss 98.9 → 96.7 MB` — trim returns
+pages between reloads, so RSS *shrinks* on reload instead of stepping.
+
+**Deferred (measured, not built):** Tier-1.1 bytes-ify the `/provider` and
+`/config/providers` payload DOMs (they are retained ~15–20 MB and deep-cloned
+per request via `Json(…clone())`). Trim already covers the current target;
+the DOM work is the next lever if main needs to go under ~60 MB.
