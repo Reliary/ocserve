@@ -162,6 +162,10 @@ case "${1:-}" in
     esac
     cap_stop
     ;;
+  pf)
+    shift
+    node /probe/replica-refine.js "$@"
+    ;;
   boot-check) boot && echo BOOT_OK ;;
   *) echo "usage: s0|s1|s1b|r1|r3|rv2 E1..E4|boot-check" >&2; exit 2 ;;
 esac
