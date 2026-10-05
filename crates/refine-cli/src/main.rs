@@ -548,7 +548,8 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     Ok(())
 }
 
-/// RSS of the node plugin sidecar child (first node process we spawned).
+/// RSS of the plugin sidecar child (bun or node — whichever runtime is
+/// active; comm is "bun" or "node-MainThread").
 fn sidecar_rss(ppid: u32) -> Option<i64> {
     let mut found = None;
     // NOTE: `?` must not appear here — /proc contains non-pid entries
@@ -571,8 +572,9 @@ fn sidecar_rss(ppid: u32) -> Option<i64> {
         let fields: Vec<&str> = rest.split_whitespace().collect();
         if fields.len() > 1 && fields[1].parse::<u32>().ok() == Some(ppid) {
             let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-            if comm.trim().starts_with("node") {
-                // comm shows node-MainThread
+            let c = comm.trim();
+            if c.starts_with("node") || c == "bun" || c.starts_with("bun-") {
+                // node: comm shows "node-MainThread"; bun: "bun"
                 let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
                 found = status
                     .lines()
