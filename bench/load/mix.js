@@ -96,7 +96,11 @@ export function doIteration() {
       req('search', 'POST', '/session/search', { query: SEARCH_Q, limit: 50 });
       break;
     case 8:
-      req('session_status', 'GET', `/session/${sid}/status`);
+      // GLOBAL status (W2 golden {}|busy map). The per-session variant
+      // does NOT exist on either server: refine 404s honestly (unregistered
+      // route), freeze returns 200 SPA catch-all HTML — a status-code-only
+      // check counted that as a pass on run1 (recorded lesson).
+      req('session_status', 'GET', '/session/status');
       break;
     default:
       break;
