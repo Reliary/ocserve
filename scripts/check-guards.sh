@@ -15,6 +15,9 @@
 #      TESTING §1.6)
 #   9. unit template keeps OOMPolicy=continue (child OOM must not bounce the
 #      service — the 2026-10-06 stop-policy bounce; A3's completion)
+#  10. A3 child wrapper stays byte-identical in refine-mcp + refine-plugin
+#      (two copies, no shared dep — drift would silently drop oom_score_adj
+#      or the L1 kids move from one spawn path)
 #  11. installer/uninstaller never delete shared opencode state (config, auth,
 #      legacy db, model cache, packages — only refine-derived *.normalized.mjs
 #      artifacts are allowed near opencode paths)
@@ -106,6 +109,16 @@ if grep -q 'OOMPolicy=continue' deploy/refine.service 2>/dev/null; then
   echo "ok"
 else
   echo "FAIL: deploy/refine.service lost OOMPolicy=continue — child OOM will bounce the whole unit again (A3 class)"; fail=1
+fi
+
+echo "== guard: A3/L1 child wrapper identical in mcp + plugin =="
+w1=$(grep -h 'oom_score_adj' crates/refine-mcp/src/lib.rs | grep 'exec' || true)
+w2=$(grep -h 'oom_score_adj' crates/refine-plugin/src/lib.rs | grep 'exec' || true)
+if [ -z "$w1" ] || [ -z "$w2" ] || [ "$w1" != "$w2" ]; then
+  echo "mcp:    $w1"; echo "plugin: $w2"
+  echo "FAIL: OOM_CHILD_WRAPPER copies drifted (rule 10 — both spawn paths must carry adj+kids move)"; fail=1
+else
+  echo "ok"
 fi
 
 echo "== guard: install/uninstall never delete shared opencode state =="

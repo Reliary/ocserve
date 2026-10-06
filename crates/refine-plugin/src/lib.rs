@@ -154,6 +154,10 @@ pub struct Sidecar {
     /// normalization output root (`data/normalized`); None = skip (tests,
     /// any sidecar without it — existing behavior untouched, D1-PLAN)
     normalize_root: Option<PathBuf>,
+    /// spawn time for the L1 recycle min-uptime guard (SRE §5) — fresh on
+    /// every (re)spawn, so a recycled sidecar can't be recycled again until
+    /// the guard window passes.
+    started_at: std::time::Instant,
 }
 
 /// `sh -c WRAPPER sh <prog> <args…>` → raise oom_score_adj then exec.
@@ -323,7 +327,33 @@ impl Sidecar {
             },
             loads: Vec::new(),
             normalize_root: None,
+            started_at: std::time::Instant::now(),
         })
+    }
+
+    /// RPCs currently in flight (the L1 recycle idle gate — a hook must
+    /// never be interrupted mid-call).
+    pub fn in_flight(&self) -> usize {
+        self.pending.lock().len()
+    }
+
+    /// Seconds since this sidecar instance was spawned (respawns reset it).
+    pub fn uptime(&self) -> std::time::Duration {
+        self.started_at.elapsed()
+    }
+
+    /// L1 graceful recycle (SRE §5): kill the sidecar child while idle.
+    /// State is disk-backed (context.db / pins) and `loads` is kept, so the
+    /// next `ensure_alive` respawns + replays hooks (warm-hash normalize is
+    /// a no-op). SIGKILL is deliberate: the host has no shutdown protocol
+    /// and nothing in it needs flushing. Returns false if already dead.
+    pub fn recycle_child(&mut self) -> bool {
+        if self.child.try_wait().ok().flatten().is_some() {
+            return false;
+        }
+        let _ = self.child.start_kill();
+        self.statuses.lock().clear();
+        true
     }
 
     /// Enable normalization for this sidecar (set once at boot; carried to

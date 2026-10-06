@@ -85,6 +85,7 @@ fn default_data_dir() -> std::path::PathBuf {
 
 mod models_dev;
 mod replay;
+mod resilience;
 mod runtime;
 
 fn main() -> Result<()> {
@@ -428,6 +429,7 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut n: u64 = 0;
+            let mut recycle_hi: u32 = 0;
             loop {
                 tick.tick().await;
                 n += 1;
@@ -446,8 +448,54 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
                 {
                     refine_metrics::gauge("refine_db_bytes", db.len() as i64);
                 }
-                if let Some(rss) = sidecar_rss(std::process::id()) {
-                    refine_metrics::gauge("refine_sidecar_rss_bytes", rss);
+                // Precise sidecar RSS: "first node/bun child of mine" is the
+                // plugin browser host after any sidecar respawn (pre-existing
+                // attribution flake) — ask the sidecar for ITS child pid.
+                let mut sidecar_rss_exact: Option<i64> = None;
+                if let Some(plug) = st.plugins.get() {
+                    let sc = plug.lock().await;
+                    sidecar_rss_exact = resilience::rss_of_pid(sc.child_pid());
+                }
+                let rss = sidecar_rss_exact.or_else(|| sidecar_rss(std::process::id()));
+                if let Some(r) = rss {
+                    refine_metrics::gauge("refine_sidecar_rss_bytes", r);
+                    // L1 graceful recycle (SRE §5): the gauge we already take,
+                    // turned into action before the kernel ever sees the cap.
+                    let thr = resilience::recycle_threshold_mb();
+                    let r_mb = (r / 1_048_576) as u64;
+                    if thr > 0 && r_mb >= thr {
+                        recycle_hi = recycle_hi.saturating_add(1);
+                    } else {
+                        recycle_hi = 0;
+                    }
+                    if recycle_hi >= 2
+                        && let Some(plug) = st.plugins.get()
+                        // busy lock ⇒ RPC in flight ⇒ not idle ⇒ skip tick
+                        && let Ok(mut sc) = plug.try_lock()
+                        && resilience::should_recycle(
+                            thr,
+                            r_mb,
+                            recycle_hi,
+                            sc.in_flight(),
+                            sc.uptime().as_secs(),
+                        )
+                        && sc.recycle_child()
+                    {
+                        recycle_hi = 0;
+                        refine_metrics::labeled_counter(
+                            "refine_sidecar_recycle_total",
+                            "reason=\"rss\"",
+                            1,
+                        );
+                        tracing::info!(
+                            "plugin sidecar recycled (rss {r_mb}MB >= {thr}MB, idle) — respawn on next trigger"
+                        );
+                    }
+                }
+                // PSI instrumentation (measure-first gate for any D-future
+                // MemoryHigh soft throttle; absent on cgroup v1 → no gauge)
+                if let Some(v) = resilience::psi_avg10_centi() {
+                    refine_metrics::gauge("refine_mem_pressure_avg10", v);
                 }
                 refine_metrics::gauge("refine_prompt_locks", st.prompt_locks.lock().len() as i64);
                 refine_metrics::gauge("refine_prompt_tasks", st.prompt_tasks.lock().len() as i64);
@@ -607,6 +655,18 @@ fn doctor(data_dir: std::path::PathBuf) -> Result<()> {
         ),
         Err(e) => println!("  version gate:    FAIL: {e:#}"),
     }
+    // The service is an OPTIONAL overlay — informational, never a failure
+    // (foreground `refine serve` is the contract; preferred: scripts/install.sh).
+    let unit = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".config/systemd/user/refine.service");
+    println!(
+        "  service:        {}",
+        if unit.exists() {
+            "installed (optional overlay; scripts/uninstall.sh removes)"
+        } else {
+            "not installed (optional overlay; preferred: scripts/install.sh)"
+        }
+    );
     let db = refine_store::writer::db_path(&data_dir);
     if db.exists() {
         match refine_store::pragma::open_writer(&db) {
