@@ -16,7 +16,7 @@ AND deno — making runtime choice irrelevant?
 | K4 | computed dynamic import survives + resolves from output location | **PASS ×3** — `` import(`@huggingface/${"transformers"}`) `` survives (folded to a literal template but left runtime — not bundled); direct probe from beside the output: K4_OK 932 exports on bun/node/deno (73–151 ms). Embedding-init log: present on node/deno raw AND norm (parity); absent on bun raw AND norm (pre-existing runtime behavior, not a regression) |
 | K5 | node:sqlite shim serves bun | **FAIL as registered** — see below |
 | K5b (post-hoc) | dual-runtime shim | **PASS** — standalone ×3 + full parity matrix green |
-| K6 | cost | **PASS** — cold ≤478 ms (limit 2 s), warm = instant content-hash hit, invalidation proven (hash-input change → cold), trigger latency raw↔norm within 2× (bun chat 0.277→0.257, xform 0.439→0.496; node xform 0.742→1.039 — norm essentially tied) |
+| K6 | cost | **PASS** — cold ≤478 ms (limit 2 s), warm = instant content-hash hit, invalidation proven (hash-input change → cold), trigger latency raw↔norm within 2×. Full interleaved comparison below |
 | K7 | treeshake off, side effects survive | **PASS** — `TreeshakeOptions::Boolean(false)` asserted in code; proven by K2/K3 |
 
 ## K5 failure (recorded exactly as it happened)
@@ -43,6 +43,27 @@ shipped shim's classes **verbatim** (byte-parity: including its duplicate
 an importer guard (`bun:sqlite` from inside the shim → external runtime
 import) so constant-folding cannot create a self-import. Result: full
 matrix green.
+
+## K6 performance — interleaved raw vs norm (5 rounds, 30 fresh processes)
+
+`perf_compare.py` mirrors the deno-spike methodology (variant order rotated
+per round, fresh process per run, 10-warmup then 100× chat RTT + 50× 120 KB
+transform RTT, host utime+stime). Medians of 5 runs:
+
+| runtime | load raw→norm | chat p50 raw→norm | xform p50 raw→norm | CPU raw→norm |
+|---|---|---|---|---|
+| bun | 400 → 472 ms (+18%) | 0.262 → 0.276 ms | 0.599 → 0.629 ms | 0.67 → 0.68 s |
+| node | 556 → **409 ms (−26%)** | 0.206 → 0.302 ms | 0.634 → 0.737 ms | 0.88 → **0.65 s** |
+| deno | 1722 → **1481 ms (−14%)** | 0.237 → 0.207 ms | 0.603 → 0.770 ms | 1.88 → **1.62 s** |
+
+- **Hot path: parity.** Every trigger median stays sub-millisecond either
+  way — the NDJSON pipe dominates, exactly as the runtime round established.
+  Worst observed ratio is node chat +0.096 ms absolute (well inside K6's 2×).
+- **Load/CPU: normalized wins on node and deno** (one file parsed instead
+  of a 154-module resolution graph; CPU −14% to −26%), pays +18% on bun
+  (bun's lazy per-file resolution was already fast; parsing the 870 KB
+  single file costs slightly more) — absolute delta 72 ms, once per boot.
+- Boot ~30–100 ms all variants — irrelevant.
 
 ## Architecture facts worth keeping
 
