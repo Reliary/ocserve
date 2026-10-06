@@ -91,8 +91,11 @@ transform RTT, host utime+stime). Medians of 5 runs:
 - K5b shim must replace/augment refine's shipped shim (default
   `NORMALIZER_SHIM` currently points at the shipped one, which fails bun —
   the experiment is explicit via env).
-- Release ceiling ≤ 10,485,760 B + build-time delta (spike crate is
-  workspace-detached; rolldown+oxc dep weight unmeasured for refine).
+- Release ceiling ≤ 10,485,760 B + build-time delta — **measured 2026-10-06
+  (STRESS Phase 3): linking rolldown reachable from `refine` = 20,309,584 B
+  (+10.39 MB, over ceiling by 9.82 MB; 455 s cold compile). FAIL as gated;
+  disposition = helper-binary architecture (D2) keeps `refine` at
+  9,918,024 B — see bench/normalizer-spike/STRESS-RESULTS.md.**
 - Load-path wiring: normalize-before-load with warm cache (measured
   warm ≈ 0), fallback to direct entry load if normalization fails.
 - Nightly: parity driver ×3 runtimes (the conformance suite).
