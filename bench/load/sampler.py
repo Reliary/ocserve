@@ -90,7 +90,17 @@ def main() -> int:
                 load1 = float(open("/proc/loadavg").read().split()[0])
             except Exception:
                 load1 = None
-            row: dict = {"t": round(ts, 1), "load1": load1}
+            mem_kb = swapfree_kb = None
+            try:
+                for line in open("/proc/meminfo"):
+                    if line.startswith("MemAvailable:"):
+                        mem_kb = int(line.split()[1])
+                    elif line.startswith("SwapFree:"):
+                        swapfree_kb = int(line.split()[1])
+            except OSError:
+                pass
+            row: dict = {"t": round(ts, 1), "load1": load1,
+                         "mem_kb": mem_kb, "swapfree_kb": swapfree_kb}
             for label, pid in pids.items():
                 cpu, rss = proc_stat(pid)
                 if label not in start_cpu and cpu is not None:

@@ -23,6 +23,26 @@ of *both* servers under **identical read load**:
   measured window; the deterministic dummy (stub) belongs to L2 only
   (`L2-DESIGN.md`, pre-registered, not built)
 
+## CPU pinning (equal resources, big/little aware)
+
+Both arms are pinned with `taskset` to **2 whole physical cores each**
+(both SMT threads, disjoint sets) of the **same CPU class**, and the k6
+client gets its own 2 physical cores — so client load never steals arm
+cores and neither arm can migrate between big and little cores
+(Meteor Lake: `cpu_core` 0-11 homogeneous big / `cpu_atom` 12-21 mixes
+regular E with LP E-cores, which is why **big is the default class** —
+same-class fairness is structural, not statistical). Allocation is
+printed in the report. Knobs:
+
+- `LOAD_ARM_CLASS=big|atom` (default `big`; atom = opt-in, see LP caveat)
+- `LOAD_REF_CORES` / `LOAD_FREEZE_CORES` / `LOAD_K6_CORES` — explicit
+  lists override detection entirely
+
+Caveat kept honest: other processes (browser, TUI) are *not* moved off
+these cores — we never touch your tasks — so the quiet-host gate, round
+ordering and recorded loadavg still stand. Pinning removes scheduler and
+big/little variance; it does not create a dedicated machine.
+
 ## Isolation (hard rules)
 
 - k6 targets **only** `127.0.0.1:4930/4931` (fixture arms). Live `:4912`
@@ -44,8 +64,11 @@ of *both* servers under **identical read load**:
 deepest session** — then both arms derive from it: freeze gets it as its
 native `opencode.db`; refine gets `refine import`. The harness asserts
 **equal `GET /session` counts** or exits infra. Disk only (never tmpfs).
-Project-scope levers if counts mismatch: (1) cwd = dominant existing
-worktree, (2) fixture-local project rewrite — both encoded in the builder.
+Scoping (lever 3, proven empirically): freeze lists `listByProject(ctx.project.id)`
+and project ids are git-derived (stored refine-project id = commit `8b87603…`),
+so boot-time cwd can never match stored ids (first run: freeze=0) — the builder
+rewrites all selected sessions to the stable `global` project and boots both
+arms at `cwd=/`. The count-equality assertion still gates every run.
 
 ## Threshold discipline (no invented numbers)
 

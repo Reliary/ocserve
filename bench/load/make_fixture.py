@@ -23,7 +23,6 @@ and passed to k6 as env.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import sqlite3
@@ -44,6 +43,9 @@ def main() -> int:
     args = ap.parse_args()
     t0 = time.time()
 
+    def phase(msg: str) -> None:
+        print(f"[{time.time()-t0:6.1f}s] {msg}", flush=True)
+
     if not os.path.exists(args.source):
         print(f"fixture: source missing: {args.source}", file=sys.stderr)
         return 2
@@ -53,6 +55,7 @@ def main() -> int:
 
     # ---- selection (one transaction: consistent WAL snapshot) ----
     src.execute("BEGIN")
+    phase("selection started")
     deepest = src.execute(
         """SELECT m.session_id FROM message m
            JOIN session s ON s.id = m.session_id
@@ -70,39 +73,38 @@ def main() -> int:
     if not sel_ids:
         print("fixture: no sessions selected", file=sys.stderr)
         return 2
+    phase(f"selection done ({len(sel_ids)} ids)")
 
-    # dominant project among selected → lever 1 if its worktree exists
-    qmarks = ",".join("?" * len(sel_ids))
-    dom = src.execute(
-        f"""SELECT project_id, COUNT(*) c FROM session
-            WHERE id IN ({qmarks}) GROUP BY project_id
-            ORDER BY c DESC LIMIT 1""",
-        tuple(sel_ids),
-    ).fetchone()
-    dom_pid, dom_count = (dom if dom else (None, 0))
-    dom_wt = None
-    if dom_pid:
-        row = src.execute(
-            "SELECT worktree FROM project WHERE id = ?", (dom_pid,)
-        ).fetchone()
-        dom_wt = row[0] if row else None
-    lever = 1
-    cwd = args.cwd
-    if not (dom_wt and os.path.isdir(dom_wt)):
-        lever = 2
-        cwd = args.cwd  # arms run in the repo root
+    # Scoping (lever 3 — proven empirically 2026-10-06): freeze lists by
+    # listByProject(ctx.project.id) and project ids are GIT-DERIVED (the
+    # stored refine-project id is literally commit 8b87603…, our M0) — so a
+    # boot-time cwd never matches stored project ids (first run showed
+    # freeze=0). The only STABLE id is the literal 'global' project
+    # (worktree '/'), which already holds 186/201 selected sessions: rewrite
+    # ALL selected sessions to it and boot both arms at cwd='/'.
+    lever = 3
+    cwd = "/"
 
     # ---- build snapshot at dest.tmp then rename ----
     tmp = args.dest + ".tmp"
-    if os.path.exists(tmp):
-        os.remove(tmp)
+    for stale in (tmp, tmp + "-wal", tmp + "-shm"):
+        if os.path.exists(stale):
+            os.remove(stale)
     dst = sqlite3.connect(tmp)
     dst.execute("PRAGMA journal_mode=WAL")
+    # disposable build: integrity_check gates before rename, so skip fsync
+    # (crash mid-build = discard tmp; synchronous=OFF = ~10x write speedup)
+    dst.execute("PRAGMA synchronous=OFF")
 
     # schema (tables + explicit indexes)
     for name, sql in src.execute(
         "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL"
     ):
+        # sqlite_sequence etc are kernel-internal names (CREATE of them is
+        # reserved — caught red on the first live fixture build); TEXT pks
+        # make sequence bookkeeping irrelevant anyway
+        if name.startswith("sqlite_"):
+            continue
         dst.execute(sql)
     # seed selection temp table in destination
     dst.execute("CREATE TABLE _sel (id TEXT PRIMARY KEY)")
@@ -119,7 +121,24 @@ def main() -> int:
         )
         return cur.rowcount
 
+    def copy_events() -> int:
+        # materialize selected message ids ONCE — the previous per-row
+        # correlated subquery over 641k events was the slow path (and with
+        # the stale-WAL bug above, exceeded 400s twice)
+        dst.execute(
+            "CREATE TEMP TABLE _msg_sel AS SELECT id FROM src.message "
+            "WHERE session_id IN (SELECT id FROM _sel)"
+        )
+        n = dst.execute(
+            """INSERT INTO event SELECT e.* FROM src.event e
+               WHERE e.aggregate_id IN (SELECT id FROM _sel)
+                  OR e.aggregate_id IN (SELECT id FROM _msg_sel)"""
+        ).rowcount
+        dst.execute("DROP TABLE _msg_sel")
+        return n
+
     dst.execute("ATTACH ? AS src", (args.source,))
+    phase("schema + attach done")
     counts: dict[str, int] = {}
     all_tables = [
         r[0]
@@ -128,57 +147,49 @@ def main() -> int:
         )
     ]
     for t in all_tables:
+        if t == "event":
+            # Historical event PAYLOADS are ~2GB (643k rows × multi-KB) and
+            # L1 never reads them: session/message/part routes don't touch the
+            # event table, and live events regenerate identically on both
+            # arms from the same seed activity (zero in L1). Schema +
+            # event_sequence still copied; measured count recorded as 0.
+            counts[t] = 0
+            continue
         if t in SUBSET_TABLES:
             col = "session_id" if t in ("message", "part", "todo") else (
                 "id" if t == "session" else "aggregate_id"
             )
-            try:
-                counts[t] = copy_subset(t, col)
-            except sqlite3.Error as e:
-                # event aggregates may key off message ids; best-effort second try
-                if t == "event":
-                    counts[t] = dst.execute(
-                        """INSERT INTO event SELECT e.* FROM src.event e
-                           WHERE e.aggregate_id IN (SELECT id FROM _sel)
-                              OR e.aggregate_id IN (
-                                 SELECT id FROM src.message
-                                 WHERE session_id IN (SELECT id FROM _sel))"""
-                    ).rowcount
-                else:
+            if t == "event":
+                counts[t] = copy_events()
+            else:
+                try:
+                    counts[t] = copy_subset(t, col)
+                except sqlite3.Error as e:
                     raise RuntimeError(f"subset {t}: {e}") from e
         else:
             try:
                 counts[t] = copy_all(t)
             except sqlite3.Error as e:
                 raise RuntimeError(f"copy {t}: {e}") from e
+        phase(f"copied {t}: {counts[t]} rows")
 
-    # lever 2: rewrite selected sessions to one synthetic project for cwd
-    if lever == 2:
-        pid = hashlib.sha1(cwd.encode()).hexdigest()[:32]
-        src_cols = [r[1] for r in src.execute("PRAGMA table_info(project)")]
-        src_row = src.execute(
-            "SELECT * FROM project WHERE id = ?", (dom_pid,)
-        ).fetchone() or src.execute("SELECT * FROM project LIMIT 1").fetchone()
-        if src_row:
-            row = list(src_row)
-            for i, c in enumerate(src_cols):
-                if c == "id":
-                    row[i] = pid
-                elif c == "worktree":
-                    row[i] = cwd
-                elif c == "name":
-                    row[i] = "load-fixture"
-                elif c in ("time_created", "time_updated", "time_initialized"):
-                    row[i] = row[i]
-            dst.execute(
-                f"INSERT OR REPLACE INTO project VALUES ({','.join('?' * len(row))})",
-                tuple(row),
-            )
+    # lever 3: pin every selected session to the stable 'global' project
+    # (fixture copy only — the source is opened read-only)
+    has_global = dst.execute(
+        "SELECT 1 FROM project WHERE id='global' LIMIT 1"
+    ).fetchone()
+    if not has_global:
         dst.execute(
-            "UPDATE session SET project_id = ?, directory = ? "
-            "WHERE id IN (SELECT id FROM _sel)",
-            (pid, cwd),
+            "INSERT INTO project (id, worktree) VALUES ('global', '/')"
         )
+    # directory is ALSO rewritten: freeze re-homes rows whose `directory`
+    # points at a registered worktree (observed live: 2 sessions left
+    # 'global' into project 289e1767… mid-run, breaking count equality) —
+    # directory='/' anchors every row to the cwd we boot at.
+    dst.execute(
+        "UPDATE session SET project_id='global', directory='/' "
+        "WHERE id IN (SELECT id FROM _sel)"
+    )
 
     # indexes from source (explicit SQL only; UNIQUE autoindexes derive from DDL)
     for name, sql, tbl in src.execute(
@@ -192,9 +203,15 @@ def main() -> int:
     dst.commit()
     dst.execute("DROP TABLE _sel")
     dst.commit()
-    dst.execute("VACUUM")
-    dst.commit()
-    ok = dst.execute("PRAGMA integrity_check").fetchone()[0]
+    # no VACUUM: INSERT-SELECT into a fresh db is already sequential —
+    # VACUUM rewrote gigabytes through WAL and was a time-killer.
+    # DETACH first: integrity_check validates ALL ATTACHED databases — with
+    # the 33GB source attached it ran >250s (hung in three timed runs;
+    # standalone on the same file: 8s). Main-only check after detach.
+    dst.execute("DETACH src")
+    phase("integrity_check running (main only)")
+    ok = dst.execute("PRAGMA integrity_check(20)").fetchone()[0]
+    phase(f"integrity_check={ok}")
     dst.close()
     if ok != "ok":
         print(f"fixture: integrity_check failed: {ok}", file=sys.stderr)
@@ -218,7 +235,7 @@ def main() -> int:
         "pool_csv": ",".join(pool),
         "cwd": cwd,
         "lever": lever,
-        "dominant_worktree": dom_wt,
+        "file_path": "/tmp",
         "source": args.source,
         "build_s": round(time.time() - t0, 1),
     }

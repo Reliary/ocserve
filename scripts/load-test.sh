@@ -129,17 +129,107 @@ for p in map(int, sys.argv[1:]):
         s.close()
 PY
 
-live_ok() {
+# ---------- CPU pinning (operator directive: equal resources per arm, big/little aware) ----------
+# Each arm fully owns 2 PHYSICAL cores (both SMT threads) of the same class;
+# k6 client owns 2 more physical cores of that class → client load never
+# steals arm cores, arms never migrate across big/little (taskset), and both
+# arms are class-identical by construction (kernel cpu_core/cpu_atom split;
+# default class = big: homogeneous 6 physical cores — the atom class mixes
+# regular E with LP E-cores, so it is opt-in only via explicit core lists).
+pick_cores() {
   python3 - "$1" <<'PY'
-import sys, urllib.request
-try:
-    urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/global/health", timeout=2)
-except Exception:
-    sys.exit(1)
+import sys, os
+cls = (sys.argv[1] if len(sys.argv) > 1 else "big").lower()
+def r(p):
+    try:
+        return open(p).read().strip()
+    except OSError:
+        return None
+def expand(spec):
+    out = []
+    for part in spec.replace("\n", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            out.extend(range(int(a), int(b) + 1))
+        else:
+            out.append(int(part))
+    return out
+hybrid_big = r("/sys/devices/cpu_core/cpus")
+hybrid_atom = r("/sys/devices/cpu_atom/cpus")
+if hybrid_big or hybrid_atom:
+    if cls in ("big", "p", "core"):
+        cpus = expand(hybrid_big or "")
+    else:
+        cpus = expand(hybrid_atom or "")
+else:
+    # homogeneous box (no hybrid sysfs — e.g. the .227 i7-1165G7): all cpus
+    cpus = expand(r("/sys/devices/system/cpu/online") or "0")
+    cls = "homogeneous"
+# group into physical cores via thread siblings (own BOTH siblings = whole core)
+seen, cores = set(), []
+for c in cpus:
+    sib = expand(r(f"/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list") or str(c))
+    key = tuple(sorted(sib))
+    if key not in seen:
+        seen.add(key)
+        cores.append(sorted(sib))
+csv = lambda cc: ",".join(str(x) for pair in cc for x in pair)
+if len(cores) >= 6:
+    print(f"REF_CORES={csv(cores[0:2])}")
+    print(f"FREEZE_CORES={csv(cores[2:4])}")
+    print(f"K6_CORES={csv(cores[4:6])}")
+elif len(cores) >= 3:
+    # small/homogeneous box: 1 whole physical core per entity
+    print(f"REF_CORES={csv(cores[0:1])}")
+    print(f"FREEZE_CORES={csv(cores[1:2])}")
+    print(f"K6_CORES={csv(cores[2:3])}")
+else:
+    print("REF_CORES=")
+    print("FREEZE_CORES=")
+    print("K6_CORES=")
+print(f"ARM_CLASS={cls}")
 PY
 }
-live_ok 4901 || say "WARN: live opencode :4901 not reachable before run"
-live_ok 4912 || say "WARN: live refine :4912 not reachable before run"
+
+if [ -n "${LOAD_REF_CORES:-}" ]; then
+  REF_CORES="$LOAD_REF_CORES"
+  FREEZE_CORES="${LOAD_FREEZE_CORES:-$LOAD_REF_CORES}"
+  K6_CORES="${LOAD_K6_CORES:-}"
+  ARM_CLASS="manual"
+else
+  eval "$(pick_cores "${LOAD_ARM_CLASS:-big}")" || die2 "CPU topology pick failed (set LOAD_*_CORES explicitly)"
+fi
+if [ -n "$REF_CORES" ]; then
+  say "cpu pinning: refine=[$REF_CORES] freeze=[$FREEZE_CORES] k6=[$K6_CORES] class=$ARM_CLASS"
+else
+  say "cpu pinning: OFF (topology insufficient — unshared run, loadavg context only)"
+  ARM_CLASS="off"
+fi
+
+live_ok() { # retries: a busy-but-healthy service must not read as down
+  python3 - "$1" <<'PY'
+import sys, time, urllib.request
+for attempt in range(4):
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/global/health", timeout=3)
+        sys.exit(0)
+    except Exception:
+        if attempt == 3:
+            sys.exit(1)
+        time.sleep(1)
+PY
+}
+PRE_4901=0; PRE_4912=0
+live_ok 4901 && PRE_4901=1 || say "WARN: live opencode :4901 not reachable before run"
+live_ok 4912 && PRE_4912=1 || say "WARN: live refine :4912 not reachable before run"
+
+# ---------- co-tenant memory guard (never OOM the host's other work) ----------
+MIN_MEM_KB="${MIN_MEM_KB:-1572864}"
+avail_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+[ "$avail_kb" -ge "$MIN_MEM_KB" ] || die2 "MemAvailable ${avail_kb}KB < ${MIN_MEM_KB}KB — refusing (co-tenant protection)"
 
 # ---------- fixture (real-data snapshot, disk-only) ----------
 mkdir -p "$FIX"
@@ -151,6 +241,7 @@ if [ -f "$FIX/meta.json" ]; then
   [ "$have" -gt $((LOAD_SESSIONS - 1)) ] && [ "$have" -le $((LOAD_SESSIONS + 1)) ] || need_build=1
 fi
 [ "${FORCE_FIXTURE:-0}" = 1 ] && need_build=1
+if [ -f "$FIX/meta.json" ] && [ "$(python3 -c "import json;print(json.load(open('$FIX/meta.json')).get('lever'))")" != 3 ]; then need_build=1; fi
 
 if [ "$need_build" = 1 ]; then
   say "== fixture: subset snapshot ($LOAD_SESSIONS + deep) from legacy (read-only) =="
@@ -162,6 +253,7 @@ fi
 
 META_CWD=$(python3 -c "import json;m=json.load(open('$FIX/meta.json'));print(m['cwd'])")
 DEEP=$(python3 -c "import json;print(json.load(open('$FIX/meta.json'))['deep_sid'] or '')")
+FILE_PATH=$(python3 -c "import json;print(json.load(open('$FIX/meta.json')).get('file_path') or '/tmp')")
 POOL=$(python3 -c "import json;print(json.load(open('$FIX/meta.json'))['pool_csv'])")
 
 # freeze home: config fresh each run, native db persists (created from snapshot once)
@@ -209,6 +301,15 @@ say "== spawn (cwd=$META_CWD) =="
 wait
 PID_F=$(cat "$FIX/freeze.pid"); PID_R=$(cat "$FIX/refine.pid")
 rm -f "$FIX/freeze.pid" "$FIX/refine.pid"
+# pin AFTER spawn (taskset -pc on the running pid): one code path for every
+# topology outcome incl. pinning-off; a failed pin degrades loudly
+pin() { # $1=pid $2=cores
+  [ -n "$2" ] || return 0
+  taskset -pc "$2" "$1" >/dev/null 2>&1 \
+    || say "WARN: taskset failed pid $1 cores $2 (running unpinned)"
+}
+pin "$PID_R" "$REF_CORES"
+pin "$PID_F" "$FREEZE_CORES"
 
 wait_healthy() { # port label
   python3 - "$1" "$2" <<'PY' || die2 "$2 never healthy on 1.18.31"
@@ -250,11 +351,18 @@ say "arm equivalence ok"
 TS=$(date +%Y%m%dT%H%M%SZ)
 RUN_DIR="$PWD/bench/load/.runs/$TS"
 mkdir -p "$RUN_DIR"
-python3 - "$FIX/meta.json" "$RUN_DIR/meta.json" "$LOAD_TARGETS" "$ROUNDS" <<'PY'
+python3 - "$FIX/meta.json" "$RUN_DIR/meta.json" "$LOAD_TARGETS" "$ROUNDS" \
+  "$REF_CORES" "$FREEZE_CORES" "$K6_CORES" "$ARM_CLASS" <<'PY'
 import json, sys
 m = json.load(open(sys.argv[1]))
 m["targets"] = sys.argv[3]
 m["rounds"] = int(sys.argv[4])
+m["cores"] = {
+    "class": sys.argv[8],
+    "refine": sys.argv[5],
+    "freeze": sys.argv[6],
+    "k6": sys.argv[7],
+}
 m["order"] = ""
 json.dump(m, open(sys.argv[2], "w"), indent=1)
 PY
@@ -289,7 +397,10 @@ k6_run() { # $1=file $2=script $3...=env assignments (K=V)
   for kv in "$@"; do envs+=(-e "$kv"); done
   local -a flags=()
   [ "${K6_NO_THRESH:-0}" = 1 ] && flags+=(--no-thresholds)
-  docker run --rm --network host \
+  # --user: the image runs k6 as a non-root user that cannot write our
+  # uid-owned run dir (permission denied on first shape test — fixed)
+  docker run --rm --network host --user "$(id -u):$(id -g)" \
+    ${K6_CORES:+--cpuset-cpus "$K6_CORES"} \
     -v "$PWD/bench/load:/k6:ro" -v "$RUN_DIR:/out" \
     "${envs[@]}" "$K6_IMG" run "${flags[@]}" \
     --summary-export "/out/$out" "/k6/$script"
@@ -314,7 +425,7 @@ urllib.request.urlopen('http://127.0.0.1:${port}/global/health',timeout=3)" 2>/d
       say "== r$round $arm/$mode (target ladder: $LOAD_TARGETS) =="
       k6_run "r$round-$arm-$mode-readhot.summary.json" read-hot.js \
         "LOAD_BASE=http://127.0.0.1:$port" "LOAD_MODE=$mode" \
-        "LOAD_SIDS=$POOL" "LOAD_DEEP=$DEEP" "LOAD_FILE_PATH=$META_CWD" \
+        "LOAD_SIDS=$POOL" "LOAD_DEEP=$DEEP" "LOAD_FILE_PATH=${FILE_PATH:-/tmp}" \
         "LOAD_TARGETS=$LOAD_TARGETS" || {
           rc=$?
           if [ "$GATED" = 1 ]; then say "THRESHOLD BREACH (r$round $arm $mode, rc=$rc)"; overall_rc=1
@@ -325,7 +436,7 @@ urllib.request.urlopen('http://127.0.0.1:${port}/global/health',timeout=3)" 2>/d
       say "== r$round $arm/arrival (${LOAD_RPS} rps offered) =="
       k6_run "r$round-$arm-arrival-arrival.summary.json" arrival.js \
         "LOAD_BASE=http://127.0.0.1:$port" "LOAD_MODE=spread" \
-        "LOAD_SIDS=$POOL" "LOAD_DEEP=$DEEP" "LOAD_FILE_PATH=$META_CWD" \
+        "LOAD_SIDS=$POOL" "LOAD_DEEP=$DEEP" "LOAD_FILE_PATH=${FILE_PATH:-/tmp}" \
         "LOAD_RPS=$LOAD_RPS" || {
           rc=$?
           if [ "$GATED" = 1 ]; then say "THRESHOLD BREACH (arrival $arm, rc=$rc)"; overall_rc=1
@@ -347,8 +458,12 @@ say ""
 say "report: $RUN_DIR/report.md"
 
 # ---------- isolation proof ----------
-live_ok 4901 && say "live opencode :4901 healthy after run" || { echo "INFRA: live :4901 unhealthy after run" >&2; overall_rc=2; }
-live_ok 4912 && say "live refine :4912 healthy after run" || { echo "INFRA: live :4912 unhealthy after run" >&2; overall_rc=2; }
+if [ "$PRE_4901" = 1 ] || [ "$PRE_4912" = 1 ]; then
+  if [ "$PRE_4901" = 1 ]; then live_ok 4901 && say "live opencode :4901 healthy after run" || { echo "INFRA: live :4901 unhealthy after run" >&2; overall_rc=2; }; fi
+  if [ "$PRE_4912" = 1 ]; then live_ok 4912 && say "live refine :4912 healthy after run" || { echo "INFRA: live :4912 unhealthy after run" >&2; overall_rc=2; }; fi
+else
+  say "live services absent on this host (recorded — runner-box mode)"
+fi
 
 if [ "$GATED" != 1 ] && [ ! -f bench/load/thresholds.json ]; then
   say ""

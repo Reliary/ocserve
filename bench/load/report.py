@@ -16,7 +16,12 @@ import sys
 
 def k6_metric(summary: dict, name: str) -> dict:
     m = (summary.get("metrics") or {}).get(name) or {}
-    return m.get("values") or {}
+    # k6 v1 wrapped stats in {"values": {...}}; k6 v2 (the grafana/k6 image
+    # we run) exports them FLAT — verified live against the image before the
+    # first baseline (a v1-only parser would have produced an all-— table).
+    if isinstance(m.get("values"), dict):
+        return m["values"]
+    return m if isinstance(m, dict) else {}
 
 
 def num(d: dict, key: str, scale: float = 1.0):
@@ -42,6 +47,14 @@ def main() -> int:
         f"(msgs={meta.get('msgs', '?')}, parts={meta.get('parts', '?')}), "
         f"deep={str(meta.get('deep_sid'))[:24]}…, lever={meta.get('lever')}"
     )
+    cores = meta.get("cores") or {}
+    if cores:
+        lines.append(
+            f"- cpu pinning (operator directive): class={cores.get('class')} · "
+            f"refine=[{cores.get('refine')}] freeze=[{cores.get('freeze')}] "
+            f"k6=[{cores.get('k6')}] — each arm owns whole physical cores "
+            f"(both SMT threads), k6 on separate cores"
+        )
     lines.append(f"- run order (rounds interleaved): {meta.get('order', '—')}")
     lines.append(f"- ramp targets (concurrency ladder): {meta.get('targets', '—')}")
     lines.append(
@@ -112,6 +125,12 @@ def main() -> int:
         lines.append(
             f"- loadavg1 during run: min {min(loads)} / max {max(loads)} "
             f"(quiet-host gate applies at start; recorded for latency context)"
+        )
+    mems = [r["mem_kb"] for r in samples if r.get("mem_kb") is not None]
+    if mems:
+        lines.append(
+            f"- MemAvailable during run: min {round(min(mems)/1048576,1)} GB "
+            f"(co-tenant guard refuses runs below 1.5 GB at start)"
         )
     lines.append("")
 
