@@ -82,4 +82,15 @@ else
   echo "ok"
 fi
 
+echo "== guard: normalized plugin outputs written atomically =="
+# D1: a torn .normalized.mjs (partial fs::write after a crash) loads as a
+# syntax error or half-plugin at boot. Every FINAL normalized path write
+# must go through atomic_write (tmp+rename); crash matrix: any prefix of
+# write→rename→hash leaves hash≠content → rebuild (D1-PLAN).
+if out=$(grep -rnE 'fs::write\([^)]*\.normalized' crates/*/src 2>/dev/null); then
+  echo "$out"; echo "FAIL: direct fs::write to a final normalized path — use atomic_write (tmp+rename), D1-PLAN"; fail=1
+else
+  echo "ok"
+fi
+
 exit $fail

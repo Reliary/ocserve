@@ -112,3 +112,20 @@ eliminated.
 moving goalposts — `refine` stays at 9,918,024 B, the helper isolates
 the 10.4 MB dependency, and the measured wins become available. D1 is the
 fallback if single-binary distribution matters more than the ceiling.
+
+
+---
+
+## D1 executed (2026-10-06)
+
+Supersedes the D2 recommendation above: the user chose **single-binary** after the
+size-context analysis (20,359,600 B measured with rolldown linked = 9× smaller than
+upstream's 185 MB ELF). The ceiling was re-baselined *from the measurement*
+(10,485,760 → 20,971,520 B, provenance comment in `scripts/nightly.sh` size_gate) —
+tripwire re-set from evidence, never relaxed to fit. M1–M3/S1–S4 stand as measured;
+execution plan + attack ledger: `D1-PLAN.md`; build evidence: FINDINGS "D1 executed".
+
+**Repro note:** re-running this lab's batteries regenerates *beside-entry* artifacts
+(`index.normalized.mjs{,.hash}`) in plugin directories — lab-only, removable. The
+production emitter (`refine` D1 conditional rule) writes self-contained bundles to
+`<data>/normalized/<path-hash>/` and removes stale beside-entry pairs automatically.

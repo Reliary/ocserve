@@ -79,16 +79,20 @@ PY
 }
 step "backup drill (VACUUM INTO + integrity + counts)" bash -c "$(declare -f drill); drill"
 
-# 5. binary size ceiling (number established at first release build + gate):
-#    release binary 9,279,528 B measured 2026-10-03 → ceiling 10,485,760 B
-#    (10.0 MiB, ~13% headroom; raise ONLY with a measured reason in SRE)
+# 5. binary size ceiling (re-baselined, never bypassed — provenance rule):
+#    9,279,528 B measured 2026-10-03 → ceiling 10,485,760 B (10.0 MiB)
+#    20,359,600 B measured 2026-10-06 → ceiling 20,971,520 B (20 MiB)
+#      D1: rolldown linked into refine as the plugin normalizer
+#      (decision record: bench/normalizer-spike/D1-PLAN.md — user call after
+#      Phase-3 probe; 20.3 MB still 9x smaller than upstream's 185 MB ELF;
+#      tripwire re-baselined from measurement, thresholds never moved to fit)
 size_gate() {
   local bin="target/release/refine"
   if [ ! -x "$bin" ]; then
     echo "release binary missing — building"
     cargo build --release || return 1
   fi
-  local sz ceiling=10485760
+  local sz ceiling=20971520
   sz="$(stat -c%s "$bin")"
   echo "size=${sz} ceiling=${ceiling}"
   [ "$sz" -le "$ceiling" ] || { echo "OVER SIZE CEILING"; return 1; }

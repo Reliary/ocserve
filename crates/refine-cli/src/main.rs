@@ -502,6 +502,9 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
             .unwrap_or_else(|_| "/".into());
         match refine_plugin::Sidecar::spawn(&host, &server_url, &directory).await {
             Ok(mut sc) => {
+                // D1: normalization root (data-dir emit for self-contained
+                // bundles; kill switch REFINE_PLUGIN_NORMALIZE=0)
+                sc.set_normalize_root(data_dir.join("normalized"));
                 let input = serde_json::json!({
                     "directory": directory,
                     "projectID": "global",

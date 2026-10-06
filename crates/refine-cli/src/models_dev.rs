@@ -583,10 +583,7 @@ mod tests {
             ("yes", false),
             ("", false),
         ] {
-            let got = matches!(
-                Some(input).map(str::to_lowercase).as_deref(),
-                Some("true") | Some("1")
-            );
+            let got = matches!(str::to_lowercase(input).as_str(), "true" | "1");
             assert_eq!(got, want, "input {input}");
         }
     }

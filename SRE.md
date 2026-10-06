@@ -50,6 +50,7 @@ behind the same auth as the rest:
 | `refine_history_truncated_total{dropped}` | counter | prompt-history budget trips (8 MB, tail-weighted) — silent context loss made measurable |
 | soak CSV `oc_rss` column | sample | native opencode RSS = the future-usage ceiling model (MEMORY §7.6) |
 | `refine_prompt_rounds_total{bucket,finish}` | counter | uncensored rounds-per-turn distribution: `bucket` = 0-9/10-19/20-39/40-79/80-159/160+, `finish` = `done`/`error`/`capped` — the K-AUTONOMY telemetry the old flat cap made unmeasurable (right-censored at 25) |
+| `refine_plugin_normalize_total{result}` | counter | plugin normalizer health (D1): sustained `error` = builds failing → raw fallback; `warm` on every load after first boot; `disabled` only when kill-switched |
 | `rss_bytes`, `rss_peak_bytes`, `mcp_*` | gauge | 300 MB budget |
 | `blob_orphans`, `blob_missing_total` | gauge/counter | storage integrity |
 | `llm_request_duration_seconds{provider,model}`, `llm_ttft_seconds`, `llm_stream_errors_total` | histogram/counter | provider health (S6) |
@@ -89,6 +90,14 @@ hard cap only — failure is surfaced, never silent) and `REFINE_PROMPT_MAX_COST
 (default 0 = off; hard USD ceiling per prompt). Declared here, not guessed: both
 have kill-criteria tests (`autonomy.rs`) and the bound lives on dollars/visibility,
 not on a magic round count.
+
+Plugin normalization knob — `REFINE_PLUGIN_NORMALIZE` (default **on**): content-hash-cached
+rolldown normalization of plugin entries at load (D1 — decision record
+`bench/normalizer-spike/D1-PLAN.md`). `=0` skips **before rolldown is constructed** (the
+panic=abort residual gate); loads fall back to the raw entry — never worse than today's
+behavior. Telemetry: `refine_plugin_normalize_total{result}` (`warm` hash hit / `built` +
+A2 log line with destination, ms, RSS before→after / `disabled` kill-switch / `error`
+WARN + raw fallback / `passthrough` double-normalize guard).
 
 Provider knob — `REFINE_ZEN_KEYLESS` (default **on**): keyless opencode zen
 endpoint (`Bearer public` + the proven discriminator wire — composite UA,

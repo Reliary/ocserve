@@ -9,6 +9,9 @@
 //! server; protocol = NDJSON on stdio; plugin chatter is forced to stderr by
 //! the host so framing cannot corrupt.
 
+pub mod normalize;
+pub use normalize::{Outcome as NormalizeOutcome, normalize_or_raw_sync};
+
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -146,7 +149,11 @@ pub struct Sidecar {
     /// spawn identity for respawn-after-death
     args: SpawnArgs,
     /// successful loads (spec, entry, input) — replayed on respawn
+    /// (entries stored RAW; load_raw re-normalizes on replay — D1-PLAN)
     loads: Vec<(String, PathBuf, Value)>,
+    /// normalization output root (`data/normalized`); None = skip (tests,
+    /// any sidecar without it — existing behavior untouched, D1-PLAN)
+    normalize_root: Option<PathBuf>,
 }
 
 /// `sh -c WRAPPER sh <prog> <args…>` → raise oom_score_adj then exec.
@@ -315,7 +322,15 @@ impl Sidecar {
                 directory: directory.to_string(),
             },
             loads: Vec::new(),
+            normalize_root: None,
         })
+    }
+
+    /// Enable normalization for this sidecar (set once at boot; carried to
+    /// respawns by `ensure_alive`). None/never-set = raw loads (today's
+    /// behavior — all existing tests stay on this path).
+    pub fn set_normalize_root(&mut self, root: PathBuf) {
+        self.normalize_root = Some(root);
     }
 
     /// Respawn after unexpected death (V8 OOM / crash) and replay every
@@ -335,6 +350,9 @@ impl Sidecar {
         let args = self.args.clone();
         let loads = std::mem::take(&mut self.loads);
         let mut fresh = Sidecar::spawn(&args.host_path, &args.server_url, &args.directory).await?;
+        // D1-PLAN: replay must normalize too (warm no-op; rebuilds if outputs
+        // were wiped mid-run — A1 stores raw, rebuilds here AND at next boot).
+        fresh.normalize_root = self.normalize_root.clone();
         for (spec, entry, input) in &loads {
             if let Err(e) = fresh.load_raw(spec, entry, input).await {
                 tracing::warn!("plugin {spec} reload after respawn failed: {e:#}");
@@ -384,6 +402,37 @@ impl Sidecar {
 
     /// Unguarded load (respawn replay only — fresh child is alive).
     async fn load_raw(&mut self, spec: &str, entry: &Path, input: &Value) -> Result<Vec<String>> {
+        // D1: normalize for the RPC (CPU on spawn_blocking — A2 class); the
+        // RAW entry is what gets recorded for respawn replay (A1).
+        let root = self.normalize_root.clone();
+        let raw = entry.to_path_buf();
+        let (load_path, outcome) = tokio::task::spawn_blocking(move || {
+            crate::normalize::normalize_or_raw_sync(root.as_deref(), &raw)
+        })
+        .await
+        .map_err(|e| anyhow!("normalize task: {e}"))?;
+        refine_metrics::labeled_counter(
+            "refine_plugin_normalize_total",
+            &format!("result=\"{}\"", outcome.label()),
+            1,
+        );
+        match &outcome {
+            crate::normalize::Outcome::Built {
+                path,
+                ms,
+                beside,
+                rss_before_kb,
+                rss_after_kb,
+            } => tracing::info!(
+                "plugin normalize {spec}: built {} ({}) in {ms}ms rss {rss_before_kb}→{rss_after_kb}kB",
+                path.display(),
+                if *beside { "beside-entry" } else { "data-dir" }
+            ),
+            crate::normalize::Outcome::Fallback { err, .. } => {
+                tracing::warn!("plugin normalize {spec} failed, loading raw entry: {err}")
+            }
+            _ => {}
+        }
         // server/directory context defaults from spawn (input may omit them)
         let mut input = input.clone();
         if input
@@ -404,7 +453,7 @@ impl Sidecar {
         }
         let params = json!({
             "spec": spec,
-            "entry": entry.to_string_lossy(),
+            "entry": load_path.to_string_lossy(),
             "input": input,
             "options": Value::Null,
         });

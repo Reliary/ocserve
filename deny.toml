@@ -20,6 +20,12 @@ allow = [
     "Zlib",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
+    # D1 rolldown tree (named dispositions, 2026-10-06):
+    #   BSD-2-Clause — pnp (via oxc_resolver); sibling of existing BSD-3-Clause,
+    #                  OSI-approved, same permissive family
+    #   BSL-1.0      — xxhash-rust; Boost Software License, OSI-approved
+    "BSD-2-Clause",
+    "BSL-1.0",
 ]
 # confidence floor: unlicensed/unknown crates fail the check, never pass quietly
 confidence-threshold = 0.8

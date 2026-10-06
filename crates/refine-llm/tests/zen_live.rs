@@ -8,6 +8,7 @@
 //!   FINDINGS P8) — this is the M6 summary path on a zen default,
 //! - negative: malformed 64-hex session id still trips the gate (E9/E4) —
 //!   proves the wall still EXISTS (if it vanishes, this goes red too).
+//!
 //! Introduction run 2026-10-05: positive 200 / text-only 200 / negative 403.
 
 use futures_util::StreamExt;

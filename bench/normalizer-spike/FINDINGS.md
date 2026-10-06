@@ -111,3 +111,48 @@ python3 parity_driver.py           # K2/K2b/K3/K4 matrix → parity-results.json
 
 Additive artifacts in the opencode cache: `index.normalized.mjs` +
 `index.normalized.mjs.hash` per plugin (removable; raw entries untouched).
+
+
+## D1 executed (2026-10-06) — normalizer linked into `refine`
+
+Decision: **D1**, superseding the D2 recommendation at the end of STRESS-RESULTS
+(user call after the size-context analysis: the linked binary measured
+**20,359,600 B** — still 9× smaller than upstream's 185 MB ELF; the size tripwire
+was re-baselined *from that measurement* to 20,971,520 B in `scripts/nightly.sh`
+with provenance, never moved to fit).
+
+Shipped: `crates/refine-plugin/src/normalize.rs` — sha256 content hash (entry bytes
++ K5b shim + `normalize-v1` salt) warm-gating BOTH candidate destinations; rolldown
+build inside `spawn_blocking` (A2 worker-blocking class); conditional emit via a
+**code-text scanner** (chunk metadata `imports`/`dynamic_imports` provably misses
+non-analyzable dynamic imports — rolldown `src/ast_scanner/impl_visit.rs:241` — so a
+metadata-only scanner would have misclassified magic-context as clean and shipped a
+broken plugin); `Sidecar::load_raw` insertion so boot AND respawn replay normalize
+(raw entry stored — A1; wipe-while-running self-heals at respawn and next boot);
+`REFINE_PLUGIN_NORMALIZE=0` checked before rolldown exists (R1 panic=abort gate);
+`refine_plugin_normalize_total{result}` + A2 log (destination, ms, RSS before→after)
+on built/error only; atomic pid-tmp + rename, hash-after-rename (guard rule 8).
+
+**Ground-truth correction (evidence over intuition, both directions):** codex-auth
+was assumed clean and the scanner flagged it needs-ancestry. The scanner was right —
+`getLockFunction()` does `await import(specifier)` with specifier = `proper-lockfile`
+(its package.json dep), a runtime-resolved bare package. Beside-entry emit in the
+cache is required (and correct); the "clean" assumption was the error.
+
+**Live battery 6/6** (2026-10-06, production unit, five boots):
+- cold: `built 3` — codex 191 ms (beside, RSS 99,348→136,864 kB), magic 467 ms
+  (beside, 137,600→184,188 kB), reliary8 4 ms (data-dir `8abd3fb9…/`, flat);
+- restart ×2: `warm 3` each, zero normalize log lines (warm = metric-only by design);
+- hook sets byte-identical 8/9/1 at first and last boot (K3 parity holds through D1);
+- kill-switch boot: `disabled 3`, zero normalize lines, all plugins still loaded (raw);
+- wipe → restart → `built 3` again; metric present on every boot; health 200;
+- spike leftovers in the reliary8 repo auto-removed by stale-pair cleanup (repo
+  `git status` clean); `<data>/normalized/` holds exactly one key (path-hash).
+
+Residuals (accepted, not hidden): **R1** rolldown panic in-process aborts refine
+(`panic = "abort"`) — gated by the kill switch; S4 fed syntax errors/cycles/garbage/
+50 MB files with zero panics. **R2** beside-entry writes land in opencode's package
+cache — same trust boundary as executing those entries (derived, never fetched).
+**R3** cold rebuild after a plugin update ≈ 0.6 s, logged with RSS before/after.
+Error-string retry across bun/node/deno dialects stays rejected; named trigger: a
+future plugin load failing module-not-found ⇒ scanner rule or retry, then.
