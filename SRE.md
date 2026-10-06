@@ -126,7 +126,8 @@ fails boot. Visibility: `refine_models_refresh_total{result}` + nightly
 
 **Justified per-arch work:**
 - zstd and sha256 (`sha2` with `cpufeatures`) dispatch to AVX2/SHA-NI at **runtime** — zero
-  code, verify with `refine bench --blob` before/after (expect nothing if already active).
+  code, verify with `refine doctor` (blob GC dry-run) before/after (expect nothing if
+  already active).
 - `available_parallelism()` for defaults (not hard-coded 22) with env override — the reliary8
   lesson (WSL2/ARM).
 - `page_size` decided per-machine at DB creation (4096 x86 NVMe; 16384 arm64) — immutable
@@ -246,7 +247,9 @@ only with a before/after number on the bench gate.
     slope/health (replaces eyeballing). Restart manually after every deploy.
   All timers `Persistent=true` (missed runs catch up on boot).
 - **Runbook:** `refine doctor` = boot checks + storage health + FTS integrity + blob GC dry-run
-  + version/contract info; `refine import`, `refine bench {--http,--blob,--replay}`.
+  + version/contract info; `refine import` (legacy snapshot), `refine replay --target|--pair`,
+  and the harnesses `scripts/{replay-check,pair-check,load-test}.sh` (`refine bench` was
+  documented here but NEVER existed — clap rejects it; corrected 2026-10-06).
 
 ## 6. Patterns adopted from your repos (and anti-patterns rejected)
 

@@ -23,6 +23,9 @@
 #      artifacts are allowed near opencode paths)
 #  12. pair-check allowlist entries must cite a named D-PAIR row (the only
 #      legitimate way a freeze↔refine divergence passes the pair gate)
+#  13. load-test: a line that INVOKES k6 may never name a LIVE service port
+#      (4912/4901) — k6 targets fixture arms only; health asserts on the
+#      live ports must not sit on k6 lines
 #   7. exact assertions on process-global counters inside src/ (in-crate unit
 #      tests run in one parallel process and race — the reader_opens flake of
 #      2026-10-05; such tests belong in tests/ where they own the process)
@@ -143,6 +146,13 @@ if [ -f bench/pair/allow.txt ]; then
   fi
 else
   echo "ok (no allowlist)"
+fi
+
+echo "== guard: k6 never targets live services =="
+if out=$(grep -nE 'K6_IMG|k6 run|k6_flags' scripts/load-test.sh | grep -E '4912|4901'); then
+  echo "$out"; echo "FAIL: k6-invoking line names a live service port (rule 13)"; fail=1
+else
+  echo "ok"
 fi
 
 exit $fail
