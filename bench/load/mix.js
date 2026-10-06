@@ -4,7 +4,10 @@
 // pooled p95 + error rate (see README claim classes).
 import http from 'k6/http';
 import { check } from 'k6';
-import { Trend } from 'k6';
+// k6 v2 moved Trend out of the 'k6' barrel (it LINKS there but evaluates to
+// null — every run died with "Value is not an object" at `new Trend`; the
+// canonical k6/metrics path works, probed live on the .227 runner)
+import { Trend } from 'k6/metrics';
 
 export const BASE = __ENV.LOAD_BASE || 'http://127.0.0.1:4930';
 export const MODE = __ENV.LOAD_MODE || 'spread'; // spread | hot
