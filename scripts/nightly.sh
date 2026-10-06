@@ -97,6 +97,7 @@ size_gate() {
   echo "size=${sz} ceiling=${ceiling}"
   [ "$sz" -le "$ceiling" ] || { echo "OVER SIZE CEILING"; return 1; }
 }
+step "uninstall selftest (canary battery)" bash -c './scripts/uninstall.sh --selftest'
 step "binary size ceiling" bash -c "$(declare -f size_gate); size_gate"
 
 # 6. zen free-tier gate (live trio, 3 requests): positive + text-only

@@ -15,6 +15,9 @@
 #      TESTING §1.6)
 #   9. unit template keeps OOMPolicy=continue (child OOM must not bounce the
 #      service — the 2026-10-06 stop-policy bounce; A3's completion)
+#  11. installer/uninstaller never delete shared opencode state (config, auth,
+#      legacy db, model cache, packages — only refine-derived *.normalized.mjs
+#      artifacts are allowed near opencode paths)
 #   7. exact assertions on process-global counters inside src/ (in-crate unit
 #      tests run in one parallel process and race — the reader_opens flake of
 #      2026-10-05; such tests belong in tests/ where they own the process)
@@ -103,6 +106,17 @@ if grep -q 'OOMPolicy=continue' deploy/refine.service 2>/dev/null; then
   echo "ok"
 else
   echo "FAIL: deploy/refine.service lost OOMPolicy=continue — child OOM will bounce the whole unit again (A3 class)"; fail=1
+fi
+
+echo "== guard: install/uninstall never delete shared opencode state =="
+# rm targets may sit next to "opencode" ONLY for the derived normalized
+# artifacts (basename-gated in remove_derived); anything else (config/auth/
+# models/packages) is the 2026-10-05 blast-radius class.
+if out=$(grep -nE 'rm .*opencode|rm .*auth\.json|rm .*models\.json' \
+    scripts/install.sh scripts/uninstall.sh 2>/dev/null | grep -v normalized); then
+  echo "$out"; echo "FAIL: installer/uninstaller would delete shared opencode state (rule 11)"; fail=1
+else
+  echo "ok"
 fi
 
 exit $fail

@@ -1,5 +1,10 @@
 # refine — systemd user unit (SRE.md §5 / MEMORY.md sidecar boundary).
-# Install: cp deploy/refine.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now refine
+# Install (preferred, but NEVER automatic — the service is an optional overlay
+# and foreground `refine serve` is fully supported):  scripts/install.sh
+#   [--dry-run|--bin-only]  — renders this template, enables, health-probes.
+# Uninstall (keeps session history by default):  scripts/uninstall.sh [--purge]
+# Manual alternative: cp deploy/refine.service ~/.config/systemd/user/ &&
+#   systemctl --user daemon-reload && systemctl --user enable --now refine.service
 [Unit]
 Description=refine (opencode-compatible server, freeze 1.18.31)
 After=network.target
@@ -57,7 +62,9 @@ OOMPolicy=continue
 MemoryMax=750M
 MemorySwapMax=0
 ProtectSystem=strict
-ReadWritePaths=%h/.local/share/refine %h/.local/share/opencode %h/.cache/opencode %h/.config/opencode %h/src/reliary8
+# refine's own data dir is required; the opencode/plugin paths are optional
+# ("-path" = ignore when absent) so a fresh machine without opencode still boots.
+ReadWritePaths=%h/.local/share/refine -%h/.local/share/opencode -%h/.cache/opencode -%h/.config/opencode -%h/src/reliary8
 NoNewPrivileges=true
 PrivateTmp=false
 
