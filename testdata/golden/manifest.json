@@ -296,9 +296,6 @@
    "$.mcp.browser-harness.environment.BH_DOMAIN_SKILLS",
    "$.mcp.browser-harness.environment.BU_CDP_URL",
    "$.mcp.browser-harness.type",
-   "$.mcp.context-mode",
-   "$.mcp.context-mode.command",
-   "$.mcp.context-mode.type",
    "$.mcp.context7",
    "$.mcp.context7.enabled",
    "$.mcp.context7.headers",
@@ -1683,7 +1680,6 @@
  "mcp": {
   "keys": [
    "$.browser-harness.status",
-   "$.context-mode.status",
    "$.context7.status"
   ],
   "mode": "keys_subset",
