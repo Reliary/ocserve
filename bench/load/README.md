@@ -73,10 +73,14 @@ arms at `cwd=/`. The count-equality assertion still gates every run.
 ## Threshold discipline (no invented numbers)
 
 1. **Baseline run** (default): `--no-thresholds` — informational only.
-2. Derive from the baseline with declared intent:
-   `bench/load/thresholds.json` =
-   `{"err_rate_max": 0.005, "p95_ms_max": max(2*baseline_p95, baseline+30)}`
-3. **`GATED=1`** runs enforce it (exit 1 on breach).
+2. Derive from the baseline with declared intent (committed BEFORE any
+   gated run — see `BASELINE.md` for the evidence):
+   `p95_ms_max` is **per-arm** (`{"refine": X, "freeze": Y}`) because the
+   baselines differ ~12x — one shared bound would be vacuous for one arm
+   and impossible for the other; each value = max(2 × that arm's worst
+   pooled-p95 cell, +30 ms). `err_rate_max` = 0.005 (declared intent).
+3. **`GATED=1`** runs enforce it per arm (exit 1 on breach); `k6
+   thresholds are read from `thresholds.json` inside `k6_run`.
 
 **Claim classes** (printed in every report): achieved-capacity and
 error-rate are valid at n=1; arm-to-arm **latency deltas are INDICATIVE

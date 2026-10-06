@@ -42,9 +42,10 @@ def main() -> int:
     meta = {}
     if os.path.exists(f"{d}/meta.json"):
         meta = json.load(open(f"{d}/meta.json"))
+    counts = meta.get("counts") or {}
     lines.append(
         f"- fixture: {meta.get('sessions', '?')} sessions "
-        f"(msgs={meta.get('msgs', '?')}, parts={meta.get('parts', '?')}), "
+        f"(msgs={counts.get('message', '?')}, parts={counts.get('part', '?')}), "
         f"deep={str(meta.get('deep_sid'))[:24]}…, lever={meta.get('lever')}"
     )
     cores = meta.get("cores") or {}
@@ -110,6 +111,11 @@ def main() -> int:
         dur = k6_metric(s, "http_req_duration")
         reqs = k6_metric(s, "http_reqs")
         failed = k6_metric(s, "http_req_failed")
+        # k6 v2 flat export: failed RATE lives in .value (the .passes field
+        # counts FAILED requests — verified against raw run1 exports where
+        # refine value=0.1077 matched 516/4790 exactly)
+        if "rate" not in failed and "value" in failed:
+            failed = dict(failed, rate=failed["value"])
         peak = peak_rss.get(arm)
         cpu = None
         if arm in cpu_delta and arm + "_start" in cpu_delta:

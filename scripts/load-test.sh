@@ -371,13 +371,20 @@ python3 bench/load/sampler.py --out "$RUN_DIR/samples.jsonl" --stop "$RUN_DIR/ST
 SAMPLER_PID=$!
 
 # ---------- k6 runs ----------
-k6_flags() { # emits threshold env (GATED) or the inert-marker (baseline)
+thresholds_env() { # $1=arm → threshold env for that arm (GATED) or inert marker
   if [ "$GATED" = 1 ]; then
-    python3 - <<'PY'
-import json
+    python3 - "$1" <<'PY'
+import json, sys
 t = json.load(open("bench/load/thresholds.json"))
-print(f"LOAD_ERR_MAX={t['err_rate_max']}")
-print(f"LOAD_P95_MAX={t['p95_ms_max']}")
+arm = sys.argv[1]
+err = t["err_rate_max"]
+p95 = t["p95_ms_max"]
+# per-arm bounds: refine and freeze baselines differ by ~20x — one shared
+# value would either be vacuous for one arm or impossible for the other
+if isinstance(p95, dict):
+    p95 = p95[arm]
+print(f"LOAD_ERR_MAX={err}")
+print(f"LOAD_P95_MAX={p95}")
 PY
   else
     echo "K6_NO_THRESH=1"
@@ -386,15 +393,18 @@ PY
 
 [ "$GATED" = 1 ] && [ ! -f bench/load/thresholds.json ] \
   && die2 "GATED=1 but bench/load/thresholds.json missing (run baseline first)"
-set -a
-eval "$(k6_flags)"
-set +a
+K6_NO_THRESH=1
+[ "$GATED" = 1 ] && K6_NO_THRESH=""
+export K6_NO_THRESH
 
-k6_run() { # $1=file $2=script $3...=env assignments (K=V)
-  local out="$1" script="$2"; shift 2
+k6_run() { # $1=file $2=script $3=arm $4..=env assignments (K=V)
+  local out="$1" script="$2" arm="$3"; shift 3
   local -a envs=()
   local kv
   for kv in "$@"; do envs+=(-e "$kv"); done
+  if [ "$GATED" = 1 ]; then
+    while IFS= read -r kv; do envs+=(-e "$kv"); done < <(thresholds_env "$arm")
+  fi
   local -a flags=()
   [ "${K6_NO_THRESH:-0}" = 1 ] && flags+=(--no-thresholds)
   # --user: the image runs k6 as a non-root user that cannot write our
@@ -423,7 +433,7 @@ urllib.request.urlopen('http://127.0.0.1:${port}/global/health',timeout=3)" 2>/d
     fi
     for mode in spread hot; do
       say "== r$round $arm/$mode (target ladder: $LOAD_TARGETS) =="
-      k6_run "r$round-$arm-$mode-readhot.summary.json" read-hot.js \
+      k6_run "r$round-$arm-$mode-readhot.summary.json" read-hot.js "$arm" \
         "LOAD_BASE=http://127.0.0.1:$port" "LOAD_MODE=$mode" \
         "LOAD_SIDS=$POOL" "LOAD_DEEP=$DEEP" "LOAD_FILE_PATH=${FILE_PATH:-/tmp}" \
         "LOAD_TARGETS=$LOAD_TARGETS" || {
@@ -434,7 +444,7 @@ urllib.request.urlopen('http://127.0.0.1:${port}/global/health',timeout=3)" 2>/d
     done
     if [ "$LOAD_ARRIVAL" = 1 ]; then
       say "== r$round $arm/arrival (${LOAD_RPS} rps offered) =="
-      k6_run "r$round-$arm-arrival-arrival.summary.json" arrival.js \
+      k6_run "r$round-$arm-arrival-arrival.summary.json" arrival.js "$arm" \
         "LOAD_BASE=http://127.0.0.1:$port" "LOAD_MODE=spread" \
         "LOAD_SIDS=$POOL" "LOAD_DEEP=$DEEP" "LOAD_FILE_PATH=${FILE_PATH:-/tmp}" \
         "LOAD_RPS=$LOAD_RPS" || {
