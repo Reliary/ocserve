@@ -205,3 +205,200 @@ pub async fn replay_all(base: &str, allow_missing: bool) -> Result<(usize, usize
     }
     Ok((pass, fail, failures))
 }
+
+// ─── Pair mode: live freeze ↔ refine direct differential ────────────────────
+//
+// Why direct diff (2026-10-06 antagonization): pass-set comparison against
+// the RECORDED corpus is a weak oracle — two servers can fail the same route
+// for different reasons, and the recorded corpus came from the real user
+// environment (drift control arm: 19 pass / 7 fail / 5 defer under fixture
+// env). The gate here is the two LIVE targets compared to EACH OTHER under
+// identical fixture environments, same cwd, same seed. Recorded-corpus
+// comparison runs alongside but prints as freshness INFO only.
+
+pub struct PairResult {
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// Allowlist for pair divergences: one `name # D-ROW reason` per line
+/// (env `REFINE_PAIR_ALLOW`). Empty/missing file = no allowances. Every
+/// entry must cite a named divergence row — this file is the only way a
+/// divergence passes the gate.
+fn load_pair_allow() -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    let Some(path) = std::env::var_os("REFINE_PAIR_ALLOW") else {
+        return map;
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return map;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (name, reason) = match line.split_once('#') {
+            Some((n, r)) => (n.trim().to_string(), r.trim().to_string()),
+            None => (line.to_string(), String::new()),
+        };
+        map.insert(name, reason);
+    }
+    map
+}
+
+async fn fetch_pair(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+) -> std::result::Result<(u16, Vec<u8>), String> {
+    let resp = client
+        .get(format!("{base}{path}"))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status().as_u16();
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("body read: {e}"))?
+        .to_vec();
+    Ok((status, body))
+}
+
+/// Compare the SAME route fetched from two live targets.
+pub async fn pair_route(
+    client: &reqwest::Client,
+    base_a: &str,
+    base_b: &str,
+    name: &str,
+    e: &Entry,
+) -> PairResult {
+    let mut rr = PairResult {
+        ok: true,
+        detail: format!("({name})"),
+    };
+    let (sa, ba) = match fetch_pair(client, base_a, &e.path).await {
+        Ok(v) => v,
+        Err(err) => {
+            rr.ok = false;
+            rr.detail = format!("target A: {err}");
+            return rr;
+        }
+    };
+    let (sb, bb) = match fetch_pair(client, base_b, &e.path).await {
+        Ok(v) => v,
+        Err(err) => {
+            rr.ok = false;
+            rr.detail = format!("target B: {err}");
+            return rr;
+        }
+    };
+    if sa != sb {
+        rr.ok = false;
+        rr.detail = format!("status differs: A={sa} B={sb} (path {})", e.path);
+        return rr;
+    }
+    match e.mode.as_str() {
+        "bytes" => {
+            if ba != bb {
+                rr.ok = false;
+                rr.detail = format!(
+                    "bytes differ: A={}B B={}B A[:80]={:?} B[:80]={:?}",
+                    ba.len(),
+                    bb.len(),
+                    String::from_utf8_lossy(&ba[..ba.len().min(80)]),
+                    String::from_utf8_lossy(&bb[..bb.len().min(80)]),
+                );
+            }
+        }
+        "keys" | "keys_subset" => {
+            // Live pair = same version + same fixture env ⇒ same key
+            // structure on both sides. (keys_subset stays strict HERE: the
+            // subset leniency exists for recorded-corpus sampling, not for
+            // instance-vs-instance equality.)
+            let va: serde_json::Value = match serde_json::from_slice(&ba) {
+                Ok(v) => v,
+                Err(err) => {
+                    rr.ok = false;
+                    rr.detail = format!("target A invalid JSON: {err}");
+                    return rr;
+                }
+            };
+            let vb: serde_json::Value = match serde_json::from_slice(&bb) {
+                Ok(v) => v,
+                Err(err) => {
+                    rr.ok = false;
+                    rr.detail = format!("target B invalid JSON: {err}");
+                    return rr;
+                }
+            };
+            let mut ka = BTreeSet::new();
+            refine_http::keypaths(&va, "$", &mut ka);
+            let mut kb = BTreeSet::new();
+            refine_http::keypaths(&vb, "$", &mut kb);
+            if ka != kb {
+                let only_a: Vec<_> = ka.difference(&kb).take(5).collect();
+                let only_b: Vec<_> = kb.difference(&ka).take(5).collect();
+                rr.ok = false;
+                rr.detail = format!("key paths differ; only_A={only_a:?} only_B={only_b:?}");
+            }
+        }
+        other => {
+            rr.ok = false;
+            rr.detail = format!("unknown mode {other}");
+        }
+    }
+    rr
+}
+
+/// Pair gate + recorded-corpus freshness info. Returns (compared, divergent,
+/// divergences). Panics never — every fetch error is a printed divergence.
+pub async fn pair_all(base_a: &str, base_b: &str) -> Result<(usize, usize, Vec<String>)> {
+    let manifest = load_manifest(&corpus_dir())?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()?;
+    let allow = load_pair_allow();
+    let mut compared = 0;
+    let mut divergent = 0;
+    let mut details = Vec::new();
+    for (name, entry) in &manifest {
+        if let Some(ms) = &entry.defer {
+            println!("DEFER {name} (declared {ms})");
+            continue;
+        }
+        if let Some(reason) = allow.get(name) {
+            println!("ALLOW {name} ({reason})");
+            continue;
+        }
+        compared += 1;
+        let r = pair_route(&client, base_a, base_b, name, entry).await;
+        if r.ok {
+            println!("PAIR-OK {name}");
+        } else {
+            divergent += 1;
+            println!("PAIR-DIVERGE {name}: {}", r.detail);
+            details.push(format!("{name} [{}]: {}", entry.mode, r.detail));
+        }
+    }
+    // Freshness INFO (never a gate): each arm vs the recorded corpus.
+    for (label, base) in [("freeze", base_a), ("refine", base_b)] {
+        let mut pass = 0;
+        let mut differ = 0;
+        for (name, entry) in &manifest {
+            if entry.defer.is_some() {
+                continue;
+            }
+            let r = replay_route(&client, base, name, entry).await;
+            if r.ok {
+                pass += 1;
+            } else {
+                differ += 1;
+                println!("FRESHNESS-INFO {label} {name}: {}", r.detail);
+            }
+        }
+        println!("FRESHNESS {label}: {pass} match recorded, {differ} differ (info only)");
+    }
+    Ok((compared, divergent, details))
+}

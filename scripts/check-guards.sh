@@ -21,6 +21,8 @@
 #  11. installer/uninstaller never delete shared opencode state (config, auth,
 #      legacy db, model cache, packages — only refine-derived *.normalized.mjs
 #      artifacts are allowed near opencode paths)
+#  12. pair-check allowlist entries must cite a named D-PAIR row (the only
+#      legitimate way a freeze↔refine divergence passes the pair gate)
 #   7. exact assertions on process-global counters inside src/ (in-crate unit
 #      tests run in one parallel process and race — the reader_opens flake of
 #      2026-10-05; such tests belong in tests/ where they own the process)
@@ -130,6 +132,17 @@ if out=$(grep -nE 'rm .*opencode|rm .*auth\.json|rm .*models\.json' \
   echo "$out"; echo "FAIL: installer/uninstaller would delete shared opencode state (rule 11)"; fail=1
 else
   echo "ok"
+fi
+
+echo "== guard: pair allowlist cites D-PAIR rows =="
+if [ -f bench/pair/allow.txt ]; then
+  if out=$(grep -v '^#' bench/pair/allow.txt | grep -vE '^\s*$' | grep -vE '# *D-PAIR-[0-9]'); then
+    echo "$out"; echo "FAIL: pair allow entry without a D-PAIR citation (rule 12)"; fail=1
+  else
+    echo "ok"
+  fi
+else
+  echo "ok (no allowlist)"
 fi
 
 exit $fail

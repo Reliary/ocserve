@@ -57,6 +57,10 @@ enum Cmd {
         /// tolerate routes the target doesn't implement yet (refine during M1-M3)
         #[arg(long)]
         allow_missing: bool,
+        /// second live target — gate becomes A↔B direct diff (pair mode;
+        /// recorded-corpus freshness prints as info only)
+        #[arg(long)]
+        pair: Option<String>,
     },
     /// Model catalog maintenance (K-MODELS — upstream `opencode models refresh`)
     Models {
@@ -127,7 +131,21 @@ fn main() -> Result<()> {
         Cmd::Replay {
             target,
             allow_missing,
+            pair,
         } => rt::block_on(async move {
+            if let Some(other) = pair {
+                // Pair gate: the two LIVE targets compared to each other;
+                // freshness vs recorded prints as info inside pair_all.
+                let (compared, divergent, details) = replay::pair_all(&target, &other).await?;
+                println!("pair {target} <-> {other}: {compared} compared, {divergent} divergent");
+                for d in &details {
+                    eprintln!("  {d}");
+                }
+                if divergent > 0 {
+                    anyhow::bail!("pair diverged on {divergent} routes");
+                }
+                return Ok(());
+            }
             let (pass, fail, failures) = replay::replay_all(&target, allow_missing).await?;
             println!("replay {target}: {pass} passed, {fail} failed");
             if fail > 0 {

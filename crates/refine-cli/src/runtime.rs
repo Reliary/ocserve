@@ -540,7 +540,24 @@ impl Runtime {
         let auth = load_auth(data_dir)?;
         let cache = read_catalog(&cache_path);
 
-        let config = raw_config.clone(); // raw file until M4 plugins add agents (keys_subset)
+        // Pair gate (2026-10-06): freeze's config loader ALWAYS answers
+        // agent/command/mode ({} when unset) + username (system user) —
+        // keypaths seen live under an identical minimal fixture; a raw echo
+        // of a config missing those keys diverged. insert-if-absent: real
+        // configs already carry agent/command and are untouched (keys_subset
+        // recorded ⊆ got also gains username, which real freeze always had).
+        let mut config = raw_config.clone(); // raw file until M4 plugins add agents (keys_subset)
+        if let Some(obj) = config.as_object_mut() {
+            for k in ["agent", "command", "mode"] {
+                obj.entry(k).or_insert(json!({}));
+            }
+            if !obj.contains_key("username")
+                && let Ok(u) = std::env::var("USER").or_else(|_| std::env::var("LOGNAME"))
+                && !u.is_empty()
+            {
+                obj.insert("username".into(), json!(u));
+            }
+        }
         let (agent, api_agent) = build_agents(&raw_config);
         let command = build_commands(&raw_config)?;
         let (config_providers, provider) = build_providers(&raw_config, &auth, &cache);
