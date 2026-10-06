@@ -1,0 +1,264 @@
+{
+ "bun-raw": {
+  "runtime": "bun",
+  "variant": "raw",
+  "hooks": {
+   "codex-auth": [
+    "auth",
+    "chat.headers",
+    "chat.message",
+    "chat.params",
+    "config",
+    "experimental.session.compacting",
+    "experimental.text.complete",
+    "tool"
+   ],
+   "magic-context": [
+    "chat.message",
+    "command.execute.before",
+    "config",
+    "event",
+    "experimental.chat.messages.transform",
+    "experimental.chat.system.transform",
+    "experimental.text.complete",
+    "tool",
+    "tool.execute.after"
+   ],
+   "reliary8": [
+    "tool.execute.after"
+   ]
+  },
+  "load_errors": {},
+  "chat": {},
+  "tool": {},
+  "event1": {
+   "delivered": 1
+  },
+  "event2": {
+   "delivered": 1
+  },
+  "stderr": [
+   "[plugin-host] trigger chat.message: 2 hook(s)",
+   "[plugin-host] trigger tool.execute.after: 2 hook(s)"
+  ]
+ },
+ "bun-norm": {
+  "runtime": "bun",
+  "variant": "norm",
+  "hooks": {
+   "codex-auth": [
+    "auth",
+    "chat.headers",
+    "chat.message",
+    "chat.params",
+    "config",
+    "experimental.session.compacting",
+    "experimental.text.complete",
+    "tool"
+   ],
+   "magic-context": [
+    "chat.message",
+    "command.execute.before",
+    "config",
+    "event",
+    "experimental.chat.messages.transform",
+    "experimental.chat.system.transform",
+    "experimental.text.complete",
+    "tool",
+    "tool.execute.after"
+   ],
+   "reliary8": [
+    "tool.execute.after"
+   ]
+  },
+  "load_errors": {},
+  "chat": {},
+  "tool": {},
+  "event1": {
+   "delivered": 1
+  },
+  "event2": {
+   "delivered": 1
+  },
+  "stderr": [
+   "[plugin-host] trigger chat.message: 2 hook(s)",
+   "[plugin-host] trigger tool.execute.after: 2 hook(s)"
+  ]
+ },
+ "node-raw": {
+  "runtime": "node",
+  "variant": "raw",
+  "hooks": {
+   "codex-auth": [
+    "auth",
+    "chat.headers",
+    "chat.message",
+    "chat.params",
+    "config",
+    "experimental.session.compacting",
+    "experimental.text.complete",
+    "tool"
+   ],
+   "magic-context": [
+    "chat.message",
+    "command.execute.before",
+    "config",
+    "event",
+    "experimental.chat.messages.transform",
+    "experimental.chat.system.transform",
+    "experimental.text.complete",
+    "tool",
+    "tool.execute.after"
+   ],
+   "reliary8": [
+    "tool.execute.after"
+   ]
+  },
+  "load_errors": {},
+  "chat": {},
+  "tool": {},
+  "event1": {
+   "delivered": 1
+  },
+  "event2": {
+   "delivered": 1
+  },
+  "stderr": [
+   "[magic-context] embedding model changed from null to local:Xenova/all-MiniLM-L6-v2; cleared embeddings for project git:8b87603b3cfefc1c05de42cf50f7f3fad6891e4b",
+   "[plugin-host] trigger chat.message: 2 hook(s)",
+   "[plugin-host] trigger tool.execute.after: 2 hook(s)"
+  ]
+ },
+ "node-norm": {
+  "runtime": "node",
+  "variant": "norm",
+  "hooks": {
+   "codex-auth": [
+    "auth",
+    "chat.headers",
+    "chat.message",
+    "chat.params",
+    "config",
+    "experimental.session.compacting",
+    "experimental.text.complete",
+    "tool"
+   ],
+   "magic-context": [
+    "chat.message",
+    "command.execute.before",
+    "config",
+    "event",
+    "experimental.chat.messages.transform",
+    "experimental.chat.system.transform",
+    "experimental.text.complete",
+    "tool",
+    "tool.execute.after"
+   ],
+   "reliary8": [
+    "tool.execute.after"
+   ]
+  },
+  "load_errors": {},
+  "chat": {},
+  "tool": {},
+  "event1": {
+   "delivered": 1
+  },
+  "event2": {
+   "delivered": 1
+  },
+  "stderr": [
+   "[magic-context] embedding model changed from null to local:Xenova/all-MiniLM-L6-v2; cleared embeddings for project git:8b87603b3cfefc1c05de42cf50f7f3fad6891e4b",
+   "[plugin-host] trigger chat.message: 2 hook(s)",
+   "[plugin-host] trigger tool.execute.after: 2 hook(s)"
+  ]
+ },
+ "deno-raw": {
+  "runtime": "deno",
+  "variant": "raw",
+  "hooks": {
+   "codex-auth": [
+    "auth",
+    "chat.headers",
+    "chat.message",
+    "chat.params",
+    "config",
+    "experimental.session.compacting",
+    "experimental.text.complete",
+    "tool"
+   ],
+   "magic-context": [
+    "chat.message",
+    "command.execute.before",
+    "config",
+    "event",
+    "experimental.chat.messages.transform",
+    "experimental.chat.system.transform",
+    "experimental.text.complete",
+    "tool",
+    "tool.execute.after"
+   ],
+   "reliary8": [
+    "tool.execute.after"
+   ]
+  },
+  "load_errors": {},
+  "chat": {},
+  "tool": {},
+  "event1": {
+   "delivered": 1
+  },
+  "event2": {
+   "delivered": 1
+  },
+  "stderr": [
+   "[magic-context] embedding model changed from null to local:Xenova/all-MiniLM-L6-v2; cleared embeddings for project git:8b87603b3cfefc1c05de42cf50f7f3fad6891e4b",
+   "[plugin-host] trigger chat.message: 2 hook(s)",
+   "[plugin-host] trigger tool.execute.after: 2 hook(s)"
+  ]
+ },
+ "deno-norm": {
+  "runtime": "deno",
+  "variant": "norm",
+  "hooks": {
+   "codex-auth": [
+    "auth",
+    "chat.headers",
+    "chat.message",
+    "chat.params",
+    "config",
+    "experimental.session.compacting",
+    "experimental.text.complete",
+    "tool"
+   ],
+   "magic-context": [
+    "chat.message",
+    "command.execute.before",
+    "config",
+    "event",
+    "experimental.chat.messages.transform",
+    "experimental.chat.system.transform",
+    "experimental.text.complete",
+    "tool",
+    "tool.execute.after"
+   ],
+   "reliary8": [
+    "tool.execute.after"
+   ]
+  },
+  "load_errors": {},
+  "chat": {},
+  "tool": {},
+  "event1": {
+   "delivered": 1
+  },
+  "event2": {
+   "delivered": 1
+  },
+  "stderr": [
+   "[magic-context] embedding model changed from null to local:Xenova/all-MiniLM-L6-v2; cleared embeddings for project git:8b87603b3cfefc1c05de42cf50f7f3fad6891e4b",
+   "[plugin-host] trigger chat.message: 2 hook(s)",
+   "[plugin-host] trigger tool.execute.after: 2 hook(s)"
+  ]
+ }
+}

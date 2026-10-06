@@ -1,0 +1,18 @@
+# R3 spike — DETACHED from the refine workspace (empty [workspace] below):
+# spikes never merge their deps into the main build; integration gate is a
+# separate decision (binary ceiling 10,485,760 B + build-time delta).
+[workspace]
+
+[package]
+name = "normalizer-spike"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[dependencies]
+rolldown = "1"
+rolldown_common = "1"
+tokio = { version = "1", features = ["rt", "macros"] }
+anyhow = "1"
+sha2 = "0.10"
+serde_json = "1"
