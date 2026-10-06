@@ -15,6 +15,10 @@ export const SIDS = (__ENV.LOAD_SIDS || '').split(',').filter(Boolean);
 export const DEEP = __ENV.LOAD_DEEP || SIDS[0] || '';
 export const FILE_PATH = __ENV.LOAD_FILE_PATH || '/tmp';
 export const SEARCH_Q = __ENV.LOAD_SEARCH_Q || 'the';
+// E0 isolation (PERF-10X Phase I): LOAD_ROUTES=comma list restricts the
+// round-robin to those endpoints — separates per-route service time from
+// cross-route convoy. Empty = all routes (default behavior unchanged).
+const ROUTE_FILTER = (__ENV.LOAD_ROUTES || '').split(',').filter(Boolean);
 
 export const ENDPOINTS = [
   'session_list',
@@ -42,6 +46,7 @@ function sidForVU() {
 }
 
 function req(endpoint, method, path, body) {
+  if (ROUTE_FILTER.length && ROUTE_FILTER.indexOf(endpoint) === -1) return null;
   const tags = { endpoint };
   const opts = body
     ? { headers: { 'Content-Type': 'application/json' }, tags }

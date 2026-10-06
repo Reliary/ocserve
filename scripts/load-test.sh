@@ -402,6 +402,11 @@ k6_run() { # $1=file $2=script $3=arm $4..=env assignments (K=V)
   local -a envs=()
   local kv
   for kv in "$@"; do envs+=(-e "$kv"); done
+  # experiment passthrough (E0 LOAD_ROUTES, query override, ladder)
+  local pv
+  for pv in LOAD_ROUTES LOAD_SEARCH_Q LOAD_TARGETS; do
+    [ -n "${!pv:-}" ] && envs+=(-e "$pv=${!pv}")
+  done
   if [ "$GATED" = 1 ]; then
     while IFS= read -r kv; do envs+=(-e "$kv"); done < <(thresholds_env "$arm")
   fi
