@@ -158,6 +158,10 @@ pub struct Sidecar {
     /// every (re)spawn, so a recycled sidecar can't be recycled again until
     /// the guard window passes.
     started_at: std::time::Instant,
+    /// L1 recycle marker: set when WE killed the child on purpose; the next
+    /// ensure_alive must log that as INFO (planned), not ERROR (crash) —
+    /// an intentional action must never read as a failure in the logs.
+    recycled: bool,
 }
 
 /// `sh -c WRAPPER sh <prog> <args…>` → raise oom_score_adj, move into the
@@ -339,6 +343,7 @@ impl Sidecar {
             loads: Vec::new(),
             normalize_root: None,
             started_at: std::time::Instant::now(),
+            recycled: false,
         })
     }
 
@@ -364,6 +369,7 @@ impl Sidecar {
         }
         let _ = self.child.start_kill();
         self.statuses.lock().clear();
+        self.recycled = true;
         true
     }
 
@@ -382,7 +388,13 @@ impl Sidecar {
         match self.child.try_wait() {
             Ok(None) => return Ok(()),
             Ok(Some(status)) => {
-                tracing::error!("plugin sidecar exited ({status}) — respawning");
+                if std::mem::take(&mut self.recycled) {
+                    tracing::info!(
+                        "plugin sidecar recycled (L1, was {status}) — respawning + replaying hooks"
+                    );
+                } else {
+                    tracing::error!("plugin sidecar exited ({status}) — respawning");
+                }
             }
             Err(e) => {
                 tracing::error!("plugin sidecar try_wait failed: {e} — respawning");

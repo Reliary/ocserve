@@ -142,23 +142,84 @@ only with a before/after number on the bench gate.
 
 ## 5. DevOps
 
-- **systemd unit** (`~/.config/systemd/user/refine.service`): `MemoryMax=750M`
-  (B-phase measured: catalog-incident peaks forced 1024M temporarily; lab A/B
-  proved fragmentation → `MALLOC_ARENA_MAX=1` + trim brought warm to ~300–460,
-  cap returned to 750M with provenance in `OOM-RELOAD-REPORT.md`),
-  `OOMPolicy=continue` (**2026-10-06 incident**: kernel OOM correctly killed
-  only the sidecar child (`oom_score_adj=500`, A3 working) but default
-  `OOMPolicy=stop` then bounced the WHOLE unit — `Failed with result 'oom-kill'`
-  → restart, journal 11:00:16. Proven fix with synthetic control units under
-  `MemoryMax=64M`: default unit → `failed/oom-kill`; `continue` unit → `active`
-  with MainPID alive after the child died. `continue` = log + survive, so
-  `ensure_alive` respawns the sidecar on the next trigger; a MAIN-process OOM
-  still restarts the service via normal process-exit handling. guard rule 9),
-  `MemorySwapMax=0` (fail-fast over swap), `Restart=on-failure`, `RestartSec=5`,
-  `Environment=RUST_LOG=refine=info` (MIMALLOC_* lines removed 2026-10-04 —
-  dead without a linked allocator; re-added only if profiling justifies wiring
-  one), hardening
-  (`ProtectSystem=strict`, `ReadWritePaths` on data dir, `NoNewPrivileges`).
+- **The service is an OPTIONAL overlay, preferred, never implicit.**
+  Foreground `refine serve` is the contract (tests, replay-check, the parity
+  harness all run it directly and gain zero requirements). Nothing in build,
+  tests, or `refine doctor` ever installs or enables anything; the ONLY code
+  path that touches systemd is an explicit `scripts/install.sh` run, and
+  `doctor` reports the overlay as one informational line either way.
+- **Resource-control stack (2026-10-06, "middle ground": neither unbounded
+  nor a knife-edge cap).** Every layer degrades to the one below on failure;
+  the cap is the BACKSTOP, not the control:
+  1. **L0 bounded-by-construction (always on):** 32 MB event ring, 8 MB
+     tail-weighted history budget, streamed `/message`, `malloc_trim`
+     cadence, `MALLOC_ARENA_MAX=1`, single catalog parse per reload.
+  2. **L1 graceful sidecar recycle** (15 s sampler): RSS ≥
+     `REFINE_SIDECAR_RECYCLE_MB` (default 450 — above the measured 365 MB
+     warm-up peak; `0` = kill switch) × 2 consecutive samples ∧ zero
+     in-flight plugin RPCs (try_lock busy ⇒ skip) ∧ uptime ≥ 300 s → kill
+     the sidecar (state is disk-backed; `ensure_alive` respawns + replays
+     next trigger, warm-hash normalize no-op). Never interrupts a hook,
+     never storms; precise RSS via the sidecar's own `child_pid` (the old
+     "first node/bun child" scan could hit the browser host after any
+     respawn). Metrics: `refine_sidecar_recycle_total{reason="rss"}`.
+  3. **L2 cgroup partition** (`partition.rs`): `mkdir main kids → move self
+     into main/ → +memory → kids/memory.max=700M` (kernel no-internal-
+     process rule); the A3 wrapper moves every child into `kids/` via
+     per-Command `REFINE_KIDS_CGROUP` env. Children get a chosen ceiling
+     (covers the measured 614 MB embedding burst); main's reserve under
+     `MemoryMax` becomes structural instead of an `oom_score_adj` lottery.
+     **Probe-first:** root-exists / owned-by-us / `memory` in controllers /
+     subtree-writable probed before any mutation; any failure → metric
+     `refine_cgroup_partition{result="unavailable"}` + today's flat shared
+     cap. **Scope gate:** runs only under systemd (`INVOCATION_ID`) or
+     forced `REFINE_CGROUP_PARTITION=1`; `=0` vetoes — bare/test/harness
+     runs never restructure a terminal's or cargo's cgroup tree.
+  4. **Kill policy:** children `oom_score_adj=500` + `OOMPolicy=continue`
+     (**2026-10-06 incident**: kernel OOM correctly killed only the sidecar
+     child (A3 working) but default `OOMPolicy=stop` then bounced the WHOLE
+     unit — `Failed with result 'oom-kill'` → restart, journal 11:00:16.
+     Proven with synthetic control units under `MemoryMax=64M`: default →
+     `failed/oom-kill`; `continue` → `active`, MainPID alive after the child
+     died. `continue` = log + survive, so `ensure_alive` respawns the
+     sidecar; a MAIN-process OOM still restarts via normal exit handling.
+     guard rule 9).
+  5. **Backstop:** `MemoryMax=1024M` — kids 700 + main reserve ~324 (≈ 2×
+     the measured 180 MB envelope); provenance comment chain in the unit
+     template (history: 480 → 600 → 750 → 1024, each step measured). A
+     larger ceiling costs **nothing at idle** (cgroups charge on touch) —
+     leak detection is the recycle gauge + soak slope, never cap proximity.
+     Also: `Delegate=yes` (systemd stops managing the unit subtree so the
+     dance can run), `MemorySwapMax=0` (fail-fast over swap — the reason
+     no `MemoryHigh` soft throttle ships yet: without swap it stalls
+     instead of shrinking; PSI gauge `refine_mem_pressure_avg10` is the
+     measure-first gate for revisiting), `Restart=on-failure`,
+     `RestartSec=5`, `RUST_LOG=refine=info` (MIMALLOC_* removed 2026-10-04
+     — dead without a linked allocator), hardening (`ProtectSystem=strict`,
+     `-path` optional ReadWritePaths for the opencode/plugin dirs so fresh
+     machines boot, `NoNewPrivileges`).
+- **Install (preferred, opt-in by invocation):** `scripts/install.sh` —
+  default = full (build-if-needed, binary used IN PLACE, render
+  `deploy/refine.service` (single source of truth), `daemon-reload`,
+  enable/restart, health-probe, print overrides + kill switches + uninstall
+  hint); `--dry-run` (diff, touch nothing), `--bin-only`; non-systemd host
+  auto-falls to bin-only. Writes `install-receipt` (BIN=) so uninstall can
+  attribute the binary. Never sudo, never non-refine units (rule 6).
+- **Uninstall (application-clean; history sacred):** `scripts/uninstall.sh`
+  — default removes refine\* units/timers/drop-ins (glob), the
+  receipt/ExecStart binary (dev `target/` builds KEPT with a note), and
+  refine-derived `*.normalized.mjs{,.hash}` artifacts (basename-gated);
+  **session history KEPT** with sizes + purge hint. `--purge` = stats →
+  confirm (`--yes` for scripts) → optional `VACUUM INTO` backup
+  (`--no-backup` to skip) → data/state removal (path from unit
+  `Environment=`, refused unless under `$HOME` AND containing `refine`;
+  custom non-conforming dirs are reported, never deleted). Shared opencode
+  state (config, `auth.json`, `opencode.db`, `models.json`, plugin
+  packages) is NEVER touched — guard rule 11 + staged `--selftest` canary
+  battery (refine artifacts gone, canaries byte-identical, receipt binary
+  removed, dev build kept, idempotent, history honored; nightly-wired).
+  Journal vacuum deliberately NOT done: the journal is shared with
+  opencode and unit logs age via the retention floor.
 - **Release profile** (matches reliary8/stria): `lto="fat"`, `codegen-units=1`,
   `opt-level=3`, `panic="abort"`, `strip=true`; **binary size ceiling 20,971,520 B (20 MiB)**
   — re-baselined 2026-10-06 from the measured D1 build (20,359,600 B with
