@@ -37,10 +37,22 @@ pub enum Partition {
 
 /// Every failure and success reason — stable strings (metric/log labels).
 pub fn setup() -> &'static str {
-    let result = match our_cgroup_root() {
+    let result = outcome(enabled(), our_cgroup_root());
+    label_and_publish(result)
+}
+
+/// Glue seam (tested — the live battery caught the first version passing
+/// `enabled()` into setup_in's `disabled` parameter, inverting the gate):
+/// enabled → dance against root; disabled → zero mutation; no v2 root →
+/// degrade.
+fn outcome(enabled: bool, root: Option<PathBuf>) -> Partition {
+    match root {
         None => Partition::Unavailable("no-v2-cgroup"),
-        Some(root) => setup_in(&root, enabled()),
-    };
+        Some(root) => setup_in(&root, !enabled),
+    }
+}
+
+fn label_and_publish(result: Partition) -> &'static str {
     let label = match &result {
         Partition::Ok => "ok",
         Partition::Disabled => "disabled",
@@ -240,6 +252,22 @@ mod tests {
         );
         assert!(setup_in(&root, false) == Partition::Ok, "idempotent re-run"); // KIDS set-once is fine
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn glue_maps_enabled_to_dance_and_disabled_to_no_mutation() {
+        let root = fixture(true);
+        // enabled + real-ish root → Ok (this is the inversion the battery caught)
+        assert_eq!(outcome(true, Some(root.clone())), Partition::Ok);
+        assert!(root.join("kids/memory.max").exists());
+        let _ = std::fs::remove_dir_all(&root);
+
+        let root = fixture(true);
+        assert_eq!(outcome(false, Some(root.clone())), Partition::Disabled);
+        assert!(!root.join("main").exists(), "disabled must not mutate");
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(outcome(true, None), Partition::Unavailable("no-v2-cgroup"));
     }
 
     #[test]
