@@ -160,9 +160,17 @@ pub struct Sidecar {
     started_at: std::time::Instant,
 }
 
-/// `sh -c WRAPPER sh <prog> <args…>` → raise oom_score_adj then exec.
-/// Kept identical in refine-mcp + refine-plugin (no shared dep) — A3.
-pub const OOM_CHILD_WRAPPER: &str = r#"echo 500 >/proc/self/oom_score_adj 2>/dev/null; exec "$@""#;
+/// `sh -c WRAPPER sh <prog> <args…>` → raise oom_score_adj, move into the
+/// L2 kids cgroup (if the partition dance published one), then exec.
+/// Kept identical in refine-mcp + refine-plugin (no shared dep) — A3/L2.
+pub const OOM_CHILD_WRAPPER: &str = r#"echo 500 >/proc/self/oom_score_adj 2>/dev/null; [ -n "$REFINE_KIDS_CGROUP" ] && echo $$ >"$REFINE_KIDS_CGROUP/cgroup.procs" 2>/dev/null; exec "$@""#;
+
+/// L2 partition: path published by refine-cli's cgroup dance; children get
+/// it as a per-Command env (race-free — no process-global set_var).
+static KIDS_CGROUP: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+pub fn set_kids_cgroup(p: impl Into<std::path::PathBuf>) {
+    let _ = KIDS_CGROUP.set(p.into());
+}
 
 /// Plugin-host runtime: Bun preferred (upstream runs plugins under Bun; real
 /// `bun:sqlite`, TS plugins load, lower RSS floor), Node fallback.
@@ -261,6 +269,9 @@ impl Sidecar {
                 ));
                 cmd.arg("--max-semi-space-size=2");
             }
+        }
+        if let Some(k) = KIDS_CGROUP.get() {
+            cmd.env("REFINE_KIDS_CGROUP", k);
         }
         cmd.arg(host_path)
             .stdin(std::process::Stdio::piped())

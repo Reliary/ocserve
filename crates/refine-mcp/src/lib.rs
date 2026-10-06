@@ -166,9 +166,17 @@ pub fn mcp_child_path(parent_path: &str, home: &str) -> String {
     merged.join(":")
 }
 
-/// `sh -c WRAPPER sh <prog> <args…>` → raise oom_score_adj then exec.
-/// Kept identical in refine-mcp + refine-plugin (no shared dep).
-pub const OOM_CHILD_WRAPPER: &str = r#"echo 500 >/proc/self/oom_score_adj 2>/dev/null; exec "$@""#;
+/// `sh -c WRAPPER sh <prog> <args…>` → raise oom_score_adj, move into the
+/// L2 kids cgroup (if the partition dance published one), then exec.
+/// Kept identical in refine-mcp + refine-plugin (no shared dep) — A3/L2.
+pub const OOM_CHILD_WRAPPER: &str = r#"echo 500 >/proc/self/oom_score_adj 2>/dev/null; [ -n "$REFINE_KIDS_CGROUP" ] && echo $$ >"$REFINE_KIDS_CGROUP/cgroup.procs" 2>/dev/null; exec "$@""#;
+
+/// L2 partition: path published by refine-cli's cgroup dance; children get
+/// it as a per-Command env (race-free — no process-global set_var).
+static KIDS_CGROUP: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+pub fn set_kids_cgroup(p: impl Into<std::path::PathBuf>) {
+    let _ = KIDS_CGROUP.set(p.into());
+}
 
 impl McpClient {
     /// Spawn (local) or prepare (remote). Errors are transport-level only;
@@ -188,6 +196,9 @@ impl McpClient {
                 cmd.arg("-c").arg(OOM_CHILD_WRAPPER).arg("sh").arg(prog);
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
                 let base_path = std::env::var("PATH").unwrap_or_default();
+                if let Some(k) = KIDS_CGROUP.get() {
+                    cmd.env("REFINE_KIDS_CGROUP", k);
+                }
                 cmd.args(rest)
                     .env("PATH", mcp_child_path(&base_path, &home))
                     .envs(env.iter().cloned())

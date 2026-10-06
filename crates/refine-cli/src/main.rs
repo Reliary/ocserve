@@ -84,6 +84,7 @@ fn default_data_dir() -> std::path::PathBuf {
 }
 
 mod models_dev;
+mod partition;
 mod replay;
 mod resilience;
 mod runtime;
@@ -171,6 +172,12 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
 
     // fail-fast boot checks (SRE.md §1) — before binding
     refine_cli::boot_checks(&data_dir)?;
+
+    // L2 partition (SRE §5): run BEFORE any child spawn (MCP probe / plugin
+    // sidecar) so every wrapper can move itself into kids/. Scoped to
+    // systemd invocations (INVOCATION_ID) — bare/test runs never restructure
+    // a terminal's or harness's cgroup tree; REFINE_CGROUP_PARTITION=0/1 force.
+    partition::setup();
 
     // Assemble config-derived payloads (fail fast if config unreadable)
     let rt = runtime::Runtime::load_for(&data_dir)
@@ -496,6 +503,15 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
                 // MemoryHigh soft throttle; absent on cgroup v1 → no gauge)
                 if let Some(v) = resilience::psi_avg10_centi() {
                     refine_metrics::gauge("refine_mem_pressure_avg10", v);
+                }
+
+                // L2 kids accounting (only when the dance published one)
+                if let Some(kp) = partition::kids_path()
+                    && let Some(v) = std::fs::read_to_string(kp.join("memory.current"))
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i64>().ok())
+                {
+                    refine_metrics::gauge("refine_kids_bytes", v);
                 }
                 refine_metrics::gauge("refine_prompt_locks", st.prompt_locks.lock().len() as i64);
                 refine_metrics::gauge("refine_prompt_tasks", st.prompt_tasks.lock().len() as i64);
