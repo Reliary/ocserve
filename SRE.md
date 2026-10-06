@@ -142,16 +142,29 @@ only with a before/after number on the bench gate.
 
 ## 5. DevOps
 
-- **systemd unit** (`~/.config/systemd/user/refine.service`): `MemoryMax=300M`,
+- **systemd unit** (`~/.config/systemd/user/refine.service`): `MemoryMax=750M`
+  (B-phase measured: catalog-incident peaks forced 1024M temporarily; lab A/B
+  proved fragmentation → `MALLOC_ARENA_MAX=1` + trim brought warm to ~300–460,
+  cap returned to 750M with provenance in `OOM-RELOAD-REPORT.md`),
+  `OOMPolicy=continue` (**2026-10-06 incident**: kernel OOM correctly killed
+  only the sidecar child (`oom_score_adj=500`, A3 working) but default
+  `OOMPolicy=stop` then bounced the WHOLE unit — `Failed with result 'oom-kill'`
+  → restart, journal 11:00:16. Proven fix with synthetic control units under
+  `MemoryMax=64M`: default unit → `failed/oom-kill`; `continue` unit → `active`
+  with MainPID alive after the child died. `continue` = log + survive, so
+  `ensure_alive` respawns the sidecar on the next trigger; a MAIN-process OOM
+  still restarts the service via normal process-exit handling. guard rule 9),
   `MemorySwapMax=0` (fail-fast over swap), `Restart=on-failure`, `RestartSec=5`,
   `Environment=RUST_LOG=refine=info` (MIMALLOC_* lines removed 2026-10-04 —
   dead without a linked allocator; re-added only if profiling justifies wiring
   one), hardening
   (`ProtectSystem=strict`, `ReadWritePaths` on data dir, `NoNewPrivileges`).
 - **Release profile** (matches reliary8/stria): `lto="fat"`, `codegen-units=1`,
-  `opt-level=3`, `panic="abort"`, `strip=true`; **binary size ceiling 10,485,760 B
-  (10.0 MiB)** — established from the measured 2026-10-03 release build (9,279,528 B);
-  raise only with a measured reason recorded here. Enforced by `scripts/nightly.sh`.
+  `opt-level=3`, `panic="abort"`, `strip=true`; **binary size ceiling 20,971,520 B (20 MiB)**
+  — re-baselined 2026-10-06 from the measured D1 build (20,359,600 B with
+  rolldown linked; original: 10,485,760 B from 9,279,528 B measured 2026-10-03).
+  Raise ONLY with a new measurement + provenance comment in `scripts/nightly.sh`
+  (the tripwire re-sets from evidence, never moves to fit). Enforced there.
 - **Per-commit gates (AGENTS §3, run by hand before every commit):** clippy `-D warnings`,
   fmt, full workspace tests, `scripts/check-guards.sh`, `scripts/check-matrix.sh`
   (+ area gate: storage `STORAGE.md §7`, memory `MEMORY.md §5`, wire differential replay).

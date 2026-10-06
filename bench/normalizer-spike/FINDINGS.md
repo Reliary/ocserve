@@ -156,3 +156,14 @@ cache — same trust boundary as executing those entries (derived, never fetched
 **R3** cold rebuild after a plugin update ≈ 0.6 s, logged with RSS before/after.
 Error-string retry across bun/node/deno dialects stays rejected; named trigger: a
 future plugin load failing module-not-found ⇒ scanner rule or retry, then.
+
+**Post-deploy incident (2026-10-06 11:00:16, during battery follow-up):** the unit
+OOM-bounced once. Attribution — **not D1**: bundle is byte-identical (K2/K3), normalize
+runs in refine-main not the sidecar; soak CSV shows the real mechanism: fresh sidecar
+warm-up (365 MB @10:55) + magic-context `event`-hook embedding a large *synced* turn
+(6 msgs / 15 parts at 11:00:09) stacked bun to 614 MB anon → 750M cap → kernel killed
+bun (`oom_score_adj=500` = A3 correct). Gap: default `OOMPolicy=stop` then failed the
+WHOLE unit ("oom-kill" → restart). Fix: `OOMPolicy=continue`, proven with synthetic
+control units (default → `failed/oom-kill`; continue → `active`, MainPID alive;
+journal 11:20:04). Sidecar episodes are transient (settles ~105 MB); cap unchanged at
+750M — raised only with new evidence, per the B-phase rule.

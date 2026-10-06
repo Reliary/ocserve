@@ -71,6 +71,10 @@ now once via `Runtime.catalog`) and activity-composite crossings (morning kills;
 allocating at 16:05). Equal `oom_score` meant the kernel always killed MAIN (full
 service death) even when a child allocated — children now raise their own
 `oom_score_adj=500` at spawn (A3 wrapper) so a future kill takes a respawnable child.
+  A3 alone proved half the story (2026-10-06 11:00:16: kernel killed ONLY bun, yet
+  default `OOMPolicy=stop` bounced the whole unit) — `OOMPolicy=continue` completes
+  it: child dies → logged → unit stays up → `ensure_alive` respawns. Control A/B
+  evidence: FINDINGS "D1 executed" addendum; guard rule 9.
 Reconcile is now INFO-logged (files + duration + RSS delta), soak gained
 `cgroup`/`cgroup_peak`/`kids` columns, and journald retention was pruned to ~3 h by
 the root fs sitting at 6.8% free (< default `SystemKeepFree`10%) — retention floor

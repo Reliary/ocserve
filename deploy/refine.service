@@ -48,6 +48,9 @@ RestartSec=5
 # reload wall-time unchanged (~2.7s). Children inherit it (node/python glibc
 # malloc use is light — monitored by soak kids column).
 Environment=MALLOC_ARENA_MAX=1
+# A3 child-first OOM containment (2026-10-06 incident): default OOMPolicy=stop
+# bounced the unit after the kernel correctly killed only the sidecar child.
+OOMPolicy=continue
 # Cap back to the documented size (measured: idle ~280 + converged reload
 # ~333 main + kids <=200 = ~533 worst -> 750M has proven burst margin; the
 # old 750M OOMs are explained and fixed, no longer a cap-size problem).

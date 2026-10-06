@@ -13,6 +13,8 @@
 #   6. non-refine systemd units mutated from repo scripts (drop-ins/restarts —
 #      the 2026-10-05 incident class; only refine* units are mutable, see
 #      TESTING §1.6)
+#   9. unit template keeps OOMPolicy=continue (child OOM must not bounce the
+#      service — the 2026-10-06 stop-policy bounce; A3's completion)
 #   7. exact assertions on process-global counters inside src/ (in-crate unit
 #      tests run in one parallel process and race — the reader_opens flake of
 #      2026-10-05; such tests belong in tests/ where they own the process)
@@ -91,6 +93,16 @@ if out=$(grep -rnE 'fs::write\([^)]*\.normalized' crates/*/src 2>/dev/null); the
   echo "$out"; echo "FAIL: direct fs::write to a final normalized path — use atomic_write (tmp+rename), D1-PLAN"; fail=1
 else
   echo "ok"
+fi
+
+echo "== guard: unit template keeps OOMPolicy=continue (A3 completion) =="
+# 2026-10-06: default OOMPolicy=stop bounced the service after the kernel
+# correctly killed only the sidecar child — the "respawnable child" property
+# is false without this line (TESTING §1.6, SRE §5).
+if grep -q 'OOMPolicy=continue' deploy/refine.service 2>/dev/null; then
+  echo "ok"
+else
+  echo "FAIL: deploy/refine.service lost OOMPolicy=continue — child OOM will bounce the whole unit again (A3 class)"; fail=1
 fi
 
 exit $fail
