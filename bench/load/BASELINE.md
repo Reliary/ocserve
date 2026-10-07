@@ -163,8 +163,7 @@ identical 201-session fixture, 0% errors both arms.
 
 | | base | lean | delta |
 |---|---:|---:|---:|
-| **CPU/req hot** | 0.6253 ms | **0.5165 ms** | **−17.4%** |
-| **CPU/req spread** | 0.5461 ms | **0.4831 ms** | **−11.5%** |
+| **CPU/req (arm-level)** | 0.2915 ms | **0.2496 ms** | **−14.4%** |
 | rps hot | 10,404 | 11,618 | +11.7% |
 | rps spread | 11,913 | 12,423 | +4.3% |
 | p95 hot | 9.56 ms | 8.85 ms | −7.4% |
@@ -173,7 +172,18 @@ identical 201-session fixture, 0% errors both arms.
 | failed | 0.0% | 0.0% | — |
 
 **Gate (pre-registered in `bench/perf/LEAN-PLAN.md` §3 Phase V: CPU/req
-−10% or better): PASS** — −17.4% hot, −11.5% spread.
+−10% or better): PASS — −14.4%** (0.2915 → 0.2496 ms/req; total CPU −7.7%
+while serving +7.7% more requests).
+
+> **Correction (same day, found by re-reading `report.py:83-93`).** An
+> earlier version of this table published *per-mode* CPU/req
+> (0.6253→0.5165 hot, 0.5461→0.4831 spread, −17.4%/−11.5%). That divided
+> **arm-level** CPU — `cpu_delta` is keyed by arm and covers the whole
+> sampled window — by a **single mode's** request counts, inflating every
+> absolute and overstating the hot delta. The arm-level numbers above are
+> the correct ones. The gate still passes (−14.4% vs −10%); only the
+> magnitudes changed. The freeze control moved **+2.7%** (2.8180 → 2.8942
+> ms/req) in the same rounds.
 
 **Co-tenant validity:** the freeze control arm ran in both rounds and moved
 only −1.5% / −3.1%, so the refine delta is not machine drift.
