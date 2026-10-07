@@ -268,6 +268,25 @@ if [ ! -f "$HF/.local/share/opencode/opencode.db" ]; then
   say "== fixture: install snapshot as freeze's native db =="
   cp "$FIX/snapshot.db" "$HF/.local/share/opencode/opencode.db"
 fi
+# schema guard: a db built by an older binary triggers its migration at
+# serve-time (v9->v10 fts rebuild = ~5-9 min) which blows the health
+# timeout — stale dbs are wiped so import always runs on schema change.
+# Marker = idx_part_search_session (created by schema v10).
+if [ -f "$HR/.local/share/refine/refine.db" ]; then
+  have_marker="$(python3 - "$HR/.local/share/refine/refine.db" <<'PYM'
+import sqlite3, sys
+try:
+    c = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
+    print(c.execute("SELECT count(*) FROM sqlite_master WHERE name='idx_part_search_session'").fetchone()[0])
+except Exception:
+    print(0)
+PYM
+)"
+  if [ "$have_marker" != "1" ]; then
+    say "== fixture: refine db schema stale (no v10 marker) — wipe + re-import =="
+    rm -f "$HR/.local/share/refine/refine.db" "$HR/.local/share/refine/refine.db-wal" "$HR/.local/share/refine/refine.db-shm"
+  fi
+fi
 if [ ! -f "$HR/.local/share/refine/refine.db" ]; then
   say "== fixture: refine import from snapshot (equivalent data by construction) =="
   "$REFINE_BIN" import --source "$FIX/snapshot.db" --limit 1000000 \
