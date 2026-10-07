@@ -190,6 +190,12 @@ that baseline → GATED.
   46.5%, visit_map 21.7%) vs SQLite 3.3%; 1,249 µs JSON vs 26 µs SQL per
   50-msg page. Also fixed the bench itself (`--deep` auto-selected a
   **message** id, so every session-scoped figure had measured 0 rows).
+- **Lean sweep M3 (filesystem walks off the worker)**: `GET /find/file`
+  (up to 20,000 dirs) and `GET /file` (per-entry `metadata()`) ran inline on
+  tokio workers — the last blocking-I/O convoy. Both now `spawn_blocking`;
+  bounds untouched. Proof is structural (thread identity), because the load
+  harness never saw it: its `LIST_PATH` is an empty /tmp dir. Negative
+  control: inline call → test red.
 - **Lean sweep M1 (list wire straight to bytes)**: `build_sessions_wire_bytes`
   writes the session-list body from the columns into one buffer (no `Value`
   tree, one pass; numbers and the `model` blob still go through serde so

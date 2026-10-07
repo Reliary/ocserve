@@ -152,6 +152,22 @@ fails boot. Visibility: `refine_models_refresh_total{result}` + nightly
 encode, JSON part encode, blob zstd, FTS insert, tool-output chunking. Optimization lands
 only with a before/after number on the bench gate.
 
+
+### 5.x Blocking filesystem I/O (M3, PERF-10X Phase II)
+
+`GET /find/file` and `GET /file` walk the filesystem. Both bodies now run via
+`tokio::task::spawn_blocking`; the walk itself is unchanged (same bounds:
+20,000 directories visited, stop at 4×limit results, 5,000 entries returned).
+Reason: they were the last inline blocking syscalls on an async worker — the
+same convoy class as the pre-F1 SQLite work, which parked a worker behind a
+slow store call.
+
+The load harness could not see this: its `LIST_PATH` is an empty `/tmp`
+directory, so a k6 run never walked anything. Proof is structural instead —
+`find_files_walk_runs_off_the_worker` asserts the walk executed on a thread
+other than the async worker (thread identity recorded by a test-only seam).
+**Negative control**: restoring the inline call makes that test red.
+
 ## 5. DevOps
 
 - **The service is an OPTIONAL overlay, preferred, never implicit.**
