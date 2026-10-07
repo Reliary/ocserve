@@ -89,8 +89,26 @@ epoch bump in-transaction ⇒ exact, zero staleness): search results + session l
 rebuilds. Planned (not trigger-gated): the 50 ms FTS floor alone exceeds the VU50 mean
 budget (11.2 ms) — arithmetic, not gaming. Dual reporting per §1-D.
 
-**A1** run ANALYZE post-import/boot if stat rows thin (compile gate already passed).
-**B1** zstd chunk LRU (sha-keyed, ≤32 MB) if Phase-I blob probe shows ≥1 blob read/page avg.
+**A1 — SATISFIED BY EXISTING CODE (no change):** `PRAGMA optimize 0x10002`
+already runs at every writer open and `PRAGMA optimize` hourly
+(main.rs optimize tick) — analyze-if-stats-thin semantics, zero new code.
+
+**B1 — TRIGGERED AND SHIPPED (428d13f):** deep-page probe on the fixture =
+13 blob reads per deep page (245 parts, 13 >8 KiB) ≥ 1 ⇒ condition met.
+Process-global byte-capped FIFO (32 MiB, `REFINE_BLOB_CACHE_MB`, oversized
+entries never admitted); content-addressed keys = immutable = exact by
+construction.
+
+**temp_store — DONE (428d13f):** value was `2` (= MEMORY) miscommented as
+FILE; set to `1` (FILE) per the S-A follow-through above.
+
+**E0 — ARTIFACTS LOST, DISPOSITION RECORDED:** the isolation chain
+reported 4/4 rc=0 but no route-filtered run directories exist on either
+box (`.runs` holds only full mixed-route runs; `.227` `.runs` is empty).
+No numbers invented. The diagnostic need (service time vs convoy per
+route) is superseded: F1 removed the convoy mechanism, S-A collapsed the
+search service time, and Phase III's per-route report table gives the
+same breakdown at target conditions for both arms.
 **temp_store** decision: after S-A removes large sorts → set `1` (FILE) per the stated
 bounded-memory intent, fix the comment either way.
 
@@ -99,9 +117,9 @@ bounded-memory intent, fix the comment either way.
 | ID | Change | Keep rule |
 |---|---|---|
 | C1 | `.cargo/config.toml`: `-Ctarget-cpu=x86-64-v3` + `CFLAGS_…=-march=x86-64-v3` (Rust+sqlite3.c+zstd). **Explicit v3, never `native`** (MTL-built native ≠ TGL-safe; v3 = AVX2/BMI2/FMA, safe both) | A/B measurable; min-ISA documented in SRE (both targets qualify) |
-| C4 | add `-DSQLITE_DEFAULT_MEMSTATUS=0` (+ evaluate `SQLITE_OMIT_GET_TABLE`) via CFLAGS env (build.rs does not override → no libsqlite3-sys patch) | A/B measurable |
+| C4 | add `-DSQLITE_DEFAULT_MEMSTATUS=0` via CFLAGS env (build.rs does not override → no libsqlite3-sys patch). `SQLITE_OMIT_GET_TABLE` **evaluated and rejected**: rusqlite never exposes `sqlite3_get_table`, but an omitted symbol is a link-time risk for any C dep that might reference it, for negligible size/win | A/B measurable |
 | C5 | `worker_threads` → `max(8, available_parallelism)` | trivial |
-| C6 | `.set_nodelay(true)` on listener (floor probe decides need) | probe |
+| C6 | `.set_nodelay(true)` on listener (floor probe decides need) | probe — **SKIPPED with evidence**: baseline summary `http_req_blocked` p99 = 0.014 ms, `http_req_sending` p95 = 0.018 ms, `http_req_connecting` p95 = 0 ⇒ loopback floor already sub-millisecond, nothing for nodelay to win |
 | C2 | PGO script (`scripts/pgo-build.sh`): profile-generate → training (replay + pair + local single-route k6 + import smoke) → profile-use. Requires `rustup component add llvm-tools-preview` (matched llvm-profdata; system LLVM-22 one risky) | re-runnable, documented cadence |
 | C7 | size ceiling: PGO +10–30% `.text` likely trips 20,971,520 B → bump only by standing rule (measurement + provenance comment) | standing rule |
 | C3 | BOLT: **deferred** — tooling absent (needs perf + llvm-bolt install approval) | — |

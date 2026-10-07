@@ -171,8 +171,17 @@ fn main() -> Result<()> {
 
 mod rt {
     pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        // PERF-10X C5: floor of 8 workers, scales with the host (tokio's
+        // own default would be avail_parallelism — we keep 8 as the floor
+        // for small machines; .227 = 8 logical => 8 either way).
+        let workers = std::cmp::max(
+            8,
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8),
+        );
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(8)
+            .worker_threads(workers)
             .thread_stack_size(1 << 20)
             // PERF-10X F1: store calls moved onto this pool — 16 threads
             // ≈ sub-ms queries × 8k+ ops/s with headroom for cold spikes;

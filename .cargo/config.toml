@@ -1,0 +1,19 @@
+# PERF-10X Phase IV (C1+C4) — compiler flags, each with a keep-rule A/B
+# (PERF-10X.md 4). Explicit x86-64-v3, NEVER `native`: Meteor Lake (this
+# box) and Tiger Lake (.227 bench box) both qualify (AVX2/BMI2/FMA), and
+# v3 keeps binaries portable to any Zen2+/Tiger Lake+ machine — `native`
+# built on MTL would not run on TGL-era hosts.
+#
+# C1: -Ctarget-cpu=x86-64-v3 applies to ALL Rust code (core, deps).
+# C4: CFLAGS reaches cc-built C deps — sqlite3.c gains
+#     -DSQLITE_DEFAULT_MEMSTATUS=0 (kill the per-connection memstatus
+#     counters on every alloc/free; nothing in our stack reads them) and
+#     zstd/hyper C bits get the same -march. `[env]` without `force` never
+#     overrides an ambient value.
+# C2 (PGO) is a separate opt-in via scripts/pgo-build.sh (see PERF-10X 4).
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Ctarget-cpu=x86-64-v3"]
+
+[env]
+CFLAGS = "-march=x86-64-v3 -DSQLITE_DEFAULT_MEMSTATUS=0"

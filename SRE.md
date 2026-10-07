@@ -4,6 +4,17 @@ Companion to `PLAN.md`. Mindset: every failure is loud and actionable at boot; e
 `PLAN.md §10` is a queryable metric; every knob is declared, typed, and validated; CPU work
 is measured before it is specialized.
 
+## Minimum CPU ISA (PERF-10X C1)
+
+Release binaries are built with `-Ctarget-cpu=x86-64-v3` / `-march=x86-64-v3`
+(`.cargo/config.toml`) — AVX2, BMI1/2, FMA, MOVBE, AVX. Qualifying hosts:
+Zen2+ (AMD), Ice Lake+ / Tiger Lake+ (Intel), Apple silicon under
+Rosetta 2 (AVX2-capable), and both known deploy targets (Meteor Lake
+workstation, Tiger Lake .227 bench box). `x86_64-v2` (the Rust baseline
+for many distros) is the practical floor; **x86-64-v1 hosts cannot run the
+release binary** — dev builds inherit the same flags via `.cargo/config.toml`;
+`RUSTFLAGS` override or removing the config file restores baseline builds.
+
 ## 1. Fail-fast
 
 **Boot self-check (`refine serve` refuses to start unless all pass):**
