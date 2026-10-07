@@ -160,6 +160,28 @@ Sequence forced: Phase II code → Phase IV compiler (profile the *shipped* code
 build, A/B each keep) → Phase III acceptance on the optimized binary → thresholds from
 that baseline → GATED.
 
+## 4b. Phase-III results (2026-10-07, full tables in bench/load/BASELINE.md addendum)
+
+- **A PASS**: closed pooled ladder 50/75/150 @4-threads = refine
+  9,234/8,140 req/s, p95 25.3/32.4 ms vs freeze 466/367 — 19.8-22.2x;
+  vs freeze recorded 454 = **20.3x** (acceptance C passes on closed).
+- **B FAIL as pre-registered**: four arrival attempts at rate=4,480,
+  64.7-98.6% achieved, p95 89-546 ms; never >=99% AND <=104 ms
+  together. Best joint = attempt 1: 97.7% @ p95 92.5 ms. Later attempts
+  degraded with runner state (freeze itself fell 432->220 req/s, RSS
+  7.6 GB) — all four recorded, none discarded.
+- **D**: thresholds re-derived pre-gated (edeac9f, refine <=65 /
+  freeze <=1417 / err <=0.5, formula on run 132925); G1 gated ran with
+  a STALE runner copy of thresholds (refine cells 25.97/32.95 pass;
+  freeze 549/587 breached the old 208) — synced + one pre-declared
+  cooldown re-run (G2), both recorded.
+- **Dual-variant (1-D)**: cache-off (all kill switches, VU75, 4T):
+  2,198/2,708 req/s p95 116/106 — memos = ~3-4x of throughput; every
+  claim above is cache-on and labelled as such.
+- Isolation table (config 24.3k @ 0.011 ms CPU/req; page 2.54 ms
+  cpu/req -> F9; list 1.33 -> wire memo) and C-track A/B disposition
+  (C1+C4 reverted) in the BASELINE addendum.
+
 ## 5. Phases
 
 **Phase I — decide by measurement (one session):**
