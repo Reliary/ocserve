@@ -84,7 +84,7 @@ impl Col {
 /// `serde_json::to_writer` for a `Value::String`: quote, backslash, and the
 /// short escapes serde uses, `\u00xx` (lowercase hex) for other C0 controls,
 /// everything else — including `/` and all non-ASCII — as UTF-8.
-fn push_json_string(out: &mut Vec<u8>, s: &str) {
+pub fn push_json_string(out: &mut Vec<u8>, s: &str) {
     out.push(b'"');
     let bytes = s.as_bytes();
     let mut start = 0usize;

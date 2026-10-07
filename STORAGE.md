@@ -62,6 +62,29 @@ on the fixture. Live: 5,900 rows spliced, 0 fallbacks. `splice_rows()` /
 `splice_fallbacks()` expose the counters; a non-zero fallback count is a
 signal, not a silent degradation.
 
+### 1.1c Session-list wire bytes (M1)
+
+`GET /session` (201 rows on the fixture) was serialized through
+`Vec<serde_json::Value>`: build 201 trees, then `to_vec`. M1
+(`build_sessions_wire_bytes`) writes the members straight from the columns
+into one buffer — no `Value` tree, one pass. Numbers and the `model` blob go
+through serde itself, so ryu/itoa/escaping is serde's by construction rather
+than reimplemented.
+
+**Attribution** (`examples/list_split.rs`, fixture, memo off): SQL row read
+74 µs, JSON build 238 µs — so JSON was ~3× the SQL, and M1 cut that build
+from ~412 µs (DOM) to 238 µs. The full cold call measures ~312 µs here and
+~660 µs in `sqlite_tune_bench`; the difference is `open_reader` (parked
+connection checkout + pragmas), which neither path changes.
+
+**Parity gate** (`tests/list_wire_parity.rs`): byte-exact against
+`to_vec(&load_sessions_wire())` over NULL/empty/unicode/quote/backslash/
+control-character columns, negative and fractional costs, i64 extremes,
+`model` stored with non-compact whitespace, `model` that is not JSON (the
+fallback), and a post-write round trip. Corpus run on the fixture:
+**201 sessions, 105,475 bytes, byte-exact.** A planted extra member turns 3
+of the 5 tests red, so the gate is not vacuous.
+
 ### 1.2 SQLite tuning audit — every pragma decided by evidence (PERF-10X stmt pass, 2026-10-07)
 
 Method: live probe of our bundled build (rusqlite 0.40.2 / SQLite 3.53.2,

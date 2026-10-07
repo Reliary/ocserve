@@ -96,15 +96,129 @@ pub fn load_sessions_wire_bytes(
             return Ok(b);
         }
     }
-    let rows = load_sessions_wire(db)?;
-    let vec = bytes::Bytes::from(serde_json::to_vec(&rows)?);
+    // M1: serialize the wire body DIRECTLY from the columns into one buffer
+    // — no `Value` tree per session and no second serialization pass. The
+    // Value-slot memo is left to `load_sessions_wire` (its own callers keep
+    // their path); this function's callers only ever want bytes, so building
+    // both would double the work. Measured on the fixture: 201 sessions cost
+    // 684 µs via the DOM path, the most expensive store query after the page.
+    let vec = build_sessions_wire_bytes(db)?;
     if enabled && write_epoch() == e0 {
         let mut l = list_memo().lock();
         l.epoch = e0;
         l.bytes = Some(std::sync::Arc::new(vec.clone()));
-        l.slot = Some(std::sync::Arc::new(rows));
+        // The Value slot is intentionally NOT populated here: filling it
+        // would run the DOM path this function exists to avoid. Callers that
+        // want `Vec<Value>` call `load_sessions_wire`, which fills it.
     }
     Ok(std::sync::Arc::new(vec))
+}
+
+/// M1: the session-list wire body, serialized straight from the columns.
+///
+/// Byte-for-byte what `serde_json::to_vec(&load_sessions_wire(db)?)` emits —
+/// pinned by `tests/list_wire_parity.rs`, which asserts equality against the
+/// DOM path over a fixture with populated, NULL and unusual columns. Member
+/// order follows the `json!` literal in `load_sessions_wire` because
+/// `serde_json` is built with `preserve_order` (insertion order).
+///
+/// Every number goes through serde_json itself (`Value::from(f64)` /
+/// `Value::from(i64)` then `to_writer`) rather than a hand-rolled formatter,
+/// so ryu formatting is serde's by construction instead of by coincidence.
+fn build_sessions_wire_bytes(db: &std::path::Path) -> anyhow::Result<bytes::Bytes> {
+    let conn = pragma::open_reader(db)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, project_id, directory, path, slug, title, version, agent, model, cost,
+                summary_additions, summary_deletions, summary_files,
+                tokens_input, tokens_output, tokens_reasoning,
+                tokens_cache_read, tokens_cache_write, time_created, time_updated
+         FROM session ORDER BY time_updated DESC",
+    )?;
+    let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
+    out.push(b'[');
+    let mut first = true;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if !first {
+            out.push(b',');
+        }
+        first = false;
+        out.extend_from_slice(b"{\"id\":");
+        push_wire_str(&mut out, &row.get::<_, String>(0)?);
+        out.extend_from_slice(b",\"projectID\":");
+        push_wire_str(&mut out, &row.get::<_, String>(1)?);
+        out.extend_from_slice(b",\"directory\":");
+        push_wire_str(&mut out, &row.get::<_, String>(2)?);
+        out.extend_from_slice(b",\"path\":");
+        push_wire_str(&mut out, &row.get::<_, String>(3)?);
+        out.extend_from_slice(b",\"slug\":");
+        push_wire_str(&mut out, &row.get::<_, String>(4)?);
+        out.extend_from_slice(b",\"title\":");
+        push_wire_str(&mut out, &row.get::<_, String>(5)?);
+        out.extend_from_slice(b",\"version\":");
+        push_wire_str(&mut out, &row.get::<_, String>(6)?);
+        out.extend_from_slice(b",\"agent\":");
+        match row.get::<_, Option<String>>(7)? {
+            Some(a) => push_wire_str(&mut out, &a),
+            None => out.extend_from_slice(b"null"),
+        }
+        // `model` is itself JSON text in the column; re-emit through serde so
+        // a stored blob with non-compact formatting normalizes as before
+        out.extend_from_slice(b",\"model\":");
+        let model_txt: Option<String> = row.get(8)?;
+        match model_txt
+            .as_deref()
+            .map(serde_json::from_str::<serde_json::Value>)
+        {
+            Some(Ok(v)) => serde_json::to_writer(&mut out, &v)?,
+            _ => {
+                out.extend_from_slice(b"{\"id\":\"\",\"providerID\":\"\",\"variant\":\"default\"}")
+            }
+        }
+        out.extend_from_slice(b",\"cost\":");
+        let cost: f64 = row.get(9)?;
+        push_wire_f64(&mut out, cost);
+        out.extend_from_slice(b",\"summary\":{\"additions\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(10)?);
+        out.extend_from_slice(b",\"deletions\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(11)?);
+        out.extend_from_slice(b",\"files\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(12)?);
+        out.extend_from_slice(b"},\"tokens\":{\"input\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(13)?);
+        out.extend_from_slice(b",\"output\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(14)?);
+        out.extend_from_slice(b",\"reasoning\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(15)?);
+        out.extend_from_slice(b",\"cache\":{\"read\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(16)?);
+        out.extend_from_slice(b",\"write\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(17)?);
+        out.extend_from_slice(b"}},\"time\":{\"created\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(18)?);
+        out.extend_from_slice(b",\"updated\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(19)?);
+        out.extend_from_slice(b"}}");
+    }
+    out.push(b']');
+    Ok(bytes::Bytes::from(out))
+}
+
+/// JSON string escaping identical to serde's for a string value — one
+/// implementation, shared with the splice module.
+fn push_wire_str(out: &mut Vec<u8>, s: &str) {
+    crate::splice::push_json_string(out, s);
+}
+
+/// Numbers through serde itself, so ryu/itoa formatting is serde's by
+/// construction rather than a reimplementation that could drift.
+fn push_wire_i64(out: &mut Vec<u8>, v: i64) {
+    serde_json::to_writer(out, &v).expect("writing an i64 into a Vec cannot fail");
+}
+
+fn push_wire_f64(out: &mut Vec<u8>, v: f64) {
+    // serde emits non-finite floats as null, same as the DOM path
+    serde_json::to_writer(out, &v).expect("writing an f64 into a Vec cannot fail");
 }
 
 /// Insert one message + its parts in a single writer batch (wire shape:

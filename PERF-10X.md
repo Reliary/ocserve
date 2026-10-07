@@ -190,6 +190,13 @@ that baseline → GATED.
   46.5%, visit_map 21.7%) vs SQLite 3.3%; 1,249 µs JSON vs 26 µs SQL per
   50-msg page. Also fixed the bench itself (`--deep` auto-selected a
   **message** id, so every session-scoped figure had measured 0 rows).
+- **Lean sweep M1 (list wire straight to bytes)**: `build_sessions_wire_bytes`
+  writes the session-list body from the columns into one buffer (no `Value`
+  tree, one pass; numbers and the `model` blob still go through serde so
+  formatting is serde's by construction). Attribution on the fixture: SQL
+  74 µs vs JSON build 238 µs, and the JSON half went 412→238 µs. Byte-exact
+  vs the DOM path over adversarial columns and on the real corpus
+  (201 sessions, 105,475 bytes); a planted extra member reddens 3 of 5 tests.
 - **Lean sweep L1 (zero-parse splice)**: `refine_store::splice` compacts
   stored JSON in one byte pass into a reused buffer and splices the three
   column keys, replacing parse→merge→serialize. Byte-identical to the DOM
