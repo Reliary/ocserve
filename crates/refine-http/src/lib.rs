@@ -961,6 +961,29 @@ async fn metrics(State(_st): State<Arc<AppState>>) -> impl IntoResponse {
     // registry counters are incremented by the timing middleware; rss sampled
     // here (scrape-time) so gauges are fresh
     refine_metrics::sample_rss();
+    // Read-path fast activity (L1 splice + F5/F7/F8 memos), published as
+    // absolute cumulative gauges at scrape time — these counters live in
+    // refine-store as atomics with no event stream of their own.
+    //  - splice_rows/fallbacks: the corpus gate proves 0 fallbacks on real
+    //    data, so a non-zero fallback gauge means stored bytes hit a shape
+    //    the splicer refuses — a signal, not a silent fallback (lib.rs L1).
+    //  - memo hit/miss: the load report's cache-on/off variants must be
+    //    observable in production, not just in a bench run.
+    refine_metrics::gauge(
+        "refine_splice_rows_total",
+        refine_store::splice_rows() as i64,
+    );
+    refine_metrics::gauge(
+        "refine_splice_fallbacks_total",
+        refine_store::splice_fallbacks() as i64,
+    );
+    let (search_hits, search_misses, list_hits, list_misses, _pad, search_len, _epoch) =
+        refine_store::memo_stats();
+    refine_metrics::gauge("refine_memo_search_hits", search_hits as i64);
+    refine_metrics::gauge("refine_memo_search_misses", search_misses as i64);
+    refine_metrics::gauge("refine_memo_list_hits", list_hits as i64);
+    refine_metrics::gauge("refine_memo_list_misses", list_misses as i64);
+    refine_metrics::gauge("refine_memo_search_entries", search_len as i64);
     let body = refine_metrics::render();
     (
         [(

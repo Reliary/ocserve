@@ -156,4 +156,34 @@ async fn metrics_exposes_kpi_series() {
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("refine_requests_total"), "counter missing");
     assert!(text.contains("refine_rss_bytes"), "rss gauge missing");
+    // L1 splice + memo activity must be observable in production, not only in
+    // a bench run (the lib.rs doc comment promised a metric that had no
+    // caller until this was wired — found during the 2026-10-07 deploy).
+    for want in [
+        "refine_splice_rows_total",
+        "refine_splice_fallbacks_total",
+        "refine_memo_search_hits",
+        "refine_memo_search_misses",
+        "refine_memo_list_hits",
+        "refine_memo_list_misses",
+        "refine_memo_search_entries",
+    ] {
+        assert!(text.contains(want), "{want} missing from /metrics");
+    }
+    // every emitted series parses as `name value` with a numeric value
+    for line in text.lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let (Some(name), Some(val)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if name.starts_with("refine_splice") || name.starts_with("refine_memo") {
+            assert!(
+                val.parse::<f64>().is_ok(),
+                "{name} has non-numeric value {val:?}"
+            );
+        }
+    }
 }
