@@ -11,3 +11,6 @@ mutants.out.old/
 
 # stray tool caches (never commit)
 .wrangler/
+
+# session-data backups (never commit)
+.safety/
