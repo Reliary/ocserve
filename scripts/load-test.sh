@@ -289,7 +289,7 @@ PYM
 fi
 if [ ! -f "$HR/.local/share/refine/refine.db" ]; then
   say "== fixture: refine import from snapshot (equivalent data by construction) =="
-  "$REFINE_BIN" import --source "$FIX/snapshot.db" --limit 1000000 \
+  "$REPO/$REFINE_BIN" import --source "$FIX/snapshot.db" --limit 1000000 \
     --data-dir "$HR/.local/share/refine" | tail -3
 fi
 
