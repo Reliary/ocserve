@@ -102,6 +102,21 @@ construction.
 **temp_store — DONE (428d13f):** value was `2` (= MEMORY) miscommented as
 FILE; set to `1` (FILE) per the S-A follow-through above.
 
+**C1+C4 A/B — FAIL KEEP-RULE, REVERTED.** Sandwich at VU50/ROUNDS=1 on
+.227 (pinning + quiet gate + both arms each run): A1 pre-C 2,612/2,868
+req/s p95 68/62 ms → B post-C 1,811/2,063 req/s p95 101/90 ms → A2 pre-C
+1,809/2,067 req/s p95 101/91 ms. Post-C ≈ pre-C **to 0.1%** (B vs A2) —
+measurement proven valid (release `sqlite3.o` rebuilt 09:39, after the
+config at 09:31 ⇒ CFLAGS reached sqlite3.c; full Rust recompile also
+observed). Keep-rule "A/B measurable" not met ⇒ `.cargo/config.toml`
+removed. A1's 40% lead over A2 (identical binary) = the fixture
+asymmetry in warm-page-cache form: A1's refine db was still resident
+from its own import; B/A2 read cold (refine db 1.7 GB vs freeze 485 MB —
+freeze held ~470 req/s across all three runs, the stable control). C5
+(worker floor) kept as declared-trivial (no-op at 8 logical cores on
+.227). C6 already skipped with floor-probe evidence. C2 (PGO) parked
+pending Phase-III plateau — revisit only if the ladder stalls short of A.
+
 **E0 — FOUND (initially mis-searched at `refine-src`; the `.227` checkout
 is `~/src/refine`) — RESULT: the config mystery is SOLVED and F1's
 hypothesis is PROVEN.** Run `20261007T004510Z` (config-route isolation,
