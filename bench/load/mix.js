@@ -56,8 +56,11 @@ function sidForVU() {
   return pool[(__VU - 1) % pool.length];
 }
 
-function req(endpoint, method, path, body) {
-  if (ROUTE_FILTER.length && ROUTE_FILTER.indexOf(endpoint) === -1) return null;
+function req(endpoint, method, path, body, force) {
+  // force=true = priming request outside the LOAD_ROUTES filter (the
+  // message_cursor-only schedule must first obtain a cursor via a page
+  // request; without this the run spun 18.3M empty iterations at 0 req/s)
+  if (!force && ROUTE_FILTER.length && ROUTE_FILTER.indexOf(endpoint) === -1) return null;
   const tags = { endpoint };
   const opts = body
     ? { headers: { 'Content-Type': 'application/json' }, tags }
@@ -95,7 +98,8 @@ export function doIteration() {
       if (cursor) {
         req('message_cursor', 'GET', `/session/${sid}/message?limit=50&before=${cursor}`);
       } else {
-        req('message_page', 'GET', `/session/${sid}/message?limit=50`);
+        // priming page — forced past LOAD_ROUTES (see req force param)
+        req('message_page', 'GET', `/session/${sid}/message?limit=50`, undefined, true);
       }
       break;
     case 'config':
