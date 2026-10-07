@@ -1,7 +1,7 @@
 //! Schema: STRICT tables, fixed-size metadata only, user_version gate.
 //! Payloads never live here — they live in the blob store (STORAGE.md §4).
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
@@ -199,6 +199,35 @@ CREATE INDEX idx_compaction_session ON compaction(session_id, time_ms);
 /// 1→current (session columns + message tables), 2→3 (message tables);
 /// refuses anything else.
 pub fn migrate(conn: &Connection) -> Result<()> {
+    apply_migrations(conn)?;
+    post_maintenance(conn)
+}
+
+/// Boot maintenance (PERF-10X stmt/pragma audit, 2026-10-07) — runs on
+/// EVERY writer spawn, including steady-state (no-migration) boots:
+/// 1. `PRAGMA optimize=0x10002` is the docs' verbatim recommendation for
+///    long-lived connections ("when first opened, then hourly") — we were
+///    violating it: the old call lived only in `create_new` (which runs
+///    BEFORE tables exist = perpetual no-op) and the hourly tick needs 240
+///    WRITE batches (GET-load benchmark runs made zero => fixture dbs had
+///    stat1=0 forever, planner ran blind; measured on the fixture:
+///    optimize(-1) listed 7 pending ANALYZEs). optimize self-limits its
+///    ANALYZE (3.46+; 0x00010 bit) so the boot cost is ~0.09 s worst case
+///    — no analysis_limit needed (docs: "applications that use optimize
+///    ... do not need to set an analysis limit").
+/// 2. FTS segment merge `INSERT INTO part_search_fts(part_search_fts)
+///    VALUES('optimize')` — measured on the fixture: search_fts 149→101 µs
+///    (-32%), zero-match LIKE-shaped walk 1090→923 µs (-15%); no-op once
+///    merged (sub-second at steady state).
+fn post_maintenance(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "optimize", "0x10002")
+        .context("optimize")?;
+    conn.execute_batch("INSERT INTO part_search_fts(part_search_fts) VALUES('optimize')")
+        .context("fts optimize")?;
+    Ok(())
+}
+
+fn apply_migrations(conn: &Connection) -> Result<()> {
     let ver: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .expect("user_version readable");
@@ -731,6 +760,9 @@ mod sa_search {
     /// Rowid = time*SLOTS + slot: same-ms increments, cross-ms disjoint,
     /// delete-gaps never collide (max+1 allocation), rt trigger enforces.
     #[test]
+    // `time * SLOTS + 0` keeps the slot0 term explicit — the rowid
+    // encoding documentation lives in these literals.
+    #[allow(clippy::identity_op)]
     fn rowid_encoding_contract() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("t.db");
@@ -954,5 +986,58 @@ mod sa_search {
         // scoped path stays scoped + ordered
         let (hits, _) = search_parts(&p, "needle", Some("ses_1"), 10, 0).unwrap();
         assert_eq!(hits.len(), 3);
+    }
+
+    /// PERF-10X stmt/pragma audit: the fixture dbs had stat1=0 forever
+    /// because optimize ran only in create_new (pre-DDL no-op) and the
+    /// hourly tick needs 240 writes. Steady-state migrate() must leave
+    /// planner stats behind AFTER data exists (docs: optimize=0x10002 at
+    /// first open / after schema change). Negative control: skipping
+    /// post_maintenance makes this red (planted 2026-10-07).
+    #[test]
+    fn steady_state_migrate_collects_planner_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.db");
+        let conn = super::super::pragma::create_new(&p).unwrap();
+        migrate(&conn).unwrap(); // arm0 + maintenance on empty tables
+        // data (STRICT + FK + rt-trigger: rowid ms must equal msg time)
+        conn.execute_batch(
+            "INSERT INTO session (id, project_id, directory, path, slug, title, version, time_created, time_updated)
+             VALUES ('ses_t','global','/w','s','s','t','1',1,1);
+             INSERT INTO msg (id, session_id, role, seq, time_created, info)
+             VALUES ('m1','ses_t','user',1,100,'{}');
+             INSERT INTO msg_part (id, message_id, session_id, seq, type, byte_len, inline, blob_sha)
+             VALUES ('p1','m1','ses_t',1,'text',4,'{}',NULL);
+             INSERT INTO part_search (rowid, part_id, session_id, message_id, text)
+             VALUES (104857600,'p1','ses_t','m1','needle text here');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap(); // steady-state path: post_maintenance runs
+        let (n,): (i64,) = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_stat1 WHERE tbl='msg'",
+                [],
+                |r| Ok((r.get(0)?,)),
+            )
+            .unwrap();
+        assert!(
+            n >= 1,
+            "optimize=0x10002 must analyze msg after data exists"
+        );
+        // stats must carry a row count > 0 for the populated table
+        let stat: String = conn
+            .query_row("SELECT stat FROM sqlite_stat1 WHERE tbl='msg'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let rows: i64 = stat
+            .split_whitespace()
+            .next()
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(0);
+        assert!(rows > 0, "stat1 rowcount for msg should be >0, got {stat}");
+        // fts optimize ran without error and search still works
+        let hits = crate::search_parts(&p, "needle", None, 10, 0).unwrap();
+        assert_eq!(hits.0.len(), 1);
     }
 }

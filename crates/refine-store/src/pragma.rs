@@ -62,6 +62,11 @@ fn apply_common(conn: &Connection) -> Result<()> {
         .context("foreign_keys")?;
     conn.pragma_update(None, "busy_timeout", 5000)
         .context("busy_timeout")?;
+    // Statement cache sized explicitly (default is 16): hot read paths use
+    // 15+ distinct static statements across routes; 32 heads off LRU thrash
+    // and is still <1 MB of VDBE. prepare_cached = SQLITE_PREPARE_PERSISTENT
+    // (rusqlite 0.40) — the modern reuse path, audited PERF-10X stmt pass.
+    conn.set_prepared_statement_cache_capacity(32);
     Ok(())
 }
 
@@ -83,8 +88,9 @@ pub fn create_new(path: &std::path::Path) -> Result<Connection> {
         .context("wal_autocheckpoint")?;
     conn.pragma_update(None, "journal_size_limit", 67_108_864)
         .context("journal_size_limit")?;
-    conn.pragma_update(None, "optimize", "0x10002")
-        .context("optimize")?;
+    // optimize intentionally NOT run here: tables don't exist yet (the old
+    // call was a perpetual no-op). schema::migrate runs it at the end of
+    // every writer spawn, post-DDL — the documented long-lived pattern.
     apply_common(&conn)?;
     conn.pragma_update(None, "cache_size", WRITER_CACHE_KB)
         .context("writer cache_size")?;

@@ -118,6 +118,9 @@ fn count_msgs(b: &[u8]) -> usize {
 /// The epoch contract: memo hit hides a raw (no-funnel) write; a
 /// writer-funnel write invalidates and the fresh read sees BOTH writes.
 #[tokio::test]
+// Holding the std Mutex across awaits is THE test's mechanism (serializes
+// process-global memo state + env flips against sibling tests) — intended.
+#[allow(clippy::await_holding_lock)]
 async fn page_memo_epoch_exact() {
     let _g = lock();
     let dir = tmp("epoch");
@@ -170,6 +173,7 @@ async fn page_memo_epoch_exact() {
 /// Kill switch: REFINE_PAGE_MEMO=0 serves every request straight from the
 /// store (raw writes visible immediately).
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn page_memo_env_off_bypasses() {
     let _g = lock();
     // SAFETY: LOCK serializes every test in this process — no sibling

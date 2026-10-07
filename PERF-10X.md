@@ -181,6 +181,10 @@ that baseline → GATED.
 - Isolation table (config 24.3k @ 0.011 ms CPU/req; page 2.54 ms
   cpu/req -> F9; list 1.33 -> wire memo) and C-track A/B disposition
   (C1+C4 reverted) in the BASELINE addendum.
+- **Stmt/pragma audit (follow-up)**: optimize placement bug found+fixed
+  (fixture stat1=0 forever), FTS optimize adopted (−32% fts), 18 sites
+  → prepare_cached/PERSISTENT (session_wire 8→1 µs), mmap + page_size
+  A/B'd to rejection — full table in STORAGE §1.2.
 
 ## 5. Phases
 

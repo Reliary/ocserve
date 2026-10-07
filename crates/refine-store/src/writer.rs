@@ -92,7 +92,11 @@ impl Drop for Writer {
 }
 
 fn bind(conn: &Connection, sql: &str, params: &[serde_json::Value]) -> Result<usize> {
-    let mut stmt = conn.prepare(sql)?;
+    // Cutting-edge statement path (PERF-10X stmt audit): prepare_cached
+    // prepares ONCE with SQLITE_PREPARE_PERSISTENT (rusqlite's documented
+    // behaviour) and reuses the VDBE across batches — every WriteOp::Sql
+    // funnels here, so op-SQL compile cost drops to LRU hits.
+    let mut stmt = conn.prepare_cached(sql)?;
     let boxed: Vec<Box<dyn rusqlite::ToSql>> = params
         .iter()
         .map(|v| match v {

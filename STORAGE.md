@@ -36,6 +36,45 @@ this scale. Write amplification is absorbed by the ≤50 ms writer batching.
 - Compaction: incremental `INSERT INTO f(f, rank) VALUES('merge', ±N)` in idle windows —
   never the all-btree `optimize` (long transaction).
 
+### 1.2 SQLite tuning audit — every pragma decided by evidence (PERF-10X stmt pass, 2026-10-07)
+
+Method: live probe of our bundled build (rusqlite 0.40.2 / SQLite 3.53.2,
+`examples/sqlite_info.rs`), official pragma docs fetched, decisive A/Bs on a
+scratch copy of the `.227` fixture db (`examples/sqlite_tune_bench.rs`,
+memos off, interleaved where noisy). Warm µs figures from `prep_A/B` and
+`m0–m2` runs in this session.
+
+| setting | value | decision + evidence |
+|---|---|---|
+| journal_mode / synchronous | WAL / NORMAL | keep — docs-standard for WAL durability |
+| page_size | 4096 | **REJECT 8192**: A/B on a VACUUM-rebuilt copy (4.1 s rebuild) = flat on all 7 hot queries (page_window 7→8 µs even); write amplification up |
+| mmap_size | 0 | **REJECT 256 MB**: A/B zero delta everywhere (page 7 µs, fts 110 µs, list 805 µs both ways); RSS/OOM history rationale intact (docs note no special caveats, but nothing to win) |
+| temp_store | 1 (FILE) | fixed earlier (value was 2=MEMORY miscommented); `/tmp` is tmpfs here → sort spill = shmem, memcg-accounted, swappable — bounded either way |
+| analysis_limit | 0 (default) | **no change** — since 3.46 `PRAGMA optimize` sets its own temporary limit (0x00010 bit, on by default); docs: "applications that use optimize … do not need to set an analysis limit" |
+| optimize placement | **FIXED** | was only in `create_new` (runs before tables exist = perpetual no-op) + hourly tick needs 240 *write* batches → fixture dbs had `stat1=0` forever (`optimize(-1)` listed 7 pending ANALYZEs). `schema::migrate` is now a wrapper that runs `post_maintenance` on EVERY writer spawn incl. steady-state boots: `optimize=0x10002` (docs' verbatim long-lived-connection value; measured 0.09 s) + FTS optimize. Test `steady_state_migrate_collects_planner_stats` + planted negative control (red→green) |
+| FTS `'optimize'` maintenance | **ADOPTED** (in `post_maintenance`) | phased same-file isolation: search_fts 149→101 µs (−32%), zero-match walk 1090→923 µs (−15%), no-op at steady state (sub-second) |
+| threads | 0 | keep — auxiliary sorter threads only help the big sorts S-A removed; per-statement thread launch would be overhead |
+| secure_delete | 0 | verified OFF in our build (compile_options lacks `SECURE_DELETE`; probe) — no rewrite amplification on prune/cascade |
+| STAT4 | compiled in | no action — `ENABLE_STAT4` present; optimize writes stat4 when it analyzes |
+| cell_size_check | 1 | keep (M0 integrity choice; docs confirm only "small hit") |
+| cache_size | writer −16 MB / reader −4 MB | keep; docs: allocation is on-demand chunks, so 4 MB×16 parked readers is a ceiling not a usage; live cgroup stayed 282–450 MB |
+| busy_timeout / wal_autocheckpoint / journal_size_limit | 5000 / 1000 / 64 MB | keep (docs defaults + WAL-reset history) |
+| case_sensitive_like / automatic_index / cache_spill / locking_mode | untouched | case_sensitive_like is deprecated (docs) and LIKE contract tests pin default semantics; the rest are docs-recommended defaults |
+
+**Prepared statements (cutting edge, rusqlite 0.40.2):** `prepare_cached`
+is the modern path — it prepares with `SQLITE_PREPARE_PERSISTENT` and LRU-
+reuses the VDBE (docs: "returns a cached statement … else prepares with
+SQLITE_PREPARE_PERSISTENT"; cache key `sql.trim()`, default capacity 16 →
+set explicitly to **32** in `apply_common`). Converted: 17 read-path sites
+(list/page/for_each/session_wire/search/todos/children/compaction_rows/
+last_message) + the writer's `bind()` choke (every WriteOp::Sql).
+Skipped with reasons: 3 backfill one-shots (never reused) and the dynamic
+`IN (…)` batch SQL in `pull_legacy_delta` (text varies per batch size —
+LRU churn, sync cadence doesn't care). `query_row` sites unchanged (no
+cached API; measured 2 µs). Measured A/B (interleaved ×3, t2): session_wire
+**8→1 µs**, for_each_page **18→13 µs**, page_window 7→6 µs, list/search
+neutral.
+
 ### 1.1 Search projection as shipped (W1 → v10, PERF-10X S-A)
 
 Supersedes the pre-W1 sketch above (`search_doc` was dropped as dead in W1 — never

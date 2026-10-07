@@ -36,7 +36,7 @@ pub fn load_sessions_wire(db: &std::path::Path) -> anyhow::Result<Vec<serde_json
         LIST_MEMO_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let conn = pragma::open_reader(db)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, project_id, directory, path, slug, title, version, agent, model, cost,
                 summary_additions, summary_deletions, summary_files,
                 tokens_input, tokens_output, tokens_reasoning,
@@ -288,7 +288,7 @@ pub fn compaction_rows(
     conn: &rusqlite::Connection,
     session_id: &str,
 ) -> anyhow::Result<Vec<CompactionRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT part_id, user_msg_id, auto, overflow, tail_start_id, summary_msg_id \
          FROM compaction WHERE session_id = ?1 ORDER BY time_ms, rowid",
     )?;
@@ -431,7 +431,7 @@ pub fn last_message_conn(
     let info: serde_json::Value = serde_json::from_str(&info_txt)?;
     let info = merge_columns(info, &mid, session_id, None);
     let blobs = crate::blob::BlobStore::new(blobs_root)?;
-    let mut pstmt = conn.prepare(
+    let mut pstmt = conn.prepare_cached(
         "SELECT id, inline, blob_sha, byte_len FROM msg_part WHERE message_id = ?1 ORDER BY seq",
     )?;
     let mut parts: Vec<serde_json::Value> = Vec::new();
@@ -657,7 +657,7 @@ pub fn page_messages(
     let n = limit.saturating_add(1);
     let rows: Vec<(String, String, i64)> = match before {
         Some((bid, btime)) => {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT id, info, time_created FROM msg WHERE session_id = ?1 \
                  AND (time_created < ?2 OR (time_created = ?2 AND id < ?3)) \
                  ORDER BY time_created DESC, id DESC LIMIT ?4",
@@ -669,7 +669,7 @@ pub fn page_messages(
             .collect()
         }
         None => {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT id, info, time_created FROM msg WHERE session_id = ?1 \
                  ORDER BY time_created DESC, id DESC LIMIT ?2",
             )?;
@@ -732,11 +732,11 @@ pub fn for_each_message_json(
             // legacy/refine timelines stay chronological (seq = write-order
             // bookkeeping only; sync appends older-by-time rows later)
             let mut stmt = match limit {
-                Some(_) => conn.prepare(
+                Some(_) => conn.prepare_cached(
                     "SELECT id, info FROM (SELECT id, info, time_created FROM msg WHERE session_id = ?1 \
                      ORDER BY time_created DESC, id DESC LIMIT ?2) ORDER BY time_created, id",
                 )?,
-                None => conn.prepare(
+                None => conn.prepare_cached(
                     "SELECT id, info FROM msg WHERE session_id = ?1 ORDER BY time_created, id",
                 )?,
             };
@@ -763,7 +763,7 @@ pub fn for_each_message_json(
     // never match a real id).
     const PART_CHUNK: usize = 64;
     let placeholders = vec!["?"; PART_CHUNK].join(",");
-    let mut pstmt = conn.prepare(&format!(
+    let mut pstmt = conn.prepare_cached(&format!(
         "SELECT message_id, id, inline, blob_sha, byte_len FROM msg_part WHERE message_id IN ({placeholders}) ORDER BY message_id, seq"
     ))?;
     #[derive(Debug)]
@@ -883,11 +883,13 @@ pub fn load_messages(
 ) -> anyhow::Result<Vec<(serde_json::Value, Vec<serde_json::Value>)>> {
     let conn = pragma::open_reader(db)?;
     let mut stmt = match limit {
-        Some(_) => conn.prepare(
+        Some(_) => conn.prepare_cached(
             "SELECT id, info FROM (SELECT id, info, seq FROM msg WHERE session_id = ?1 \
              ORDER BY seq DESC LIMIT ?2) ORDER BY seq",
         )?,
-        None => conn.prepare("SELECT id, info FROM msg WHERE session_id = ?1 ORDER BY seq")?,
+        None => {
+            conn.prepare_cached("SELECT id, info FROM msg WHERE session_id = ?1 ORDER BY seq")?
+        }
     };
     let msgs: Vec<(String, String)> = match limit {
         Some(n) => stmt
@@ -910,7 +912,7 @@ pub fn load_messages(
     for (mid, info_txt) in msgs {
         let info: serde_json::Value = serde_json::from_str(&info_txt)?;
         let info = merge_columns(info, &mid, session_id, None);
-        let mut pstmt = conn.prepare(
+        let mut pstmt = conn.prepare_cached(
             "SELECT id, inline, blob_sha, byte_len FROM msg_part WHERE message_id = ?1 ORDER BY seq",
         )?;
         let mut parts: Vec<serde_json::Value> = Vec::new();
@@ -1079,7 +1081,7 @@ pub fn load_session_wire(
     session_id: &str,
 ) -> anyhow::Result<Option<serde_json::Value>> {
     let conn = pragma::open_reader(db)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT id, project_id, directory, path, slug, title, version, agent, model, cost,
                 summary_additions, summary_deletions, summary_files,
                 tokens_input, tokens_output, tokens_reasoning,
@@ -1345,8 +1347,8 @@ pub fn load_children(
     session_id: &str,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
     let conn = pragma::open_reader(db)?;
-    let mut stmt =
-        conn.prepare("SELECT id FROM session WHERE parent_id = ?1 ORDER BY time_updated DESC")?;
+    let mut stmt = conn
+        .prepare_cached("SELECT id FROM session WHERE parent_id = ?1 ORDER BY time_updated DESC")?;
     let ids: Vec<String> = stmt
         .query_map([session_id], |r| r.get(0))?
         .filter_map(|r| r.ok())
@@ -1367,7 +1369,7 @@ pub fn load_todos(
     session_id: &str,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
     let conn = pragma::open_reader(db)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT content, status, priority FROM todo WHERE session_id = ?1 ORDER BY time_created",
     )?;
     let rows = stmt.query_map([session_id], |r| {
@@ -1553,7 +1555,7 @@ pub fn pull_legacy_delta(
 ) -> anyhow::Result<(Vec<LegacyMsg>, bool)> {
     let mut msgs: Vec<LegacyMsg> = match cursor {
         Some((cid, ctime)) => {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT id, time_created, data FROM message \
                  WHERE session_id = ?1 AND (time_created > ?2 OR (time_created = ?2 AND id > ?3)) \
                  ORDER BY time_created, id LIMIT ?4",
@@ -1563,7 +1565,7 @@ pub fn pull_legacy_delta(
                 .collect()
         }
         None => {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT id, time_created, data FROM message \
                  WHERE session_id = ?1 ORDER BY time_created, id LIMIT ?2",
             )?;
@@ -1963,7 +1965,7 @@ pub fn search_parts(
             ),
         }
     };
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let row_slice: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
     let rows: Vec<SearchHit> = stmt
         .query_map(row_slice.as_slice(), row_hit)?
