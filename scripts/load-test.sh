@@ -314,6 +314,9 @@ say "== spawn (cwd=$META_CWD) =="
   cd "$META_CWD"
   setsid env HOME="$HR" OPENCODE_DISABLE_MODELS_FETCH=1 \
     REFINE_DATA_DIR="$HR/.local/share/refine" REFINE_LEGACY_SYNC=0 \
+    REFINE_SEARCH_MEMO="${REFINE_SEARCH_MEMO:-1}" \
+    REFINE_LIST_MEMO="${REFINE_LIST_MEMO:-1}" \
+    REFINE_WIRE_CACHE="${REFINE_WIRE_CACHE:-1}" \
     "$REPO/$REFINE_BIN" serve --port "$PORT_R" >"$FIX/refine.log" 2>&1 &
   echo $! > "$FIX/refine.pid"
 ) &
