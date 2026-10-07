@@ -705,6 +705,7 @@ pub fn page_messages(
 /// as serde Values). Column merge applied per row (see merge_columns).
 /// What to walk: full/tail history (seq order) or an explicit pre-ordered
 /// cursor window from `page_messages` (tuple order).
+#[derive(Clone)]
 pub enum MessageWalk {
     /// last `limit` messages in seq order (`None` = all)
     Seq { limit: Option<usize> },

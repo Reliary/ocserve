@@ -149,14 +149,22 @@ async fn page_headers_cursor_follow_and_streamed_body() {
     seed_msgs(&st, "ses_p", 12);
     let app = refine_http::router(st.clone());
 
-    // page 1: newest 5, ASC, headers present, NO content-length (streamed
-    // invariant — the materialization regression guard)
+    // page 1: newest 5, ASC, headers present. Content-Length policy (F9
+    // amendment — the OOM class lives in the UNBOUNDED full-history
+    // stream, not in paged bodies): a paged response may be a bounded
+    // materialization (memo cap 4 MiB, enforced in PageMemoState::put),
+    // and if it carries Content-Length it must PROVE the bound. The
+    // full-history no-CL invariant is asserted below on the same
+    // session (negative control: full history never enters the memo).
     let (s, b, h) = get(&app, "/session/ses_p/message?limit=5").await;
     assert_eq!(s, 200);
-    assert!(
-        h.get(axum::http::header::CONTENT_LENGTH).is_none(),
-        "message responses must stream (no Content-Length) — guardrail for the OOM class"
-    );
+    if let Some(cl) = h.get(axum::http::header::CONTENT_LENGTH) {
+        let n: usize = cl.to_str().unwrap().parse().unwrap();
+        assert!(
+            n <= refine_http::PAGE_MEMO_ENTRY_CAP,
+            "paged Content-Length must respect the memo entry cap: {n}"
+        );
+    }
     let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
     let ids: Vec<&str> = v
         .as_array()
@@ -167,6 +175,15 @@ async fn page_headers_cursor_follow_and_streamed_body() {
     assert_eq!(
         ids,
         ["msg_0007", "msg_0008", "msg_0009", "msg_0010", "msg_0011"]
+    );
+    // full-history (no limit) MUST stream with no Content-Length — the
+    // original OOM-class invariant, now scoped where it actually applies
+    // (F9 never memoizes unbounded walks; page_n.is_some() gate).
+    let (sf, _bf, hf) = get(&app, "/session/ses_p/message").await;
+    assert_eq!(sf, 200);
+    assert!(
+        hf.get(axum::http::header::CONTENT_LENGTH).is_none(),
+        "full-history must stream (no Content-Length) — unbounded OOM class guard"
     );
     let cur = h
         .get("x-next-cursor")

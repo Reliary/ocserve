@@ -703,6 +703,133 @@ async fn vcs_info() -> impl IntoResponse {
     }))
 }
 
+// ---- PERF-10X F9: paged /message wire memo ----
+//
+// message_page was the CPU hog (route isolation: ~3 ms CPU/page — parse +
+// merge + serialize per message, blocking-pool thread, channel framing).
+// A paged response (limit>0, ≤50 messages) is assembled ONCE per
+// (db, session, limit, cursor, write-epoch) and served as refcounted
+// Bytes; hits skip reader, queries, parse, thread and channel entirely.
+// Bound by construction: entries ≤ 4 MiB (larger assemblies abort and
+// fall back to the original streaming path — the unbounded full-history
+// stream is NEVER memoized, AGENTS §2.3), FIFO capped at 32 entries.
+// Exactness: keys carry the write epoch; a writer bump invalidates
+// (lazy clear on epoch mismatch — same rule as F7/F8). Kill switch:
+// REFINE_PAGE_MEMO=0.
+pub const PAGE_MEMO_ENTRY_CAP: usize = 4 * 1024 * 1024;
+const PAGE_MEMO_MAX_ENTRIES: usize = 32;
+
+struct PageEntry {
+    body: bytes::Bytes,
+    next: Option<String>,
+}
+
+struct PageMemoState {
+    epoch: u64,
+    entries: std::collections::VecDeque<(String, PageEntry)>,
+}
+
+impl PageMemoState {
+    fn new() -> Self {
+        Self {
+            epoch: 0,
+            entries: std::collections::VecDeque::new(),
+        }
+    }
+    fn get(&mut self, key: &str, epoch: u64) -> Option<PageEntry> {
+        if self.epoch != epoch {
+            self.entries.clear();
+            self.epoch = epoch;
+        }
+        self.entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, e)| PageEntry {
+                body: e.body.clone(),
+                next: e.next.clone(),
+            })
+    }
+    fn put(&mut self, key: String, entry: PageEntry, epoch: u64) {
+        if entry.body.len() > PAGE_MEMO_ENTRY_CAP {
+            return;
+        }
+        if self.epoch != epoch {
+            self.entries.clear();
+            self.epoch = epoch;
+        }
+        self.entries.retain(|(k, _)| k != &key);
+        self.entries.push_back((key, entry));
+        while self.entries.len() > PAGE_MEMO_MAX_ENTRIES {
+            self.entries.pop_front();
+        }
+    }
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+static PAGE_MEMO: std::sync::OnceLock<parking_lot::Mutex<PageMemoState>> =
+    std::sync::OnceLock::new();
+static PAGE_MEMO_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PAGE_MEMO_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn page_memo() -> &'static parking_lot::Mutex<PageMemoState> {
+    PAGE_MEMO.get_or_init(|| parking_lot::Mutex::new(PageMemoState::new()))
+}
+
+pub fn page_memo_enabled() -> bool {
+    std::env::var("REFINE_PAGE_MEMO")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// (hits, misses, entries) for the load report / tests.
+pub fn page_memo_stats() -> (u64, u64, usize) {
+    (
+        PAGE_MEMO_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        PAGE_MEMO_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+        page_memo().lock().len(),
+    )
+}
+
+/// Page response builder shared by the memo path and the streaming path
+/// (headers rule = upstream session.ts:133-147: Link echoes the request
+/// origin — Host / x-forwarded-proto — so headers are rebuilt per request
+/// even on a memo hit; only the BODY is cached).
+fn page_response(
+    headers: &axum::http::HeaderMap,
+    uri: &axum::http::Uri,
+    page_n: &Option<u64>,
+    page_next: &Option<String>,
+    body: axum::body::Body,
+) -> Result<axum::response::Response, ApiError> {
+    let mut builder = axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/json");
+    if let (Some(n), Some(cur)) = (page_n, page_next) {
+        let scheme = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("http");
+        let host = headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("localhost");
+        let link = format!(
+            "<{scheme}://{host}{}?limit={n}&before={cur}>; rel=\"next\"",
+            uri.path()
+        );
+        builder = builder
+            .header("x-next-cursor", cur.as_str())
+            .header("link", link)
+            .header("access-control-expose-headers", "Link, X-Next-Cursor");
+    }
+    builder.body(body).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("response build: {e}"),
+    })
+}
+
 async fn get_sessions(State(st): State<Arc<AppState>>) -> axum::response::Response {
     // Fresh DB rows (upstream semantics) — the boot map was stale after
     // prompts (M2 finding); load_sessions_wire orders by time_updated DESC.
@@ -1146,6 +1273,87 @@ async fn get_messages(
         }
         None => refine_store::MessageWalk::Seq { limit: None },
     };
+    // F9: memoized paged body. Key carries db path (cross-test/process
+    // isolation: same session id in another tmpdir must not collide) +
+    // limit + cursor + the live write epoch (checked inside get).
+    if page_n.is_some() && page_memo_enabled() {
+        let memo_key = format!("{}\u{1}{id}\u{1}{limit:?}\u{1}{before:?}", st.db.display());
+        let e0 = refine_store::write_epoch();
+        {
+            let mut m = page_memo().lock();
+            if let Some(e) = m.get(&memo_key, e0) {
+                drop(m);
+                PAGE_MEMO_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return page_response(
+                    &headers,
+                    &uri,
+                    &page_n,
+                    &page_next,
+                    axum::body::Body::from(e.body),
+                )
+                .map_err(Into::into);
+            }
+        }
+        PAGE_MEMO_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // assemble the page bounded — oversize aborts the collect and we
+        // fall through to the original streaming path (walk not consumed:
+        // the assembler gets a clone).
+        let walk_asm = walk.clone();
+        let db_asm = st.db.clone();
+        let sid_asm = id.clone();
+        let asm: anyhow::Result<std::result::Result<Vec<u8>, ()>> =
+            run_blocking(&db_asm, move |db| {
+                let mut buf: Vec<u8> = Vec::new();
+                let mut total = 0usize;
+                let mut first = true;
+                let r = refine_store::for_each_message_json(db, &sid_asm, walk_asm, |chunk| {
+                    let framed = if first {
+                        first = false;
+                        format!("[{chunk}")
+                    } else {
+                        format!(",{chunk}")
+                    };
+                    if total + framed.len() > PAGE_MEMO_ENTRY_CAP {
+                        return Err(anyhow::anyhow!("page memo entry cap"));
+                    }
+                    total += framed.len();
+                    buf.extend_from_slice(framed.as_bytes());
+                    Ok(())
+                });
+                match r {
+                    Ok(()) => {
+                        // mirror the streaming close exactly: zero chunks
+                        // => "[]" (a bare "]" would not be valid JSON)
+                        if first {
+                            buf.extend_from_slice(b"[]");
+                        } else {
+                            buf.push(b']');
+                        }
+                        Ok(Ok(buf))
+                    }
+                    Err(e) if e.to_string().contains("entry cap") => Ok(Err(())),
+                    Err(e) => Err(e),
+                }
+            })
+            .await;
+        if let Ok(Ok(buf)) = asm {
+            let bytes = bytes::Bytes::from(buf);
+            let entry = PageEntry {
+                body: bytes.clone(),
+                next: page_next.clone(),
+            };
+            page_memo().lock().put(memo_key, entry, e0);
+            return page_response(
+                &headers,
+                &uri,
+                &page_n,
+                &page_next,
+                axum::body::Body::from(bytes),
+            )
+            .map_err(Into::into);
+        }
+        // oversize or assemble error → original streaming path below
+    }
     // STREAMED response: one message per chunk through a bounded channel —
     // materializing a 16k-message session as Values OOM-killed the cgroup
     // (93MB response ≈ 400MB+ parsed; AGENTS §2.3 violation caught live).
@@ -1188,36 +1396,14 @@ async fn get_messages(
             )
         })
     });
-    let mut builder = axum::response::Response::builder()
-        .header(axum::http::header::CONTENT_TYPE, "application/json");
-    // Page headers (upstream session.ts:133-147): Link echoes the request
-    // origin (Host; x-forwarded-proto honored) + X-Next-Cursor + expose list.
-    if let (Some(n), Some(cur)) = (&page_n, &page_next) {
-        let scheme = headers
-            .get("x-forwarded-proto")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("http");
-        let host = headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("localhost");
-        let link = format!(
-            "<{scheme}://{host}{}?limit={n}&before={cur}>; rel=\"next\"",
-            uri.path()
-        );
-        builder = builder
-            .header("x-next-cursor", cur.as_str())
-            .header("link", link)
-            .header("access-control-expose-headers", "Link, X-Next-Cursor");
-    }
-    let resp = builder
-        .body(axum::body::Body::from_stream(body_stream))
-        .map_err(|e| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            name: "InternalError",
-            message: format!("response build: {e}"),
-        })?;
-    Ok(resp)
+    page_response(
+        &headers,
+        &uri,
+        &page_n,
+        &page_next,
+        axum::body::Body::from_stream(body_stream),
+    )
+    .map_err(Into::into)
 }
 
 /// PATCH /config + PATCH /global/config — W4 merge (v1 ConfigHttpApi.update:
