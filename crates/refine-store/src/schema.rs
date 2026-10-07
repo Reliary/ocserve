@@ -220,10 +220,74 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 ///    (-32%), zero-match LIKE-shaped walk 1090→923 µs (-15%); no-op once
 ///    merged (sub-second at steady state).
 fn post_maintenance(conn: &Connection) -> Result<()> {
-    conn.pragma_update(None, "optimize", "0x10002")
-        .context("optimize")?;
-    conn.execute_batch("INSERT INTO part_search_fts(part_search_fts) VALUES('optimize')")
-        .context("fts optimize")?;
+    // Both steps are STATISTICS work, not schema: losing them only means the
+    // planner runs without fresh stats until the next hourly tick, which is
+    // strictly better than refusing to boot. A boot that dies here takes the
+    // server with it — hit in the load harness (2026-10-07), where a stale
+    // fixture wipe left a second connection holding the write lock and
+    // `PRAGMA optimize` failed with SQLITE_BUSY, so `refine serve` exited 1
+    // and the harness reported "never healthy". Fail-fast is right for
+    // migration DDL (STORAGE §1) and wrong for this.
+    //
+    // `busy_timeout` does not cover this: it applies to lock acquisition, and
+    // a *statement-level* BUSY on a pragma can still surface immediately —
+    // hence the bounded retry with backoff, then warn and continue.
+    const ATTEMPTS: u32 = 5;
+    let mut last: Option<anyhow::Error> = None;
+    for n in 1..=ATTEMPTS {
+        let err = match conn
+            .pragma_update(None, "optimize", "0x10002")
+            .context("optimize")
+        {
+            Ok(()) => {
+                last = None;
+                break;
+            }
+            Err(e) => e,
+        };
+        let busy = err.root_cause().to_string().contains("database is locked");
+        if !busy {
+            // not contention — a real failure, keep it loud
+            return Err(err);
+        }
+        last = Some(err);
+        if n < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(n)));
+        }
+    }
+    if let Some(e) = last {
+        tracing::warn!(
+            "post_maintenance: optimize skipped after {ATTEMPTS} attempts              (stats refresh deferred to the hourly tick): {e:#}"
+        );
+    }
+    // same policy for the FTS segment merge
+    let mut last: Option<anyhow::Error> = None;
+    for n in 1..=ATTEMPTS {
+        match conn
+            .execute_batch("INSERT INTO part_search_fts(part_search_fts) VALUES('optimize')")
+            .context("fts optimize")
+        {
+            Ok(()) => {
+                last = None;
+                break;
+            }
+            Err(e) => {
+                let busy = e.root_cause().to_string().contains("database is locked");
+                if !busy {
+                    return Err(e);
+                }
+                last = Some(e);
+                if n < ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(n)));
+                }
+            }
+        }
+    }
+    if let Some(e) = last {
+        tracing::warn!(
+            "post_maintenance: fts optimize skipped after {ATTEMPTS} attempts              (segment merge deferred): {e:#}"
+        );
+    }
     Ok(())
 }
 

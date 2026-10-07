@@ -55,6 +55,35 @@ fallback) on anything unprovable: non-object top level, unbalanced brackets,
 duplicate top-level keys, non-canonical integers > 19 digits, malformed
 values.
 
+### 1.1d Boot must not die on write-lock contention (found by the load harness)
+
+The optimize-placement fix (this file §1.2) moved `PRAGMA optimize` onto the
+boot path, where it runs on **every** writer spawn. The A/B run immediately
+exposed the consequence: with a second connection holding the write lock (the
+load harness wipes a stale fixture while another handle lingers),
+`pragma_update` returned `SQLITE_BUSY` → `migrate` failed → `refine serve`
+exited 1 → "refine never healthy". `busy_timeout` does not cover it: that
+applies to lock acquisition, and a statement-level BUSY on a pragma can
+surface immediately.
+
+Both maintenance steps (`PRAGMA optimize`, the FTS `'optimize'` merge) are now
+**statistics work, not schema**, so:
+
+- transient `database is locked` → bounded retry (5 attempts, 100/200/300/400
+  ms backoff = 1 s budget), then WARN and continue. Losing stats costs only a
+  stale planner until the next hourly tick; losing the boot costs the server.
+- any **non**-contention error → still propagates. The swallow is scoped to
+  the exact `database is locked` string.
+
+Tests: `tests/lock_retry.rs` — `boot_survives_a_contended_optimize` (real
+`BEGIN EXCLUSIVE` blocker, asserts success AND a bounded runtime),
+`stats_are_collected_when_the_lock_is_free`, and
+`non_contention_errors_are_not_swallowed` (drops `part_search_fts` so the
+maintenance statement fails hard). **Planted negative control**: making the
+retry absorb *every* error turns the third test red — proven. A first attempt
+at that control used `PRAGMA <unknown>`, which SQLite silently ignores, so it
+was vacuous and was replaced.
+
 **Gate:** `tests/splice_parity.rs` proves byte-parity against the DOM as
 oracle, and `splice_parity_over_corpus` runs the differential over **every**
 stored row (`REFINE_SPLICE_DB=<db>`): 218,393 rows, 0 refused, 0 mismatched
