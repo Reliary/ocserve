@@ -158,6 +158,10 @@ fn run_loop(conn: &Connection, rx: mpsc::Receiver<Batch>) {
                     if let Err(e) = conn.execute_batch("COMMIT") {
                         failure = Some(format!("commit: {e:#}"));
                         let _ = conn.execute_batch("ROLLBACK");
+                    } else {
+                        // F7/F8: committed => epoch bump + eager memo clear
+                        // (exact invalidation for the single-writer caches)
+                        crate::bump_write_epoch();
                     }
                 }
                 Some(_) => {
@@ -209,6 +213,10 @@ pub fn apply_ops(conn: &Connection, ops: &[WriteOp]) -> Result<usize> {
     let mut affected = 0;
     for op in ops {
         exec_op(conn, op, &mut affected)?;
+    }
+    if !ops.is_empty() {
+        // F7/F8: caller-owned batches (importer/fork/tests) invalidate too
+        crate::bump_write_epoch();
     }
     Ok(affected)
 }

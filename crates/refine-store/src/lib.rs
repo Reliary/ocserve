@@ -20,6 +20,21 @@ pub use writer::{WriteOp, Writer, apply_ops};
 /// Upstream wire shape of a session list entry (PLAN F1; keys verified against
 /// recorded manifest session_list keys).
 pub fn load_sessions_wire(db: &std::path::Path) -> anyhow::Result<Vec<serde_json::Value>> {
+    // F8 memo: single slot, epoch-exact (see F7/F8 module). Lock is NEVER
+    // held across the query — the writer's eager clear shares this lock.
+    let enabled = list_memo_enabled();
+    let e0 = write_epoch();
+    if enabled {
+        let hit = {
+            let l = list_memo().lock();
+            if l.epoch == e0 { l.slot.clone() } else { None }
+        };
+        if let Some(v) = hit {
+            LIST_MEMO_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok((*v).clone());
+        }
+        LIST_MEMO_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let conn = pragma::open_reader(db)?;
     let mut stmt = conn.prepare(
         "SELECT id, project_id, directory, path, slug, title, version, agent, model, cost,
@@ -55,6 +70,11 @@ pub fn load_sessions_wire(db: &std::path::Path) -> anyhow::Result<Vec<serde_json
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
+    }
+    if enabled && write_epoch() == e0 {
+        let mut l = list_memo().lock();
+        l.epoch = e0;
+        l.slot = Some(std::sync::Arc::new(out.clone()));
     }
     Ok(out)
 }
@@ -1657,7 +1677,7 @@ pub fn backfill_part_search(
 }
 
 /// Search hit (W1 contract — PLAN §17 block).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SearchHit {
     pub session_id: String,
     pub message_id: String,
@@ -1670,6 +1690,146 @@ pub struct SearchHit {
 /// Content search over part payloads. ≥3 chars → trigram FTS MATCH (quoted
 /// phrase, substring semantics); shorter → LIKE fallback (same projection).
 /// One SQL statement; `limit+1` probe reports `truncated`.
+// ---- PERF-10X F7/F8: epoch-keyed memoization (exact, single-writer) ----
+//
+// Single writer => a monotonically bumped WRITE_EPOCH (bumped after every
+// committed writer batch and every apply_ops batch, eager-cleared) makes
+// lookups EXACTLY correct: an entry is only served when its epoch equals
+// the live epoch, and a query that raced a write is discarded rather than
+// stored (e1 != e0). No TTL, no staleness window, no LRU revalidation.
+// Caps: 64 search entries (FIFO) + 1 list entry; kill switches
+// REFINE_SEARCH_MEMO=0 / REFINE_LIST_MEMO=0. Benchmark reports MUST carry
+// cache-on and cache-off variants (PERF-10X ethics): k6 repeats one query,
+// which overstates the hit rate vs real traffic.
+static WRITE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SEARCH_MEMO_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SEARCH_MEMO_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LIST_MEMO_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LIST_MEMO_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub const SEARCH_MEMO_CAP: usize = 64;
+
+/// Live write epoch (Acquire).
+pub fn write_epoch() -> u64 {
+    WRITE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Bump after a committed write batch + eagerly clear both memos (memory
+/// released immediately; lazy epoch checks remain the correctness backstop).
+pub fn bump_write_epoch() {
+    WRITE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+    let mut s = search_memo().lock();
+    s.clear();
+    let mut l = list_memo().lock();
+    l.slot = None;
+    l.epoch = 0;
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct SearchKey {
+    needle: String,
+    scope: Option<String>,
+    limit: u32,
+    offset: u32,
+}
+
+/// Cached result: hits + truncated flag, shared so a hit is an Arc clone.
+type CachedHits = std::sync::Arc<(Vec<SearchHit>, bool)>;
+
+struct SearchMemoState {
+    epoch: u64,
+    entries: std::collections::VecDeque<(SearchKey, CachedHits)>,
+}
+
+impl SearchMemoState {
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+    fn get(
+        &mut self,
+        key: &SearchKey,
+        epoch: u64,
+    ) -> Option<std::sync::Arc<(Vec<SearchHit>, bool)>> {
+        if self.epoch != epoch {
+            self.entries.clear();
+            self.epoch = epoch;
+        }
+        // FIFO walk (cap 64 — linear scan of ≤64 short keys, cheaper than a
+        // HashMap upkeep; keys are workload-stable)
+        self.entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| std::sync::Arc::clone(v))
+    }
+    fn put(&mut self, key: SearchKey, val: CachedHits, epoch: u64) {
+        if self.epoch != epoch {
+            self.entries.clear();
+            self.epoch = epoch;
+        }
+        self.entries.retain(|(k, _)| k != &key);
+        self.entries.push_back((key, val));
+        while self.entries.len() > SEARCH_MEMO_CAP {
+            self.entries.pop_front();
+        }
+    }
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+struct ListMemoState {
+    epoch: u64,
+    slot: Option<std::sync::Arc<Vec<serde_json::Value>>>,
+}
+
+fn search_memo() -> &'static parking_lot::Mutex<SearchMemoState> {
+    static M: std::sync::OnceLock<parking_lot::Mutex<SearchMemoState>> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        parking_lot::Mutex::new(SearchMemoState {
+            epoch: 0,
+            entries: std::collections::VecDeque::new(),
+        })
+    })
+}
+
+fn list_memo() -> &'static parking_lot::Mutex<ListMemoState> {
+    static M: std::sync::OnceLock<parking_lot::Mutex<ListMemoState>> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        parking_lot::Mutex::new(ListMemoState {
+            epoch: 0,
+            slot: None,
+        })
+    })
+}
+
+/// Kill-switch semantics as a PURE fn (testable without env mutation):
+/// explicit override wins; otherwise env "0" disables, anything else (or
+/// unset) enables.
+fn memo_enabled(ovr: Option<bool>, env: Option<&str>) -> bool {
+    ovr.unwrap_or_else(|| env.is_none_or(|v| v != "0"))
+}
+
+pub fn search_memo_enabled() -> bool {
+    memo_enabled(None, std::env::var("REFINE_SEARCH_MEMO").ok().as_deref())
+}
+
+pub fn list_memo_enabled() -> bool {
+    memo_enabled(None, std::env::var("REFINE_LIST_MEMO").ok().as_deref())
+}
+
+/// Observable counters for tests + the load report (hit rate per variant).
+pub fn memo_stats() -> (u64, u64, u64, u64, u64, usize, u64) {
+    (
+        SEARCH_MEMO_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        SEARCH_MEMO_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+        LIST_MEMO_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        LIST_MEMO_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        search_memo().lock().len(),
+        write_epoch(),
+    )
+}
+
 // Search SQL shapes (PERF-10X S-A). All single-line (check-guards rule 2).
 // Global match: fts rowid-DESC walk + LIMIT inside the subquery (early
 // termination), payload+msg join only for the <=limit+1 survivors.
@@ -1688,6 +1848,29 @@ pub fn search_parts(
     limit: u32,
     offset: u32,
 ) -> anyhow::Result<(Vec<SearchHit>, bool)> {
+    // F7 memo: epoch-exact cache checked BEFORE the reader opens — a hit
+    // costs zero db handles (see F7/F8 module for the correctness rule).
+    let enabled = search_memo_enabled();
+    let key = SearchKey {
+        needle: needle.to_string(),
+        scope: scope.map(str::to_string),
+        limit,
+        offset,
+    };
+    let e0 = write_epoch();
+    if enabled {
+        let hit = {
+            let memo = search_memo();
+            let mut m = memo.lock();
+            m.get(&key, write_epoch())
+        };
+        if let Some(v) = hit {
+            SEARCH_MEMO_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (h, t) = &*v;
+            return Ok((h.clone(), *t));
+        }
+        SEARCH_MEMO_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let conn = pragma::open_reader(db)?;
     let chars = needle.chars().count();
     let probe = limit as i64 + 1;
@@ -1758,6 +1941,12 @@ pub fn search_parts(
         hits.truncate(limit as usize);
     }
     drop(stmt);
+    if enabled && write_epoch() == e0 {
+        // raced a write (e1 != e0) => discard rather than store (never stale)
+        let memo = search_memo();
+        let mut m = memo.lock();
+        m.put(key, std::sync::Arc::new((hits.clone(), truncated)), e0);
+    }
     Ok((hits, truncated))
 }
 
@@ -2101,5 +2290,24 @@ mod f3_chunk {
         // time_created asc across frames (frame 1 = m1 ... frame 70 = m70)
         assert!(frames[64].contains("\"part65\""), "post-boundary frame");
         assert!(frames[63].contains("\"part64\""), "boundary frame");
+    }
+}
+
+#[cfg(test)]
+mod memo_switch_table {
+    use super::memo_enabled;
+
+    /// Kill-switch truth table (pure — no env, no globals).
+    #[test]
+    fn memo_enabled_table() {
+        assert!(memo_enabled(None, None), "unset = on");
+        assert!(memo_enabled(None, Some("1")), "explicit 1 = on");
+        assert!(memo_enabled(None, Some("auto")), "any non-0 = on");
+        assert!(!memo_enabled(None, Some("0")), "0 = off");
+        assert!(
+            memo_enabled(Some(true), Some("0")),
+            "override wins over env"
+        );
+        assert!(!memo_enabled(Some(false), None), "override wins over unset");
     }
 }
