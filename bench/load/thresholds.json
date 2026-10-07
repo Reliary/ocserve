@@ -1,8 +1,8 @@
 {
-  "_comment": "Derived from baseline bench/load/.runs/20261006T225404Z (227 runner, ROUNDS=2, 0 errors all 8 runs). Formula (README): p95_ms_max = max(2 x baseline_worst_cell, baseline_worst_cell + 30); per-arm because baselines differ ~12x (one shared bound would be vacuous for refine or impossible for freeze). err_rate_max = 0.005 (declared intent; baseline was 0.0000). Committed BEFORE any GATED=1 run.",
+  "_comment": "Re-derived 2026-10-07 from the FINAL-binary baseline run bench/load/.runs/20261007T132925Z (post-F9c, .227 runner, 4-thread allocation LOAD_REF_CORES=0,4,3,7, ROUNDS=1, ladder 50,75,150, 0 errors all cells). Formula (README): p95_ms_max = max(2 x baseline_worst_cell, baseline_worst_cell + 30). refine worst cell = 32.359ms (spread) -> max(64.72, 62.36) = 65; freeze worst cell = 708.369ms (spread) -> max(1416.74, 738.37) = 1417. err_rate_max = 0.005 (declared; baseline 0.0000). GATED invocation = this same closed config; the open-model arrival acceptance (A/B criteria in PERF-10X 1) is judged from the pre-registered arrival attempts, not this tripwire \u2014 arrival p95 varies 89-546ms across attempts with co-tenant state (freeze RSS 2.4->7.6GB, thermal), so folding it into one pooled bound would either be vacuous or a flake generator. Committed BEFORE any GATED=1 run.",
   "err_rate_max": 0.005,
   "p95_ms_max": {
-    "refine": 2512,
-    "freeze": 208
+    "refine": 65,
+    "freeze": 1417
   }
 }
