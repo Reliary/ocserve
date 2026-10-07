@@ -174,7 +174,10 @@ mod rt {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(8)
             .thread_stack_size(1 << 20)
-            .max_blocking_threads(8)
+            // PERF-10X F1: store calls moved onto this pool — 16 threads
+            // ≈ sub-ms queries × 8k+ ops/s with headroom for cold spikes;
+            // budget bound: 16 threads × 4 MB parked reader cache = 64 MB.
+            .max_blocking_threads(16)
             .enable_all()
             .build()
             .expect("tokio runtime")

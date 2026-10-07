@@ -73,6 +73,23 @@ pub struct Payloads {
     pub compaction: serde_json::Value,
 }
 
+/// PERF-10X F1: run a blocking store call on the runtime's blocking pool.
+/// Store fns are sync by design (STORAGE: never hold a connection across
+/// `.await`) — calling them inline parks a tokio worker for the query's
+/// duration. Baseline measured exactly that convoy: one 6s search held a
+/// worker and every other route queued behind it (config p95 998ms for a
+/// payload read; starvation signature: tail explodes while CPU ≪100%).
+async fn run_blocking<T, F>(db: &std::path::Path, op: F) -> anyhow::Result<T>
+where
+    F: FnOnce(&std::path::Path) -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let db = db.to_path_buf();
+    tokio::task::spawn_blocking(move || op(&db))
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking task join: {e}"))?
+}
+
 /// Upstream error envelope: {"name":"NotFoundError","data":{"message":"..."}} (captured live).
 pub struct ApiError {
     pub status: StatusCode,
@@ -557,10 +574,12 @@ async fn get_experimental_sessions(
     State(st): State<Arc<AppState>>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
-    let mut v = refine_store::load_sessions_wire(&st.db).unwrap_or_else(|e| {
-        tracing::error!("session list read failed: {e:#}");
-        Vec::new()
-    });
+    let mut v = run_blocking(&st.db, refine_store::load_sessions_wire)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("session list read failed: {e:#}");
+            Vec::new()
+        });
     if let Some(search) = q.get("search").filter(|s| !s.is_empty()) {
         let needle = search.to_lowercase();
         v.retain(|s| {
@@ -625,10 +644,12 @@ async fn vcs_info() -> impl IntoResponse {
 async fn get_sessions(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     // Fresh DB rows (upstream semantics) — the boot map was stale after
     // prompts (M2 finding); load_sessions_wire orders by time_updated DESC.
-    let v = refine_store::load_sessions_wire(&st.db).unwrap_or_else(|e| {
-        tracing::error!("session list read failed: {e:#}");
-        Vec::new()
-    });
+    let v = run_blocking(&st.db, refine_store::load_sessions_wire)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("session list read failed: {e:#}");
+            Vec::new()
+        });
     Json(v)
 }
 
@@ -636,14 +657,18 @@ async fn get_session(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    refine_store::load_session_wire(&st.db, &id)
-        .map_err(|e| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            name: "InternalError",
-            message: format!("{e:#}"),
-        })?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))
+    let wire_id = id.clone();
+    run_blocking(&st.db, move |db| {
+        refine_store::load_session_wire(db, &wire_id)
+    })
+    .await
+    .map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })?
+    .map(Json)
+    .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))
 }
 
 /// GET /session/status — map of NON-idle sessions only (upstream
@@ -910,13 +935,17 @@ async fn post_fork(
             }
         }
     };
-    let src = refine_store::load_session_wire(&st.db, &id)
-        .map_err(|e| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            name: "InternalError",
-            message: format!("{e:#}"),
-        })?
-        .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))?;
+    let src_id = id.clone();
+    let src = run_blocking(&st.db, move |db| {
+        refine_store::load_session_wire(db, &src_id)
+    })
+    .await
+    .map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })?
+    .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))?;
 
     let new_id = refine_core::ids::ses_id();
     let now = now_ms();
@@ -937,19 +966,30 @@ async fn post_fork(
         "tokens": {"input": 0, "output": 0, "reasoning": 0,
                    "cache": {"read": 0, "write": 0}},
     });
-    let env = refine_store::fork::ForkEnv {
-        writer: &st.writer,
-        blobs: Some(&*st.blobs),
-        db: &st.db,
-    };
-    let stats = refine_store::fork_session(
-        &env,
-        &info,
-        &id,
-        upto.as_deref(),
-        refine_core::ids::msg_id,
-        refine_core::ids::prt_id,
-    )
+    // PERF-10X F1: fork copies the whole source session (32k msgs measured)
+    // — inline it parked a worker for the entire copy.
+    let writer = st.writer.clone();
+    let blobs = st.blobs.clone();
+    let db = st.db.clone();
+    let fork_info = info.clone();
+    let fork_id = id.clone();
+    let fork_upto = upto.clone();
+    let stats = run_blocking(&db, move |db| {
+        let env = refine_store::fork::ForkEnv {
+            writer: &writer,
+            blobs: Some(&*blobs),
+            db,
+        };
+        refine_store::fork_session(
+            &env,
+            &fork_info,
+            &fork_id,
+            fork_upto.as_deref(),
+            refine_core::ids::msg_id,
+            refine_core::ids::prt_id,
+        )
+    })
+    .await
     .map_err(|e| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         name: "InternalError",
@@ -999,7 +1039,12 @@ async fn get_messages(
         }
         (None, _) => None,
     };
-    if !refine_store::session_exists(&st.db, &id).map_err(|e| ApiError {
+    let exists_id = id.clone();
+    if !run_blocking(&st.db, move |db| {
+        refine_store::session_exists(db, &exists_id)
+    })
+    .await
+    .map_err(|e| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         name: "InternalError",
         message: format!("{e:#}"),
@@ -1012,12 +1057,17 @@ async fn get_messages(
     let mut page_next: Option<String> = None;
     let walk: refine_store::MessageWalk = match limit.filter(|n| *n > 0) {
         Some(n) => {
-            let (rows, _more, next) = refine_store::page_messages(
-                &st.db,
-                &id,
-                n,
-                before.as_ref().map(|(b, t)| (b.as_str(), *t)),
-            )
+            let page_id = id.clone();
+            let before_owned = before.clone();
+            let (rows, _more, next) = run_blocking(&st.db, move |db| {
+                refine_store::page_messages(
+                    db,
+                    &page_id,
+                    n,
+                    before_owned.as_ref().map(|(b, t)| (b.as_str(), *t)),
+                )
+            })
+            .await
             .map_err(|e| ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 name: "InternalError",
@@ -1175,7 +1225,12 @@ async fn post_summarize(
     axum::extract::Path(sid): axum::extract::Path<String>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    if !refine_store::session_exists(&st.db, &sid).map_err(|e| ApiError {
+    let exists_id = sid.clone();
+    if !run_blocking(&st.db, move |db| {
+        refine_store::session_exists(db, &exists_id)
+    })
+    .await
+    .map_err(|e| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         name: "InternalError",
         message: format!("{e:#}"),
@@ -1210,12 +1265,16 @@ async fn post_summarize(
     // the pending anchor — no generation runs (exit via last-message
     // summary check). Session-shaped history load ONLY for findLast user's
     // agent (v1 line 280).
-    let history = refine_store::load_messages(&st.db, &sid, None) // allow:load_messages (summarize compaction)
-        .map_err(|e| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            name: "InternalError",
-            message: format!("{e:#}"),
-        })?;
+    let history = run_blocking(&st.db, {
+        let sid = sid.clone();
+        move |db| refine_store::load_messages(db, &sid, None) // allow:load_messages (summarize compaction)
+    })
+    .await
+    .map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })?;
     let agent = history
         .iter()
         .rev()
@@ -1503,14 +1562,16 @@ async fn search_messages(
         .unwrap_or(50)
         .clamp(1, 200) as u32;
     let offset = body.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    let (hits, truncated) =
-        refine_store::search_parts(&st.db, &query, scope.as_deref(), limit, offset).map_err(
-            |e| ApiError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                name: "InternalError",
-                message: format!("{e:#}"),
-            },
-        )?;
+    let needle = query.clone();
+    let (hits, truncated) = run_blocking(&st.db, move |db| {
+        refine_store::search_parts(db, &needle, scope.as_deref(), limit, offset)
+    })
+    .await
+    .map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })?;
     let out = json!({
         "hits": hits
             .iter()
@@ -1818,7 +1879,12 @@ async fn post_prompt_async(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(payload): Json<Value>,
 ) -> Result<StatusCode, ApiError> {
-    if !refine_store::session_exists(&st.db, &id).map_err(|e| ApiError {
+    let exists_id = id.clone();
+    if !run_blocking(&st.db, move |db| {
+        refine_store::session_exists(db, &exists_id)
+    })
+    .await
+    .map_err(|e| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         name: "InternalError",
         message: format!("{e:#}"),
@@ -1862,7 +1928,8 @@ async fn get_children(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    refine_store::load_children(&st.db, &id)
+    run_blocking(&st.db, move |db| refine_store::load_children(db, &id))
+        .await
         .map(|v| Json(Value::Array(v)))
         .map_err(|e| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1875,7 +1942,8 @@ async fn get_todos(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    refine_store::load_todos(&st.db, &id)
+    run_blocking(&st.db, move |db| refine_store::load_todos(db, &id))
+        .await
         .map(|v| Json(Value::Array(v)))
         .map_err(|e| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1892,7 +1960,12 @@ async fn patch_session(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    if !refine_store::session_exists(&st.db, &id).map_err(|e| ApiError {
+    let exists_id = id.clone();
+    if !run_blocking(&st.db, move |db| {
+        refine_store::session_exists(db, &exists_id)
+    })
+    .await
+    .map_err(|e| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         name: "InternalError",
         message: format!("{e:#}"),
@@ -1988,13 +2061,17 @@ async fn patch_session(
             })?;
         dirty = true;
     }
-    let info = refine_store::load_session_wire(&st.db, &id)
-        .map_err(|e| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            name: "InternalError",
-            message: format!("{e:#}"),
-        })?
-        .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))?;
+    let info_id = id.clone();
+    let info = run_blocking(&st.db, move |db| {
+        refine_store::load_session_wire(db, &info_id)
+    })
+    .await
+    .map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })?
+    .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))?;
     if dirty {
         // partial session.updated (prompt's own partial shape) so other
         // clients re-sort/re-render without a refetch
@@ -2579,7 +2656,12 @@ async fn post_command(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    if !refine_store::session_exists(&st.db, &id).map_err(|e| ApiError {
+    let exists_id = id.clone();
+    if !run_blocking(&st.db, move |db| {
+        refine_store::session_exists(db, &exists_id)
+    })
+    .await
+    .map_err(|e| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         name: "InternalError",
         message: format!("{e:#}"),
@@ -2691,7 +2773,12 @@ async fn post_shell(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    if !refine_store::session_exists(&st.db, &id).map_err(|e| ApiError {
+    let exists_id = id.clone();
+    if !run_blocking(&st.db, move |db| {
+        refine_store::session_exists(db, &exists_id)
+    })
+    .await
+    .map_err(|e| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         name: "InternalError",
         message: format!("{e:#}"),
@@ -3251,5 +3338,56 @@ mod limit_matrix {
         assert_eq!(parse_limit("1e3"), Ok(1000)); // JS Number("1e3") = 1000
         assert_eq!(parse_limit("0"), Ok(0));
         assert_eq!(parse_limit("9007199254740991"), Ok(9007199254740991)); // 2^53-1
+    }
+}
+
+#[cfg(test)]
+mod f1_blocking_tests {
+    use super::run_blocking;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    /// PERF-10X F1: a blocking store call must NOT park the async worker.
+    /// Single-worker runtime makes this discriminating: with the call inlined
+    /// (the pre-F1 shape) the ticker cannot advance while the call runs
+    /// (after == before → red); via the blocking pool it keeps ticking.
+    /// Negative control: swap run_blocking for the inline sleep → red.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn run_blocking_frees_the_worker() {
+        let ticks = Arc::new(AtomicU64::new(0));
+        let t = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            let mut i = 0u64;
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                i += 1;
+                t.store(i, Ordering::Relaxed);
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let before = ticks.load(Ordering::Relaxed);
+        assert!(before > 0, "ticker must be running before the probe");
+
+        // The probe runs as a SPAWNED task: only spawned tasks execute on
+        // worker threads (the #[tokio::test] body itself runs on block_on's
+        // thread — an inline sleep there parked nothing and the first version
+        // of this test passed its own negative control; caught 2026-10-06).
+        let probe = tokio::spawn(async move {
+            run_blocking(std::path::Path::new("/nonexistent/f1-probe"), |_db| {
+                std::thread::sleep(Duration::from_millis(250));
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .expect("probe op");
+        });
+        probe.await.expect("probe join");
+
+        let after = ticks.load(Ordering::Relaxed);
+        ticker.abort();
+        assert!(
+            after > before,
+            "blocking call parked the worker: before={before} after={after}"
+        );
     }
 }
