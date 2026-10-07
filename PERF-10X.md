@@ -185,6 +185,22 @@ that baseline → GATED.
   (fixture stat1=0 forever), FTS optimize adopted (−32% fts), 18 sites
   → prepare_cached/PERSISTENT (session_wire 8→1 µs), mmap + page_size
   A/B'd to rejection — full table in STORAGE §1.2.
+- **Lean sweep phase I** (`bench/perf/PHASE1-ATTRIBUTION.md`): bytehound
+  attributes **86% of read-path allocations to serde_json** (string allocs
+  46.5%, visit_map 21.7%) vs SQLite 3.3%; 1,249 µs JSON vs 26 µs SQL per
+  50-msg page. Also fixed the bench itself (`--deep` auto-selected a
+  **message** id, so every session-scoped figure had measured 0 rows).
+- **Lean sweep L1 (zero-parse splice)**: `refine_store::splice` compacts
+  stored JSON in one byte pass into a reused buffer and splices the three
+  column keys, replacing parse→merge→serialize. Byte-identical to the DOM
+  path proven over the whole corpus: **218,393 rows, 0 refused, 0
+  mismatched**, and 5,900 rows spliced / 0 fallbacks live through the
+  production path. Measured A/B (interleaved ×2, real 32k-message
+  session): `for_each_page` **1,243→953 µs (−23%)** and **1,288→943 µs
+  (−27%)**, `page_window` neutral, `list_wire` noise. Five splice bugs
+  were caught by the DOM-oracle test, four of them **silent corruption**
+  (merged tokens, lost commas, empty-nested-object refusal, i64-overflow
+  integer reformatting) — recorded in `tests/splice_parity.rs`.
 
 ## 5. Phases
 

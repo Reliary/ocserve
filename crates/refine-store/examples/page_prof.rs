@@ -42,10 +42,11 @@ fn main() -> anyhow::Result<()> {
     // same gate as sqlite_tune_bench: never profile an empty session
     {
         let conn = refine_store::pragma::open_reader(&dbp)?;
-        let n: i64 =
-            conn.query_row("SELECT count(*) FROM msg WHERE session_id = ?1", [&deep], |r| {
-                r.get(0)
-            })?;
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM msg WHERE session_id = ?1",
+            [&deep],
+            |r| r.get(0),
+        )?;
         anyhow::ensure!(n > 0, "PROFILE_DEEP={deep} has 0 messages — refusing");
         eprintln!("profile: deep={deep} msgs={n} iters={iters}");
     }

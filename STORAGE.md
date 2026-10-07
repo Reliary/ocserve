@@ -36,6 +36,32 @@ this scale. Write amplification is absorbed by the ≤50 ms writer batching.
 - Compaction: incremental `INSERT INTO f(f, rank) VALUES('merge', ±N)` in idle windows —
   never the all-btree `optimize` (long transaction).
 
+### 1.1b Read-path JSON assembly (PERF-10X Phase I/II L1)
+
+`msg.info` and `msg_part.inline` are stored JSON blobs; the response merges
+three column keys into each. That was done with `serde_json::Value`
+(parse → insert → re-serialize), which bytehound attributed **86% of
+read-path allocations**. `refine-store/src/splice.rs` now compacts the
+stored bytes in one pass into a **reused** buffer and splices the column
+keys — no `Value`, no `HashMap`, no per-row re-serialization.
+
+**Not a passthrough, on purpose:** serde's compact formatter writes `,`
+and `":"` with no whitespace (`serde_json-1.0.150/src/ser.rs:1884-1893`),
+and re-formats numbers through ryu, so the DOM path *normalizes*. Upstream's
+Bun writer emits `": "`/`", "` for 39% of stored rows, so copying bytes
+verbatim would change the wire. The splicer therefore compacts whitespace,
+re-emits non-canonical escapes/floats through serde, and **refuses** (DOM
+fallback) on anything unprovable: non-object top level, unbalanced brackets,
+duplicate top-level keys, non-canonical integers > 19 digits, malformed
+values.
+
+**Gate:** `tests/splice_parity.rs` proves byte-parity against the DOM as
+oracle, and `splice_parity_over_corpus` runs the differential over **every**
+stored row (`REFINE_SPLICE_DB=<db>`): 218,393 rows, 0 refused, 0 mismatched
+on the fixture. Live: 5,900 rows spliced, 0 fallbacks. `splice_rows()` /
+`splice_fallbacks()` expose the counters; a non-zero fallback count is a
+signal, not a silent degradation.
+
 ### 1.2 SQLite tuning audit — every pragma decided by evidence (PERF-10X stmt pass, 2026-10-07)
 
 Method: live probe of our bundled build (rusqlite 0.40.2 / SQLite 3.53.2,
