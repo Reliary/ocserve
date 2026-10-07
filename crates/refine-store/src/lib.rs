@@ -798,6 +798,8 @@ pub fn for_each_message_json(
     // churn group in the profile). The frame itself is still an owned
     // String (it crosses the channel); everything nested is append-only.
     let mut ser: Vec<u8> = Vec::with_capacity(64 * 1024);
+    // L1 splice scratch (key set + one decoded-key slot), reused per row
+    let mut scratch = crate::splice::SpliceScratch::default();
     let mut groups: std::collections::HashMap<String, Vec<PartRow>> =
         std::collections::HashMap::new();
     let mut padded: Vec<Option<String>> = Vec::with_capacity(PART_CHUNK);
@@ -843,8 +845,14 @@ pub fn for_each_message_json(
             let mut chunk = String::with_capacity(info_txt.len() + 8192);
             chunk.push_str("{\"info\":");
             ser.clear();
-            let spliced_info =
-                crate::splice::compact_splice(info_txt, mid, session_id, None, &mut ser);
+            let spliced_info = crate::splice::compact_splice(
+                info_txt,
+                mid,
+                session_id,
+                None,
+                &mut ser,
+                &mut scratch,
+            );
             if spliced_info {
                 SPLICE_ROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 chunk.push_str(std::str::from_utf8(&ser)?);
@@ -898,7 +906,14 @@ pub fn for_each_message_json(
                 };
                 let Some(text) = inline else { continue };
                 ser.clear();
-                if crate::splice::compact_splice(&text, &prow.id, session_id, Some(mid), &mut ser) {
+                if crate::splice::compact_splice(
+                    &text,
+                    &prow.id,
+                    session_id,
+                    Some(mid),
+                    &mut ser,
+                    &mut scratch,
+                ) {
                     SPLICE_ROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     chunk.push_str(std::str::from_utf8(&ser)?);
                 } else {

@@ -126,6 +126,38 @@ fn scan_string(b: &[u8], start: usize) -> Option<usize> {
     None
 }
 
+/// Caller-owned scratch for one `compact_splice` call: a reusable hash set
+/// of the top-level keys already seen, plus one slot for a decoded escaped
+/// key. Reusing it across rows is what keeps the splice allocation-free —
+/// a per-row `HashSet` plus a per-key `String` were 14.2% + 36.3% of
+/// allocations in the first post-L1 profile (bytes allocated 2.1%, so it is
+/// a *count* problem, not a volume one).
+#[derive(Default)]
+pub struct SpliceScratch {
+    seen: std::collections::HashSet<u64>,
+    decoded_key: String,
+}
+
+impl SpliceScratch {
+    /// Drop every recorded key. Callers hold one scratch per fetch.
+    pub fn clear(&mut self) {
+        self.seen.clear();
+    }
+
+    /// True if this key hash was NOT already recorded (i.e. insert is new).
+    fn seen(&mut self, hash: u64) -> bool {
+        self.seen.insert(hash)
+    }
+
+    /// Stash a decoded escaped key and borrow it (valid until the next
+    /// `put_key`/`clear`).
+    fn put_key(&mut self, k: String) -> Option<&str> {
+        self.decoded_key.clear();
+        self.decoded_key.push_str(&k);
+        Some(self.decoded_key.as_str())
+    }
+}
+
 /// FNV-1a over a key: only used for duplicate detection, so a collision is
 /// harmless (it can only cause a conservative refusal).
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -381,6 +413,7 @@ pub fn compact_splice(
     session_id: &str,
     message: Option<&str>,
     out: &mut Vec<u8>,
+    scratch: &mut SpliceScratch,
 ) -> bool {
     let b = src.as_bytes();
     let mut i = 0usize;
@@ -395,10 +428,12 @@ pub fn compact_splice(
     work.push(b'{');
     i += 1;
     let mut seen = [false; 3];
-    // duplicate top-level keys would deserialize differently under serde
-    // (last wins) than they appear in the bytes; refuse instead of emitting
-    // bytes whose meaning changed
-    let mut keyset: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // Duplicate top-level keys deserialize differently under serde (last
+    // wins) than they appear in the bytes; refuse rather than emit bytes
+    // whose meaning changed. Caller-provided scratch: a fresh HashSet per
+    // row was 14.2% of all allocations in the post-L1 profile
+    // (hashbrown reserve_rehash) on rows that never have a duplicate.
+    scratch.clear();
     let mut first = true;
     let mut ok = true;
 
@@ -449,24 +484,42 @@ pub fn compact_splice(
         let colon = i;
         i += 1;
 
-        // Decide whether this member is one of ours BEFORE writing anything.
-        let decoded: Option<String> = if raw_key.contains(&b'\\') {
-            std::str::from_utf8(raw_key)
-                .ok()
-                .and_then(|k| serde_json::from_str::<String>(k).ok())
-        // a non-UTF8 key can't appear in valid JSON; refuse rather than guess
+        // Borrowed key bytes — no String per member. The escaped-key branch
+        // is the only one that allocates, and only when a key literally
+        // contains a backslash (vanishingly rare in stored payloads), in
+        // which case the decoded key lives in caller scratch.
+        let key_ref: Option<&str> = if raw_key.contains(&b'\\') {
+            let raw_key_str = match std::str::from_utf8(raw_key) {
+                Ok(k) => k,
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            };
+            match serde_json::from_str::<String>(raw_key_str) {
+                Ok(k) => {
+                    if !scratch.seen(fnv1a(k.as_bytes())) {
+                        ok = false; // duplicate key — DOM path decides
+                        break;
+                    }
+                    scratch.put_key(k)
+                }
+                Err(_) => None,
+            }
         } else {
-            std::str::from_utf8(&raw_key[1..raw_key.len() - 1])
-                .ok()
-                .map(str::to_string)
+            match std::str::from_utf8(&raw_key[1..raw_key.len() - 1]) {
+                Ok(k) => {
+                    if !scratch.seen(fnv1a(k.as_bytes())) {
+                        ok = false; // duplicate key — DOM path decides
+                        break;
+                    }
+                    Some(k)
+                }
+                // a non-UTF8 key cannot appear in valid JSON
+                Err(_) => None,
+            }
         };
-        if let Some(k) = &decoded
-            && !keyset.insert(fnv1a(k.as_bytes()))
-        {
-            ok = false; // duplicate key — DOM path decides
-            break;
-        }
-        let key: Option<Col> = decoded.as_deref().and_then(Col::of);
+        let key: Option<Col> = key_ref.and_then(Col::of);
 
         if !first {
             work.push(b',');

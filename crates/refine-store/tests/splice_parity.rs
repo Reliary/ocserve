@@ -17,6 +17,7 @@
 //!     sample): every `msg.info` and every `msg_part.inline`, byte-compared
 //!     against the DOM reference. This is the gate L1 must pass to ship.
 
+use refine_store::splice::SpliceScratch;
 use refine_store::splice::compact_splice;
 
 fn dom_reference(src: &str, id: &str, session_id: &str, message: Option<&str>) -> String {
@@ -31,7 +32,8 @@ fn dom_reference(src: &str, id: &str, session_id: &str, message: Option<&str>) -
 
 fn assert_parity(src: &str, id: &str, sid: &str, mid: Option<&str>) {
     let mut out = Vec::with_capacity(512);
-    let ok = compact_splice(src, id, sid, mid, &mut out);
+    let mut scratch = SpliceScratch::default();
+    let ok = compact_splice(src, id, sid, mid, &mut out, &mut scratch);
     assert!(ok, "splice refused a VALID object: {src}");
     let got = String::from_utf8(out).expect("utf8");
     let want = dom_reference(src, id, sid, mid);
@@ -90,8 +92,9 @@ fn splice_refuses_duplicate_keys_which_serde_collapses() {
     // the DOM path then decides, which is correct by construction.
     for src in [r#"{"k":1,"k":2}"#, r#"{"a":1,"id":"x","a":2}"#] {
         let mut out = Vec::new();
+        let mut scratch = SpliceScratch::default();
         assert!(
-            !compact_splice(src, "I", "S", Some("M"), &mut out),
+            !compact_splice(src, "I", "S", Some("M"), &mut out, &mut scratch),
             "must refuse duplicate keys: {src}"
         );
     }
@@ -104,7 +107,15 @@ fn splice_tolerates_trailing_comma_that_serde_rejects() {
     // errored the whole request), so the contract is "valid output", not
     // "byte-identical".
     let mut out = Vec::new();
-    assert!(compact_splice(r#"{"a":1,}"#, "I", "S", Some("M"), &mut out));
+    let mut scratch = SpliceScratch::default();
+    assert!(compact_splice(
+        r#"{"a":1,}"#,
+        "I",
+        "S",
+        Some("M"),
+        &mut out,
+        &mut scratch
+    ));
     let v: serde_json::Value = serde_json::from_slice(&out).expect("valid JSON");
     assert_eq!(v["a"], 1);
     assert_eq!(v["id"], "I");
@@ -124,8 +135,9 @@ fn splice_refuses_malformed_so_dom_path_runs() {
     ];
     for b in bad {
         let mut out = Vec::new();
+        let mut scratch = SpliceScratch::default();
         assert!(
-            !compact_splice(b, "i", "s", Some("m"), &mut out),
+            !compact_splice(b, "i", "s", Some("m"), &mut out, &mut scratch),
             "must refuse {b:?} and let the caller fall back"
         );
     }
@@ -136,10 +148,18 @@ fn splice_reuses_caller_buffer_without_growing_it() {
     // the caller owns `out` for the whole page; the splice must not
     // reallocate it per message
     let mut out = Vec::with_capacity(64 * 1024);
+    let mut scratch = SpliceScratch::default();
     let ptr = out.as_ptr();
     for i in 0..1000 {
         let src = format!(r#"{{"type":"text","text":"message {i}","n":{i}}}"#);
-        assert!(compact_splice(&src, "id", "ses", Some("m"), &mut out));
+        assert!(compact_splice(
+            &src,
+            "id",
+            "ses",
+            Some("m"),
+            &mut out,
+            &mut scratch
+        ));
     }
     assert_eq!(
         ptr,
@@ -152,7 +172,15 @@ fn splice_reuses_caller_buffer_without_growing_it() {
 fn splice_output_is_valid_json() {
     let src = r#"{"type":"text", "text":"a,b}c", "time":{"start":1}}"#;
     let mut out = Vec::new();
-    assert!(compact_splice(src, "i", "s", Some("m"), &mut out));
+    let mut scratch = SpliceScratch::default();
+    assert!(compact_splice(
+        src,
+        "i",
+        "s",
+        Some("m"),
+        &mut out,
+        &mut scratch
+    ));
     let v: serde_json::Value = serde_json::from_slice(&out).expect("valid JSON");
     assert_eq!(v["id"], "i");
     assert_eq!(v["sessionID"], "s");
@@ -173,6 +201,7 @@ fn splice_parity_over_corpus() {
         return;
     };
     let conn = refine_store::pragma::open_reader(std::path::Path::new(&db)).unwrap();
+    let mut scratch = SpliceScratch::default();
     let mut checked = 0u64;
     let mut refused = 0u64;
     let mut mismatched = 0u64;
@@ -194,7 +223,7 @@ fn splice_parity_over_corpus() {
     for r in rows.flatten() {
         let (mid, sid, info) = r;
         let mut out = Vec::with_capacity(info.len() + 160);
-        if !compact_splice(&info, &mid, &sid, None, &mut out) {
+        if !compact_splice(&info, &mid, &sid, None, &mut out, &mut scratch) {
             refused += 1;
             if examples.len() < 5 {
                 examples.push(format!("REFUSED msg.info: {info}"));
@@ -231,7 +260,7 @@ fn splice_parity_over_corpus() {
     for r in rows.flatten() {
         let (pid, sid, mid, inline) = r;
         let mut out = Vec::with_capacity(inline.len() + 160);
-        if !compact_splice(&inline, &pid, &sid, Some(&mid), &mut out) {
+        if !compact_splice(&inline, &pid, &sid, Some(&mid), &mut out, &mut scratch) {
             refused += 1;
             if examples.len() < 5 {
                 examples.push(format!("REFUSED inline: {inline}"));
