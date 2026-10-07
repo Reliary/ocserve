@@ -185,6 +185,12 @@ that baseline → GATED.
   (fixture stat1=0 forever), FTS optimize adopted (−32% fts), 18 sites
   → prepare_cached/PERSISTENT (session_wire 8→1 µs), mmap + page_size
   A/B'd to rejection — full table in STORAGE §1.2.
+- **Lean sweep Phase V (gate)**: A/B at G2 conditions, runs `20261007T224955Z`
+  (base `1f2df92`) vs `20261007T223621Z` (lean `1a30aa6`) — **CPU/req −17.4%
+  hot / −11.5% spread** against a pre-registered −10% gate, rps +11.7%/+4.3%,
+  peak RSS −20.2% (77.8→62.1 MB), 0% errors. Freeze control arm moved only
+  −1.5%/−3.1%, so the delta is not machine drift. Two rounds, not four —
+  caveats in `bench/load/BASELINE.md`.
 - **Lean sweep phase I** (`bench/perf/PHASE1-ATTRIBUTION.md`): bytehound
   attributes **86% of read-path allocations to serde_json** (string allocs
   46.5%, visit_map 21.7%) vs SQLite 3.3%; 1,249 µs JSON vs 26 µs SQL per
