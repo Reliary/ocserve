@@ -717,7 +717,14 @@ async fn vcs_info() -> impl IntoResponse {
 // (lazy clear on epoch mismatch — same rule as F7/F8). Kill switch:
 // REFINE_PAGE_MEMO=0.
 pub const PAGE_MEMO_ENTRY_CAP: usize = 4 * 1024 * 1024;
-const PAGE_MEMO_MAX_ENTRIES: usize = 32;
+/// Count + BYTE bounds (F9c): the first cap (32) thrashed against the
+/// fixture's 200-session spread working set (VU150/300 spread fell to
+/// 3,794 rps, p95 278ms — every rotation missed and paid the full
+/// assemble path; arrival never recovered from it). Working set ≈
+/// sessions x pages-per-loop ≈ 600 keys; typical pages are 10-50KB so a
+/// 64 MiB total budget holds the whole set (env: REFINE_PAGE_MEMO_MB).
+pub const PAGE_MEMO_MAX_ENTRIES: usize = 2048;
+pub const PAGE_MEMO_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 struct PageEntry {
     body: bytes::Bytes,
@@ -727,6 +734,7 @@ struct PageEntry {
 struct PageMemoState {
     epoch: u64,
     entries: std::collections::VecDeque<(String, PageEntry)>,
+    bytes: usize,
 }
 
 impl PageMemoState {
@@ -734,11 +742,13 @@ impl PageMemoState {
         Self {
             epoch: 0,
             entries: std::collections::VecDeque::new(),
+            bytes: 0,
         }
     }
     fn get(&mut self, key: &str, epoch: u64) -> Option<PageEntry> {
         if self.epoch != epoch {
             self.entries.clear();
+            self.bytes = 0;
             self.epoch = epoch;
         }
         self.entries
@@ -755,12 +765,30 @@ impl PageMemoState {
         }
         if self.epoch != epoch {
             self.entries.clear();
+            self.bytes = 0;
             self.epoch = epoch;
         }
-        self.entries.retain(|(k, _)| k != &key);
+        // drop same-key old copy (byte accounting)
+        if let Some(pos) = self.entries.iter().position(|(k, _)| k == &key) {
+            let (_, old) = self.entries.remove(pos).expect("position found");
+            self.bytes -= old.body.len();
+        }
+        let budget = std::env::var("REFINE_PAGE_MEMO_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(64)
+            * 1024
+            * 1024;
+        self.bytes += entry.body.len();
         self.entries.push_back((key, entry));
-        while self.entries.len() > PAGE_MEMO_MAX_ENTRIES {
-            self.entries.pop_front();
+        while self.entries.len() > PAGE_MEMO_MAX_ENTRIES
+            || (self.bytes > budget && self.entries.len() > 1)
+        {
+            if let Some((_, old)) = self.entries.pop_front() {
+                self.bytes -= old.body.len();
+            } else {
+                break;
+            }
         }
     }
     fn len(&self) -> usize {
