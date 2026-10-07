@@ -45,7 +45,13 @@ pub fn assert_version_ok() -> Result<()> {
 fn apply_common(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "mmap_size", 0)
         .context("mmap_size")?;
-    conn.pragma_update(None, "temp_store", 2) // FILE: bounded, MEMORY has no ceiling
+    // 1 = FILE: bounded. The old value was 2 (= MEMORY) with a comment
+    // claiming FILE — an unbounded temp ceiling on every connection.
+    // PERF-10X temp_store decision: S-A removed the large sorts (E1:
+    // search = fts rowid walk, no temp b-tree), remaining temp = small
+    // maintenance sorts (event-window prunes) — disk-bound is the right
+    // default again.
+    conn.pragma_update(None, "temp_store", 1)
         .context("temp_store")?;
     conn.pragma_update(None, "threads", 0).context("threads")?;
     conn.pragma_update(None, "cell_size_check", 1)

@@ -20,6 +20,87 @@ pub const ZSTD_LEVEL: i32 = 3;
 /// Single-allocation cap for any payload window (MEMORY.md §6).
 pub const MAX_ALLOC: usize = 8 * 1024 * 1024;
 
+// ---- PERF-10X B1: process-global assembled-blob cache ----
+//
+// Trigger (Phase-I probe): deep-page reads pull 13 blobbed parts per page
+// (plan condition: >=1 blob read/page avg). Content-addressed keys (sha256
+// of the full object) are IMMUTABLE => exact by construction: no epoch, no
+// TTL, a sha can never change meaning. Byte-capped FIFO at 32 MiB default
+// (REFINE_BLOB_CACHE_MB; 0 disables; entries larger than the cap are not
+// cached so one big object can never evict the working set).
+use std::collections::{HashMap, VecDeque};
+
+static BLOB_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct BlobCache {
+    map: HashMap<String, std::sync::Arc<Vec<u8>>>,
+    order: VecDeque<(String, usize)>,
+    bytes: usize,
+}
+
+impl BlobCache {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+    fn get(&mut self, sha: &str) -> Option<std::sync::Arc<Vec<u8>>> {
+        // FIFO (no touch): insertion order approximates recency here — the
+        // workload replays a small stable set of blobs per page.
+        self.map.get(sha).map(std::sync::Arc::clone)
+    }
+    fn put(&mut self, sha: String, val: std::sync::Arc<Vec<u8>>, cap: usize) {
+        let len = val.len();
+        if len > cap {
+            return;
+        }
+        if self.map.contains_key(&sha) {
+            return; // immutable — same sha is the same bytes
+        }
+        while self.bytes + len > cap {
+            match self.order.pop_front() {
+                Some((old, n)) => {
+                    self.bytes = self.bytes.saturating_sub(n);
+                    self.map.remove(&old);
+                }
+                None => break,
+            }
+        }
+        self.bytes += len;
+        self.order.push_back((sha.clone(), len));
+        self.map.insert(sha, val);
+    }
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+fn blob_cache() -> &'static parking_lot::Mutex<BlobCache> {
+    static C: std::sync::OnceLock<parking_lot::Mutex<BlobCache>> = std::sync::OnceLock::new();
+    C.get_or_init(|| parking_lot::Mutex::new(BlobCache::new()))
+}
+
+/// Per-call env read (~ns-scale; enables the kill switch without process
+/// restart in tests). Unset => 32 MiB; parse failure => 32 MiB.
+fn blob_cache_cap_bytes() -> usize {
+    std::env::var("REFINE_BLOB_CACHE_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(32)
+        * 1024
+        * 1024
+}
+
+/// Test/observability: current cache occupancy (entries) and hits.
+pub fn blob_cache_stats() -> (usize, u64) {
+    (
+        blob_cache().lock().len(),
+        BLOB_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 pub struct BlobStore {
     root: PathBuf,
 }
@@ -173,8 +254,20 @@ impl BlobStore {
     }
 
     pub fn get(&self, sha: &str, expect_len: u64) -> Result<Vec<u8>> {
+        let cap = blob_cache_cap_bytes();
+        if cap > 0
+            && let Some(v) = blob_cache().lock().get(sha)
+        {
+            BLOB_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok((*v).clone());
+        }
         let mut out = Vec::with_capacity(expect_len.min(MAX_ALLOC as u64) as usize);
         self.get_into(sha, expect_len, &mut out)?;
+        if cap > 0 && out.len() <= cap {
+            blob_cache()
+                .lock()
+                .put(sha.to_string(), std::sync::Arc::new(out.clone()), cap);
+        }
         Ok(out)
     }
 
@@ -285,5 +378,41 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(bs.get(&live, 7).is_ok());
         assert!(bs.get(&dead, 9).is_err(), "orphan must be gone");
+    }
+
+    /// PERF-10X B1 end-to-end: a second get() after the chunks are GONE
+    /// must still return byte-identical content — only possible if the
+    /// cache served it (disk path would error "blob missing").
+    #[test]
+    fn cached_get_survives_chunk_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let bs = BlobStore::new(dir.path()).unwrap();
+        let payload = b"B1 cache proof payload".to_vec();
+        let (sha, len, _) = bs.put(&payload).unwrap();
+        let first = bs.get(&sha, len).unwrap();
+        assert_eq!(first, payload);
+        // remove the object from disk entirely
+        let obj_dir = dir.path().join("chunks").join(&sha[0..2]).join(&sha);
+        std::fs::remove_dir_all(&obj_dir).unwrap();
+        let second = bs.get(&sha, len).unwrap();
+        assert_eq!(second, payload, "second get must be served from cache");
+    }
+
+    /// Eviction contract: byte cap respected, FIFO order, oversized entries
+    /// never admitted (so one big object cannot evict the working set).
+    #[test]
+    fn blob_cache_evicts_fifo_and_rejects_oversized() {
+        let mut c = BlobCache::new();
+        c.put("a".into(), std::sync::Arc::new(vec![0u8; 60]), 100);
+        c.put("b".into(), std::sync::Arc::new(vec![0u8; 60]), 100);
+        assert!(c.get("a").is_none(), "oldest evicted at cap");
+        assert!(c.get("b").is_some());
+        assert!(c.bytes <= 100, "byte accounting respected: {}", c.bytes);
+        c.put("big".into(), std::sync::Arc::new(vec![0u8; 101]), 100);
+        assert!(c.get("big").is_none(), "oversized entry not admitted");
+        assert_eq!(c.len(), 1);
+        // same sha twice = immutable, single entry
+        c.put("b".into(), std::sync::Arc::new(vec![1u8; 60]), 100);
+        assert_eq!(c.len(), 1, "same-sha put is a no-op");
     }
 }
