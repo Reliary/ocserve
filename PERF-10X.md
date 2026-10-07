@@ -102,13 +102,18 @@ construction.
 **temp_store — DONE (428d13f):** value was `2` (= MEMORY) miscommented as
 FILE; set to `1` (FILE) per the S-A follow-through above.
 
-**E0 — ARTIFACTS LOST, DISPOSITION RECORDED:** the isolation chain
-reported 4/4 rc=0 but no route-filtered run directories exist on either
-box (`.runs` holds only full mixed-route runs; `.227` `.runs` is empty).
-No numbers invented. The diagnostic need (service time vs convoy per
-route) is superseded: F1 removed the convoy mechanism, S-A collapsed the
-search service time, and Phase III's per-route report table gives the
-same breakdown at target conditions for both arms.
+**E0 — FOUND (initially mis-searched at `refine-src`; the `.227` checkout
+is `~/src/refine`) — RESULT: the config mystery is SOLVED and F1's
+hypothesis is PROVEN.** Run `20261007T004510Z` (config-route isolation,
+single round, both arms, pinned homogeneous cores): **refine 9,655 req/s,
+p50 0.90 ms, p95 4.42 ms** vs **freeze 3,152 req/s, p50 4.31 ms, p95
+11.14 ms**, 0% errors both arms. The baseline's config p95 of 998 ms was
+therefore ~99.6% queueing (convoy behind the multi-second search/page
+work on shared workers) — the route itself was always ~4 ms. Refine is
+3.1× faster than freeze on this isolated route. Remaining E0 steps
+(search/page/list isolation) were not preserved as separate run dirs
+(the chain's per-route outputs beyond config are absent); Phase III's
+per-route table supersedes them at final-binary conditions.
 **temp_store** decision: after S-A removes large sorts → set `1` (FILE) per the stated
 bounded-memory intent, fix the comment either way.
 
