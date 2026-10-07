@@ -126,9 +126,21 @@ p50 0.90 ms, p95 4.42 ms** vs **freeze 3,152 req/s, p50 4.31 ms, p95
 therefore ~99.6% queueing (convoy behind the multi-second search/page
 work on shared workers) — the route itself was always ~4 ms. Refine is
 3.1× faster than freeze on this isolated route. Remaining E0 steps
-(search/page/list isolation) were not preserved as separate run dirs
-(the chain's per-route outputs beyond config are absent); Phase III's
-per-route table supersedes them at final-binary conditions.
+as separate run dirs... FULL TABLE (chain `e0-chain.log`, k6 summary
+extraction from the per-route logs — pre-F1 binary, both arms, pinned):
+
+| route | refine req/s | refine p95 | freeze req/s | freeze p95 |
+|---|---:|---:|---:|---:|
+| config | 9,656 | 4.42 ms | 3,152 | 11.14 ms |
+| search (selective query) | 5,422 | 7.85 ms | 5,486 | 7.86 ms |
+| session_list | 1,099 | 31.6 ms | 145 | 172.0 ms |
+| message_page | **incomplete** (chain log truncated before k6 summary; progress lines only) — superseded by Phase III per-route tables |
+
+Reading: refine already led config (2.8×) and session_list (7.6× rps,
+5.4× p95); search tied at ~5.4k req/s both arms (selective query — the
+6-7 s figure in E1 was the `"the"` match-set pathology, not this shape);
+the pooled-baseline pain (config p95 998 ms) was queueing behind those
+routes on shared workers, exactly F1's diagnosis.
 **temp_store** decision: after S-A removes large sorts → set `1` (FILE) per the stated
 bounded-memory intent, fix the comment either way.
 
