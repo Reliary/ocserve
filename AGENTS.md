@@ -15,6 +15,7 @@ tests pass.
 | `TESTING.md` | test levels/techniques, traceability matrix, anti-theater rules, adversarial program, entry/exit criteria |
 | `COMPACTION.md` | auto-compaction (M6): upstream algorithm line-cited, wire/compat surfaces, schema v8 projection, perf improvements (P1–P8), divergence ledger, test plan |
 | `DIFFERENTIATION.md` | what we build vs upstream and why: harness thesis, candidates D1–D7 with evidence, graveyard of killed ideas, primitives rolled in (sift placement law), phasing |
+| `PERF-10X.md` | performance program: 10× target + acceptance A–D, evidence base, fixes F1–F8, compiler track C1–C7, phases, kill-switches/ethics (dual cache reporting) |
 
 Precedence when documents disagree: `TESTING.md` gates always win (nothing ships untested);
 then `PLAN.md`; then the companion spec for that domain (`STORAGE`/`MEMORY`/`SRE`). Any

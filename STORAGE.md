@@ -36,6 +36,35 @@ this scale. Write amplification is absorbed by the ≤50 ms writer batching.
 - Compaction: incremental `INSERT INTO f(f, rank) VALUES('merge', ±N)` in idle windows —
   never the all-btree `optimize` (long transaction).
 
+### 1.1 Search projection as shipped (W1 → v10, PERF-10X S-A)
+
+Supersedes the pre-W1 sketch above (`search_doc` was dropped as dead in W1 — never
+populated live). Current design: `part_search(rowid, part_id, session_id, message_id, text)`
++ external-content `part_search_fts` (`tokenize='trigram'`, `content='part_search'`),
+synced by the ai/ad/au triggers; single writer-side choke point
+(`part_search_upsert_ops`).
+
+**Rowid contract (v10):** `rowid = msg.time_created * 1_048_576 + slot` where `slot` =
+max slot already taken in that millisecond + 1 (`PART_SEARCH_SLOTS = 1<<20`;
+max observed parts/ms = 22; overflow ⇒ `% slots` wraps into an occupied slot ⇒ loud PK
+conflict). Consequences, all load-bearing:
+
+- `ORDER BY rowid DESC` **is** the search contract order (time DESC, insert order within
+  the ms) — the search query needs no sort and the fts walk early-terminates at LIMIT
+  (E1: 5.9 s → 0.2 ms warm on the fixture).
+- `message_id` carries `REFERENCES msg(id)` so a missing msg can never NULL the rowid
+  (NULL ⇒ silent auto-assign ⇒ broken order); the `part_search_rt` trigger aborts any
+  insert whose rowid encodes a different ms than its message's `time_created`.
+- `(session_id)` index exists for the scoped search walk (reverse index scan =
+  rowid DESC for free; per-row `EXISTS` probe bounds cost by session size).
+- Migrations touching rowids are full table rebuilds (in-place reorder = PK collisions);
+  the v9→v10 rebuild's fts `rebuild` re-tokenizes the whole corpus — **measured 551 s
+  one-time on the 1.5 GB fixture (378 MB text; stepwise timings logged via
+  `tracing::info`)**; fresh dbs (0→current) and fixture imports take the fast path and
+  never pay it. `detail=column/none` cannot shrink this: E3 proved phrase queries error
+  (or silently return 0 rows) without `detail=full`, and our queries are always phrases
+  (quoted) under trigram.
+
 ## 2. Page/pragmas — exact set
 
 **First connection, before any table exists (creation profile):**

@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -117,13 +117,22 @@ CREATE TABLE import_sync (
 -- zstd payloads stay searchable. ad/au triggers keep the FTS shadow in
 -- lockstep; FK cascade fires them on session/msg/part deletion (proven:
 -- child triggers fire on FK cascade with recursive_triggers=OFF).
+-- Rowid contract (PERF-10X S-A, v10): rowid = time_created * 1048576 + slot
+-- so ORDER BY rowid == the search contract order (time DESC, insert order
+-- within the ms) and the fts walk early-terminates at LIMIT instead of
+-- materializing the corpus match set (E1: 5.9s -> 0.2ms warm). Allocated by
+-- part_search_upsert_ops (max+1 within the ms range; % 1048576 makes a
+-- pathological overflow a loud PK conflict). message_id FK makes a missing
+-- msg impossible (rowid expr would otherwise be NULL -> auto-assign).
 CREATE TABLE part_search (
     rowid      INTEGER PRIMARY KEY,
     part_id    TEXT NOT NULL UNIQUE REFERENCES msg_part(id) ON DELETE CASCADE,
     session_id TEXT NOT NULL,
-    message_id TEXT NOT NULL,
+    message_id TEXT NOT NULL REFERENCES msg(id) ON DELETE CASCADE,
     text       TEXT NOT NULL
 ) STRICT;
+
+CREATE INDEX idx_part_search_session ON part_search(session_id);
 
 CREATE VIRTUAL TABLE part_search_fts USING fts5(
     text, content='part_search', content_rowid='rowid', tokenize='trigram'
@@ -131,6 +140,11 @@ CREATE VIRTUAL TABLE part_search_fts USING fts5(
 
 CREATE TRIGGER part_search_ai AFTER INSERT ON part_search BEGIN
     INSERT INTO part_search_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
+CREATE TRIGGER part_search_rt AFTER INSERT ON part_search
+WHEN (NEW.rowid / 1048576) <> (SELECT time_created FROM msg WHERE id = NEW.message_id)
+BEGIN
+    SELECT RAISE(ABORT, 'part_search rowid/time mismatch (encoding overflow or direct rowid write)');
 END;
 CREATE TRIGGER part_search_ad AFTER DELETE ON part_search BEGIN
     INSERT INTO part_search_fts(part_search_fts, rowid, text)
@@ -307,6 +321,83 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                 // (K-ALWAYS — was in-memory only; lost on restart).
                 conn.execute_batch("ALTER TABLE session ADD COLUMN permission TEXT;")?;
             }
+            9 => {
+                // v9->v10: time-encoded part_search rowids (PERF-10X S-A).
+                // Rowid reorder cannot happen in place (PK collisions mid-
+                // shuffle) — full rebuild in one transaction: copy with dense
+                // per-ms ranks, swap, rebuild the fts shadow, recreate the
+                // triggers (dropping the table kills them), add the session
+                // index and the rowid/time invariant trigger.
+                let step = |label: &str, sql: &str| -> Result<()> {
+                    let t = std::time::Instant::now();
+                    conn.execute_batch(sql)?;
+                    tracing::info!(
+                        "migrate v9->v10: {label} took {:.1}s",
+                        t.elapsed().as_secs_f32()
+                    );
+                    Ok(())
+                };
+                let (rows, bytes): (i64, i64) = conn.query_row(
+                    "SELECT count(*), coalesce(sum(length(text)), 0) FROM part_search",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                tracing::info!(
+                    "migrate v9->v10: time-encoded part_search rowids — {rows} rows, {bytes} bytes text; the trigram fts rebuild is the long step (measured ~5-9 min on a 1.5GB db, one-time; fresh imports skip this path)"
+                );
+                conn.execute_batch("BEGIN;")?;
+                step(
+                    "create+copy",
+                    "CREATE TABLE part_search_v10 (
+                        rowid      INTEGER PRIMARY KEY,
+                        part_id    TEXT NOT NULL UNIQUE REFERENCES msg_part(id) ON DELETE CASCADE,
+                        session_id TEXT NOT NULL,
+                        message_id TEXT NOT NULL REFERENCES msg(id) ON DELETE CASCADE,
+                        text       TEXT NOT NULL
+                    ) STRICT;
+                    INSERT INTO part_search_v10 (rowid, part_id, session_id, message_id, text)
+                    SELECT m.time_created * 1048576
+                         + (ROW_NUMBER() OVER (PARTITION BY m.time_created ORDER BY ps.rowid) - 1),
+                           ps.part_id, ps.session_id, ps.message_id, ps.text
+                    FROM part_search ps JOIN msg m ON m.id = ps.message_id;",
+                )?;
+                step(
+                    "drop old+swap",
+                    "DROP TABLE part_search_fts;
+                    DROP TABLE part_search;
+                    ALTER TABLE part_search_v10 RENAME TO part_search;
+                    CREATE INDEX idx_part_search_session ON part_search(session_id);",
+                )?;
+                step(
+                    "create fts + rebuild (long)",
+                    "CREATE VIRTUAL TABLE part_search_fts USING fts5(
+                        text, content='part_search', content_rowid='rowid', tokenize='trigram'
+                    );
+                    INSERT INTO part_search_fts(part_search_fts) VALUES('rebuild');",
+                )?;
+                step(
+                    "triggers",
+                    "CREATE TRIGGER part_search_ai AFTER INSERT ON part_search BEGIN
+                        INSERT INTO part_search_fts(rowid, text) VALUES (new.rowid, new.text);
+                    END;
+                    CREATE TRIGGER part_search_ad AFTER DELETE ON part_search BEGIN
+                        INSERT INTO part_search_fts(part_search_fts, rowid, text)
+                        VALUES ('delete', old.rowid, old.text);
+                    END;
+                    CREATE TRIGGER part_search_au AFTER UPDATE ON part_search BEGIN
+                        INSERT INTO part_search_fts(part_search_fts, rowid, text)
+                        VALUES ('delete', old.rowid, old.text);
+                        INSERT INTO part_search_fts(rowid, text) VALUES (new.rowid, new.text);
+                    END;
+                    CREATE TRIGGER part_search_rt AFTER INSERT ON part_search
+                    WHEN (NEW.rowid / 1048576) <> (SELECT time_created FROM msg WHERE id = NEW.message_id)
+                    BEGIN
+                        SELECT RAISE(ABORT, 'part_search rowid/time mismatch (encoding overflow or direct rowid write)');
+                    END;",
+                )?;
+                conn.execute_batch("COMMIT")?;
+                tracing::info!("migrate v9->v10: committed");
+            }
             other => {
                 bail!(
                     "database schema version {other} out of step for {SCHEMA_VERSION}; \
@@ -464,9 +555,12 @@ mod fts_m0 {
              VALUES ('p1','m1','ses_1',1,'text',44,'{}',NULL);",
         )
         .unwrap();
+        // v10 rowid contract: time_created(1) * 1048576 + slot(0) — the
+        // part_search_rt trigger rejects anything else (proven: raw auto
+        // rowids fail this test with "rowid/time mismatch").
         conn.execute(
-            "INSERT INTO part_search (part_id, session_id, message_id, text)
-             VALUES ('p1','ses_1','m1','{\"type\":\"text\",\"text\":\"the REFINE engine is fast\"}')",
+            "INSERT INTO part_search (rowid, part_id, session_id, message_id, text)
+             VALUES (1048576,'p1','ses_1','m1','{\"type\":\"text\",\"text\":\"the REFINE engine is fast\"}')",
             [],
         )
         .unwrap();
@@ -605,5 +699,260 @@ mod migration_tests {
         )
         .unwrap();
         migrate(&conn).unwrap(); // idempotent at v2
+    }
+}
+
+#[cfg(test)]
+mod sa_search {
+    //! PERF-10X S-A: time-encoded rowids + fts early-termination rewrite.
+    use super::*;
+    use crate::SEARCH_MATCH_GLOBAL;
+    use crate::{apply_ops, part_search_upsert_ops, pragma, search_parts};
+
+    const SLOTS: i64 = 1 << 20;
+
+    fn seed(conn: &Connection) {
+        conn.execute_batch(
+            "INSERT INTO session (id, project_id, directory, path, slug, title, version, time_created, time_updated) VALUES ('ses_1','global','/w','s','s','t','1',1,1);
+             INSERT INTO msg (id, session_id, role, seq, time_created, info) VALUES ('m1','ses_1','user',1,100,'{}');
+             INSERT INTO msg (id, session_id, role, seq, time_created, info) VALUES ('m2','ses_1','user',2,500,'{}');
+             INSERT INTO msg (id, session_id, role, seq, time_created, info) VALUES ('m3','ses_1','user',3,200,'{}');
+             INSERT INTO msg_part (id, message_id, session_id, seq, type, byte_len, inline, blob_sha) VALUES ('p1','m1','ses_1',1,'text',5,'{}',NULL);
+             INSERT INTO msg_part (id, message_id, session_id, seq, type, byte_len, inline, blob_sha) VALUES ('p2','m2','ses_1',1,'text',5,'{}',NULL);
+             INSERT INTO msg_part (id, message_id, session_id, seq, type, byte_len, inline, blob_sha) VALUES ('p3','m3','ses_1',1,'text',5,'{}',NULL);",
+        )
+        .unwrap();
+    }
+
+    fn upsert(conn: &Connection, part: &str, msg: &str, text: &str) {
+        apply_ops(conn, &[part_search_upsert_ops(part, "ses_1", msg, text)]).unwrap();
+    }
+
+    /// Rowid = time*SLOTS + slot: same-ms increments, cross-ms disjoint,
+    /// delete-gaps never collide (max+1 allocation), rt trigger enforces.
+    #[test]
+    fn rowid_encoding_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.db");
+        let conn = pragma::create_new(&p).unwrap();
+        migrate(&conn).unwrap();
+        seed(&conn);
+        upsert(&conn, "p1", "m1", "needle alpha");
+        upsert(&conn, "p2", "m2", "needle beta");
+        upsert(&conn, "p3", "m3", "needle gamma");
+        let rows: Vec<(String, i64)> = conn
+            .prepare("SELECT part_id, rowid FROM part_search ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("p1".into(), 100 * SLOTS + 0),
+                ("p3".into(), 200 * SLOTS + 0),
+                ("p2".into(), 500 * SLOTS + 0),
+            ],
+            "rowid order == time order (insert order differs: p1,p2,p3)"
+        );
+        // gap: delete p3 (slot0 of its ms), reinsert another part in m3's ms
+        conn.execute("DELETE FROM part_search WHERE part_id='p3'", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO msg_part (id, message_id, session_id, seq, type, byte_len, inline, blob_sha) VALUES ('p4','m3','ses_1',2,'text',5,'{}',NULL)",
+            [],
+        )
+        .unwrap();
+        upsert(&conn, "p4", "m3", "needle delta");
+        let r: i64 = conn
+            .query_row(
+                "SELECT rowid FROM part_search WHERE part_id='p4'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // max in range was 500's? no — m3 range only had slot0 (deleted) →
+        // coalesce(max) over empty range = -1 → slot0. Re-insert lands slot0
+        // because the range is empty again; either way it must be IN range.
+        assert_eq!(r, 200 * SLOTS + 0, "empty-range realloc uses slot0");
+        // invariant trigger: raw wrong-rowid insert is rejected loudly
+        conn.execute(
+            "INSERT INTO msg_part (id, message_id, session_id, seq, type, byte_len, inline, blob_sha) VALUES ('p9','m1','ses_1',9,'text',5,'{}',NULL)",
+            [],
+        )
+        .unwrap();
+        let err = conn.execute(
+            "INSERT INTO part_search (rowid, part_id, session_id, message_id, text) VALUES (77,'p9','ses_1','m1','x')",
+            [],
+        );
+        assert!(
+            err.unwrap_err().to_string().contains("rowid/time mismatch"),
+            "rt trigger must reject rowid outside the message's ms range"
+        );
+    }
+
+    /// Manual: time the v9→v10 rebuild on a REAL (copied) db.
+    /// REFINE_SA_TIMING_DB=/path/to/scratch.db cargo test -p refine-store \
+    ///   sa_search::migration_timing_on_real_db -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual: needs REFINE_SA_TIMING_DB (a disposable copy)"]
+    fn migration_timing_on_real_db() {
+        let path = std::env::var("REFINE_SA_TIMING_DB")
+            .expect("set REFINE_SA_TIMING_DB to a DISPOSABLE db copy");
+        let conn = pragma::open_writer(std::path::Path::new(&path)).expect("open_writer");
+        let ver: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        if ver == SCHEMA_VERSION {
+            println!("already v{SCHEMA_VERSION} — nothing to migrate");
+            return;
+        }
+        let t = std::time::Instant::now();
+        migrate(&conn).expect("migrate");
+        println!("v{ver} -> v{SCHEMA_VERSION} migration: {:?}", t.elapsed());
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM part_search", [], |r| r.get(0))
+            .unwrap();
+        println!("part_search rows: {n}");
+        let bad: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM part_search ps WHERE (ps.rowid / 1048576) <> (SELECT time_created FROM msg WHERE id = ps.message_id)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bad, 0, "every rowid must encode its message's ms");
+    }
+
+    /// Quote-doubling inside the FTS phrase must survive (a no-op replace
+    /// here turns every quote needle into an unterminated phrase → SQL
+    /// error; the HTTP 200-only test passes vacuously under that bug, this
+    /// one does not). Planted-cliff guard for the no_effect_replace class.
+    #[test]
+    fn quote_needle_never_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.db");
+        let conn = pragma::create_new(&p).unwrap();
+        migrate(&conn).unwrap();
+        seed(&conn);
+        upsert(
+            &conn,
+            "p1",
+            "m1",
+            r#"plain text with embedded "quotes" inside"#,
+        );
+        for needle in ["quotes", r#"embedded "q"#, r#""#, r#"a" OR "b"#] {
+            let res = search_parts(&p, needle, None, 10, 0);
+            assert!(res.is_ok(), "needle {needle:?} must not error: {res:?}");
+        }
+        let (hits, _) = search_parts(&p, r#"embedded "q"#, None, 10, 0).unwrap();
+        assert_eq!(hits.len(), 1, "doubled quote still finds the phrase");
+    }
+
+    /// EQP control (mutation: re-shape search to the pre-S-A
+    /// time-join+sort form → "USE TEMP B-TREE" reappears → this reds).
+    #[test]
+    fn global_match_plan_is_an_fts_walk_without_sort() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.db");
+        let conn = pragma::create_new(&p).unwrap();
+        migrate(&conn).unwrap();
+        seed(&conn);
+        upsert(&conn, "p1", "m1", "needle one");
+        upsert(&conn, "p2", "m2", "needle two");
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {SEARCH_MATCH_GLOBAL}"))
+            .unwrap();
+        let plan: String = stmt
+            .query_map(rusqlite::params!["\"needle\"", 10_i64, 0_i64], |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(plan.contains("part_search_fts"), "plan: {plan}");
+        assert!(
+            !plan.contains("TEMP B-TREE"),
+            "sort must be gone (E1 winner shape); plan: {plan}"
+        );
+    }
+
+    /// v9→v10 migration preserves the recorded contract order exactly —
+    /// including the case insert-order and time-order disagree (the whole
+    /// point of the encoding). Pre-computed with the OLD SQL shape, compared
+    /// against search_parts AFTER the rebuild.
+    #[test]
+    fn v9_migration_preserves_contract_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.db");
+        let conn = pragma::create_new(&p).unwrap();
+        migrate(&conn).unwrap();
+        // rewind to a v9-shaped part_search: auto rowids (insert order),
+        // no session index, no rt trigger, no msg FK
+        conn.execute_batch(
+            "DROP TABLE part_search_fts;
+             DROP TABLE part_search;
+             CREATE TABLE part_search (
+                 rowid      INTEGER PRIMARY KEY,
+                 part_id    TEXT NOT NULL UNIQUE REFERENCES msg_part(id) ON DELETE CASCADE,
+                 session_id TEXT NOT NULL,
+                 message_id TEXT NOT NULL,
+                 text       TEXT NOT NULL
+             ) STRICT;
+             CREATE VIRTUAL TABLE part_search_fts USING fts5(
+                 text, content='part_search', content_rowid='rowid', tokenize='trigram'
+             );
+             CREATE TRIGGER part_search_ai AFTER INSERT ON part_search BEGIN
+                 INSERT INTO part_search_fts(rowid, text) VALUES (new.rowid, new.text);
+             END;
+             CREATE TRIGGER part_search_ad AFTER DELETE ON part_search BEGIN
+                 INSERT INTO part_search_fts(part_search_fts, rowid, text)
+                 VALUES ('delete', old.rowid, old.text);
+             END;
+             CREATE TRIGGER part_search_au AFTER UPDATE ON part_search BEGIN
+                 INSERT INTO part_search_fts(part_search_fts, rowid, text)
+                 VALUES ('delete', old.rowid, old.text);
+                 INSERT INTO part_search_fts(rowid, text) VALUES (new.rowid, new.text);
+             END;",
+        )
+        .unwrap();
+        seed(&conn); // parts p1(m1 t=100), p2(m2 t=500), p3(m3 t=200)
+        upsert(&conn, "p1", "m1", "needle alpha");
+        upsert(&conn, "p2", "m2", "needle beta");
+        upsert(&conn, "p3", "m3", "needle gamma");
+        // record expectation with the PRE-S-A contract SQL
+        let expected: Vec<String> = conn
+            .prepare(
+                "SELECT ps.part_id FROM part_search ps JOIN msg m ON m.id = ps.message_id WHERE ps.rowid IN (SELECT rowid FROM part_search_fts WHERE part_search_fts MATCH '\"needle\"') ORDER BY m.time_created DESC, ps.rowid DESC",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(
+            expected,
+            vec!["p2", "p3", "p1"],
+            "pre-migration contract order"
+        );
+        conn.pragma_update(None, "user_version", 9).unwrap();
+        migrate(&conn).unwrap(); // runs arm9 → v10
+        let ver: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, SCHEMA_VERSION);
+        let (hits, trunc) = search_parts(&p, "needle", None, 10, 0).unwrap();
+        let got: Vec<&str> = hits.iter().map(|h| h.part_id.as_str()).collect();
+        assert_eq!(got, expected, "post-migration search order == contract");
+        assert!(!trunc);
+        // LIKE path (<3 chars uses it too) — same order guarantee
+        let (hits, _) = search_parts(&p, "ne", None, 10, 0).unwrap();
+        let got: Vec<&str> = hits.iter().map(|h| h.part_id.as_str()).collect();
+        assert_eq!(got, expected, "LIKE fallback order == contract");
+        // scoped path stays scoped + ordered
+        let (hits, _) = search_parts(&p, "needle", Some("ses_1"), 10, 0).unwrap();
+        assert_eq!(hits.len(), 3);
     }
 }

@@ -144,16 +144,29 @@ pub fn insert_message(
 
 /// Upsert into the content-search projection (W1). Runs the au trigger on
 /// conflict → FTS shadow reindexed. Text = the stored part JSON.
+///
+/// Rowid (PERF-10X S-A, v10): `time_created * 1048576 + slot` where slot =
+/// max slot already taken in that ms range + 1 (gaps from deletes never
+/// collide; `% 1048576` turns a pathological 1M-parts-in-one-ms overflow
+/// into a loud PK conflict instead of a wrong-slot row). msg must exist —
+/// the v10 FK + the part_search_rt trigger both enforce it (a NULL rowid
+/// would silently auto-assign insert order, i.e. the old broken contract).
+/// Parts-per-ms slots in the time-encoded rowid (1_048_576 = 1<<20; with ms
+/// epoch ~1.7e12 the rowid fits i64 until year ~2249; max observed parts/ms
+/// = 22 — overflow is a PK conflict, never silent).
+pub const PART_SEARCH_SLOTS: i64 = 1 << 20;
+
 pub fn part_search_upsert_ops(
     part_id: &str,
     session_id: &str,
     message_id: &str,
     text: &str,
 ) -> WriteOp {
+    let slots = PART_SEARCH_SLOTS;
     WriteOp::Sql {
-        sql: "INSERT INTO part_search (part_id, session_id, message_id, text) VALUES (?1, ?2, ?3, ?4) \
-              ON CONFLICT(part_id) DO UPDATE SET text = excluded.text"
-            .into(),
+        sql: format!(
+            "INSERT INTO part_search (rowid, part_id, session_id, message_id, text) VALUES ((SELECT (m.time_created * {slots}) + ((SELECT coalesce(max(ps2.rowid) - m.time_created * {slots}, -1) + 1 FROM part_search ps2 WHERE ps2.rowid >= m.time_created * {slots} AND ps2.rowid < (m.time_created + 1) * {slots}) % {slots}) FROM msg m WHERE m.id = ?3), ?1, ?2, ?3, ?4) ON CONFLICT(part_id) DO UPDATE SET text = excluded.text"
+        ),
         params: vec![
             part_id.into(),
             session_id.into(),
@@ -1596,6 +1609,7 @@ pub fn backfill_part_search(
 }
 
 /// Search hit (W1 contract — PLAN §17 block).
+#[derive(Debug)]
 pub struct SearchHit {
     pub session_id: String,
     pub message_id: String,
@@ -1608,6 +1622,17 @@ pub struct SearchHit {
 /// Content search over part payloads. ≥3 chars → trigram FTS MATCH (quoted
 /// phrase, substring semantics); shorter → LIKE fallback (same projection).
 /// One SQL statement; `limit+1` probe reports `truncated`.
+// Search SQL shapes (PERF-10X S-A). All single-line (check-guards rule 2).
+// Global match: fts rowid-DESC walk + LIMIT inside the subquery (early
+// termination), payload+msg join only for the <=limit+1 survivors.
+const SEARCH_MATCH_GLOBAL: &str = "SELECT ps.session_id, ps.message_id, ps.part_id, m.role, m.time_created, ps.text FROM part_search ps JOIN msg m ON m.id = ps.message_id WHERE ps.rowid IN (SELECT rowid FROM part_search_fts WHERE part_search_fts MATCH ?1 ORDER BY rowid DESC LIMIT ?2 OFFSET ?3) ORDER BY ps.rowid DESC";
+// Scoped match: session rowid-range walk (idx_part_search_session, reverse
+// scan = rowid DESC for free) + EXISTS probe per candidate row.
+const SEARCH_MATCH_SCOPED: &str = "SELECT ps.session_id, ps.message_id, ps.part_id, m.role, m.time_created, ps.text FROM part_search ps JOIN msg m ON m.id = ps.message_id WHERE ps.session_id = ?2 AND EXISTS (SELECT 1 FROM part_search_fts f WHERE f.rowid = ps.rowid AND part_search_fts MATCH ?1) ORDER BY ps.rowid DESC LIMIT ?3 OFFSET ?4";
+// LIKE fallback (<3 chars): rowid-DESC scan with LIMIT — no sort needed.
+const SEARCH_LIKE_GLOBAL: &str = "SELECT ps.session_id, ps.message_id, ps.part_id, m.role, m.time_created, ps.text FROM part_search ps JOIN msg m ON m.id = ps.message_id WHERE ps.text LIKE ?1 ESCAPE '\\' ORDER BY ps.rowid DESC LIMIT ?2 OFFSET ?3";
+const SEARCH_LIKE_SCOPED: &str = "SELECT ps.session_id, ps.message_id, ps.part_id, m.role, m.time_created, ps.text FROM part_search ps JOIN msg m ON m.id = ps.message_id WHERE ps.session_id = ?2 AND ps.text LIKE ?1 ESCAPE '\\' ORDER BY ps.rowid DESC LIMIT ?3 OFFSET ?4";
+
 pub fn search_parts(
     db: &std::path::Path,
     needle: &str,
@@ -1617,50 +1642,68 @@ pub fn search_parts(
 ) -> anyhow::Result<(Vec<SearchHit>, bool)> {
     let conn = pragma::open_reader(db)?;
     let chars = needle.chars().count();
-    let (cond, param): (String, String) = if chars >= 3 {
-        // FTS phrase: double quotes are escaped by doubling inside a phrase
-        (
-            "ps.rowid IN (SELECT rowid FROM part_search_fts WHERE part_search_fts MATCH ?1)"
-                .to_string(),
-            format!("\"{}\"", needle.replace('"', "\"\"")),
-        )
-    } else {
-        (
-            "ps.text LIKE ?1 ESCAPE '\\'".to_string(),
-            format!(
-                "%{}%",
-                needle
-                    .replace('\\', "\\\\")
-                    .replace('%', "\\%")
-                    .replace('_', "\\_")
-            ),
-        )
-    };
-    let scope_sql = if scope.is_some() {
-        " AND ps.session_id = ?2"
-    } else {
-        ""
-    };
-    // single-line SQL: `\` line continuations inside strings are the exact
-    // bug class check-guards rule 2 exists for (a stray literal backslash
-    // reaches SQLite → parse error). Never split SQL across lines.
-    let limit_idx = if scope.is_some() { "3" } else { "2" };
-    let offset_idx = if scope.is_some() { "4" } else { "3" };
-    let sql = format!(
-        "SELECT ps.session_id, ps.message_id, ps.part_id, m.role, m.time_created, ps.text FROM part_search ps JOIN msg m ON m.id = ps.message_id WHERE {cond}{scope_sql} ORDER BY m.time_created DESC, ps.rowid DESC LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
-    );
-    let mut stmt = conn.prepare(&sql)?;
     let probe = limit as i64 + 1;
     let off = offset as i64;
-    let rows: Vec<SearchHit> = if let Some(sc) = scope {
-        stmt.query_map(rusqlite::params![param, sc, probe, off], row_hit)?
-            .filter_map(|r| r.ok())
-            .collect()
+    // PERF-10X S-A (E1 shootout winner): v10 rowids encode time, so the
+    // contract order IS rowid order and the hot path is a pure fts5 walk
+    // with LIMIT — it terminates inside the virtual table after LIMIT hits
+    // (0.2ms warm / 9.7ms cold measured) instead of the pre-S-A shape that
+    // materialized the whole match set (58k rows for "the"), PK-looked-up
+    // every row, and sorted full text payloads (5.9-6.3s; EQP: TEMP
+    // B-TREE). Scoped searches never materialize the corpus set either: a
+    // bounded walk over that session's rowid range with a per-row EXISTS
+    // probe (cost ceiling = session size, never corpus size).
+    // Single-line SQL: backslash continuations inside strings are the exact
+    // bug class check-guards rule 2 exists for -- never split SQL lines.
+    let (sql, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if chars >= 3 {
+        // FTS phrase: double quotes are escaped by doubling inside a phrase
+        let param: Box<dyn rusqlite::ToSql> =
+            Box::new(format!("\"{}\"", needle.replace('"', "\"\"")));
+        match scope {
+            Some(sc) => (
+                SEARCH_MATCH_SCOPED.to_string(),
+                vec![
+                    param,
+                    Box::new(sc.to_string()),
+                    Box::new(probe),
+                    Box::new(off),
+                ],
+            ),
+            None => (
+                SEARCH_MATCH_GLOBAL.to_string(),
+                vec![param, Box::new(probe), Box::new(off)],
+            ),
+        }
     } else {
-        stmt.query_map(rusqlite::params![param, probe, off], row_hit)?
-            .filter_map(|r| r.ok())
-            .collect()
+        let param: Box<dyn rusqlite::ToSql> = Box::new(format!(
+            "%{}%",
+            needle
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        ));
+        match scope {
+            Some(sc) => (
+                SEARCH_LIKE_SCOPED.to_string(),
+                vec![
+                    param,
+                    Box::new(sc.to_string()),
+                    Box::new(probe),
+                    Box::new(off),
+                ],
+            ),
+            None => (
+                SEARCH_LIKE_GLOBAL.to_string(),
+                vec![param, Box::new(probe), Box::new(off)],
+            ),
+        }
     };
+    let mut stmt = conn.prepare(&sql)?;
+    let row_slice: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let rows: Vec<SearchHit> = stmt
+        .query_map(row_slice.as_slice(), row_hit)?
+        .filter_map(|r| r.ok())
+        .collect();
     let mut hits = rows;
     let truncated = hits.len() as u32 > limit;
     if truncated {
