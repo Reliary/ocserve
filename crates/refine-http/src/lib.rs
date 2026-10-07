@@ -703,16 +703,21 @@ async fn vcs_info() -> impl IntoResponse {
     }))
 }
 
-async fn get_sessions(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+async fn get_sessions(State(st): State<Arc<AppState>>) -> axum::response::Response {
     // Fresh DB rows (upstream semantics) — the boot map was stale after
     // prompts (M2 finding); load_sessions_wire orders by time_updated DESC.
-    let v = run_blocking(&st.db, refine_store::load_sessions_wire)
-        .await
-        .unwrap_or_else(|e| {
+    // F5-extends-F8: serialized once per write-epoch, then served as
+    // refcounted Bytes (zero serde per request on the hit path).
+    match run_blocking(&st.db, refine_store::load_sessions_wire_bytes).await {
+        Ok(b) => axum::response::Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from((*b).clone()))
+            .expect("static response"),
+        Err(e) => {
             tracing::error!("session list read failed: {e:#}");
-            Vec::new()
-        });
-    Json(v)
+            Json(Vec::<serde_json::Value>::new()).into_response()
+        }
+    }
 }
 
 async fn get_session(

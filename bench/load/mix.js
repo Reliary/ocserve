@@ -32,6 +32,17 @@ export const ENDPOINTS = [
   'session_status',
 ];
 
+// Iteration schedule over ONLY the active endpoints. (First E0-era filter
+// returned null from req() for excluded routes while the switch still cycled
+// all 9 cases — r.headers on null crashed any run whose filter excluded
+// message_page. Schedule + switch both keyed on ACTIVE now.)
+const ACTIVE = ENDPOINTS.filter(
+  (e) => ROUTE_FILTER.length === 0 || ROUTE_FILTER.indexOf(e) !== -1
+);
+if (ACTIVE.length === 0) {
+  throw new Error('LOAD_ROUTES matched no endpoint: ' + ROUTE_FILTER.join(','));
+}
+
 const trends = {};
 for (const e of ENDPOINTS) trends[e] = new Trend('lat_' + e, true);
 
@@ -68,39 +79,41 @@ export function doIteration() {
     cursor = null; // new session scope → paging restarts
     lastSid = sid;
   }
-  switch (__ITER % ENDPOINTS.length) {
-    case 0:
+  switch (ACTIVE[__ITER % ACTIVE.length]) {
+    case 'session_list':
       req('session_list', 'GET', '/session?limit=500');
       break;
-    case 1: {
+    case 'message_page': {
       const r = req('message_page', 'GET', `/session/${sid}/message?limit=50`);
-      const next = r.headers['X-Next-Cursor'] || r.headers['x-next-cursor'];
-      cursor = next || null;
+      if (r) {
+        const next = r.headers['X-Next-Cursor'] || r.headers['x-next-cursor'];
+        cursor = next || null;
+      }
       break;
     }
-    case 2:
+    case 'message_cursor':
       if (cursor) {
         req('message_cursor', 'GET', `/session/${sid}/message?limit=50&before=${cursor}`);
       } else {
         req('message_page', 'GET', `/session/${sid}/message?limit=50`);
       }
       break;
-    case 3:
+    case 'config':
       req('config', 'GET', '/config');
       break;
-    case 4:
+    case 'agent':
       req('agent', 'GET', '/agent');
       break;
-    case 5:
+    case 'command':
       req('command', 'GET', '/command');
       break;
-    case 6:
+    case 'file_list':
       req('file_list', 'GET', `/file?path=${encodeURIComponent(FILE_PATH)}`);
       break;
-    case 7:
+    case 'search':
       req('search', 'POST', '/session/search', { query: SEARCH_Q, limit: 50 });
       break;
-    case 8:
+    case 'session_status':
       // GLOBAL status (W2 golden {}|busy map). The per-session variant
       // does NOT exist on either server: refine 404s honestly (unregistered
       // route), freeze returns 200 SPA catch-all HTML — a status-code-only

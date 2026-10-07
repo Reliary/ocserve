@@ -79,6 +79,34 @@ pub fn load_sessions_wire(db: &std::path::Path) -> anyhow::Result<Vec<serde_json
     Ok(out)
 }
 
+/// F5-extends-F8: same list, serialized ONCE per epoch. GET /session
+/// serves these bytes refcounted (zero serde on the hit path). Same kill
+/// switch (REFINE_LIST_MEMO=0) — a cache-off run disables both layers.
+pub fn load_sessions_wire_bytes(
+    db: &std::path::Path,
+) -> anyhow::Result<std::sync::Arc<bytes::Bytes>> {
+    let enabled = list_memo_enabled();
+    let e0 = write_epoch();
+    if enabled {
+        let hit = {
+            let l = list_memo().lock();
+            if l.epoch == e0 { l.bytes.clone() } else { None }
+        };
+        if let Some(b) = hit {
+            return Ok(b);
+        }
+    }
+    let rows = load_sessions_wire(db)?;
+    let vec = bytes::Bytes::from(serde_json::to_vec(&rows)?);
+    if enabled && write_epoch() == e0 {
+        let mut l = list_memo().lock();
+        l.epoch = e0;
+        l.bytes = Some(std::sync::Arc::new(vec.clone()));
+        l.slot = Some(std::sync::Arc::new(rows));
+    }
+    Ok(std::sync::Arc::new(vec))
+}
+
 /// Insert one message + its parts in a single writer batch (wire shape:
 /// msg.info holds the full upstream info JSON; parts inline ≤8KB else blob).
 /// Inline threshold (MEMORY §6 / STORAGE §4): parts ≤8 KiB live in-row,
@@ -1722,6 +1750,7 @@ pub fn bump_write_epoch() {
     s.clear();
     let mut l = list_memo().lock();
     l.slot = None;
+    l.bytes = None;
     l.epoch = 0;
 }
 
@@ -1780,6 +1809,9 @@ impl SearchMemoState {
 struct ListMemoState {
     epoch: u64,
     slot: Option<std::sync::Arc<Vec<serde_json::Value>>>,
+    /// Serialized wire bytes of the same list (F5-extends-F8): a hit is a
+    /// refcounted Bytes clone — no per-request 300KB serde pass.
+    bytes: Option<std::sync::Arc<bytes::Bytes>>,
 }
 
 fn search_memo() -> &'static parking_lot::Mutex<SearchMemoState> {
@@ -1798,6 +1830,7 @@ fn list_memo() -> &'static parking_lot::Mutex<ListMemoState> {
         parking_lot::Mutex::new(ListMemoState {
             epoch: 0,
             slot: None,
+            bytes: None,
         })
     })
 }
