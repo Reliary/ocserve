@@ -143,3 +143,14 @@ ceiling re-baselined to 21,500,000 from measurement.
   497/568 ms (<=1417), 0% errors all cells. Acceptance D: GREEN (both
   G1 and G2 recorded; G1's failure dispositioned as stale runner
   artifact, not a result).
+
+## Stmt/pragma audit confirmation (0f25f87 binary, VU50, ROUNDS=1, 4-thread)
+
+`20261007T174649Z`: refine **9,228 / 9,099 req/s, p95 13.1 / 13.6 ms**
+(hot/spread), freeze 460 / 420, 0% errors, **0 breaches**, peak RSS
+182.7 MB. vs G2 (8,988/7,948 @ 25.96/33.08): p95 roughly halved,
+throughput at or above — no regression from the stmt/pragma changes, and
+**the fixture's first-ever planner stats confirmed post-boot**
+(`sqlite_stat1` = 2 tables / 15 rows — the optimize placement fix
+exercised through the real load-test spawn path).
+
