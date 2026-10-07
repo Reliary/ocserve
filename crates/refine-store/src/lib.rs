@@ -26,7 +26,14 @@ pub fn load_sessions_wire(db: &std::path::Path) -> anyhow::Result<Vec<serde_json
     let e0 = write_epoch();
     if enabled {
         let hit = {
-            let l = list_memo().lock();
+            let mut l = list_memo().lock();
+            // epoch AND db identity (see ListMemoState::db): a foreign db
+            // clears the slot rather than being served it.
+            if l.db.as_deref().is_some_and(|d| d != db) {
+                l.slot = None;
+                l.bytes = None;
+                l.db = None;
+            }
             if l.epoch == e0 { l.slot.clone() } else { None }
         };
         if let Some(v) = hit {
@@ -74,6 +81,7 @@ pub fn load_sessions_wire(db: &std::path::Path) -> anyhow::Result<Vec<serde_json
     if enabled && write_epoch() == e0 {
         let mut l = list_memo().lock();
         l.epoch = e0;
+        l.db = Some(db.to_path_buf());
         l.slot = Some(std::sync::Arc::new(out.clone()));
     }
     Ok(out)
@@ -89,7 +97,12 @@ pub fn load_sessions_wire_bytes(
     let e0 = write_epoch();
     if enabled {
         let hit = {
-            let l = list_memo().lock();
+            let mut l = list_memo().lock();
+            if l.db.as_deref().is_some_and(|d| d != db) {
+                l.slot = None;
+                l.bytes = None;
+                l.db = None;
+            }
             if l.epoch == e0 { l.bytes.clone() } else { None }
         };
         if let Some(b) = hit {
@@ -106,6 +119,7 @@ pub fn load_sessions_wire_bytes(
     if enabled && write_epoch() == e0 {
         let mut l = list_memo().lock();
         l.epoch = e0;
+        l.db = Some(db.to_path_buf());
         l.bytes = Some(std::sync::Arc::new(vec.clone()));
         // The Value slot is intentionally NOT populated here: filling it
         // would run the DOM path this function exists to avoid. Callers that
@@ -1943,6 +1957,7 @@ pub fn bump_write_epoch() {
     l.slot = None;
     l.bytes = None;
     l.epoch = 0;
+    l.db = None;
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -1958,21 +1973,32 @@ type CachedHits = std::sync::Arc<(Vec<SearchHit>, bool)>;
 
 struct SearchMemoState {
     epoch: u64,
+    /// See `ListMemoState::db` — same identity rule: a memo entry is only
+    /// served to the db that produced it, otherwise the table is cleared.
+    db: Option<std::path::PathBuf>,
     entries: std::collections::VecDeque<(SearchKey, CachedHits)>,
 }
 
 impl SearchMemoState {
     fn clear(&mut self) {
         self.entries.clear();
+        self.db = None;
     }
     fn get(
         &mut self,
         key: &SearchKey,
         epoch: u64,
+        db: &std::path::Path,
     ) -> Option<std::sync::Arc<(Vec<SearchHit>, bool)>> {
         if self.epoch != epoch {
             self.entries.clear();
             self.epoch = epoch;
+            self.db = None;
+        }
+        // identity: same db, or nothing was ever cached (db set on first put)
+        if self.db.as_deref().is_some_and(|d| d != db) {
+            self.entries.clear();
+            self.db = None;
         }
         // FIFO walk (cap 64 — linear scan of ≤64 short keys, cheaper than a
         // HashMap upkeep; keys are workload-stable)
@@ -1981,10 +2007,17 @@ impl SearchMemoState {
             .find(|(k, _)| k == key)
             .map(|(_, v)| std::sync::Arc::clone(v))
     }
-    fn put(&mut self, key: SearchKey, val: CachedHits, epoch: u64) {
+    fn put(&mut self, key: SearchKey, val: CachedHits, epoch: u64, db: &std::path::Path) {
         if self.epoch != epoch {
             self.entries.clear();
             self.epoch = epoch;
+        }
+        if self.db.as_deref().is_some_and(|d| d != db) {
+            self.entries.clear();
+            self.db = None;
+        }
+        if self.db.is_none() {
+            self.db = Some(db.to_path_buf());
         }
         self.entries.retain(|(k, _)| k != &key);
         self.entries.push_back((key, val));
@@ -1999,6 +2032,14 @@ impl SearchMemoState {
 
 struct ListMemoState {
     epoch: u64,
+    /// DB identity this slot was filled from. The epoch alone is NOT an
+    /// identity: `write_epoch` is process-global, so two different databases
+    /// in one process (tests, or any future multi-db reader) can share an
+    /// epoch and silently serve each other's bytes. Found 2026-10-07 when the
+    /// corpus parity gate ran two dbs in one test binary and the synthetic
+    /// test received the live db's bytes. A hit now requires BOTH epoch and
+    /// path match; a path mismatch clears the slot rather than serving it.
+    db: Option<std::path::PathBuf>,
     slot: Option<std::sync::Arc<Vec<serde_json::Value>>>,
     /// Serialized wire bytes of the same list (F5-extends-F8): a hit is a
     /// refcounted Bytes clone — no per-request 300KB serde pass.
@@ -2010,6 +2051,7 @@ fn search_memo() -> &'static parking_lot::Mutex<SearchMemoState> {
     M.get_or_init(|| {
         parking_lot::Mutex::new(SearchMemoState {
             epoch: 0,
+            db: None,
             entries: std::collections::VecDeque::new(),
         })
     })
@@ -2020,6 +2062,7 @@ fn list_memo() -> &'static parking_lot::Mutex<ListMemoState> {
     M.get_or_init(|| {
         parking_lot::Mutex::new(ListMemoState {
             epoch: 0,
+            db: None,
             slot: None,
             bytes: None,
         })
@@ -2086,7 +2129,7 @@ pub fn search_parts(
         let hit = {
             let memo = search_memo();
             let mut m = memo.lock();
-            m.get(&key, write_epoch())
+            m.get(&key, write_epoch(), db)
         };
         if let Some(v) = hit {
             SEARCH_MEMO_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2169,7 +2212,7 @@ pub fn search_parts(
         // raced a write (e1 != e0) => discard rather than store (never stale)
         let memo = search_memo();
         let mut m = memo.lock();
-        m.put(key, std::sync::Arc::new((hits.clone(), truncated)), e0);
+        m.put(key, std::sync::Arc::new((hits.clone(), truncated)), e0, db);
     }
     Ok((hits, truncated))
 }

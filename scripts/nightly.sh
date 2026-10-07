@@ -41,6 +41,25 @@ step "cargo deny" cargo deny check
 # 2. crash protocol: SIGKILL fuzz on the blob/DB writer (M0 decisive test)
 step "crash fuzz (SIGKILL blob/DB)" cargo test -p refine-store --test crash_fuzz
 
+# 2b. CORPUS GATES — the byte-parity differentials for the read-path fast
+#     paths. These are env-gated and would otherwise never run: no CI exists
+#     in this repo, so a `cargo test` run silently skips them (they print
+#     "skipped: ... not set" and pass). Run them here against the LIVE db,
+#     read-only (`open_reader`), so the gates track the real corpus:
+#     - splice: every msg.info + every part (inline AND blob_sha) — the
+#       splice fast path must be byte-identical to the DOM path, 0 refused;
+#       226,646 rows on the load fixture, more live.
+#     - list wire: session-list bytes built from columns must equal the
+#       JSON-building path.
+# A skipped gate is worse than no gate: it looks green while proving
+# nothing. So the step FAILS if the env var could not be set (missing db).
+step "corpus: splice byte-parity over live db" \
+  env REFINE_SPLICE_DB="${REFINE_DATA_DIR:-$HOME/.local/share/refine}/refine.db" \
+      cargo test -p refine-store --test splice_parity -- --nocapture
+step "corpus: session-list wire parity over live db" \
+  env REFINE_LIST_PARITY_DB="${REFINE_DATA_DIR:-$HOME/.local/share/refine}/refine.db" \
+      cargo test -p refine-store --test list_wire_parity -- --nocapture
+
 # 3. provider stream fuzz: 10k seeded chunk-boundary splits vs whole-buffer
 step "stream chunk-split fuzz" cargo test -p refine-llm chunk_split_fuzz
 

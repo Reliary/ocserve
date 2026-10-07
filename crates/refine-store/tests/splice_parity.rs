@@ -280,6 +280,81 @@ fn splice_parity_over_corpus() {
         checked += 1;
     }
 
+    // --- blob parts (blob_sha, no inline) -----------------------------------
+    // These go through the SAME compact_splice in production
+    // (`for_each_message_json` decodes the blob then splices), but they are
+    // the majority of bytes (8,253 rows / 207 MB; 1,622 in the deep session
+    // that hot-mode benchmarks hammer). A gate that only reads
+    // `inline IS NOT NULL` would leave them unproven — found by auditing test
+    // coverage against what the bench actually exercises.
+    let blobs_root = std::path::Path::new(&db)
+        .parent()
+        .expect("db has parent")
+        .join("blobs");
+    if blobs_root.is_dir() {
+        let blobs = refine_store::blob::BlobStore::new(&blobs_root).expect("open blobs");
+        let mut st = conn
+            .prepare(
+                "SELECT id, session_id, message_id, blob_sha, byte_len
+                 FROM msg_part WHERE inline IS NULL AND blob_sha IS NOT NULL",
+            )
+            .unwrap();
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })
+            .unwrap();
+        let mut blob_checked = 0u64;
+        for r in rows.flatten() {
+            let (pid, sid, mid, sha, len) = r;
+            let Ok(raw) = blobs.get(&sha, len as u64) else {
+                // production warns + skips unreadable blobs; the gate must too
+                continue;
+            };
+            // production decodes with UTF-8, lossy fallback (lib.rs part loop)
+            let text = match String::from_utf8(raw) {
+                Ok(s) => s,
+                Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+            };
+            let mut out = Vec::with_capacity(text.len() + 160);
+            if !compact_splice(&text, &pid, &sid, Some(&mid), &mut out, &mut scratch) {
+                refused += 1;
+                if examples.len() < 5 {
+                    examples.push(format!(
+                        "REFUSED blob inline: {}",
+                        &text[..text.len().min(400)]
+                    ));
+                }
+                continue;
+            }
+            let got = String::from_utf8(out).unwrap();
+            let want = dom_reference(&text, &pid, &sid, Some(&mid));
+            if got != want {
+                mismatched += 1;
+                if examples.len() < 5 {
+                    examples.push(format!(
+                        "MISMATCH blob inline\n  src: {}\n  got: {got}\n want: {want}",
+                        &text[..text.len().min(400)]
+                    ));
+                }
+            }
+            checked += 1;
+            blob_checked += 1;
+        }
+        eprintln!("splice corpus: blob rows checked={blob_checked}");
+    } else {
+        eprintln!(
+            "splice corpus: blob leg SKIPPED (no blobs dir at {})",
+            blobs_root.display()
+        );
+    }
+
     eprintln!("splice corpus: checked={checked} refused={refused} mismatched={mismatched}");
     for e in &examples {
         eprintln!("{e}");
