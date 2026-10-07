@@ -8,3 +8,6 @@ bench/drift/
 bench/zen-probe/runs/
 mutants.out/
 mutants.out.old/
+
+# stray tool caches (never commit)
+.wrangler/
