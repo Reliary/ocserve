@@ -200,6 +200,14 @@ pub struct AppState {
     /// Config-derived route payloads (W4: swappable after PATCH /config —
     /// upstream marks the instance for disposal and serves fresh config).
     pub payloads: parking_lot::RwLock<Payloads>,
+    /// PERF-10X F5: pre-serialized bytes for the hot Json-clone handlers
+    /// (config/agent/command/config_providers/provider/console/capabilities).
+    /// Built at construction + every reload, so a request is a Bytes clone
+    /// (refcount) + zero-copy Body — no per-request Value clone/serialize.
+    /// Kill-switch: REFINE_WIRE_CACHE=0 (wire_off) falls back to the Value
+    /// path; both paths serve serde-identical bytes (unit-tested).
+    pub wire: parking_lot::RwLock<HashMap<&'static str, bytes::Bytes>>,
+    pub wire_off: std::sync::atomic::AtomicBool,
     /// Boot-injected config reloader (Runtime lives in refine-cli; the
     /// closure avoids a crate cycle). None in tests → PATCH still writes
     /// the file, swap skipped (logged).
@@ -281,6 +289,47 @@ pub struct Wires {
     pub llm: LlmRegistry,
 }
 
+/// Serialize the hot payload fields once (reload-time). off => empty map
+/// (handlers fall back to the Value path).
+pub(crate) fn rebuild_wire(p: &Payloads, off: bool) -> HashMap<&'static str, bytes::Bytes> {
+    let mut m = HashMap::new();
+    if off {
+        return m;
+    }
+    // serde_json::to_vec is exactly what axum's Json uses — byte-identical.
+    fn one<T: serde::Serialize>(
+        m: &mut HashMap<&'static str, bytes::Bytes>,
+        k: &'static str,
+        v: &T,
+    ) {
+        if let Ok(b) = serde_json::to_vec(v) {
+            m.insert(k, bytes::Bytes::from(b));
+        }
+    }
+    one(&mut m, "config", &p.config);
+    one(&mut m, "agent", &p.agent);
+    one(&mut m, "command", &p.command);
+    one(&mut m, "config_providers", &p.config_providers);
+    one(&mut m, "provider", &p.provider);
+    one(&mut m, "console", &p.console);
+    one(&mut m, "capabilities", &p.capabilities);
+    m
+}
+
+/// Serve cached bytes as a JSON response; None = fall back to Value clone.
+fn wire_json(st: &AppState, key: &'static str) -> Option<axum::response::Response> {
+    if st.wire_off.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let b = st.wire.read().get(key).cloned()?;
+    Some(
+        axum::response::Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(b))
+            .expect("static response"),
+    )
+}
+
 impl AppState {
     pub fn new() -> Arc<Self> {
         Self::with_auth(None)
@@ -326,8 +375,14 @@ impl AppState {
         let worktree = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "/".into());
+        let wire_off = std::env::var("REFINE_WIRE_CACHE")
+            .map(|v| v == "0")
+            .unwrap_or(false);
+        let wire_map = rebuild_wire(&p, wire_off);
         Arc::new(Self {
             payloads: parking_lot::RwLock::new(p),
+            wire: parking_lot::RwLock::new(wire_map),
+            wire_off: std::sync::atomic::AtomicBool::new(wire_off),
             reloader: parking_lot::RwLock::new(None),
             sessions: parking_lot::RwLock::new(HashMap::new()),
             // upstream /path shape (keys golden: home/state/config/worktree/directory)
@@ -374,32 +429,39 @@ async fn health() -> impl IntoResponse {
     Json(json!({"healthy": true, "version": FREEZE_VERSION}))
 }
 
-async fn get_config(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(st.payloads.read().config.clone())
+async fn get_config(State(st): State<Arc<AppState>>) -> axum::response::Response {
+    wire_json(&st, "config")
+        .unwrap_or_else(|| Json(st.payloads.read().config.clone()).into_response())
 }
 
-async fn get_agent(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(st.payloads.read().agent.clone())
+async fn get_agent(State(st): State<Arc<AppState>>) -> axum::response::Response {
+    wire_json(&st, "agent")
+        .unwrap_or_else(|| Json(st.payloads.read().agent.clone()).into_response())
 }
 
-async fn get_command(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(st.payloads.read().command.clone())
+async fn get_command(State(st): State<Arc<AppState>>) -> axum::response::Response {
+    wire_json(&st, "command")
+        .unwrap_or_else(|| Json(st.payloads.read().command.clone()).into_response())
 }
 
-async fn get_config_providers(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(st.payloads.read().config_providers.clone())
+async fn get_config_providers(State(st): State<Arc<AppState>>) -> axum::response::Response {
+    wire_json(&st, "config_providers")
+        .unwrap_or_else(|| Json(st.payloads.read().config_providers.clone()).into_response())
 }
 
-async fn get_provider(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(st.payloads.read().provider.clone())
+async fn get_provider(State(st): State<Arc<AppState>>) -> axum::response::Response {
+    wire_json(&st, "provider")
+        .unwrap_or_else(|| Json(st.payloads.read().provider.clone()).into_response())
 }
 
-async fn get_console(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(st.payloads.read().console.clone())
+async fn get_console(State(st): State<Arc<AppState>>) -> axum::response::Response {
+    wire_json(&st, "console")
+        .unwrap_or_else(|| Json(st.payloads.read().console.clone()).into_response())
 }
 
-async fn get_capabilities(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(st.payloads.read().capabilities.clone())
+async fn get_capabilities(State(st): State<Arc<AppState>>) -> axum::response::Response {
+    wire_json(&st, "capabilities")
+        .unwrap_or_else(|| Json(st.payloads.read().capabilities.clone()).into_response())
 }
 
 /// v2-style location envelope shared by /api/* routes (captured live).
@@ -3389,5 +3451,53 @@ mod f1_blocking_tests {
             after > before,
             "blocking call parked the worker: before={before} after={after}"
         );
+    }
+}
+
+#[cfg(test)]
+mod f5_wire {
+    use super::*;
+
+    /// Identity control: cached bytes == what axum's Json would produce
+    /// (both serde_json::to_vec) — one value per key, no drift.
+    #[test]
+    fn wire_bytes_are_serde_identical() {
+        let st = AppState::new();
+        let p = st.payloads.read();
+        let w = st.wire.read();
+        for (k, v) in [
+            ("config", &p.config),
+            ("config_providers", &p.config_providers),
+            ("provider", &p.provider),
+            ("console", &p.console),
+            ("capabilities", &p.capabilities),
+        ] {
+            let cached = w.get(k).unwrap_or_else(|| panic!("missing wire key {k}"));
+            let want = serde_json::to_vec(v).unwrap();
+            assert_eq!(
+                &cached[..],
+                &want[..],
+                "wire bytes for {k} must equal Value serialization"
+            );
+        }
+        for (k, v) in [("agent", &p.agent), ("command", &p.command)] {
+            let cached = w.get(k).unwrap_or_else(|| panic!("missing wire key {k}"));
+            let want = serde_json::to_vec(v).unwrap();
+            assert_eq!(&cached[..], &want[..]);
+        }
+    }
+
+    /// Kill-switch: wire_off => no cache, wire_json falls back (None).
+    #[test]
+    fn wire_off_disables_cache() {
+        let empty = rebuild_wire(&Payloads::default(), true);
+        assert!(empty.is_empty(), "off => nothing serialized");
+        let st = AppState::new();
+        st.wire_off
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(wire_json(&st, "config").is_none(), "off => Value path");
+        st.wire_off
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(wire_json(&st, "config").is_some(), "on => Bytes path");
     }
 }

@@ -195,7 +195,15 @@ pub async fn reconcile(st: &Arc<AppState>) -> anyhow::Result<()> {
             .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .collect()
     };
+    // F5: re-serialize the wire cache in the SAME swap window as the values
+    // (build first from the borrow, then publish both — a reader never sees
+    // values without their matching bytes).
+    let wire_map = crate::rebuild_wire(
+        &payloads,
+        st.wire_off.load(std::sync::atomic::Ordering::Relaxed),
+    );
     *st.payloads.write() = payloads;
+    *st.wire.write() = wire_map;
     *st.llm.write() = registry;
     observe(st); // only after success (retry semantics above)
     // hand the build pipeline's freed pages back (measured ~218 MB high-water)
