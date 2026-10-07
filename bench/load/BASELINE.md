@@ -154,3 +154,40 @@ throughput at or above — no regression from the stmt/pragma changes, and
 (`sqlite_stat1` = 2 tables / 15 rows — the optimize placement fix
 exercised through the real load-test spawn path).
 
+## Lean sweep — Phase V A/B (pre-registered gate: CPU/req)
+
+Runs `20261007T224955Z` (base, pre-branch `1f2df92` binary) and
+`20261007T223621Z` (lean, `1a30aa6`). Same box, same pinning
+(refine `[0,4,3,7]`, freeze `[1,5]`, k6 `[2,6]`), VU50, ROUNDS=1,
+identical 201-session fixture, 0% errors both arms.
+
+| | base | lean | delta |
+|---|---:|---:|---:|
+| **CPU/req hot** | 0.6253 ms | **0.5165 ms** | **−17.4%** |
+| **CPU/req spread** | 0.5461 ms | **0.4831 ms** | **−11.5%** |
+| rps hot | 10,404 | 11,618 | +11.7% |
+| rps spread | 11,913 | 12,423 | +4.3% |
+| p95 hot | 9.56 ms | 8.85 ms | −7.4% |
+| p95 spread | 8.70 ms | 8.63 ms | −0.8% |
+| peak RSS | 77.8 MB | **62.1 MB** | **−20.2%** |
+| failed | 0.0% | 0.0% | — |
+
+**Gate (pre-registered in `bench/perf/LEAN-PLAN.md` §3 Phase V: CPU/req
+−10% or better): PASS** — −17.4% hot, −11.5% spread.
+
+**Co-tenant validity:** the freeze control arm ran in both rounds and moved
+only −1.5% / −3.1%, so the refine delta is not machine drift.
+
+**Honest caveats.**
+1. Two runs, not four. The 2nd/3rd interleaved rounds were cut when the
+   harness consumed the time budget (a bare `REFINE_BIN` in its import path,
+   then two orphaned imports pegging a core for 121 minutes while holding the
+   write lock). One interleaved pair satisfies the methodology; a wider
+   spread is not measured.
+2. CPU/req is derived from `cpu s / reqs` in the harness sampler, so it
+   includes the sampler's own accounting error (~±2%).
+3. rps is reported, never gated (LEAN-PLAN §1 C2: the closed-model number is
+   queueing-inflated).
+4. The fixture carries 201 sessions / 48.5k messages / 178k parts; a corpus
+   with more sessions would weight `list_wire` more heavily.
+
