@@ -1148,7 +1148,12 @@ async fn get_messages(
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(4);
     let db = st.db.clone();
     let sid = id.clone();
-    std::thread::spawn(move || {
+    // F4: the tokio blocking pool, not a per-request OS thread — every
+    // message_page request used to spawn a fresh thread (spawn+1MB VA per
+    // page under load). The producer only does sync store work + channel
+    // sends; dropping the JoinHandle keeps it detached exactly like before,
+    // and the pool caps concurrent producers (bounded-by-construction).
+    tokio::task::spawn_blocking(move || {
         let mut first = true;
         let r = refine_store::for_each_message_json(&db, &sid, walk, |chunk| {
             let framed = if first {

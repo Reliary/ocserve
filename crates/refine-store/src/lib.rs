@@ -703,60 +703,108 @@ pub fn for_each_message_json(
             }
         }
     };
-    let mut pstmt = conn.prepare(
-        "SELECT id, inline, blob_sha, byte_len FROM msg_part WHERE message_id = ?1 ORDER BY seq",
-    )?;
+    // F3 (PERF-10X): parts prefetched in chunks of 64 messages — one IN
+    // query per chunk instead of one per message (51 queries -> 1 per
+    // page; measured 11ms on the deep session, becomes the per-request
+    // floor once S-A removed the tail). Chunking (not one big query) is
+    // load-bearing: a whole-session prefetch of the 16k-message stream
+    // would hold every inline part in RAM at once — the exact OOM class
+    // the bounded channel exists for (AGENTS §2.3). Peak = 64 messages'
+    // parts. Statement prepared ONCE (fixed 64 params; trailing NULLs
+    // never match a real id).
+    const PART_CHUNK: usize = 64;
+    let placeholders = vec!["?"; PART_CHUNK].join(",");
+    let mut pstmt = conn.prepare(&format!(
+        "SELECT message_id, id, inline, blob_sha, byte_len FROM msg_part WHERE message_id IN ({placeholders}) ORDER BY message_id, seq"
+    ))?;
+    #[derive(Debug)]
+    struct PartRow {
+        id: String,
+        inline: Option<String>,
+        sha: Option<String>,
+        byte_len: i64,
+    }
     // K-EFFICIENCY (bytehound group #2): ONE reusable serializer buffer per
     // fetch — Value::to_string grew a fresh String per message/part (top
     // churn group in the profile). The frame itself is still an owned
     // String (it crosses the channel); everything nested is append-only.
     let mut ser: Vec<u8> = Vec::with_capacity(64 * 1024);
-    for (mid, info_txt) in msgs {
-        // string-only assembly: parse→merge→serialize per row, never a
-        // json!-wrapper Value tree (the wrapper roughly doubled transient
-        // churn during the 101MB stream — measured RSS 599/600MB)
-        let info: serde_json::Value = serde_json::from_str(&info_txt)?;
-        let info = merge_columns(info, &mid, session_id, None);
-        // capacity estimate: info + parts (inline lens known after query —
-        // fixed floor avoids the doubling-growth pattern on big messages)
-        let mut chunk = String::with_capacity(info_txt.len() + 8192);
-        chunk.push_str("{\"info\":");
-        ser.clear();
-        serde_json::to_writer(&mut ser, &info)?;
-        chunk.push_str(std::str::from_utf8(&ser)?);
-        chunk.push_str(",\"parts\":[");
-        let mut rows = pstmt.query([&mid])?;
-        let mut first_part = true;
-        while let Some(row) = rows.next()? {
-            let part_id: String = row.get(0)?;
-            let inline: Option<String> = row.get(1)?;
-            let sha: Option<String> = row.get(2)?;
-            let byte_len: i64 = row.get(3)?;
-            // blob parts: parse straight from bytes (skips a full
-            // lossy-String copy per blob — phase-1 churn cut)
-            let parsed = match inline {
-                Some(t) => serde_json::from_str::<serde_json::Value>(&t),
-                None => match (&sha, byte_len) {
-                    (Some(sha), len) => {
-                        let raw = blobs.get(sha, len as u64)?;
-                        serde_json::from_slice::<serde_json::Value>(&raw)
-                    }
-                    (None, _) => continue,
-                },
-            };
-            if let Ok(v) = parsed {
-                let merged = merge_columns(v, &part_id, session_id, Some(&mid));
-                if !first_part {
-                    chunk.push(',');
-                }
-                first_part = false;
-                ser.clear();
-                serde_json::to_writer(&mut ser, &merged)?;
-                chunk.push_str(std::str::from_utf8(&ser)?);
+    let mut groups: std::collections::HashMap<String, Vec<PartRow>> =
+        std::collections::HashMap::new();
+    let mut padded: Vec<Option<String>> = Vec::with_capacity(PART_CHUNK);
+    let mut msg_iter = msgs.into_iter();
+    loop {
+        // next up-to-64 messages: prefetch their parts in ONE query, then
+        // emit frames in message order (groups drained per mid).
+        let head: Vec<(String, String)> = (&mut msg_iter).take(PART_CHUNK).collect();
+        if head.is_empty() {
+            break;
+        }
+        groups.clear();
+        padded.clear();
+        for (mid, _) in &head {
+            padded.push(Some(mid.clone()));
+        }
+        while padded.len() < PART_CHUNK {
+            padded.push(None);
+        }
+        {
+            let mut rows = pstmt.query(rusqlite::params_from_iter(padded.iter()))?;
+            while let Some(row) = rows.next()? {
+                groups
+                    .entry(row.get::<_, String>(0)?)
+                    .or_default()
+                    .push(PartRow {
+                        id: row.get(1)?,
+                        inline: row.get(2)?,
+                        sha: row.get(3)?,
+                        byte_len: row.get(4)?,
+                    });
             }
         }
-        chunk.push_str("]}");
-        visit(chunk)?;
+        for (mid, info_txt) in &head {
+            // string-only assembly: parse→merge→serialize per row, never a
+            // json!-wrapper Value tree (the wrapper roughly doubled transient
+            // churn during the 101MB stream — measured RSS 599/600MB)
+            let info: serde_json::Value = serde_json::from_str(info_txt)?;
+            let info = merge_columns(info, mid, session_id, None);
+            // capacity estimate: info + parts (inline lens known after query —
+            // fixed floor avoids the doubling-growth pattern on big messages)
+            let mut chunk = String::with_capacity(info_txt.len() + 8192);
+            chunk.push_str("{\"info\":");
+            ser.clear();
+            serde_json::to_writer(&mut ser, &info)?;
+            chunk.push_str(std::str::from_utf8(&ser)?);
+            chunk.push_str(",\"parts\":[");
+            let parts = groups.remove(mid).unwrap_or_default();
+            let mut first_part = true;
+            for prow in &parts {
+                // blob parts: parse straight from bytes (skips a full
+                // lossy-String copy per blob — phase-1 churn cut)
+                let parsed = match &prow.inline {
+                    Some(t) => serde_json::from_str::<serde_json::Value>(t),
+                    None => match (&prow.sha, prow.byte_len) {
+                        (Some(sha), len) => {
+                            let raw = blobs.get(sha, len as u64)?;
+                            serde_json::from_slice::<serde_json::Value>(&raw)
+                        }
+                        (None, _) => continue,
+                    },
+                };
+                if let Ok(v) = parsed {
+                    let merged = merge_columns(v, &prow.id, session_id, Some(mid));
+                    if !first_part {
+                        chunk.push(',');
+                    }
+                    first_part = false;
+                    ser.clear();
+                    serde_json::to_writer(&mut ser, &merged)?;
+                    chunk.push_str(std::str::from_utf8(&ser)?);
+                }
+            }
+            chunk.push_str("]}");
+            visit(chunk)?;
+        }
     }
     Ok(())
 }
@@ -1993,5 +2041,65 @@ mod compaction_projection_tests {
             3,
             "compaction part adds projection"
         );
+    }
+}
+
+#[cfg(test)]
+mod f3_chunk {
+    use super::*;
+    use crate::writer::db_path;
+
+    /// Chunk-boundary BVA (TESTING §1: EP/BVA on chunk boundaries): 70
+    /// messages cross PART_CHUNK=64 — parts on msgs 1/64/65/70 must all
+    /// appear, in message order, with no duplicates or drops at either
+    /// edge of the IN batch.
+    #[test]
+    fn part_batches_cross_chunk_boundary_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db_path(dir.path());
+        let w = Writer::spawn(db.clone()).unwrap();
+        let mut ops = vec![WriteOp::Sql {
+            sql: "INSERT INTO session (id, project_id, directory, path, slug, title, version, time_created, time_updated) VALUES ('ses_c', 'global', '/w', 's', 's', 't', '1', 1, 1)".into(),
+            params: vec![],
+        }];
+        for i in 1..=70i64 {
+            ops.push(WriteOp::Sql {
+                sql: format!(
+                    "INSERT INTO msg (id, session_id, role, seq, time_created, info) VALUES ('m{i}', 'ses_c', 'user', {i}, {i}, '{{}}')"
+                ),
+                params: vec![],
+            });
+            ops.push(WriteOp::Sql {
+                sql: format!(
+                    "INSERT INTO msg_part (id, message_id, session_id, seq, type, byte_len, inline, blob_sha) VALUES ('p{i}', 'm{i}', 'ses_c', 1, 'text', 4, '{{\"type\":\"text\",\"text\":\"part{i}\"}}', NULL)"
+                ),
+                params: vec![],
+            });
+        }
+        w.write(ops).unwrap();
+        let mut frames: Vec<String> = Vec::new();
+        for_each_message_json(&db, "ses_c", MessageWalk::Seq { limit: None }, |chunk| {
+            frames.push(chunk);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(frames.len(), 70, "every message visited once");
+        for i in [1, 63, 64, 65, 70] {
+            let f = &frames[i - 1];
+            assert!(
+                f.contains(&format!("\"part{i}\"")),
+                "frame {i} must carry its part: {f}"
+            );
+            if i > 1 {
+                assert!(
+                    !f.contains(&format!("\"part{}\"", i - 1)) || i == 65,
+                    "frame {i} must not carry the previous part: {f}"
+                );
+            }
+        }
+        // exact order: seq asc inside each message (single part each) and
+        // time_created asc across frames (frame 1 = m1 ... frame 70 = m70)
+        assert!(frames[64].contains("\"part65\""), "post-boundary frame");
+        assert!(frames[63].contains("\"part64\""), "boundary frame");
     }
 }
