@@ -90,6 +90,8 @@ where
         .map_err(|e| anyhow::anyhow!("blocking task join: {e}"))?
 }
 
+pub mod tui;
+
 /// Upstream error envelope: {"name":"NotFoundError","data":{"message":"..."}} (captured live).
 pub struct ApiError {
     pub status: StatusCode,
@@ -262,6 +264,8 @@ pub struct AppState {
     pub prompt_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Question rendezvous (v1 Question service): pending asks + reply/reject.
     pub question_gate: std::sync::Arc<ocserve_core::question::QuestionGate>,
+    /// /tui/control rendezvous queues (v1 shared/tui-control.ts)
+    pub tui: crate::tui::TuiControl,
 }
 
 /// LLM endpoint resolution for the prompt runner (assembled by Runtime).
@@ -407,6 +411,7 @@ impl AppState {
             )),
             prompt_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             question_gate: ocserve_core::question::QuestionGate::new(),
+            tui: crate::tui::TuiControl::default(),
             db: w.db,
             blobs: w.blobs,
             writer: w.writer,
@@ -607,6 +612,11 @@ async fn experimental_resource() -> Json<Value> {
     Json(json!({}))
 }
 async fn experimental_workspace() -> Json<Value> {
+    Json(json!([]))
+}
+
+/// GET /experimental/workspace/status — freeze: `[]` 200 (probed live).
+async fn experimental_workspace_status() -> Json<Value> {
     Json(json!([]))
 }
 async fn formatter_list() -> Json<Value> {
@@ -3586,6 +3596,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/reference", get(get_api_reference))
         .route("/experimental/resource", get(experimental_resource))
         .route("/experimental/workspace", get(experimental_workspace))
+        // TUI attach calls this at boot (observed live 2026-10-08); freeze
+        // answers [] with 200 under an empty workspace state.
+        .route(
+            "/experimental/workspace/status",
+            get(experimental_workspace_status),
+        )
         .route("/formatter", get(formatter_list))
         .route("/lsp", get(lsp_list))
         .route("/project/{id}/directories", get(project_directories))
@@ -3621,6 +3637,38 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::delete(delete_part_route).patch(patch_part_route),
         )
         .route("/experimental/session", get(get_experimental_sessions))
+        // /tui/* — external-controller ingress (PLAN §17; VS Code extension)
+        .route(
+            "/tui/append-prompt",
+            axum::routing::post(tui::append_prompt),
+        )
+        .route("/tui/open-help", axum::routing::post(tui::open_help))
+        .route(
+            "/tui/open-sessions",
+            axum::routing::post(tui::open_sessions),
+        )
+        .route("/tui/open-themes", axum::routing::post(tui::open_themes))
+        .route("/tui/open-models", axum::routing::post(tui::open_models))
+        .route(
+            "/tui/submit-prompt",
+            axum::routing::post(tui::submit_prompt),
+        )
+        .route("/tui/clear-prompt", axum::routing::post(tui::clear_prompt))
+        .route(
+            "/tui/execute-command",
+            axum::routing::post(tui::execute_command),
+        )
+        .route("/tui/show-toast", axum::routing::post(tui::show_toast))
+        .route("/tui/publish", axum::routing::post(tui::publish_event))
+        .route(
+            "/tui/select-session",
+            axum::routing::post(tui::select_session),
+        )
+        .route("/tui/control/next", get(tui::control_next))
+        .route(
+            "/tui/control/response",
+            axum::routing::post(tui::control_response),
+        )
         .route("/mcp", get(get_mcp))
         .route("/permission", get(get_permissions))
         .route(

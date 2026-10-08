@@ -17,6 +17,15 @@ hook (`.githooks/pre-commit`).
 | `m2/llm_stream_*.bin` | Recorded OpenAI-compatible SSE streams — now living in `crates/ocserve-llm/testdata/` so the crate packages independently | Not bit-identical (provider output varies); the *shape* is what tests assert |
 | `m2/session_fixture.json`, `prompt_response.json`, `tool_fixture.json` | Prompt-contract captures: message/part shapes as upstream emits them | Yes — re-capture via a prompt against upstream |
 
+## Routes not carried in the corpus
+
+`/tui/*` (external-controller ingress) is event-shaped: every endpoint
+answers `true` and publishes onto the global SSE stream. Its contract is
+asserted in `crates/ocserve-http/tests/tui.rs` against semantics probed live
+from freeze 1.18.31 (2026-10-08), including the upstream quirks (open-themes
+publishes `session.list`; unknown execute-command publishes empty
+properties; toast duration defaults 5000).
+
 ## Privacy rules (binding)
 
 1. **No real session ids.** Every `ses_*` in this tree is either a placeholder
