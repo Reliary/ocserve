@@ -48,6 +48,38 @@ fn read_json(path: &Path) -> Result<Value> {
     serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
 }
 
+/// Global config read with upstream parity (config.ts: missing file → empty,
+/// unreadable/corrupt → "using defaults" + continue). Found by CI 2026-10-08:
+/// `serve` on a bare machine (no `~/.config/opencode/opencode.json`) died at
+/// boot — a fresh install of the drop-in server must start with defaults, and
+/// upstream treats both cases as defaults, never as fatal. Per-user errors
+/// stay loud: the missing/corrupt file is logged with its path.
+fn read_global_config(path: &Path) -> Value {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    "global config unreadable ({}), using defaults: {e}",
+                    path.display()
+                );
+                json!({})
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!("no global config at {} — using defaults", path.display());
+            json!({})
+        }
+        Err(e) => {
+            tracing::warn!(
+                "global config unreadable ({}), using defaults: {e}",
+                path.display()
+            );
+            json!({})
+        }
+    }
+}
+
 /// models catalog read with upstream self-heal semantics (models-dev.ts
 /// loadFromDisk): unreadable/corrupt → remove best-effort + treat missing
 /// so the hourly refresh refetches. NEVER fails the caller — a broken cache
@@ -528,7 +560,7 @@ impl Runtime {
         // K-MODELS: OPENCODE_MODELS_URL/_PATH aware (upstream read precedence)
         let cache_path = crate::models_dev::read_path();
 
-        let mut raw_config = read_json(&config_path)?;
+        let mut raw_config = read_global_config(&config_path);
         // W4 overlay: a ocserve-owned patch file (OCSERVE_CONFIG_WRITE=overlay
         // writes it) deep-merges OVER the shared opencode.json on every load —
         // never mutates the user's other server's config unless told to.
@@ -1448,6 +1480,39 @@ mod b2_public_tier_tests {
         other.insert("paid".into(), json!({"cost": {"input": 9.0}}));
         apply_public_tier_filter("deepseek", false, &mut other);
         assert_eq!(other.len(), 1, "non-opencode providers never filtered");
+    }
+}
+
+#[cfg(test)]
+mod bare_machine_tests {
+    use super::*;
+
+    /// CI 2026-10-08: `serve` on a bare machine (no ~/.config/opencode) died
+    /// at boot with "load runtime config" — a fresh install must start with
+    /// defaults (upstream parity: config.ts logs "using defaults" and
+    /// continues). The regression this guards: read_json(config)? was fatal.
+    #[test]
+    fn missing_global_config_reads_as_defaults_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("opencode.json");
+        assert_eq!(read_global_config(&missing), json!({}));
+    }
+
+    #[test]
+    fn corrupt_global_config_reads_as_defaults_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("opencode.json");
+        std::fs::write(&bad, "{ not json").unwrap();
+        assert_eq!(read_global_config(&bad), json!({}), "warn + defaults");
+        assert!(bad.exists(), "server never deletes the user's config file");
+    }
+
+    #[test]
+    fn valid_global_config_is_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("opencode.json");
+        std::fs::write(&good, r#"{"theme":"dark"}"#).unwrap();
+        assert_eq!(read_global_config(&good)["theme"], "dark");
     }
 }
 
