@@ -30,7 +30,7 @@ your own box rather than trusting them.
 ```sh
 cargo install ocserve          # Rust toolchain
 # or grab a release binary:
-#   https://github.com/alderpath/ocserve/releases
+#   https://github.com/Reliary/ocserve/releases
 ```
 
 ## Run

@@ -18,8 +18,8 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.98"
-repository = "https://github.com/alderpath/ocserve"
-homepage = "https://github.com/alderpath/ocserve"
+repository = "https://github.com/Reliary/ocserve"
+homepage = "https://github.com/Reliary/ocserve"
 keywords = ["opencode", "server", "sqlite", "sse", "api"]
 categories = ["web-programming::http-server", "database-implementations", "development-tools"]
 
