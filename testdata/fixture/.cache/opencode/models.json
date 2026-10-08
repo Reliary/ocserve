@@ -1,0 +1,24 @@
+{
+  "stub": {
+    "id": "stub",
+    "name": "Parity Stub",
+    "npm": "@ai-sdk/openai-compatible",
+    "api": "http://127.0.0.1:9/v1",
+    "env": [],
+    "models": {
+      "stub-1": {
+        "id": "stub-1",
+        "name": "Stub One",
+        "family": "stub",
+        "release_date": "2026-01-01",
+        "attachment": false,
+        "reasoning": false,
+        "temperature": true,
+        "tool_call": true,
+        "cost": { "input": 0.1, "output": 0.2, "cache_read": 0.05, "cache_write": 0.05 },
+        "limit": { "context": 200000, "output": 8192 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      }
+    }
+  }
+}

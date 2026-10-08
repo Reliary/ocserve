@@ -44,7 +44,19 @@ trap cleanup EXIT
 # production path).
 pkill -f "/tmp/ocserve-repl" 2>/dev/null || true
 
-setsid env OCSERVE_DATA_DIR="$DATA" OCSERVE_LEGACY_SYNC=0 "$BIN" serve \
+# Fixture HOME (2026-10-08, CI finding): the recorded corpus encodes
+# config-derived routes (agent/command keys, /config/providers defaults,
+# /mcp statuses), so the corpus oracle only holds under a config that
+# carries those keys. Booting with the ambient HOME made this gate
+# machine-dependent: green on a developer box, red on a bare runner whose
+# HOME has no opencode config. The COMMITTED fixture (testdata/fixture,
+# recorded by scripts/record-corpus.sh) is the one the corpus was recorded
+# under, so the gate means the same thing everywhere and on CI.
+FH="$DATA/fixture-home"
+cp -r "$PWD/testdata/fixture" "$FH"
+
+setsid env HOME="$FH" OCSERVE_DATA_DIR="$DATA" OCSERVE_LEGACY_SYNC=0 \
+  OPENCODE_DISABLE_MODELS_FETCH=1 "$BIN" serve \
   --port "$PORT" >/dev/null 2>&1 &
 PID=$!
 

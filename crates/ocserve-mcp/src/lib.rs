@@ -471,7 +471,9 @@ pub struct McpHub {
     statuses: parking_lot::Mutex<HashMap<String, (String, Option<String>)>>,
     /// lazy tool-schema cache (populated on first prompt; listChanged=false)
     tools_cache: parking_lot::Mutex<Option<Vec<Value>>>,
-    /// enabled configs retained so connect can respawn a disconnected server
+    /// ALL configs retained (incl. disabled): connect reads enabled ones,
+    /// and statuses() enumerates configured-but-disabled like freeze does
+    /// (mcp/index.ts:599-604: absent from s.status => {status:"disabled"}).
     cfgs: parking_lot::Mutex<Vec<ServerCfg>>,
 }
 
@@ -480,7 +482,7 @@ impl McpHub {
     /// Failures are captured, never fatal (upstream: status map, §1146).
     pub async fn probe_all(cfgs: &[ServerCfg]) -> McpHub {
         let hub = McpHub::default();
-        *hub.cfgs.lock() = cfgs.iter().filter(|c| c.enabled).cloned().collect();
+        *hub.cfgs.lock() = cfgs.to_vec();
         for cfg in cfgs.iter().filter(|c| c.enabled) {
             match McpClient::connect(cfg).await {
                 Ok(mut client) => match client.initialize().await {
@@ -590,6 +592,18 @@ impl McpHub {
     /// Freeze route shape: {name: {status, error?}} (§1146).
     pub fn statuses(&self) -> Value {
         let mut out = serde_json::Map::new();
+        // freeze parity (v1 mcp/index.ts:599-604): every CONFIGURED server is
+        // listed; one with no recorded status reads `{status:"disabled"}`
+        // (disabled configs never probe, so they land here).
+        let known: std::collections::HashSet<String> =
+            self.statuses.lock().keys().cloned().collect();
+        for cfg in self.cfgs.lock().iter() {
+            if !known.contains(&cfg.name) {
+                let mut v = serde_json::Map::new();
+                v.insert("status".into(), json!("disabled"));
+                out.insert(cfg.name.clone(), Value::Object(v));
+            }
+        }
         for (name, (status, err)) in self.statuses.lock().iter() {
             let mut v = serde_json::Map::new();
             v.insert("status".into(), json!(status));

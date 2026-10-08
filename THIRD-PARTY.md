@@ -33,3 +33,13 @@ SOFTWARE.
 ```
 
 Upstream project: `github.com/anomalyco/opencode`.
+
+## Embedded prompt assets
+
+`crates/ocserve-cli/assets/*.txt` (initialize, review, compaction, explore,
+summary, title) and `customize-opencode.txt` are prompt/skill bodies that
+originate from the upstream project's MIT-licensed source
+(`packages/core/src/plugin/skill/customize-opencode.md` and the v1 prompt
+templates) or are captured from its wire responses; the notice above covers
+them. They are embedded so the built-in commands and skills behave
+byte-equivalently to the frozen upstream.

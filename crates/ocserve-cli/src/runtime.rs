@@ -959,6 +959,16 @@ fn merge_agent(item: &mut Value, value: &Value) {
 fn build_commands(cfg: &Value) -> Result<Vec<Value>> {
     let init = include_str!("../assets/initialize.txt");
     let review = include_str!("../assets/review.txt");
+    // Built-in skill command (freeze parity): v1 skill/index.ts registers
+    // `customize-opencode` unconditionally and command/index.ts:134 exposes
+    // it through /command with source "skill". Content is the upstream MIT
+    // skill body (THIRD-PARTY.md carries the notice).
+    let customize = include_str!("../assets/customize-opencode.txt");
+    const CUSTOMIZE_DESC: &str = "Use ONLY when the user is editing or creating opencode's own configuration: \
+         opencode.json, opencode.jsonc, files under .opencode/, or files under \
+         ~/.config/opencode/. Also use when creating or fixing opencode agents, subagents, \
+         skills, plugins, MCP servers, or permission rules. Do not use for the user's own \
+         application code, or for any project that is not configuring opencode itself.";
     let hints_of = |template: &str| -> Vec<String> {
         let mut hints: Vec<String> = Vec::new();
         let mut rest = template;
@@ -986,6 +996,10 @@ fn build_commands(cfg: &Value) -> Result<Vec<Value>> {
         json!({
             "name": "review", "description": "Code review", "source": "command",
             "template": review, "hints": hints_of(review),
+        }),
+        json!({
+            "name": "customize-opencode", "description": CUSTOMIZE_DESC, "source": "skill",
+            "template": customize, "hints": <Vec<String>>::new(),
         }),
     ];
     if let Some(commands) = cfg.get("command").and_then(|v| v.as_object()) {
