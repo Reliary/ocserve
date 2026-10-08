@@ -79,9 +79,16 @@ fn consider(best: &mut Option<(Encoding, f32)>, enc: Encoding, q: f32) {
     if q <= 0.0 {
         return;
     }
-    match best {
-        Some((_, bq)) if *bq >= q => {}
-        _ => *best = Some((enc, q)),
+    // Tie-break by encoding quality, not header order: browsers send
+    // `gzip, deflate, br, zstd` (gzip first), but brotli is universally
+    // smaller — RFC 9110 §12.5.3 lets the server choose among equal q. A
+    // strictly higher q still wins.
+    let better = match best {
+        None => true,
+        Some((cur, bq)) => q > *bq || (q == *bq && *cur == Encoding::Gzip && enc == Encoding::Brotli),
+    };
+    if better {
+        *best = Some((enc, q));
     }
 }
 
@@ -94,7 +101,7 @@ pub fn compress(data: &[u8], enc: Encoding) -> Vec<u8> {
         Encoding::Gzip => {
             use flate2::write::GzEncoder;
             use std::io::Write as _;
-            let mut e = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            let mut e = GzEncoder::new(Vec::new(), flate2::Compression::default());
             // write_all to a Vec cannot fail.
             if e.write_all(data).is_err() {
                 return data.to_vec();
@@ -220,8 +227,9 @@ mod tests {
         assert_eq!(negotiate(Some("")), None);
         assert_eq!(negotiate(Some("gzip")), Some(Encoding::Gzip));
         assert_eq!(negotiate(Some("br")), Some(Encoding::Brotli));
-        // br preferred on tie (listed first, equal q → first wins)
+        // br preferred on tie regardless of header order (quality tie-break)
         assert_eq!(negotiate(Some("br, gzip")), Some(Encoding::Brotli));
+        assert_eq!(negotiate(Some("gzip, deflate, br, zstd")), Some(Encoding::Brotli));
         // explicit q wins
         assert_eq!(
             negotiate(Some("br;q=0.5, gzip;q=1.0")),
