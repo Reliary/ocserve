@@ -1,6 +1,6 @@
 {
  "session": {
-  "id": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+  "id": "ses_000000000000AAAAAAAAAAAAAA",
   "slug": "stellar-orchid",
   "projectID": "global",
   "directory": "~",
@@ -26,7 +26,7 @@
   {
    "info": {
     "id": "msg_0fa1e3f770014jHIfQNh0Lhiu3",
-    "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+    "sessionID": "ses_000000000000AAAAAAAAAAAAAA",
     "role": "user",
     "time": {
      "created": 1790902681463
@@ -43,7 +43,7 @@
    "parts": [
     {
      "id": "prt_0fa1e3f83001JiHmClmYNlen2r",
-     "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+     "sessionID": "ses_000000000000AAAAAAAAAAAAAA",
      "messageID": "msg_0fa1e3f770014jHIfQNh0Lhiu3",
      "type": "text",
      "text": "Reply with exactly: HELLO_OCSERVE"
@@ -53,7 +53,7 @@
   {
    "info": {
     "id": "msg_0fa1e40320021uzxinLPieHWUJ",
-    "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+    "sessionID": "ses_000000000000AAAAAAAAAAAAAA",
     "role": "assistant",
     "time": {
      "created": 1790902681650,
@@ -84,13 +84,13 @@
    "parts": [
     {
      "id": "prt_0fa1e4b11001nq7GD4aaMgEhbd",
-     "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+     "sessionID": "ses_000000000000AAAAAAAAAAAAAA",
      "messageID": "msg_0fa1e40320021uzxinLPieHWUJ",
      "type": "step-start"
     },
     {
      "id": "prt_0fa1e4b25001wzf7iBoGuNGm2E",
-     "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+     "sessionID": "ses_000000000000AAAAAAAAAAAAAA",
      "messageID": "msg_0fa1e40320021uzxinLPieHWUJ",
      "type": "text",
      "text": "HELLO_OCSERVE",
@@ -101,7 +101,7 @@
     },
     {
      "id": "prt_0fa1e4b300016vTkLM1ca17Ary",
-     "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+     "sessionID": "ses_000000000000AAAAAAAAAAAAAA",
      "messageID": "msg_0fa1e40320021uzxinLPieHWUJ",
      "type": "step-finish",
      "reason": "stop",

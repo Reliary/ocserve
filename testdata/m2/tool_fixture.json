@@ -1,6 +1,6 @@
 {
  "session": {
-  "id": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+  "id": "ses_000000000000BBBBBBBBBBBBBB",
   "slug": "mighty-river",
   "projectID": "global",
   "directory": "<HOMEPATH>",
@@ -26,7 +26,7 @@
   {
    "info": {
     "id": "msg_0fa4712af001cfaoPgl4FbqQsX",
-    "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+    "sessionID": "ses_000000000000BBBBBBBBBBBBBB",
     "role": "user",
     "time": {
      "created": 1790905356975
@@ -43,7 +43,7 @@
    "parts": [
     {
      "id": "prt_0fa4712b7001pQLJxGJmZ7vjVh",
-     "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+     "sessionID": "ses_000000000000BBBBBBBBBBBBBB",
      "messageID": "msg_0fa4712af001cfaoPgl4FbqQsX",
      "type": "text",
      "text": "Run `echo TOOL_OK` with the bash tool, then reply with the output you saw. You must use the bash tool."
@@ -53,7 +53,7 @@
   {
    "info": {
     "id": "msg_0fa471325001oGI2F5v1qfV2Bs",
-    "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+    "sessionID": "ses_000000000000BBBBBBBBBBBBBB",
     "role": "assistant",
     "time": {
      "created": 1790905357093,
@@ -84,13 +84,13 @@
    "parts": [
     {
      "id": "prt_0fa471a6c001rJ5mf5JeHxQntp",
-     "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+     "sessionID": "ses_000000000000BBBBBBBBBBBBBB",
      "messageID": "msg_0fa471325001oGI2F5v1qfV2Bs",
      "type": "step-start"
     },
     {
      "id": "prt_0fa471a82001l4z0kQBD5jMoID",
-     "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+     "sessionID": "ses_000000000000BBBBBBBBBBBBBB",
      "messageID": "msg_0fa471325001oGI2F5v1qfV2Bs",
      "type": "reasoning",
      "text": "The user asked me to run `echo TOOL_OK` with the bash tool. But there's a plan mode system reminder that says I'm in read-only phase and cannot modify files. However, running `echo TOOL_OK` is a read-only operation - it just prints text, it doesn't modify anything. The plan mode says commands may ONLY read/inspect. `echo TOOL_OK` doesn't modify anything, it's just printing to stdout.\n\nThis is a simple verification request. Let me run it.",
@@ -101,7 +101,7 @@
     },
     {
      "id": "prt_0fa471b9f001whGT6tORio5xxN",
-     "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+     "sessionID": "ses_000000000000BBBBBBBBBBBBBB",
      "messageID": "msg_0fa471325001oGI2F5v1qfV2Bs",
      "type": "tool",
      "callID": "call_e6995cbecb9745e290f8518d",
@@ -126,7 +126,7 @@
     },
     {
      "id": "prt_0fa471c3c001UE5kM5sV2Axxxn",
-     "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+     "sessionID": "ses_000000000000BBBBBBBBBBBBBB",
      "messageID": "msg_0fa471325001oGI2F5v1qfV2Bs",
      "type": "step-finish",
      "reason": "tool-calls",
@@ -147,7 +147,7 @@
   {
    "info": {
     "id": "msg_0fa471ce9002WfpWXTmlP2T5Zt",
-    "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+    "sessionID": "ses_000000000000BBBBBBBBBBBBBB",
     "role": "assistant",
     "time": {
      "created": 1790905359594,
@@ -178,13 +178,13 @@
    "parts": [
     {
      "id": "prt_0fa4721b20017QuFJiU5HdHZvg",
-     "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+     "sessionID": "ses_000000000000BBBBBBBBBBBBBB",
      "messageID": "msg_0fa471ce9002WfpWXTmlP2T5Zt",
      "type": "step-start"
     },
     {
      "id": "prt_0fa4721c0001GYM40tNWAV4fSi",
-     "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+     "sessionID": "ses_000000000000BBBBBBBBBBBBBB",
      "messageID": "msg_0fa471ce9002WfpWXTmlP2T5Zt",
      "type": "text",
      "text": "TOOL_OK",
@@ -195,7 +195,7 @@
     },
     {
      "id": "prt_0fa4721cb001n9Z3OnzeamZ4yK",
-     "sessionID": "ses_f05b8ed66ffeoqBnykx3hvKOdj",
+     "sessionID": "ses_000000000000BBBBBBBBBBBBBB",
      "messageID": "msg_0fa471ce9002WfpWXTmlP2T5Zt",
      "type": "step-finish",
      "reason": "stop",

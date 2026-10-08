@@ -27,13 +27,13 @@
   },
   "finish": "stop",
   "id": "msg_0fa1e40320021uzxinLPieHWUJ",
-  "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD"
+  "sessionID": "ses_000000000000AAAAAAAAAAAAAA"
  },
  "parts": [
   {
    "type": "step-start",
    "id": "prt_0fa1e4b11001nq7GD4aaMgEhbd",
-   "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+   "sessionID": "ses_000000000000AAAAAAAAAAAAAA",
    "messageID": "msg_0fa1e40320021uzxinLPieHWUJ"
   },
   {
@@ -44,7 +44,7 @@
     "end": 1790902684460
    },
    "id": "prt_0fa1e4b25001wzf7iBoGuNGm2E",
-   "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+   "sessionID": "ses_000000000000AAAAAAAAAAAAAA",
    "messageID": "msg_0fa1e40320021uzxinLPieHWUJ"
   },
   {
@@ -62,7 +62,7 @@
    },
    "cost": 0.003958926,
    "id": "prt_0fa1e4b300016vTkLM1ca17Ary",
-   "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
+   "sessionID": "ses_000000000000AAAAAAAAAAAAAA",
    "messageID": "msg_0fa1e40320021uzxinLPieHWUJ"
   }
  ]
