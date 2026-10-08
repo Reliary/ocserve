@@ -108,6 +108,8 @@ step "backup drill (VACUUM INTO + integrity + counts)" bash -c "$(declare -f dri
 #      (decision record: bench/normalizer-spike/D1-PLAN.md — user call after
 #      Phase-3 probe; 20.3 MB still 9x smaller than upstream's 185 MB ELF;
 #      tripwire re-baselined from measurement, thresholds never moved to fit)
+#     K-PTY/K-REVERT/SDK-route batch: 21,124,176 B measured 2026-10-08
+#      (pty crate + compat routes) → ceiling 21,500,000 B unchanged (fits)
 size_gate() {
   local bin="target/release/ocserve"
   if [ ! -x "$bin" ]; then

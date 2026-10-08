@@ -540,6 +540,79 @@ pub fn last_message(
     last_message_conn(&conn, session_id, &blobs_root)
 }
 
+/// Single message WITH parts, or None (v1 `GET /session/{id}/message/{mid}`
+/// → {info, parts}; unknown id → 404 NotFoundError envelope).
+pub fn message_by_id(
+    db: &std::path::Path,
+    session_id: &str,
+    message_id: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let conn = pragma::open_reader(db)?;
+    let blobs_root = db
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("db parent"))?
+        .join("blobs");
+    message_by_id_conn(&conn, session_id, message_id, &blobs_root)
+}
+
+pub fn message_by_id_conn(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    message_id: &str,
+    blobs_root: &std::path::Path,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let row: Option<String> = conn
+        .query_row(
+            "SELECT info FROM msg WHERE id = ?1 AND session_id = ?2",
+            (message_id, session_id),
+            |r| r.get(0),
+        )
+        .ok();
+    let Some(info_txt) = row else {
+        return Ok(None);
+    };
+    let info: serde_json::Value = serde_json::from_str(&info_txt)?;
+    let info = merge_columns(info, message_id, session_id, None);
+    let parts = load_parts_for_message(conn, message_id, session_id, blobs_root)?;
+    Ok(Some(serde_json::json!({"info": info, "parts": parts})))
+}
+
+/// Parts for one message (inline read; blob spilled parts decompressed) —
+/// same row/merge path as `load_messages` (byte parity by construction).
+fn load_parts_for_message(
+    conn: &rusqlite::Connection,
+    message_id: &str,
+    session_id: &str,
+    blobs_root: &std::path::Path,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let blobs = crate::blob::BlobStore::new(blobs_root.to_path_buf())?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, inline, blob_sha, byte_len FROM msg_part WHERE message_id = ?1 ORDER BY seq",
+    )?;
+    let rows: Vec<(String, Option<String>, Option<String>, i64)> = stmt
+        .query_map([message_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    let mut out = Vec::with_capacity(rows.len());
+    for (part_id, inline, sha, byte_len) in rows {
+        let txt = match inline {
+            Some(t) => t,
+            None => match (&sha, byte_len) {
+                (Some(sha), len) => {
+                    String::from_utf8_lossy(&blobs.get(sha, len as u64)?).into_owned()
+                }
+                (None, _) => continue,
+            },
+        };
+        if let Ok(v) = serde_json::from_str(&txt) {
+            out.push(merge_columns(v, &part_id, session_id, Some(message_id)));
+        }
+    }
+    Ok(out)
+}
+
 /// `last_message` on an EXISTING connection (preflight: zero extra opens).
 pub fn last_message_conn(
     conn: &rusqlite::Connection,
@@ -1287,7 +1360,7 @@ pub fn load_session_wire(
         "SELECT id, project_id, directory, path, slug, title, version, agent, model, cost,
                 summary_additions, summary_deletions, summary_files,
                 tokens_input, tokens_output, tokens_reasoning,
-                tokens_cache_read, tokens_cache_write, time_created, time_updated
+                tokens_cache_read, tokens_cache_write, time_created, time_updated, revert
          FROM session WHERE id = ?1",
     )?;
     let rows = stmt.query_map([session_id], |r| {
@@ -1312,9 +1385,61 @@ pub fn load_session_wire(
                 "cache": {"read": r.get::<_, i64>(16)?, "write": r.get::<_, i64>(17)?},
             },
             "time": {"created": r.get::<_, i64>(18)?, "updated": r.get::<_, i64>(19)?},
+            "revert": r.get::<_, Option<String>>(20)?
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .unwrap_or(serde_json::Value::Null),
         }))
     })?;
     Ok(rows.filter_map(|r| r.ok()).next())
+}
+
+/// K-REVERT: set/clear the session `revert` marker (stored as JSON text).
+pub fn set_session_revert(
+    writer: &Writer,
+    session_id: &str,
+    revert: Option<&serde_json::Value>,
+) -> anyhow::Result<usize> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    match revert {
+        Some(v) => writer.write(vec![WriteOp::Sql {
+            sql: "UPDATE session SET revert = ?2, time_updated = ?3 WHERE id = ?1".into(),
+            params: vec![session_id.into(), v.to_string().into(), now.into()],
+        }]),
+        None => writer.write(vec![WriteOp::Sql {
+            sql: "UPDATE session SET revert = NULL, time_updated = ?2 WHERE id = ?1".into(),
+            params: vec![session_id.into(), now.into()],
+        }]),
+    }
+}
+
+/// Messages from `message_id` onward (revert range computation; v1 slices
+/// the message list from the revert target's index).
+pub fn messages_from(
+    db: &std::path::Path,
+    session_id: &str,
+    message_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let conn = pragma::open_reader(db)?;
+    let target: Option<i64> = conn
+        .query_row(
+            "SELECT time_created FROM msg WHERE id = ?1 AND session_id = ?2",
+            (message_id, session_id),
+            |r| r.get(0),
+        )
+        .ok();
+    let Some(t) = target else { return Ok(vec![]) };
+    let mut stmt = conn.prepare_cached(
+        "SELECT id FROM msg WHERE session_id = ?1 AND (time_created > ?2 OR (time_created = ?2 AND id >= ?3)) \
+         ORDER BY time_created, id",
+    )?;
+    let out = stmt
+        .query_map((session_id, t, message_id), |r| r.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(out)
 }
 
 /// Online backup (STORAGE §5): `VACUUM INTO` — consistent snapshot, source

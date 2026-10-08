@@ -1,0 +1,26 @@
+[Unit]
+# Loopback alias: the opencode web UI (hosted app.opencode.ai and the
+# README quickstart) dials http://localhost:4096; the live unit serves on
+# 4912 (oc-remote + tailnet forward). This forwarder makes the documented
+# port work locally without touching the primary listener.
+# PartOf: stop/start together with ocserve.service.
+Description=ocserve web-UI loopback forward (4096 -> 4912)
+PartOf=ocserve.service
+After=ocserve.service
+
+[Service]
+Type=simple
+# wait for ocserve to accept connections (30 x 1s, upstream tailscale pattern)
+ExecStartPre=/usr/bin/bash -c 'for _ in {1..30}; do timeout 1 bash -c "</dev/tcp/127.0.0.1/4912" && exit 0; sleep 1; done; exit 1'
+ExecStart=/usr/bin/socat TCP-LISTEN:4096,bind=127.0.0.1,fork,reuseaddr TCP:127.0.0.1:4912
+Restart=on-failure
+RestartSec=2
+StartLimitBurst=5
+StartLimitIntervalSec=60
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

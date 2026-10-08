@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -33,7 +33,8 @@ CREATE TABLE session (
     time_created  INTEGER NOT NULL,
     time_updated  INTEGER NOT NULL,
     version_dirt  INTEGER NOT NULL DEFAULT 0,
-    permission    TEXT
+    permission    TEXT,
+    revert        TEXT
 ) STRICT;
 
 CREATE INDEX idx_session_updated ON session(time_updated DESC);
@@ -557,6 +558,26 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                 )?;
                 conn.execute_batch("COMMIT")?;
                 tracing::info!("migrate v9->v10: committed");
+            }
+            10 => {
+                // v10->v11: session revert marker (K-REVERT). The v1 revert
+                // route sets {messageID, partID?, snapshot?, diff?} on the
+                // session info and unrevert clears it; file-level snapshot
+                // restore is the snapshot engine (out of MVP, divergence
+                // D-REVERT-NOSNAP). Column stored as JSON text.
+                // Guard: idempotent when a test rewinds user_version without
+                // dropping the column (the version gate normally prevents
+                // re-runs; the guard keeps rewind-based arms composable).
+                let has: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM pragma_table_info('session') WHERE name = 'revert'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                if has == 0 {
+                    conn.execute_batch("ALTER TABLE session ADD COLUMN revert TEXT;")?;
+                }
             }
             other => {
                 bail!(

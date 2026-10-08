@@ -10,6 +10,7 @@ members = [
     "crates/ocserve-plugin",
     "crates/ocserve-importer",
     "crates/ocserve-metrics",
+    "crates/ocserve-pty",
     "crates/ocserve-cli",
 ]
 
@@ -33,11 +34,12 @@ ocserve-tools = { path = "crates/ocserve-tools", version = "0.1.0" }
 ocserve-mcp = { path = "crates/ocserve-mcp", version = "0.1.0" }
 ocserve-plugin = { path = "crates/ocserve-plugin", version = "0.1.0" }
 ocserve-metrics = { path = "crates/ocserve-metrics", version = "0.1.0" }
+ocserve-pty = { path = "crates/ocserve-pty", version = "0.1.0" }
 ocserve-importer = { path = "crates/ocserve-importer", version = "0.1.0" }
 
 # runtime / web
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs", "io-util", "net"] }
-axum = { version = "0.8", features = ["json"] }
+axum = { version = "0.8", features = ["json", "ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 hyper = "1"

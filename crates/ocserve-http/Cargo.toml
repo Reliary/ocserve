@@ -12,6 +12,7 @@ readme = "README.md"
 description = "axum router, auth, byte-golden SSE, error envelope"
 
 [dependencies]
+ocserve-pty = { workspace = true }
 rusqlite = { workspace = true }
 anyhow.workspace = true
 thiserror.workspace = true

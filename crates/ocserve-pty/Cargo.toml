@@ -1,0 +1,18 @@
+[package]
+name = "ocserve-pty"
+description = "ocserve PTY session manager (terminal routes, freeze-parity)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+ocserve-core = { workspace = true }
+serde_json.workspace = true
+tracing.workspace = true
+tokio = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

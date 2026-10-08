@@ -90,6 +90,7 @@ where
         .map_err(|e| anyhow::anyhow!("blocking task join: {e}"))?
 }
 
+pub mod pty;
 pub mod tui;
 pub mod ui;
 
@@ -269,6 +270,8 @@ pub struct AppState {
     pub tui: crate::tui::TuiControl,
     /// Web-UI reverse proxy (Phase 7; upstream serveUIEffect parity)
     pub ui: crate::ui::UiProxy,
+    /// PTY sessions (/pty/* — web-UI terminal)
+    pub pty: std::sync::Arc<ocserve_pty::PtyManager>,
     /// User CORS allowlist (config `server.cors` + `--cors`), read once at boot
     pub cors_extra: Vec<String>,
 }
@@ -388,6 +391,20 @@ impl AppState {
             .map(|v| v == "0")
             .unwrap_or(false);
         let wire_map = rebuild_wire(&p, wire_off);
+        let bus = ocserve_core::EventBus::new();
+        let pty = {
+            let mgr = ocserve_pty::PtyManager::new(worktree.clone());
+            let bus_for_pty = bus.clone();
+            let dir_for_pty = worktree.clone();
+            mgr.set_event_sink(std::sync::Arc::new(move |event_type, properties| {
+                bus_for_pty.publish(ocserve_core::event::frame(
+                    &dir_for_pty,
+                    event_type,
+                    properties,
+                ));
+            }));
+            mgr
+        };
         Arc::new(Self {
             payloads: parking_lot::RwLock::new(p),
             wire: parking_lot::RwLock::new(wire_map),
@@ -404,7 +421,7 @@ impl AppState {
             }),
             auth,
             requests: std::sync::atomic::AtomicU64::new(0),
-            bus: ocserve_core::EventBus::new(),
+            bus,
             gate: ocserve_core::PermissionGate::new(),
             mcp: std::sync::OnceLock::new(),
             plugins: std::sync::OnceLock::new(),
@@ -418,6 +435,7 @@ impl AppState {
             question_gate: ocserve_core::question::QuestionGate::new(),
             tui: crate::tui::TuiControl::default(),
             ui: crate::ui::UiProxy::from_env(),
+            pty,
             cors_extra: read_cors_env(),
             db: w.db,
             blobs: w.blobs,
@@ -1854,6 +1872,320 @@ async fn global_dispose(State(st): State<Arc<AppState>>) -> Result<Json<Value>, 
         tracing::warn!("payload reload failed: {e:#}");
     }
     tracing::info!("global dispose: emitted + payloads reloaded");
+    Ok(Json(json!(true)))
+}
+
+/// POST /session/{id}/revert — v1 reverts to {messageID, partID?}: the
+/// session info carries a `revert` marker; the message list is sliced from
+/// the target (synchronous slice — v1 removes rows lazily via `cleanup`
+/// before the next prompt; ocserve marks only, so history survives until
+/// the next prompt's filter step). Snapshot restore is engine-out
+/// (D-REVERT-NOSNAP): `snapshot`/`diff` fields are not populated.
+async fn post_revert(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(payload): Json<Value>,
+) -> Result<axum::response::Response, ApiError> {
+    let exists_id = id.clone();
+    if !run_blocking(&st.db, move |db| {
+        ocserve_store::session_exists(db, &exists_id)
+    })
+    .await
+    .map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })? {
+        return Err(ApiError::not_found(format!("Session not found: {id}")));
+    }
+    let message_id = payload
+        .get("messageID")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if message_id.is_empty() {
+        // freeze shape: {"name":"BadRequest","data":{"message":...,
+        // "kind":"Payload"}} — probed 2026-10-08.
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "name": "BadRequest",
+                "data": {
+                    "message": "Missing key\n  at [\"messageID\"]",
+                    "kind": "Payload"
+                }
+            })),
+        )
+            .into_response());
+    }
+    let part_id = payload.get("partID").cloned();
+    let mut marker = json!({"messageID": message_id});
+    if let Some(p) = part_id
+        && !p.is_null()
+    {
+        marker["partID"] = p;
+    }
+    ocserve_store::set_session_revert(&st.writer, &id, Some(&marker)).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })?;
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    st.bus.publish(ocserve_core::event::frame(
+        &dir,
+        "session.updated",
+        json!({"sessionID": id, "info": {"id": id, "revert": marker}}),
+    ));
+    let sid = id.clone();
+    run_blocking(&st.db, move |db| ocserve_store::load_session_wire(db, &sid))
+        .await
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("{e:#}"),
+        })?
+        .map(|j| axum::Json(j).into_response())
+        .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))
+}
+
+/// POST /session/{id}/unrevert — clears the marker (v1 clearRevert).
+async fn post_unrevert(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let exists_id = id.clone();
+    if !run_blocking(&st.db, move |db| {
+        ocserve_store::session_exists(db, &exists_id)
+    })
+    .await
+    .map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })? {
+        return Err(ApiError::not_found(format!("Session not found: {id}")));
+    }
+    ocserve_store::set_session_revert(&st.writer, &id, None).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })?;
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    st.bus.publish(ocserve_core::event::frame(
+        &dir,
+        "session.updated",
+        json!({"sessionID": id, "info": {"id": id, "revert": Value::Null}}),
+    ));
+    let sid = id.clone();
+    run_blocking(&st.db, move |db| ocserve_store::load_session_wire(db, &sid))
+        .await
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("{e:#}"),
+        })?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))
+}
+
+/// POST /instance/dispose — freeze returns `true` (marks the instance for
+/// disposal; a single-instance server's equivalent is publishing
+/// server.instance.disposed like /global/dispose).
+async fn instance_dispose(State(st): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    let _disposed = global_dispose(State(st)).await?;
+    Ok(Json(json!(true)))
+}
+
+/// POST /session/{id}/init — runs the built-in `init` command
+/// (command/index.ts Default.INIT, template initialize.txt) with the
+/// caller's model. Freeze payload {messageID, providerID, modelID}; missing
+/// model fields → 400 Effect Payload envelope ("Missing key at [modelID]").
+async fn post_init(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(payload): Json<Value>,
+) -> Result<axum::response::Response, ApiError> {
+    let provider = payload.get("providerID").and_then(|v| v.as_str());
+    let model = payload.get("modelID").and_then(|v| v.as_str());
+    let (Some(provider), Some(model)) = (provider, model) else {
+        let missing = if provider.is_none() {
+            "providerID"
+        } else {
+            "modelID"
+        };
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "name": "BadRequest",
+                "data": {
+                    "message": format!("Missing key\n  at [\"{missing}\"]"),
+                    "kind": "Payload"
+                }
+            })),
+        )
+            .into_response());
+    };
+    let exists_id = id.clone();
+    if !run_blocking(&st.db, move |db| {
+        ocserve_store::session_exists(db, &exists_id)
+    })
+    .await
+    .map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })? {
+        return Err(ApiError::not_found(format!("Session not found: {id}")));
+    }
+    // Reuse the /command path: command=init, arguments="", model from payload.
+    let cmd_payload = json!({
+        "command": "init",
+        "arguments": "",
+        "model": format!("{provider}/{model}"),
+        "messageID": payload.get("messageID").cloned().unwrap_or(Value::Null),
+    });
+    post_command(State(st), axum::extract::Path(id), Json(cmd_payload))
+        .await
+        .map(|j| j.into_response())
+}
+
+/// POST /provider/{id}/oauth/authorize — ocserve has no OAuth flows; the
+/// freeze shape for a non-OAuth provider is 400 {"name":"BadRequest",
+/// "data":{}} (probed). OAuth login remains a named deferral (PLAN §17).
+async fn post_provider_oauth(
+    axum::extract::Path(_id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        axum::Json(json!({"name": "BadRequest", "data": {}})),
+    )
+        .into_response()
+}
+
+/// POST /provider/{id}/oauth/callback — same divergence as authorize.
+async fn post_provider_oauth_callback(
+    axum::extract::Path(_id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        axum::Json(json!({"name": "BadRequest", "data": {}})),
+    )
+        .into_response()
+}
+
+/// POST /mcp/{name}/auth/authenticate — unknown → 404 tagged; known (all
+/// non-OAuth in practice) → 400 McpUnsupportedOAuthError (probe shapes).
+async fn post_mcp_auth_authenticate(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<axum::response::Response, HttpError> {
+    mcp_auth_gate(&st, &name)?;
+    Err(HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "McpUnsupportedOAuthError",
+        fields: json!({"error": format!("MCP server {name} does not support OAuth")}),
+    })
+}
+
+/// POST /mcp/{name}/auth/callback — same gate as authenticate.
+async fn post_mcp_auth_callback(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<axum::response::Response, HttpError> {
+    mcp_auth_gate(&st, &name)?;
+    Err(HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "McpUnsupportedOAuthError",
+        fields: json!({"error": format!("MCP server {name} does not support OAuth")}),
+    })
+}
+
+/// Shared existence check: unknown server → tagged 404 (probed shape).
+fn mcp_auth_gate(st: &Arc<AppState>, name: &str) -> Result<(), HttpError> {
+    let known = st
+        .mcp
+        .get()
+        .map(|h| h.statuses().get(name).is_some())
+        .unwrap_or(false);
+    if known {
+        return Ok(());
+    }
+    Err(HttpError::TaggedData {
+        status: StatusCode::NOT_FOUND,
+        tag: "McpServerNotFoundError",
+        fields: json!({
+            "name": name,
+            "message": format!("MCP server not found: {name}"),
+        }),
+    })
+}
+
+/// GET /session/{id}/message/{mid} → {info, parts}; unknown → 404
+/// NotFoundError envelope (probed freeze: {"name":"NotFoundError",
+/// "data":{"message":"Message not found: <mid>"}}).
+async fn get_message_by_id(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path((id, mid)): axum::extract::Path<(String, String)>,
+) -> Result<axum::response::Response, ApiError> {
+    let db = st.db.clone();
+    let sid = id.clone();
+    let mid_c = mid.clone();
+    let found = run_blocking(&db, move |db| {
+        ocserve_store::message_by_id(db, &sid, &mid_c)
+    })
+    .await
+    .map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })?;
+    match found {
+        Some(v) => Ok(axum::Json(v).into_response()),
+        None => Err(ApiError::not_found(format!("Message not found: {mid}"))),
+    }
+}
+
+/// POST /session/{id}/permissions/{pid} — deprecated v1 respond route; maps
+/// onto the same gate as /permission/{id}/reply. Body {response: once|always|
+/// reject}; unknown id → tagged PermissionNotFoundError (probed).
+async fn post_session_permission_respond(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path((_id, pid)): axum::extract::Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Result<axum::response::Response, HttpError> {
+    let reply = body
+        .get("response")
+        .and_then(|v| v.as_str())
+        .unwrap_or("reject")
+        .to_string();
+    if !st.gate.reply(&pid, &reply) {
+        return Err(HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "PermissionNotFoundError",
+            fields: json!({
+                "requestID": pid,
+                "message": format!("Permission request not found: {pid}"),
+            }),
+        });
+    }
+    Ok(axum::Json(json!(true)).into_response())
+}
+
+/// POST /log — v1 control-plane log writer; body {service,level,message,extra?}
+/// → true (probed). Writes to the tracing target so it lands in the journal.
+async fn post_log(Json(body): Json<Value>) -> Result<Json<Value>, HttpError> {
+    let level = body.get("level").and_then(|v| v.as_str()).unwrap_or("info");
+    let service = body
+        .get("service")
+        .and_then(|v| v.as_str())
+        .unwrap_or("app");
+    let message = body.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    match level {
+        "debug" => tracing::debug!(target: "ocserve::client", service, "{message}"),
+        "warn" => tracing::warn!(target: "ocserve::client", service, "{message}"),
+        "error" => tracing::error!(target: "ocserve::client", service, "{message}"),
+        _ => tracing::info!(target: "ocserve::client", service, "{message}"),
+    }
     Ok(Json(json!(true)))
 }
 
@@ -3637,13 +3969,65 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/session/{id}/shell", axum::routing::post(post_shell))
         .route(
             "/session/{id}/message/{mid}",
-            axum::routing::delete(delete_message_route),
+            get(get_message_by_id).delete(delete_message_route),
+        )
+        // legacy permission respond (deprecated upstream; oc-remote uses
+        // /permission/{id}/reply — this is the SDK/v1 shape)
+        .route(
+            "/session/{id}/permissions/{pid}",
+            axum::routing::post(post_session_permission_respond),
+        )
+        // v1 control-plane log writer (web UI diagnostics)
+        .route("/log", axum::routing::post(post_log))
+        // revert/unrevert (K-REVERT): marker semantics only — the snapshot/
+        // git-restore engine is out of MVP (divergence D-REVERT-NOSNAP,
+        // PLAN §17). Marker shapes mirrored from session/revert.ts.
+        .route("/session/{id}/revert", axum::routing::post(post_revert))
+        .route("/session/{id}/unrevert", axum::routing::post(post_unrevert))
+        // /instance/dispose — v1 single-instance dispose (freeze: true)
+        .route("/instance/dispose", axum::routing::post(instance_dispose))
+        // /session/{id}/init — built-in `init` command (guided AGENTS.md;
+        // payload {messageID,providerID,modelID} — probed freeze)
+        .route("/session/{id}/init", axum::routing::post(post_init))
+        // provider OAuth: ocserve implements no OAuth flows; the route
+        // exists and answers the freeze shape for non-OAuth providers
+        // (400 BadRequest {}) instead of falling through to the SPA.
+        .route(
+            "/provider/{id}/oauth/authorize",
+            axum::routing::post(post_provider_oauth),
+        )
+        .route(
+            "/provider/{id}/oauth/callback",
+            axum::routing::post(post_provider_oauth_callback),
+        )
+        // MCP OAuth: tagged shapes probed (unknown → 404
+        // McpServerNotFoundError; known/non-OAuth → 400
+        // McpUnsupportedOAuthError). No OAuth-capable servers in practice.
+        .route(
+            "/mcp/{name}/auth/authenticate",
+            axum::routing::post(post_mcp_auth_authenticate),
+        )
+        .route(
+            "/mcp/{name}/auth/callback",
+            axum::routing::post(post_mcp_auth_callback),
         )
         .route(
             "/session/{id}/message/{mid}/part/{pid}",
             axum::routing::delete(delete_part_route).patch(patch_part_route),
         )
         .route("/experimental/session", get(get_experimental_sessions))
+        // ---- /pty/* (web-UI terminal; freeze-probed 2026-10-08) ----
+        .route("/pty/shells", get(pty::get_shells))
+        .route("/pty", get(pty::list).post(pty::create))
+        .route(
+            "/pty/{id}",
+            get(pty::get).put(pty::update).delete(pty::remove),
+        )
+        .route(
+            "/pty/{id}/connect-token",
+            axum::routing::post(pty::connect_token),
+        )
+        .route("/pty/{id}/connect", get(pty::connect))
         // /tui/* — external-controller ingress (PLAN §17; VS Code extension)
         .route(
             "/tui/append-prompt",
@@ -3696,6 +4080,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         // or proxied to app.opencode.ai), matching v1 serveUIEffect. Disabled
         // via OCSERVE_UI=0 → JSON 404.
         .fallback(crate::ui::ui_fallback)
+        // Upstream's catch-all is a *route*, not a fallback: a known path with
+        // an unknown method (e.g. PATCH /pty/{id}) also gets the SPA, not a
+        // 405. Probed against freeze 2026-10-08.
+        .method_not_allowed_fallback(crate::ui::ui_fallback)
         .with_state(state)
 }
 

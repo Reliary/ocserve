@@ -18,13 +18,17 @@ struct Cli {
 enum Cmd {
     /// Start the HTTP/SSE server (replaces `opencode serve`)
     Serve {
-        /// Default 4096 mirrors upstream: the hosted web UI at
-        /// app.opencode.ai dials http://localhost:4096 for non-opencode.ai
-        /// origins, and `opencode attach` defaults to the same.
-        #[arg(long, default_value = "4096")]
-        port: u16,
-        #[arg(long, default_value = "127.0.0.1")]
-        hostname: String,
+        /// Port. Precedence: --port flag > OCSERVE_PORT env > 4096 default
+        /// (upstream's default; the hosted web UI at app.opencode.ai dials
+        /// http://localhost:4096 for non-opencode.ai origins and
+        /// `opencode attach` defaults to the same). Explicit flag wins over
+        /// the env var; both override the default.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Hostname. Precedence: --hostname flag > OCSERVE_HOSTNAME env >
+        /// 127.0.0.1 default (loopback-only unless overridden).
+        #[arg(long)]
+        hostname: Option<String>,
         #[arg(long)]
         data_dir: Option<std::path::PathBuf>,
     },
@@ -79,6 +83,32 @@ enum ModelsCmd {
     Refresh,
 }
 
+/// Port precedence: explicit `--port` > `OCSERVE_PORT` > 4096 default.
+/// A malformed env value is a fail-fast boot error (SRE §1) — a typo'd port
+/// silently serving elsewhere is worse than refusing to start.
+fn resolve_port(flag: Option<u16>) -> u16 {
+    if let Some(p) = flag {
+        return p;
+    }
+    match std::env::var("OCSERVE_PORT") {
+        Ok(v) if !v.is_empty() => v
+            .parse::<u16>()
+            .unwrap_or_else(|_| panic!("OCSERVE_PORT is not a valid port number: {v:?}")),
+        _ => 4096,
+    }
+}
+
+/// Hostname precedence: explicit flag > env > default. Empty env = unset.
+fn resolve_net(flag: Option<String>, env_key: &str, default: &str) -> String {
+    if let Some(h) = flag {
+        return h;
+    }
+    match std::env::var(env_key) {
+        Ok(v) if !v.is_empty() => v,
+        _ => default.to_string(),
+    }
+}
+
 fn default_data_dir() -> std::path::PathBuf {
     std::env::var_os("OCSERVE_DATA_DIR")
         .map(Into::into)
@@ -111,8 +141,8 @@ fn main() -> Result<()> {
             hostname,
             data_dir,
         } => rt::block_on(serve(
-            hostname,
-            port,
+            resolve_net(hostname, "OCSERVE_HOSTNAME", "127.0.0.1"),
+            resolve_port(port),
             data_dir.unwrap_or_else(default_data_dir),
         )),
         Cmd::Doctor { data_dir } => doctor(data_dir.unwrap_or_else(default_data_dir)),

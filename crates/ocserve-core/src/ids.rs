@@ -39,6 +39,33 @@ pub fn que_id() -> String {
     format!("que_{}", encode(ms, &nonce[..8]))
 }
 
+/// Upstream `Identifier.ascending()` tail: 13 hex chars = ms*4096+counter
+/// encoded big-endian in 6 bytes; +12 random base62. Used for pty_ ids
+/// (schema/src/identifier.ts, procced live 2026-10-08).
+pub fn ascending_tail() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let ms = now_ms();
+    let prev = LAST_MS.swap(ms, Ordering::Relaxed);
+    if prev != ms {
+        COUNTER.store(0, Ordering::Relaxed);
+    }
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    let current = ms.wrapping_mul(0x1000).wrapping_add(counter);
+    let mut time = String::with_capacity(12);
+    for i in 0..6 {
+        let byte = (current >> (40 - 8 * i)) & 0xff;
+        time.push_str(&format!("{byte:02x}"));
+    }
+    const CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut tail = String::with_capacity(14);
+    for _ in 0..14 {
+        tail.push(CHARS[rand_byte() as usize % 62] as char);
+    }
+    format!("{time}{tail}")
+}
+
 pub fn evt_id() -> String {
     let ms = now_ms();
     let nonce: Vec<u8> = std::iter::repeat_with(rand_byte).take(8).collect();

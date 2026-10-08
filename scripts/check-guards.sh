@@ -26,6 +26,10 @@
 #  13. load-test: a line that INVOKES k6 may never name a LIVE service port
 #      (4912/4901) — k6 targets fixture arms only; health asserts on the
 #      live ports must not sit on k6 lines
+#  14. every URL in the frozen v1 SDK surface is bound in the router or has
+#      an exact-URL PLAN §17 citation — unbound routes fall through to the
+#      HTML proxy and crash JSON-expecting clients (the 2026-10-08 web-UI
+#      settings crash: /pty/shells → HTML → e.shells.reduce TypeError)
 #   7. exact assertions on process-global counters inside src/ (in-crate unit
 #      tests run in one parallel process and race — the reader_opens flake of
 #      2026-10-05; such tests belong in tests/ where they own the process)
@@ -153,6 +157,55 @@ if out=$(grep -nE 'K6_IMG|k6 run|k6_flags' scripts/load-test.sh | grep -E '4912|
   echo "$out"; echo "FAIL: k6-invoking line names a live service port (rule 13)"; fail=1
 else
   echo "ok"
+fi
+
+echo "== guard: v1 SDK routes all bound (rule 14) =="
+# The 2026-10-08 crash class: a v1 SDK route we don't implement falls through
+# the catch-all to the app.opencode.ai proxy, which returns HTML where the
+# client expects JSON (web UI settings: e.shells.reduce on an HTML string).
+# Every URL in the frozen v1 SDK surface must be bound in the router or be a
+# NAMED deferral whose exact URL string appears in PLAN.md §17.
+# Matching: router path extraction handles multi-line .route( calls and
+# treats a router wildcard segment ({id}) as matching any literal segment
+# (e.g. /mcp/{name}/{action} covers /mcp/x/disconnect).
+SDK_URLS="$(dirname "$0")/../bench/sdk-routes.txt"
+if [ -f "$SDK_URLS" ]; then
+  missing=$(python3 - "$SDK_URLS" crates/ocserve-http/src/lib.rs PLAN.md <<'PYEOF'
+import re, sys
+urls_file, router_file, plan_file = sys.argv[1], sys.argv[2], sys.argv[3]
+router = open(router_file, encoding="utf-8").read()
+plan = open(plan_file, encoding="utf-8").read()
+# every .route("...") path (whitespace incl. newlines between args)
+paths = re.findall(r'\.route\(\s*"([^"]+)"', router)
+def segs(p): return [x for x in p.split("/") if x != ""]
+def covers(route, url):
+    r, u = segs(route), segs(url)
+    if len(r) != len(u): return False
+    for a, b in zip(r, u):
+        if a.startswith("{") and a.endswith("}"):
+            continue  # wildcard segment covers any single segment
+        if a != b: return False
+    return True
+missing = []
+for raw in open(urls_file, encoding="utf-8"):
+    url = raw.strip()
+    if not url: continue
+    if url in router: continue           # verbatim presence (comments ok)
+    if any(covers(r, url) for r in paths):
+        continue
+    if url in plan:                      # named deferral, exact URL cited
+        continue
+    missing.append(url)
+print("\n".join(missing))
+PYEOF
+)
+  if [ -n "$missing" ]; then
+    echo "$missing"; echo "FAIL: v1 SDK route unbound and not a named deferral (rule 14)"; fail=1
+  else
+    echo "ok"
+  fi
+else
+  echo "ok (no sdk route list)"
 fi
 
 exit $fail
