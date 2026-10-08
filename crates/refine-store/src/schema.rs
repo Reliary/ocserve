@@ -199,8 +199,20 @@ CREATE INDEX idx_compaction_session ON compaction(session_id, time_ms);
 /// 1→current (session columns + message tables), 2→3 (message tables);
 /// refuses anything else.
 pub fn migrate(conn: &Connection) -> Result<()> {
+    let t0 = std::time::Instant::now();
     apply_migrations(conn)?;
-    post_maintenance(conn)
+    let t1 = std::time::Instant::now();
+    post_maintenance(conn)?;
+    let t2 = std::time::Instant::now();
+    // Boot-cost visibility: the 2026-10-07 deploy spent 5m40s silent between
+    // process start and boot checks, with no log line to attribute it to.
+    tracing::info!(
+        "migrate: schema {:.0}ms, maintenance {:.0}ms (total {:.0}ms)",
+        t1.duration_since(t0).as_millis(),
+        t2.duration_since(t1).as_millis(),
+        t2.duration_since(t0).as_millis()
+    );
+    Ok(())
 }
 
 /// Boot maintenance (PERF-10X stmt/pragma audit, 2026-10-07) — runs on
@@ -215,58 +227,55 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 ///    ANALYZE (3.46+; 0x00010 bit) so the boot cost is ~0.09 s worst case
 ///    — no analysis_limit needed (docs: "applications that use optimize
 ///    ... do not need to set an analysis limit").
-/// 2. FTS segment merge `INSERT INTO part_search_fts(part_search_fts)
-///    VALUES('optimize')` — measured on the fixture: search_fts 149→101 µs
-///    (-32%), zero-match LIKE-shaped walk 1090→923 µs (-15%); no-op once
-///    merged (sub-second at steady state).
+/// 2. FTS segment merge — **REMOVED from this path (2026-10-08)**. The
+///    fixture had measured it at -32% search / -15% LIKE-shaped walk, but the
+///    LIVE 1.6 GB db measured the same statement at **175,796 ms (2m56s)**
+///    with serve blocked the whole time (boot went from seconds to ~3 minutes;
+///    an earlier deploy without timing showed 5m40s of unattributable silence).
+///    A second writer spawn 3 s later measured 0 ms, proving the cost is the
+///    merge itself, not the call. FTS5's default automerge already maintains
+///    segments during normal inserts, and S-A's early-termination walk keeps
+///    search in the millisecond class, so the -32% fixture win does not pay
+///    for a 3-minute boot. Re-add only as offline maintenance if a real search
+///    regression is observed: `sqlite3 refine.db
+///    "INSERT INTO part_search_fts(part_search_fts) VALUES('optimize');"`.
 fn post_maintenance(conn: &Connection) -> Result<()> {
-    // Both steps are STATISTICS work, not schema: losing them only means the
-    // planner runs without fresh stats until the next hourly tick, which is
-    // strictly better than refusing to boot. A boot that dies here takes the
-    // server with it — hit in the load harness (2026-10-07), where a stale
-    // fixture wipe left a second connection holding the write lock and
+    // STATISTICS work, not schema: losing it only means the planner runs
+    // without fresh stats until the next hourly tick, which is strictly
+    // better than refusing to boot. A boot that dies here takes the server
+    // with it — hit in the load harness (2026-10-07), where a stale fixture
+    // wipe left a second connection holding the write lock and
     // `PRAGMA optimize` failed with SQLITE_BUSY, so `refine serve` exited 1
     // and the harness reported "never healthy". Fail-fast is right for
     // migration DDL (STORAGE §1) and wrong for this.
     //
     // `busy_timeout` does not cover this: it applies to lock acquisition, and
     // a *statement-level* BUSY on a pragma can still surface immediately —
-    // hence the bounded retry with backoff, then warn and continue.
+    // hence `retry_busy` (bounded retry with backoff, then warn and
+    // continue), which is unit-tested with synthetic errors so the loudness
+    // rule does not depend on being able to provoke SQLite.
+    let t_opt = std::time::Instant::now();
+    retry_busy("post_maintenance: optimize", || {
+        conn.pragma_update(None, "optimize", "0x10002")
+            .context("optimize")
+    })?;
+    tracing::info!(
+        "post_maintenance: optimize {:.0}ms",
+        t_opt.elapsed().as_millis()
+    );
+    Ok(())
+}
+
+/// Run a maintenance statement with bounded retry on write-lock contention
+/// ONLY. `database is locked` → up to `ATTEMPTS` (100/200/300/400 ms
+/// backoff), then WARN and return Ok (the caller's work is deferred to the
+/// next tick). Any other error → propagated immediately: non-contention
+/// failures stay loud.
+fn retry_busy(label: &str, mut f: impl FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
     const ATTEMPTS: u32 = 5;
     let mut last: Option<anyhow::Error> = None;
     for n in 1..=ATTEMPTS {
-        let err = match conn
-            .pragma_update(None, "optimize", "0x10002")
-            .context("optimize")
-        {
-            Ok(()) => {
-                last = None;
-                break;
-            }
-            Err(e) => e,
-        };
-        let busy = err.root_cause().to_string().contains("database is locked");
-        if !busy {
-            // not contention — a real failure, keep it loud
-            return Err(err);
-        }
-        last = Some(err);
-        if n < ATTEMPTS {
-            std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(n)));
-        }
-    }
-    if let Some(e) = last {
-        tracing::warn!(
-            "post_maintenance: optimize skipped after {ATTEMPTS} attempts              (stats refresh deferred to the hourly tick): {e:#}"
-        );
-    }
-    // same policy for the FTS segment merge
-    let mut last: Option<anyhow::Error> = None;
-    for n in 1..=ATTEMPTS {
-        match conn
-            .execute_batch("INSERT INTO part_search_fts(part_search_fts) VALUES('optimize')")
-            .context("fts optimize")
-        {
+        match f() {
             Ok(()) => {
                 last = None;
                 break;
@@ -285,10 +294,68 @@ fn post_maintenance(conn: &Connection) -> Result<()> {
     }
     if let Some(e) = last {
         tracing::warn!(
-            "post_maintenance: fts optimize skipped after {ATTEMPTS} attempts              (segment merge deferred): {e:#}"
+            "{label} skipped after {ATTEMPTS} attempts (deferred to the next tick): {e:#}"
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod retry_policy_tests {
+    use super::retry_busy;
+
+    fn busy() -> anyhow::Error {
+        anyhow::anyhow!("SQLITE_BUSY: database is locked")
+    }
+
+    #[test]
+    fn contention_is_retried_bounded_then_deferred() {
+        let mut calls = 0u32;
+        let res = retry_busy("t", || {
+            calls += 1;
+            Err(busy())
+        });
+        assert!(res.is_ok(), "contention must end in a defer, not an error");
+        assert_eq!(calls, 5, "exactly ATTEMPTS tries, never unbounded");
+    }
+
+    #[test]
+    fn non_contention_errors_propagate_on_the_first_try() {
+        let mut calls = 0u32;
+        let res = retry_busy("t", || {
+            calls += 1;
+            Err(anyhow::anyhow!("disk I/O error"))
+        });
+        let err = res.expect_err("a real failure must not be swallowed");
+        assert_eq!(calls, 1, "no retry burn for non-contention errors");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("database is locked"), "must be the real error");
+        assert!(msg.contains("disk I/O error"), "got: {msg}");
+    }
+
+    #[test]
+    fn success_after_transient_contention_clears_the_defer() {
+        let mut calls = 0u32;
+        let res = retry_busy("t", || {
+            calls += 1;
+            if calls < 3 {
+                Err(busy())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(res.is_ok());
+        assert_eq!(calls, 3, "recovered on the 3rd attempt");
+    }
+
+    #[test]
+    fn busy_marker_must_match_the_sqlite_wording() {
+        // the swallow is scoped to this exact substring: a mis-scoped check
+        // would either hide real failures or burn the whole budget on them
+        let other = anyhow::anyhow!("database is locked by another process with a different reason");
+        let msg = format!("{}", other.root_cause());
+        assert!(msg.contains("database is locked"), "marker check wording");
+    }
 }
 
 fn apply_migrations(conn: &Connection) -> Result<()> {

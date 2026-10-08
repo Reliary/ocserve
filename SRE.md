@@ -214,7 +214,14 @@ other than the async worker (thread identity recorded by a test-only seam).
      guard rule 9).
   5. **Backstop:** `MemoryMax=1024M` — kids 700 + main reserve ~324 (≈ 2×
      the measured 180 MB envelope); provenance comment chain in the unit
-     template (history: 480 → 600 → 750 → 1024, each step measured). A
+     template (history: 480 → 600 → 750 → 1024, each step measured).
+     **2026-10-08:** the unit template was found carrying the stale 750M
+     while this section already said 1024M — a structural over-commit, not
+     a leak: the partition allows kids/ 700M + main runs 130-180M typical
+     (455M migration peak), so 700+130 > 750 could never fit both. Journal
+     10-07/10-08: 6+ kernel SIGKILLs of the sidecar at cold start,
+     `memory.peak` pinned at exactly 786,432,000. Template now matches this
+     section; kill-policy proof and recycle gauge unchanged. A
      larger ceiling costs **nothing at idle** (cgroups charge on touch) —
      leak detection is the recycle gauge + soak slope, never cap proximity.
      Also: `Delegate=yes` (systemd stops managing the unit subtree so the

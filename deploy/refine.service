@@ -59,7 +59,16 @@ OOMPolicy=continue
 # Cap back to the documented size (measured: idle ~280 + converged reload
 # ~333 main + kids <=200 = ~533 worst -> 750M has proven burst margin; the
 # old 750M OOMs are explained and fixed, no longer a cap-size problem).
-MemoryMax=750M
+# 2026-10-08: raised 750M->1024M — STRUCTURAL over-commit, not a leak: the
+# C3 cgroup partition allows kids/ up to 700M (REFINE_KIDS_MEMORY_MAX_MB,
+# sized for the measured 614M sidecar warm-up) while main runs 130-180M
+# typical (455M peak during the v10 migration). 700+130 > 750, so the unit
+# cap could never hold both ceilings — journal 10-07/10-08 shows 6+ kernel
+# OOM SIGKILLs of the sidecar at cold start (magic-context warm-up) with
+# memory.peak pinned at exactly 786,432,000. Kids ceiling stays 700M;
+# 1024M = kids 700 + main ~250 allowance + slab. Kill switch evidence kept:
+# bytehound proved fragmentation-not-leak, so this is spike headroom.
+MemoryMax=1024M
 MemorySwapMax=0
 ProtectSystem=strict
 # refine's own data dir is required; the opencode/plugin paths are optional

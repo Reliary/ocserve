@@ -66,8 +66,7 @@ exited 1 → "refine never healthy". `busy_timeout` does not cover it: that
 applies to lock acquisition, and a statement-level BUSY on a pragma can
 surface immediately.
 
-Both maintenance steps (`PRAGMA optimize`, the FTS `'optimize'` merge) are now
-**statistics work, not schema**, so:
+Maintenance in this path is **statistics work, not schema**, so:
 
 - transient `database is locked` → bounded retry (5 attempts, 100/200/300/400
   ms backoff = 1 s budget), then WARN and continue. Losing stats costs only a
@@ -129,8 +128,8 @@ memos off, interleaved where noisy). Warm µs figures from `prep_A/B` and
 | mmap_size | 0 | **REJECT 256 MB**: A/B zero delta everywhere (page 7 µs, fts 110 µs, list 805 µs both ways); RSS/OOM history rationale intact (docs note no special caveats, but nothing to win) |
 | temp_store | 1 (FILE) | fixed earlier (value was 2=MEMORY miscommented); `/tmp` is tmpfs here → sort spill = shmem, memcg-accounted, swappable — bounded either way |
 | analysis_limit | 0 (default) | **no change** — since 3.46 `PRAGMA optimize` sets its own temporary limit (0x00010 bit, on by default); docs: "applications that use optimize … do not need to set an analysis limit" |
-| optimize placement | **FIXED** | was only in `create_new` (runs before tables exist = perpetual no-op) + hourly tick needs 240 *write* batches → fixture dbs had `stat1=0` forever (`optimize(-1)` listed 7 pending ANALYZEs). `schema::migrate` is now a wrapper that runs `post_maintenance` on EVERY writer spawn incl. steady-state boots: `optimize=0x10002` (docs' verbatim long-lived-connection value; measured 0.09 s) + FTS optimize. Test `steady_state_migrate_collects_planner_stats` + planted negative control (red→green) |
-| FTS `'optimize'` maintenance | **ADOPTED** (in `post_maintenance`) | phased same-file isolation: search_fts 149→101 µs (−32%), zero-match walk 1090→923 µs (−15%), no-op at steady state (sub-second) |
+| optimize placement | **FIXED** | was only in `create_new` (runs before tables exist = perpetual no-op) + hourly tick needs 240 *write* batches → fixture dbs had `stat1=0` forever (`optimize(-1)` listed 7 pending ANALYZEs). `schema::migrate` is now a wrapper that runs `post_maintenance` on EVERY writer spawn incl. steady-state boots: `optimize=0x10002` (docs' verbatim long-lived-connection value; measured **6 ms live**, 0.09 s fixture) — with per-phase timing logs added after a 2026-10-07 deploy spent 5m40s silent with nothing to attribute it to. Test `steady_state_migrate_collects_planner_stats` + planted negative control (red→green) |
+| FTS `'optimize'` maintenance | **REMOVED from the boot path (2026-10-08)** — kept only as documented offline SQL | fixture had said ADOPTED (−32% search, −15% LIKE-shaped walk, "sub-second at steady state") but the LIVE 1.6 GB db measured the same statement at **175,796 ms** with serve blocked (boot 3 min; an earlier untimed deploy showed 5m40s silence; second writer spawn 3 s later = 0 ms ⇒ the merge itself is the cost). FTS5 default automerge maintains segments during inserts and S-A keeps search ms-class, so the fixture win does not pay for a 3-minute boot. Offline re-run: `sqlite3 refine.db "INSERT INTO part_search_fts(part_search_fts) VALUES('optimize');"`. Re-add to boot only on measured search regression |
 | threads | 0 | keep — auxiliary sorter threads only help the big sorts S-A removed; per-statement thread launch would be overhead |
 | secure_delete | 0 | verified OFF in our build (compile_options lacks `SECURE_DELETE`; probe) — no rewrite amplification on prune/cascade |
 | STAT4 | compiled in | no action — `ENABLE_STAT4` present; optimize writes stat4 when it analyzes |

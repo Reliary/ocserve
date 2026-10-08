@@ -86,14 +86,17 @@ fn stats_are_collected_when_the_lock_is_free() {
     assert_eq!(n, 1, "uncontended boot must leave planner stats behind");
 }
 
-/// A NON-contention failure must stay loud (the retry only absorbs BUSY).
+/// The FTS segment merge was REMOVED from `post_maintenance` (2026-10-08:
+/// it measured 175,796 ms on the live 1.6 GB index with serve blocked, vs a
+/// 6 ms `PRAGMA optimize`). This test guards that removal: a missing
+/// `part_search_fts` must no longer block boot, because nothing on the boot
+/// path may touch it.
 ///
-/// `PRAGMA <unknown>` is silently ignored by SQLite, so the honest way to
-/// drive a hard error through the same path is to drop the table the FTS
-/// maintenance statement needs: `INSERT INTO part_search_fts(...)` then
-/// fails with "no such table", which is not contention and must propagate.
+/// Non-contention loudness (the property this test used to check via a
+/// missing FTS table) now lives where it can be tested deterministically:
+/// `schema::retry_policy_tests::non_contention_errors_propagate_on_the_first_try`.
 #[test]
-fn non_contention_errors_are_not_swallowed() {
+fn migrate_succeeds_without_the_fts_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.db");
     {
@@ -104,13 +107,8 @@ fn non_contention_errors_are_not_swallowed() {
     let conn = refine_store::pragma::create_new(&db).unwrap();
     let res = refine_store::schema::migrate(&conn);
     assert!(
-        res.is_err(),
-        "a missing FTS table is a real failure and must not be swallowed by \
-         the contention retry"
-    );
-    let msg = format!("{:#}", res.unwrap_err());
-    assert!(
-        !msg.contains("database is locked"),
-        "error should be the real one, got: {msg}"
+        res.is_ok(),
+        "boot must not depend on the FTS segment merge, got: {:?}",
+        res.err()
     );
 }
