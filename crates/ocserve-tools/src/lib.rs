@@ -261,15 +261,25 @@ fn resolve(cwd: &Path, p: &str) -> PathBuf {
 fn bash(input: &Value, cwd: &Path) -> Result<ToolResult> {
     let command = input["command"].as_str().context("bash.command")?;
     let timeout_ms = input["timeout"].as_u64().unwrap_or(120_000).min(600_000);
-    let mut child = std::process::Command::new("sh")
-        .arg("-c")
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawn: {command}"))?;
+        .stderr(std::process::Stdio::piped());
+    // Own process group per invocation (CI 2026-10-08 caught the bug this
+    // fixes: killing only `sh` left `sleep`/pipeline grandchildren alive,
+    // holding the pipe write-ends, so the bounded-drain joins blocked for the
+    // child's full natural duration — and in production a timed-out command
+    // kept running invisibly). With the child as group leader, the timeout
+    // kill sweeps the whole tree below.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().with_context(|| format!("spawn: {command}"))?;
     // K-EFFICIENCY: start the bounded drain BEFORE waiting — otherwise a
     // >pipe-buffer child stalls until the timeout kill (and full-capture
     // ratcheted unbounded bytes into RSS — the OOM chain).
@@ -293,6 +303,17 @@ fn bash(input: &Value, cwd: &Path) -> Result<ToolResult> {
                 if std::time::Instant::now() >= deadline {
                     timed_out = true;
                     let _ = child.kill();
+                    #[cfg(unix)]
+                    {
+                        // Safety: `killpg` takes no pointers and is
+                        // async-signal-safe. The pid IS the pgid: the spawn
+                        // above made the child its own group leader
+                        // (`process_group(0)`), so this signals exactly the
+                        // command tree we started and nothing else.
+                        unsafe {
+                            libc::killpg(child.id() as i32, libc::SIGKILL);
+                        }
+                    }
                     let _ = child.wait();
                     break;
                 }
