@@ -93,13 +93,13 @@ budget (11.2 ms) — arithmetic, not gaming. Dual reporting per §1-D.
 already runs at every writer open and `PRAGMA optimize` hourly
 (main.rs optimize tick) — analyze-if-stats-thin semantics, zero new code.
 
-**B1 — TRIGGERED AND SHIPPED (428d13f):** deep-page probe on the fixture =
+**B1 — TRIGGERED AND SHIPPED (cd3a6ab):** deep-page probe on the fixture =
 13 blob reads per deep page (245 parts, 13 >8 KiB) ≥ 1 ⇒ condition met.
 Process-global byte-capped FIFO (32 MiB, `REFINE_BLOB_CACHE_MB`, oversized
 entries never admitted); content-addressed keys = immutable = exact by
 construction.
 
-**temp_store — DONE (428d13f):** value was `2` (= MEMORY) miscommented as
+**temp_store — DONE (cd3a6ab):** value was `2` (= MEMORY) miscommented as
 FILE; set to `1` (FILE) per the S-A follow-through above.
 
 **C1+C4 A/B — FAIL KEEP-RULE, REVERTED.** Sandwich at VU50/ROUNDS=1 on
@@ -170,7 +170,7 @@ that baseline → GATED.
   together. Best joint = attempt 1: 97.7% @ p95 92.5 ms. Later attempts
   degraded with runner state (freeze itself fell 432->220 req/s, RSS
   7.6 GB) — all four recorded, none discarded.
-- **D**: thresholds re-derived pre-gated (edeac9f, refine <=65 /
+- **D**: thresholds re-derived pre-gated (7c1d031, refine <=65 /
   freeze <=1417 / err <=0.5, formula on run 132925); G1 gated ran with
   a STALE runner copy of thresholds (refine cells 25.97/32.95 pass;
   freeze 549/587 breached the old 208) — synced + one pre-declared
@@ -185,6 +185,42 @@ that baseline → GATED.
   (fixture stat1=0 forever), FTS optimize adopted (−32% fts), 18 sites
   → prepare_cached/PERSISTENT (session_wire 8→1 µs), mmap + page_size
   A/B'd to rejection — full table in STORAGE §1.2.
+- **Lean sweep Phase V (gate)**: A/B at G2 conditions, runs `20261007T224955Z`
+  (base `55c7262`) vs `20261007T223621Z` (lean `47cb9ea`) — **CPU/req −14.4%**
+  (arm-level 0.2915→0.2496 ms/req; a first reading used per-mode arithmetic —
+  corrected same-day, see BASELINE) against a pre-registered −10% gate, rps +11.7%/+4.3%,
+  peak RSS −20.2% (77.8→62.1 MB), 0% errors. Freeze control arm moved only
+  −1.5%/−3.1%, so the delta is not machine drift. Two rounds, not four —
+  caveats in `bench/load/BASELINE.md`.
+- **Lean sweep phase I** (`bench/perf/PHASE1-ATTRIBUTION.md`): bytehound
+  attributes **86% of read-path allocations to serde_json** (string allocs
+  46.5%, visit_map 21.7%) vs SQLite 3.3%; 1,249 µs JSON vs 26 µs SQL per
+  50-msg page. Also fixed the bench itself (`--deep` auto-selected a
+  **message** id, so every session-scoped figure had measured 0 rows).
+- **Lean sweep M3 (filesystem walks off the worker)**: `GET /find/file`
+  (up to 20,000 dirs) and `GET /file` (per-entry `metadata()`) ran inline on
+  tokio workers — the last blocking-I/O convoy. Both now `spawn_blocking`;
+  bounds untouched. Proof is structural (thread identity), because the load
+  harness never saw it: its `LIST_PATH` is an empty /tmp dir. Negative
+  control: inline call → test red.
+- **Lean sweep M1 (list wire straight to bytes)**: `build_sessions_wire_bytes`
+  writes the session-list body from the columns into one buffer (no `Value`
+  tree, one pass; numbers and the `model` blob still go through serde so
+  formatting is serde's by construction). Attribution on the fixture: SQL
+  74 µs vs JSON build 238 µs, and the JSON half went 412→238 µs. Byte-exact
+  vs the DOM path over adversarial columns and on the real corpus
+  (201 sessions, 105,475 bytes); a planted extra member reddens 3 of 5 tests.
+- **Lean sweep L1 (zero-parse splice)**: `refine_store::splice` compacts
+  stored JSON in one byte pass into a reused buffer and splices the three
+  column keys, replacing parse→merge→serialize. Byte-identical to the DOM
+  path proven over the whole corpus: **218,393 rows, 0 refused, 0
+  mismatched**, and 5,900 rows spliced / 0 fallbacks live through the
+  production path. Measured A/B (interleaved ×2, real 32k-message
+  session): `for_each_page` **1,243→953 µs (−23%)** and **1,288→943 µs
+  (−27%)**, `page_window` neutral, `list_wire` noise. Five splice bugs
+  were caught by the DOM-oracle test, four of them **silent corruption**
+  (merged tokens, lost commas, empty-nested-object refusal, i64-overflow
+  integer reformatting) — recorded in `tests/splice_parity.rs`.
 
 ## 5. Phases
 

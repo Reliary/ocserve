@@ -54,8 +54,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &dbp,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
+        // MUST be session_id, not id — `SELECT id … GROUP BY session_id`
+        // returns a MESSAGE id, so every session-scoped query then measured
+        // an empty session (found 2026-10-07: 32,341-msg session vs a
+        // phantom `msg_…`). Negative control below proves the fix.
         deep = conn.query_row(
-            "SELECT id FROM msg GROUP BY session_id ORDER BY count(*) DESC LIMIT 1",
+            "SELECT session_id FROM msg GROUP BY session_id ORDER BY count(*) DESC LIMIT 1",
             [],
             |r| r.get::<_, String>(0),
         )?;
@@ -86,7 +90,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             |x| x.get(0),
         )
         .unwrap_or(0);
-    println!("TUNE[{tag}] db={db} deep={deep} reps={reps} mmap={st} stat1={stat1} stat4={stat4}");
+    // Hard gate: benchmarking an EMPTY session produces plausible-looking
+    // single-digit-microsecond numbers that measure nothing — the 2026-10-07
+    // bug class (the auto-selected "deep session" was a message id, so every
+    // session-scoped query hit 0 rows). Refuse rather than publish them.
+    let deep_msgs: i64 = r.query_row(
+        "SELECT count(*) FROM msg WHERE session_id = ?1",
+        [&deep],
+        |x| x.get(0),
+    )?;
+    let deep_parts: i64 = r.query_row(
+        "SELECT count(*) FROM msg_part WHERE session_id = ?1",
+        [&deep],
+        |x| x.get(0),
+    )?;
+    assert!(
+        deep_msgs > 0,
+        "deep={deep} has 0 messages — refusing to benchmark an empty session \
+         (id-vs-session_id bug class, 2026-10-07)"
+    );
+    println!(
+        "TUNE[{tag}] db={db} deep={deep} msgs={deep_msgs} parts={deep_parts} \
+         reps={reps} mmap={st} stat1={stat1} stat4={stat4}"
+    );
 
     // warmup (page-cache + parked reader + any statement cache)
     for _ in 0..50 {

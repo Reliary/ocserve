@@ -26,7 +26,14 @@ pub fn load_sessions_wire(db: &std::path::Path) -> anyhow::Result<Vec<serde_json
     let e0 = write_epoch();
     if enabled {
         let hit = {
-            let l = list_memo().lock();
+            let mut l = list_memo().lock();
+            // epoch AND db identity (see ListMemoState::db): a foreign db
+            // clears the slot rather than being served it.
+            if l.db.as_deref().is_some_and(|d| d != db) {
+                l.slot = None;
+                l.bytes = None;
+                l.db = None;
+            }
             if l.epoch == e0 { l.slot.clone() } else { None }
         };
         if let Some(v) = hit {
@@ -74,6 +81,7 @@ pub fn load_sessions_wire(db: &std::path::Path) -> anyhow::Result<Vec<serde_json
     if enabled && write_epoch() == e0 {
         let mut l = list_memo().lock();
         l.epoch = e0;
+        l.db = Some(db.to_path_buf());
         l.slot = Some(std::sync::Arc::new(out.clone()));
     }
     Ok(out)
@@ -89,22 +97,142 @@ pub fn load_sessions_wire_bytes(
     let e0 = write_epoch();
     if enabled {
         let hit = {
-            let l = list_memo().lock();
+            let mut l = list_memo().lock();
+            if l.db.as_deref().is_some_and(|d| d != db) {
+                l.slot = None;
+                l.bytes = None;
+                l.db = None;
+            }
             if l.epoch == e0 { l.bytes.clone() } else { None }
         };
         if let Some(b) = hit {
             return Ok(b);
         }
     }
-    let rows = load_sessions_wire(db)?;
-    let vec = bytes::Bytes::from(serde_json::to_vec(&rows)?);
+    // M1: serialize the wire body DIRECTLY from the columns into one buffer
+    // — no `Value` tree per session and no second serialization pass. The
+    // Value-slot memo is left to `load_sessions_wire` (its own callers keep
+    // their path); this function's callers only ever want bytes, so building
+    // both would double the work. Measured on the fixture: 201 sessions cost
+    // 684 µs via the DOM path, the most expensive store query after the page.
+    let vec = build_sessions_wire_bytes(db)?;
     if enabled && write_epoch() == e0 {
         let mut l = list_memo().lock();
         l.epoch = e0;
+        l.db = Some(db.to_path_buf());
         l.bytes = Some(std::sync::Arc::new(vec.clone()));
-        l.slot = Some(std::sync::Arc::new(rows));
+        // The Value slot is intentionally NOT populated here: filling it
+        // would run the DOM path this function exists to avoid. Callers that
+        // want `Vec<Value>` call `load_sessions_wire`, which fills it.
     }
     Ok(std::sync::Arc::new(vec))
+}
+
+/// M1: the session-list wire body, serialized straight from the columns.
+///
+/// Byte-for-byte what `serde_json::to_vec(&load_sessions_wire(db)?)` emits —
+/// pinned by `tests/list_wire_parity.rs`, which asserts equality against the
+/// DOM path over a fixture with populated, NULL and unusual columns. Member
+/// order follows the `json!` literal in `load_sessions_wire` because
+/// `serde_json` is built with `preserve_order` (insertion order).
+///
+/// Every number goes through serde_json itself (`Value::from(f64)` /
+/// `Value::from(i64)` then `to_writer`) rather than a hand-rolled formatter,
+/// so ryu formatting is serde's by construction instead of by coincidence.
+fn build_sessions_wire_bytes(db: &std::path::Path) -> anyhow::Result<bytes::Bytes> {
+    let conn = pragma::open_reader(db)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, project_id, directory, path, slug, title, version, agent, model, cost,
+                summary_additions, summary_deletions, summary_files,
+                tokens_input, tokens_output, tokens_reasoning,
+                tokens_cache_read, tokens_cache_write, time_created, time_updated
+         FROM session ORDER BY time_updated DESC",
+    )?;
+    let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
+    out.push(b'[');
+    let mut first = true;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if !first {
+            out.push(b',');
+        }
+        first = false;
+        out.extend_from_slice(b"{\"id\":");
+        push_wire_str(&mut out, &row.get::<_, String>(0)?);
+        out.extend_from_slice(b",\"projectID\":");
+        push_wire_str(&mut out, &row.get::<_, String>(1)?);
+        out.extend_from_slice(b",\"directory\":");
+        push_wire_str(&mut out, &row.get::<_, String>(2)?);
+        out.extend_from_slice(b",\"path\":");
+        push_wire_str(&mut out, &row.get::<_, String>(3)?);
+        out.extend_from_slice(b",\"slug\":");
+        push_wire_str(&mut out, &row.get::<_, String>(4)?);
+        out.extend_from_slice(b",\"title\":");
+        push_wire_str(&mut out, &row.get::<_, String>(5)?);
+        out.extend_from_slice(b",\"version\":");
+        push_wire_str(&mut out, &row.get::<_, String>(6)?);
+        out.extend_from_slice(b",\"agent\":");
+        match row.get::<_, Option<String>>(7)? {
+            Some(a) => push_wire_str(&mut out, &a),
+            None => out.extend_from_slice(b"null"),
+        }
+        // `model` is itself JSON text in the column; re-emit through serde so
+        // a stored blob with non-compact formatting normalizes as before
+        out.extend_from_slice(b",\"model\":");
+        let model_txt: Option<String> = row.get(8)?;
+        match model_txt
+            .as_deref()
+            .map(serde_json::from_str::<serde_json::Value>)
+        {
+            Some(Ok(v)) => serde_json::to_writer(&mut out, &v)?,
+            _ => {
+                out.extend_from_slice(b"{\"id\":\"\",\"providerID\":\"\",\"variant\":\"default\"}")
+            }
+        }
+        out.extend_from_slice(b",\"cost\":");
+        let cost: f64 = row.get(9)?;
+        push_wire_f64(&mut out, cost);
+        out.extend_from_slice(b",\"summary\":{\"additions\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(10)?);
+        out.extend_from_slice(b",\"deletions\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(11)?);
+        out.extend_from_slice(b",\"files\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(12)?);
+        out.extend_from_slice(b"},\"tokens\":{\"input\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(13)?);
+        out.extend_from_slice(b",\"output\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(14)?);
+        out.extend_from_slice(b",\"reasoning\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(15)?);
+        out.extend_from_slice(b",\"cache\":{\"read\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(16)?);
+        out.extend_from_slice(b",\"write\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(17)?);
+        out.extend_from_slice(b"}},\"time\":{\"created\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(18)?);
+        out.extend_from_slice(b",\"updated\":");
+        push_wire_i64(&mut out, row.get::<_, i64>(19)?);
+        out.extend_from_slice(b"}}");
+    }
+    out.push(b']');
+    Ok(bytes::Bytes::from(out))
+}
+
+/// JSON string escaping identical to serde's for a string value — one
+/// implementation, shared with the splice module.
+fn push_wire_str(out: &mut Vec<u8>, s: &str) {
+    crate::splice::push_json_string(out, s);
+}
+
+/// Numbers through serde itself, so ryu/itoa formatting is serde's by
+/// construction rather than a reimplementation that could drift.
+fn push_wire_i64(out: &mut Vec<u8>, v: i64) {
+    serde_json::to_writer(out, &v).expect("writing an i64 into a Vec cannot fail");
+}
+
+fn push_wire_f64(out: &mut Vec<u8>, v: f64) {
+    // serde emits non-finite floats as null, same as the DOM path
+    serde_json::to_writer(out, &v).expect("writing an f64 into a Vec cannot fail");
 }
 
 /// Insert one message + its parts in a single writer batch (wire shape:
@@ -713,6 +841,26 @@ pub enum MessageWalk {
     Window(Vec<(String, String)>),
 }
 
+pub mod splice;
+
+/// L1 splice fallbacks (DOM path taken) since process start. The corpus
+/// differential proves 0 on real data; anything non-zero means stored bytes
+/// hit a shape the splicer will not guess at, which is a signal, not a
+/// silent fallback. Exported for the metric + tests.
+pub static SPLICE_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn splice_fallbacks() -> u64 {
+    SPLICE_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Rows that took the zero-parse path since process start.
+pub fn splice_rows() -> u64 {
+    SPLICE_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Splice throughput counters: (rows spliced, rows sent to the DOM path).
+static SPLICE_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn for_each_message_json(
     db: &std::path::Path,
     session_id: &str,
@@ -778,6 +926,8 @@ pub fn for_each_message_json(
     // churn group in the profile). The frame itself is still an owned
     // String (it crosses the channel); everything nested is append-only.
     let mut ser: Vec<u8> = Vec::with_capacity(64 * 1024);
+    // L1 splice scratch (key set + one decoded-key slot), reused per row
+    let mut scratch = crate::splice::SpliceScratch::default();
     let mut groups: std::collections::HashMap<String, Vec<PartRow>> =
         std::collections::HashMap::new();
     let mut padded: Vec<Option<String>> = Vec::with_capacity(PART_CHUNK);
@@ -812,43 +962,95 @@ pub fn for_each_message_json(
             }
         }
         for (mid, info_txt) in &head {
-            // string-only assembly: parse→merge→serialize per row, never a
-            // json!-wrapper Value tree (the wrapper roughly doubled transient
-            // churn during the 101MB stream — measured RSS 599/600MB)
-            let info: serde_json::Value = serde_json::from_str(info_txt)?;
-            let info = merge_columns(info, mid, session_id, None);
-            // capacity estimate: info + parts (inline lens known after query —
-            // fixed floor avoids the doubling-growth pattern on big messages)
+            // L1 (PERF-10X Phase II): zero-parse assembly. Phase I attributed
+            // 86% of read-path allocations to serde_json DOM work, so the
+            // splice replaces parse→merge→serialize with one byte pass into a
+            // REUSED buffer. Proven byte-identical to the DOM path over the
+            // whole stored corpus (218,393 rows, 0 refused, 0 mismatched —
+            // `tests/splice_parity.rs::splice_parity_over_corpus`), and it
+            // falls back to the DOM path on anything it cannot prove, so the
+            // fast path can never change semantics.
             let mut chunk = String::with_capacity(info_txt.len() + 8192);
             chunk.push_str("{\"info\":");
             ser.clear();
-            serde_json::to_writer(&mut ser, &info)?;
-            chunk.push_str(std::str::from_utf8(&ser)?);
+            let spliced_info = crate::splice::compact_splice(
+                info_txt,
+                mid,
+                session_id,
+                None,
+                &mut ser,
+                &mut scratch,
+            );
+            if spliced_info {
+                SPLICE_ROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                chunk.push_str(std::str::from_utf8(&ser)?);
+            } else {
+                // DOM fallback — unreachable on real data, proven by the
+                // corpus differential, and never silent
+                let info: serde_json::Value = serde_json::from_str(info_txt)?;
+                let info = merge_columns(info, mid, session_id, None);
+                ser.clear();
+                serde_json::to_writer(&mut ser, &info)?;
+                chunk.push_str(std::str::from_utf8(&ser)?);
+                SPLICE_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             chunk.push_str(",\"parts\":[");
             let parts = groups.remove(mid).unwrap_or_default();
             let mut first_part = true;
             for prow in &parts {
-                // blob parts: parse straight from bytes (skips a full
-                // lossy-String copy per blob — phase-1 churn cut)
-                let parsed = match &prow.inline {
-                    Some(t) => serde_json::from_str::<serde_json::Value>(t),
+                if !first_part {
+                    chunk.push(',');
+                }
+                first_part = false;
+                // blob parts: decode straight from bytes (no lossy String copy)
+                let inline: Option<std::borrow::Cow<'_, str>> = match &prow.inline {
+                    Some(t) => Some(std::borrow::Cow::Borrowed(t.as_str())),
                     None => match (&prow.sha, prow.byte_len) {
-                        (Some(sha), len) => {
-                            let raw = blobs.get(sha, len as u64)?;
-                            serde_json::from_slice::<serde_json::Value>(&raw)
+                        (Some(sha), len) => match blobs.get(sha, len as u64) {
+                            Ok(raw) => match String::from_utf8(raw) {
+                                Ok(s) => Some(std::borrow::Cow::Owned(s)),
+                                Err(e) => Some(std::borrow::Cow::Owned(
+                                    String::from_utf8_lossy(e.as_bytes()).into_owned(),
+                                )),
+                            },
+                            Err(e) => {
+                                // unreadable blob: skip the part exactly as the
+                                // DOM path did (it errored on `?`) — but now
+                                // loud, because silently dropping a part would
+                                // be a wire change
+                                tracing::warn!("page part blob {sha} unreadable: {e:#}");
+                                SPLICE_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                chunk.pop(); // undo the separator we just wrote
+                                first_part = true;
+                                continue;
+                            }
+                        },
+                        (None, _) => {
+                            chunk.pop();
+                            first_part = true;
+                            continue;
                         }
-                        (None, _) => continue,
                     },
                 };
-                if let Ok(v) = parsed {
+                let Some(text) = inline else { continue };
+                ser.clear();
+                if crate::splice::compact_splice(
+                    &text,
+                    &prow.id,
+                    session_id,
+                    Some(mid),
+                    &mut ser,
+                    &mut scratch,
+                ) {
+                    SPLICE_ROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    chunk.push_str(std::str::from_utf8(&ser)?);
+                } else {
+                    let v: serde_json::Value = serde_json::from_str(&text)?;
                     let merged = merge_columns(v, &prow.id, session_id, Some(mid));
-                    if !first_part {
-                        chunk.push(',');
-                    }
-                    first_part = false;
                     ser.clear();
                     serde_json::to_writer(&mut ser, &merged)?;
                     chunk.push_str(std::str::from_utf8(&ser)?);
+                    SPLICE_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             chunk.push_str("]}");
@@ -1755,6 +1957,7 @@ pub fn bump_write_epoch() {
     l.slot = None;
     l.bytes = None;
     l.epoch = 0;
+    l.db = None;
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -1770,21 +1973,32 @@ type CachedHits = std::sync::Arc<(Vec<SearchHit>, bool)>;
 
 struct SearchMemoState {
     epoch: u64,
+    /// See `ListMemoState::db` — same identity rule: a memo entry is only
+    /// served to the db that produced it, otherwise the table is cleared.
+    db: Option<std::path::PathBuf>,
     entries: std::collections::VecDeque<(SearchKey, CachedHits)>,
 }
 
 impl SearchMemoState {
     fn clear(&mut self) {
         self.entries.clear();
+        self.db = None;
     }
     fn get(
         &mut self,
         key: &SearchKey,
         epoch: u64,
+        db: &std::path::Path,
     ) -> Option<std::sync::Arc<(Vec<SearchHit>, bool)>> {
         if self.epoch != epoch {
             self.entries.clear();
             self.epoch = epoch;
+            self.db = None;
+        }
+        // identity: same db, or nothing was ever cached (db set on first put)
+        if self.db.as_deref().is_some_and(|d| d != db) {
+            self.entries.clear();
+            self.db = None;
         }
         // FIFO walk (cap 64 — linear scan of ≤64 short keys, cheaper than a
         // HashMap upkeep; keys are workload-stable)
@@ -1793,10 +2007,17 @@ impl SearchMemoState {
             .find(|(k, _)| k == key)
             .map(|(_, v)| std::sync::Arc::clone(v))
     }
-    fn put(&mut self, key: SearchKey, val: CachedHits, epoch: u64) {
+    fn put(&mut self, key: SearchKey, val: CachedHits, epoch: u64, db: &std::path::Path) {
         if self.epoch != epoch {
             self.entries.clear();
             self.epoch = epoch;
+        }
+        if self.db.as_deref().is_some_and(|d| d != db) {
+            self.entries.clear();
+            self.db = None;
+        }
+        if self.db.is_none() {
+            self.db = Some(db.to_path_buf());
         }
         self.entries.retain(|(k, _)| k != &key);
         self.entries.push_back((key, val));
@@ -1811,6 +2032,14 @@ impl SearchMemoState {
 
 struct ListMemoState {
     epoch: u64,
+    /// DB identity this slot was filled from. The epoch alone is NOT an
+    /// identity: `write_epoch` is process-global, so two different databases
+    /// in one process (tests, or any future multi-db reader) can share an
+    /// epoch and silently serve each other's bytes. Found 2026-10-07 when the
+    /// corpus parity gate ran two dbs in one test binary and the synthetic
+    /// test received the live db's bytes. A hit now requires BOTH epoch and
+    /// path match; a path mismatch clears the slot rather than serving it.
+    db: Option<std::path::PathBuf>,
     slot: Option<std::sync::Arc<Vec<serde_json::Value>>>,
     /// Serialized wire bytes of the same list (F5-extends-F8): a hit is a
     /// refcounted Bytes clone — no per-request 300KB serde pass.
@@ -1822,6 +2051,7 @@ fn search_memo() -> &'static parking_lot::Mutex<SearchMemoState> {
     M.get_or_init(|| {
         parking_lot::Mutex::new(SearchMemoState {
             epoch: 0,
+            db: None,
             entries: std::collections::VecDeque::new(),
         })
     })
@@ -1832,6 +2062,7 @@ fn list_memo() -> &'static parking_lot::Mutex<ListMemoState> {
     M.get_or_init(|| {
         parking_lot::Mutex::new(ListMemoState {
             epoch: 0,
+            db: None,
             slot: None,
             bytes: None,
         })
@@ -1898,7 +2129,7 @@ pub fn search_parts(
         let hit = {
             let memo = search_memo();
             let mut m = memo.lock();
-            m.get(&key, write_epoch())
+            m.get(&key, write_epoch(), db)
         };
         if let Some(v) = hit {
             SEARCH_MEMO_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1981,7 +2212,7 @@ pub fn search_parts(
         // raced a write (e1 != e0) => discard rather than store (never stale)
         let memo = search_memo();
         let mut m = memo.lock();
-        m.put(key, std::sync::Arc::new((hits.clone(), truncated)), e0);
+        m.put(key, std::sync::Arc::new((hits.clone(), truncated)), e0, db);
     }
     Ok((hits, truncated))
 }

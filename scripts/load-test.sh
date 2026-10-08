@@ -289,19 +289,41 @@ PYM
 fi
 if [ ! -f "$HR/.local/share/refine/refine.db" ]; then
   say "== fixture: refine import from snapshot (equivalent data by construction) =="
-  "$REFINE_BIN" import --source "$FIX/snapshot.db" --limit 1000000 \
-    --data-dir "$HR/.local/share/refine" | tail -3
+  "$REPO/$REFINE_BIN" import --source "$FIX/snapshot.db" --limit 1000000 \
+    --data-dir "$HR/.local/share/refine" | tail -3 &
+  PID_IMPORT=$!
+  wait "$PID_IMPORT"
+  PID_IMPORT=""
 fi
 
 # ---------- spawn arms ----------
-PID_F=""; PID_R=""
+PID_F=""; PID_R=""; PID_IMPORT=""
+
+# Sweep orphaned `refine import` processes BEFORE the run. An import that
+# hangs (contended lock, a fixture wiped under it) is not covered by the
+# arm cleanup below — it starts before PID_R exists — and it survives the
+# shell exiting, holding the write lock so every later run also hangs.
+# Observed 2026-10-07: two stuck imports, one 121 minutes old, pegging a core
+# each; the A/B could not start until they were killed.
+sweep_imports() {
+  local pids
+  pids=$(pgrep -f "$HR/.local/share/refine|refine import --source $FIX" 2>/dev/null || true)
+  [ -n "$pids" ] || return 0
+  say "sweep: killing $stale import(s): $(echo "$pids" | tr '\n' ' ')"
+  # shellcheck disable=SC2086
+  kill -9 $pids 2>/dev/null || true
+  sleep 1
+}
+
 cleanup() {
-  for p in "$PID_R" "$PID_F"; do
+  for p in "$PID_R" "$PID_F" "$PID_IMPORT"; do
     [ -n "$p" ] && { kill -- "-$p" 2>/dev/null || kill "$p" 2>/dev/null || true; }
   done
   [ -n "${SAMPLER_PID:-}" ] && { touch "${RUN_DIR:-/nonexistent}/STOP" 2>/dev/null || true; kill "$SAMPLER_PID" 2>/dev/null || true; }
+  sweep_imports
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
+sweep_imports
 
 say "== spawn (cwd=$META_CWD) =="
 (

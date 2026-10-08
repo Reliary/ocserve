@@ -961,6 +961,29 @@ async fn metrics(State(_st): State<Arc<AppState>>) -> impl IntoResponse {
     // registry counters are incremented by the timing middleware; rss sampled
     // here (scrape-time) so gauges are fresh
     refine_metrics::sample_rss();
+    // Read-path fast activity (L1 splice + F5/F7/F8 memos), published as
+    // absolute cumulative gauges at scrape time — these counters live in
+    // refine-store as atomics with no event stream of their own.
+    //  - splice_rows/fallbacks: the corpus gate proves 0 fallbacks on real
+    //    data, so a non-zero fallback gauge means stored bytes hit a shape
+    //    the splicer refuses — a signal, not a silent fallback (lib.rs L1).
+    //  - memo hit/miss: the load report's cache-on/off variants must be
+    //    observable in production, not just in a bench run.
+    refine_metrics::gauge(
+        "refine_splice_rows_total",
+        refine_store::splice_rows() as i64,
+    );
+    refine_metrics::gauge(
+        "refine_splice_fallbacks_total",
+        refine_store::splice_fallbacks() as i64,
+    );
+    let (search_hits, search_misses, list_hits, list_misses, _pad, search_len, _epoch) =
+        refine_store::memo_stats();
+    refine_metrics::gauge("refine_memo_search_hits", search_hits as i64);
+    refine_metrics::gauge("refine_memo_search_misses", search_misses as i64);
+    refine_metrics::gauge("refine_memo_list_hits", list_hits as i64);
+    refine_metrics::gauge("refine_memo_list_misses", list_misses as i64);
+    refine_metrics::gauge("refine_memo_search_entries", search_len as i64);
     let body = refine_metrics::render();
     (
         [(
@@ -2507,21 +2530,33 @@ async fn list_directory(
     let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/"));
     let raw = q.get("path").map(String::as_str).unwrap_or(".");
     let dir = scope_path(base, raw)?;
-    let rd = std::fs::read_dir(&dir).map_err(|e| ApiError {
-        status: StatusCode::BAD_REQUEST,
-        name: "BadRequest",
-        message: format!("list {}: {e}", dir.display()),
-    })?;
+    // M3 (same class as find_files): `read_dir` + per-entry `metadata()` is
+    // blocking syscalls, inline on a tokio worker. A directory with thousands
+    // of entries would park the worker for the whole loop.
+    let dir_for_worker = dir.clone();
+    let raw_owned = raw.to_string();
+    let rd = tokio::task::spawn_blocking(move || std::fs::read_dir(&dir_for_worker))
+        .await
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalServerError",
+            message: format!("list worker: {e}"),
+        })?
+        .map_err(|e| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            name: "BadRequest",
+            message: format!("list {}: {e}", dir.display()),
+        })?;
     let mut nodes: Vec<Value> = Vec::new();
     for entry in rd.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         let path = entry.path();
         let meta = entry.metadata().ok();
         let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-        let rel = if raw.is_empty() || raw == "." {
+        let rel = if raw_owned.is_empty() || raw_owned == "." {
             name.clone()
         } else {
-            format!("{}/{}", raw.trim_end_matches('/'), name)
+            format!("{}/{}", raw_owned.trim_end_matches('/'), name)
         };
         let ignored =
             name.starts_with('.') || name == "node_modules" || name == "target" || name == ".git";
@@ -2589,7 +2624,7 @@ async fn find_files(
     State(st): State<Arc<AppState>>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
-    let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/"));
+    let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/")).to_path_buf();
     let query = q
         .get("query")
         .map(String::as_str)
@@ -2598,13 +2633,65 @@ async fn find_files(
     if query.is_empty() {
         return Ok(Json(json!([])));
     }
-    let want_type = q.get("type").map(String::as_str).unwrap_or("");
+    let want_type = q.get("type").map(String::as_str).unwrap_or("").to_string();
     let limit: usize = q
         .get("limit")
         .and_then(|l| l.parse().ok())
         .unwrap_or(50)
         .clamp(1, 200);
     let glob_mode = query.contains('*') || query.contains('?');
+    // M3: the walk is a blocking filesystem scan (bounded at 20,000 dirs, but
+    // a big worktree still means thousands of `read_dir` syscalls per
+    // request). It ran INLINE on a tokio worker — the same convoy class as the
+    // pre-F1 SQLite work, which is exactly what `run_blocking` exists for.
+    // The load harness never caught this because its LIST_PATH is an empty
+    // /tmp dir; on a real worktree it would park a worker.
+    let out = tokio::task::spawn_blocking(move || {
+        walk_files(&base, &query, &want_type, limit, glob_mode)
+    })
+    .await
+    .map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalServerError",
+        message: format!("find_files worker: {e}"),
+    })?
+    .map_err(|e| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        name: "BadRequest",
+        message: format!("find_files: {e:#}"),
+    })?;
+    Ok(Json(Value::Array(
+        out.into_iter().map(Value::String).collect(),
+    )))
+}
+
+/// Thread the last `walk_files` executed on (M3 test seam).
+///
+/// Global, not `thread_local!`: the walk runs on a *blocking-pool* thread, so
+/// a thread-local record would be written on one thread and read on another —
+/// the first version of this seam was invisible for exactly that reason (caught
+/// by the test asserting on it).
+static WALK_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> = std::sync::Mutex::new(None);
+
+/// Blocking body of `GET /find/file` — a bounded, single-threaded directory
+/// walk. Existing bounds kept exactly (20,000 dirs visited, stop once the
+/// result set reaches 4×limit); only the *thread* it runs on changed.
+fn walk_files(
+    base: &std::path::Path,
+    query: &str,
+    want_type: &str,
+    limit: usize,
+    glob_mode: bool,
+) -> anyhow::Result<Vec<String>> {
+    // M3 test seam: which thread executed the walk. Async tokio workers and
+    // the blocking pool are different threads, so comparing this with the
+    // thread a request body runs on proves the walk was moved OFF the worker
+    // without depending on wall-clock timing (a small tree walks in
+    // microseconds — the first version of this test used a ticker and passed
+    // even with the walk inline, i.e. it was not discriminating).
+    if let Ok(mut g) = WALK_THREAD.lock() {
+        *g = Some(std::thread::current().id());
+    }
     let mut out: Vec<String> = Vec::new();
     let mut stack = vec![(base.to_path_buf(), String::new())];
     let mut visited = 0usize;
@@ -2628,9 +2715,9 @@ async fn find_files(
                 format!("{rel}/{name}")
             };
             let matched = if glob_mode {
-                refine_tools::wildcard_match(&name, &query)
+                refine_tools::wildcard_match(&name, query)
             } else {
-                child_rel.to_lowercase().contains(&query)
+                child_rel.to_lowercase().contains(query)
             };
             if matched
                 && (want_type.is_empty()
@@ -2646,14 +2733,12 @@ async fn find_files(
     }
     // prefix matches first, then lexicographic; capped
     out.sort_by(|a, b| {
-        let pa = a.to_lowercase().starts_with(&query);
-        let pb = b.to_lowercase().starts_with(&query);
+        let pa = a.to_lowercase().starts_with(query);
+        let pb = b.to_lowercase().starts_with(query);
         pb.cmp(&pa).then_with(|| a.cmp(b))
     });
     out.truncate(limit);
-    Ok(Json(Value::Array(
-        out.into_iter().map(Value::String).collect(),
-    )))
+    Ok(out)
 }
 
 /// GET /find?pattern= — text search → SearchMatch list. Single `grep -rnE`
@@ -3629,7 +3714,7 @@ mod limit_matrix {
 
 #[cfg(test)]
 mod f1_blocking_tests {
-    use super::run_blocking;
+    use super::{AppState, Payloads, router, run_blocking};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -3638,8 +3723,62 @@ mod f1_blocking_tests {
     /// Single-worker runtime makes this discriminating: with the call inlined
     /// (the pre-F1 shape) the ticker cannot advance while the call runs
     /// (after == before → red); via the blocking pool it keeps ticking.
+    /// M3: `GET /find/file`'s directory walk must execute OFF the tokio
+    /// worker. Structural proof via thread identity, not timing: a ticker-
+    /// based version of this test passed with the walk still inline (a few
+    /// thousand files walk in microseconds), so it proved nothing.
+    ///
+    /// The probe drives the REAL route — calling `walk_files` directly would
+    /// bypass the very `spawn_blocking` under test, which the first version
+    /// of this test did (and it failed for exactly that reason).
+    #[tokio::test]
+    async fn find_files_walk_runs_off_the_worker() {
+        use tower::ServiceExt as _;
+        let dir = std::env::temp_dir().join(format!(
+            "refine-m3-walk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..200 {
+            std::fs::write(dir.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+
+        let mut payloads = Payloads::default();
+        payloads.config["directory"] = serde_json::Value::String(dir.to_string_lossy().to_string());
+        let st = AppState::with_payloads(None, payloads);
+
+        let handler_thread = std::thread::current().id();
+        let req = axum::http::Request::builder()
+            .uri("/find/file?query=f1&limit=10")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tokio::spawn(async move { router(st).oneshot(req).await })
+            .await
+            .expect("route task")
+            .expect("infallible");
+        assert_eq!(resp.status(), 200);
+
+        let walked_on = super::WALK_THREAD.lock().ok().and_then(|g| *g);
+        let walked_on = walked_on.expect("walk_files must record its thread");
+        assert_ne!(
+            walked_on, handler_thread,
+            "the walk ran on the async worker — blocking syscalls must go \
+             through spawn_blocking (M3)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PERF-10X F1: a blocking store call must NOT park the async worker.
+    /// Single-worker runtime makes this discriminating: with the call inlined
+    /// (the pre-F1 shape) the ticker cannot advance while the call runs
+    /// (after == before → red); via the blocking pool it keeps ticking.
     /// Negative control: swap run_blocking for the inline sleep → red.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+
     async fn run_blocking_frees_the_worker() {
         let ticks = Arc::new(AtomicU64::new(0));
         let t = ticks.clone();

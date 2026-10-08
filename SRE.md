@@ -152,6 +152,22 @@ fails boot. Visibility: `refine_models_refresh_total{result}` + nightly
 encode, JSON part encode, blob zstd, FTS insert, tool-output chunking. Optimization lands
 only with a before/after number on the bench gate.
 
+
+### 5.x Blocking filesystem I/O (M3, PERF-10X Phase II)
+
+`GET /find/file` and `GET /file` walk the filesystem. Both bodies now run via
+`tokio::task::spawn_blocking`; the walk itself is unchanged (same bounds:
+20,000 directories visited, stop at 4×limit results, 5,000 entries returned).
+Reason: they were the last inline blocking syscalls on an async worker — the
+same convoy class as the pre-F1 SQLite work, which parked a worker behind a
+slow store call.
+
+The load harness could not see this: its `LIST_PATH` is an empty `/tmp`
+directory, so a k6 run never walked anything. Proof is structural instead —
+`find_files_walk_runs_off_the_worker` asserts the walk executed on a thread
+other than the async worker (thread identity recorded by a test-only seam).
+**Negative control**: restoring the inline call makes that test red.
+
 ## 5. DevOps
 
 - **The service is an OPTIONAL overlay, preferred, never implicit.**
@@ -198,7 +214,14 @@ only with a before/after number on the bench gate.
      guard rule 9).
   5. **Backstop:** `MemoryMax=1024M` — kids 700 + main reserve ~324 (≈ 2×
      the measured 180 MB envelope); provenance comment chain in the unit
-     template (history: 480 → 600 → 750 → 1024, each step measured). A
+     template (history: 480 → 600 → 750 → 1024, each step measured).
+     **2026-10-08:** the unit template was found carrying the stale 750M
+     while this section already said 1024M — a structural over-commit, not
+     a leak: the partition allows kids/ 700M + main runs 130-180M typical
+     (455M migration peak), so 700+130 > 750 could never fit both. Journal
+     10-07/10-08: 6+ kernel SIGKILLs of the sidecar at cold start,
+     `memory.peak` pinned at exactly 786,432,000. Template now matches this
+     section; kill-policy proof and recycle gauge unchanged. A
      larger ceiling costs **nothing at idle** (cgroups charge on touch) —
      leak detection is the recycle gauge + soak slope, never cap proximity.
      Also: `Delegate=yes` (systemd stops managing the unit subtree so the

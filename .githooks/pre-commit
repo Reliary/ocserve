@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Commit gate hooks (AGENTS §3): banned-string check + docs-required check.
+# Tracked copy — enable with: git config core.hooksPath .githooks
+# (see .githooks/README.md). Contains NO literal personal values: the login
+# token is derived at runtime via `whoami`, emails are pattern-matched.
+# Fast by design (no network, no builds) — full gates run per AGENTS §3 body.
+set -euo pipefail
+rc=0
+
+# 1. banned strings: login name (any casing, word-boundary) + absolute home paths
+U="$(whoami)"
+while IFS= read -r f; do
+  [ -f "$f" ] || continue
+  case "$f" in node_modules/*|target/*|.git/*|__pycache__/*|*.pyc) continue ;; esac
+  if grep -rniE "(^|[^A-Za-z0-9_-])${U}([^A-Za-z0-9_-]|$)" -- "$f" >/dev/null 2>&1; then
+    echo "BANNED: login name in $f"; rc=1
+  fi
+  # system install prefixes are NOT personal paths (documented exclusions;
+  # the no-personal-name rule states the hook's exclusion list governs)
+  if grep -rniE '/home/[A-Za-z0-9_-]+/' -- "$f" 2>/dev/null \
+      | grep -viE '/home/linuxbrew/' >/dev/null 2>&1; then
+    echo "BANNED: absolute home path in $f"; rc=1
+  fi
+  # email addresses (personal data): the login-name check is whole-token and
+  # missed a wrapped form once (wrangler account json, 2026-10-06 — scrubbed
+  # by the 2026-10-08 filter-repo rewrite together with all .pyc caches).
+  # testdata/ used to be exempt on the theory that recorded corpora "may
+  # legitimately contain addresses" — an all-history scan proved zero do, so
+  # the exemption is gone: scan everywhere, allow only clearly non-personal
+  # domains.
+  if grep -rnoE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' -- "$f" 2>/dev/null \
+      | grep -viE 'example\.com|noreply|localhost' | head -1 | grep -q .; then
+    echo "BANNED: email address in $f"; rc=1
+  fi
+done < <(git diff --cached --name-only --diff-filter=ACM)
+[ "$rc" -eq 0 ] || { echo "pre-commit: banned-string check failed"; exit 1; }
+
+# 2. docs-required: any staged behavior (crates/**.rs) must carry its matrix row
+if [ "${REFINE_SKIP_DOCS:-0}" != "1" ]; then
+  if git diff --cached --name-only | grep -q '^crates/.*\.rs$'; then
+    if ! git diff --cached --name-only | grep -q '^TRACEABILITY\.md$'; then
+      echo "docs-required: staged crates/*.rs but TRACEABILITY.md not staged"
+      echo "(matrix row for the requirement/test ID — REFINE_SKIP_DOCS=1 only for test-only/refactor commits)"
+      exit 1
+    fi
+  fi
+fi
+exit 0

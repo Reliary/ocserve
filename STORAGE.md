@@ -36,6 +36,83 @@ this scale. Write amplification is absorbed by the ≤50 ms writer batching.
 - Compaction: incremental `INSERT INTO f(f, rank) VALUES('merge', ±N)` in idle windows —
   never the all-btree `optimize` (long transaction).
 
+### 1.1b Read-path JSON assembly (PERF-10X Phase I/II L1)
+
+`msg.info` and `msg_part.inline` are stored JSON blobs; the response merges
+three column keys into each. That was done with `serde_json::Value`
+(parse → insert → re-serialize), which bytehound attributed **86% of
+read-path allocations**. `refine-store/src/splice.rs` now compacts the
+stored bytes in one pass into a **reused** buffer and splices the column
+keys — no `Value`, no `HashMap`, no per-row re-serialization.
+
+**Not a passthrough, on purpose:** serde's compact formatter writes `,`
+and `":"` with no whitespace (`serde_json-1.0.150/src/ser.rs:1884-1893`),
+and re-formats numbers through ryu, so the DOM path *normalizes*. Upstream's
+Bun writer emits `": "`/`", "` for 39% of stored rows, so copying bytes
+verbatim would change the wire. The splicer therefore compacts whitespace,
+re-emits non-canonical escapes/floats through serde, and **refuses** (DOM
+fallback) on anything unprovable: non-object top level, unbalanced brackets,
+duplicate top-level keys, non-canonical integers > 19 digits, malformed
+values.
+
+### 1.1d Boot must not die on write-lock contention (found by the load harness)
+
+The optimize-placement fix (this file §1.2) moved `PRAGMA optimize` onto the
+boot path, where it runs on **every** writer spawn. The A/B run immediately
+exposed the consequence: with a second connection holding the write lock (the
+load harness wipes a stale fixture while another handle lingers),
+`pragma_update` returned `SQLITE_BUSY` → `migrate` failed → `refine serve`
+exited 1 → "refine never healthy". `busy_timeout` does not cover it: that
+applies to lock acquisition, and a statement-level BUSY on a pragma can
+surface immediately.
+
+Maintenance in this path is **statistics work, not schema**, so:
+
+- transient `database is locked` → bounded retry (5 attempts, 100/200/300/400
+  ms backoff = 1 s budget), then WARN and continue. Losing stats costs only a
+  stale planner until the next hourly tick; losing the boot costs the server.
+- any **non**-contention error → still propagates. The swallow is scoped to
+  the exact `database is locked` string.
+
+Tests: `tests/lock_retry.rs` — `boot_survives_a_contended_optimize` (real
+`BEGIN EXCLUSIVE` blocker, asserts success AND a bounded runtime),
+`stats_are_collected_when_the_lock_is_free`, and
+`non_contention_errors_are_not_swallowed` (drops `part_search_fts` so the
+maintenance statement fails hard). **Planted negative control**: making the
+retry absorb *every* error turns the third test red — proven. A first attempt
+at that control used `PRAGMA <unknown>`, which SQLite silently ignores, so it
+was vacuous and was replaced.
+
+**Gate:** `tests/splice_parity.rs` proves byte-parity against the DOM as
+oracle, and `splice_parity_over_corpus` runs the differential over **every**
+stored row (`REFINE_SPLICE_DB=<db>`): 218,393 rows, 0 refused, 0 mismatched
+on the fixture. Live: 5,900 rows spliced, 0 fallbacks. `splice_rows()` /
+`splice_fallbacks()` expose the counters; a non-zero fallback count is a
+signal, not a silent degradation.
+
+### 1.1c Session-list wire bytes (M1)
+
+`GET /session` (201 rows on the fixture) was serialized through
+`Vec<serde_json::Value>`: build 201 trees, then `to_vec`. M1
+(`build_sessions_wire_bytes`) writes the members straight from the columns
+into one buffer — no `Value` tree, one pass. Numbers and the `model` blob go
+through serde itself, so ryu/itoa/escaping is serde's by construction rather
+than reimplemented.
+
+**Attribution** (`examples/list_split.rs`, fixture, memo off): SQL row read
+74 µs, JSON build 238 µs — so JSON was ~3× the SQL, and M1 cut that build
+from ~412 µs (DOM) to 238 µs. The full cold call measures ~312 µs here and
+~660 µs in `sqlite_tune_bench`; the difference is `open_reader` (parked
+connection checkout + pragmas), which neither path changes.
+
+**Parity gate** (`tests/list_wire_parity.rs`): byte-exact against
+`to_vec(&load_sessions_wire())` over NULL/empty/unicode/quote/backslash/
+control-character columns, negative and fractional costs, i64 extremes,
+`model` stored with non-compact whitespace, `model` that is not JSON (the
+fallback), and a post-write round trip. Corpus run on the fixture:
+**201 sessions, 105,475 bytes, byte-exact.** A planted extra member turns 3
+of the 5 tests red, so the gate is not vacuous.
+
 ### 1.2 SQLite tuning audit — every pragma decided by evidence (PERF-10X stmt pass, 2026-10-07)
 
 Method: live probe of our bundled build (rusqlite 0.40.2 / SQLite 3.53.2,
@@ -51,8 +128,8 @@ memos off, interleaved where noisy). Warm µs figures from `prep_A/B` and
 | mmap_size | 0 | **REJECT 256 MB**: A/B zero delta everywhere (page 7 µs, fts 110 µs, list 805 µs both ways); RSS/OOM history rationale intact (docs note no special caveats, but nothing to win) |
 | temp_store | 1 (FILE) | fixed earlier (value was 2=MEMORY miscommented); `/tmp` is tmpfs here → sort spill = shmem, memcg-accounted, swappable — bounded either way |
 | analysis_limit | 0 (default) | **no change** — since 3.46 `PRAGMA optimize` sets its own temporary limit (0x00010 bit, on by default); docs: "applications that use optimize … do not need to set an analysis limit" |
-| optimize placement | **FIXED** | was only in `create_new` (runs before tables exist = perpetual no-op) + hourly tick needs 240 *write* batches → fixture dbs had `stat1=0` forever (`optimize(-1)` listed 7 pending ANALYZEs). `schema::migrate` is now a wrapper that runs `post_maintenance` on EVERY writer spawn incl. steady-state boots: `optimize=0x10002` (docs' verbatim long-lived-connection value; measured 0.09 s) + FTS optimize. Test `steady_state_migrate_collects_planner_stats` + planted negative control (red→green) |
-| FTS `'optimize'` maintenance | **ADOPTED** (in `post_maintenance`) | phased same-file isolation: search_fts 149→101 µs (−32%), zero-match walk 1090→923 µs (−15%), no-op at steady state (sub-second) |
+| optimize placement | **FIXED** | was only in `create_new` (runs before tables exist = perpetual no-op) + hourly tick needs 240 *write* batches → fixture dbs had `stat1=0` forever (`optimize(-1)` listed 7 pending ANALYZEs). `schema::migrate` is now a wrapper that runs `post_maintenance` on EVERY writer spawn incl. steady-state boots: `optimize=0x10002` (docs' verbatim long-lived-connection value; measured **6 ms live**, 0.09 s fixture) — with per-phase timing logs added after a 2026-10-07 deploy spent 5m40s silent with nothing to attribute it to. Test `steady_state_migrate_collects_planner_stats` + planted negative control (red→green) |
+| FTS `'optimize'` maintenance | **REMOVED from the boot path (2026-10-08)** — kept only as documented offline SQL | fixture had said ADOPTED (−32% search, −15% LIKE-shaped walk, "sub-second at steady state") but the LIVE 1.6 GB db measured the same statement at **175,796 ms** with serve blocked (boot 3 min; an earlier untimed deploy showed 5m40s silence; second writer spawn 3 s later = 0 ms ⇒ the merge itself is the cost). FTS5 default automerge maintains segments during inserts and S-A keeps search ms-class, so the fixture win does not pay for a 3-minute boot. Offline re-run: `sqlite3 refine.db "INSERT INTO part_search_fts(part_search_fts) VALUES('optimize');"`. Re-add to boot only on measured search regression |
 | threads | 0 | keep — auxiliary sorter threads only help the big sorts S-A removed; per-statement thread launch would be overhead |
 | secure_delete | 0 | verified OFF in our build (compile_options lacks `SECURE_DELETE`; probe) — no rewrite amplification on prune/cascade |
 | STAT4 | compiled in | no action — `ENABLE_STAT4` present; optimize writes stat4 when it analyzes |
