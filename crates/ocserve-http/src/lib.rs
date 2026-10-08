@@ -91,6 +91,7 @@ where
 }
 
 pub mod tui;
+pub mod ui;
 
 /// Upstream error envelope: {"name":"NotFoundError","data":{"message":"..."}} (captured live).
 pub struct ApiError {
@@ -266,6 +267,10 @@ pub struct AppState {
     pub question_gate: std::sync::Arc<ocserve_core::question::QuestionGate>,
     /// /tui/control rendezvous queues (v1 shared/tui-control.ts)
     pub tui: crate::tui::TuiControl,
+    /// Web-UI reverse proxy (Phase 7; upstream serveUIEffect parity)
+    pub ui: crate::ui::UiProxy,
+    /// User CORS allowlist (config `server.cors` + `--cors`), read once at boot
+    pub cors_extra: Vec<String>,
 }
 
 /// LLM endpoint resolution for the prompt runner (assembled by Runtime).
@@ -412,6 +417,8 @@ impl AppState {
             prompt_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             question_gate: ocserve_core::question::QuestionGate::new(),
             tui: crate::tui::TuiControl::default(),
+            ui: crate::ui::UiProxy::from_env(),
+            cors_extra: read_cors_env(),
             db: w.db,
             blobs: w.blobs,
             writer: w.writer,
@@ -3679,7 +3686,33 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.clone(),
             auth_gate,
         ))
+        // CORS (upstream cors.ts parity) sits OUTSIDE auth: preflights must
+        // answer without credentials, exactly like upstream.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::ui::cors_gate,
+        ))
+        // Catch-all: unmatched paths serve the web UI (embedded upstream-side
+        // or proxied to app.opencode.ai), matching v1 serveUIEffect. Disabled
+        // via OCSERVE_UI=0 → JSON 404.
+        .fallback(crate::ui::ui_fallback)
         .with_state(state)
+}
+
+/// CORS extras: OCSERVE_CORS (comma-separated) — the `--cors` equivalent.
+/// Config-file `server.cors` support arrives with the config passthrough;
+/// env is the runtime-tunable equivalent until then.
+fn read_cors_env() -> Vec<String> {
+    std::env::var("OCSERVE_CORS")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// JSON key-path projection: `$`, `$.a`, `$.a[].b`, … (values ignored).

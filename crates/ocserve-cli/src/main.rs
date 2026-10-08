@@ -18,7 +18,10 @@ struct Cli {
 enum Cmd {
     /// Start the HTTP/SSE server (replaces `opencode serve`)
     Serve {
-        #[arg(long, default_value = "4901")]
+        /// Default 4096 mirrors upstream: the hosted web UI at
+        /// app.opencode.ai dials http://localhost:4096 for non-opencode.ai
+        /// origins, and `opencode attach` defaults to the same.
+        #[arg(long, default_value = "4096")]
         port: u16,
         #[arg(long, default_value = "127.0.0.1")]
         hostname: String,
