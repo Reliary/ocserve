@@ -376,7 +376,7 @@ def run_one(task: str, seed: int, cond: str, port: int, attempt: int) -> dict:
 
 def main() -> int:
     if not os.path.exists(OCSERVE):
-        print(f"missing binary {OCSERVE} (cargo build -p ocserve-cli)", file=sys.stderr)
+        print(f"missing binary {OCSERVE} (cargo build -p ocserve)", file=sys.stderr)
         return 2
     os.makedirs(RESULTS, exist_ok=True)
     os.makedirs(WORK_ROOT, exist_ok=True)

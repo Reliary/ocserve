@@ -1,11 +1,11 @@
-# ocserve-cli
+# ocserve
 
 The `ocserve` binary: `serve` (the drop-in opencode-compatible server),
 `import`, `backup`, `doctor`, `models`, `replay` (differential wire
 harness), and the self-check commands.
 
 ```sh
-cargo install ocserve-cli
+cargo install ocserve
 ocserve serve --port 4912
 ```
 

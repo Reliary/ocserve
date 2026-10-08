@@ -16,7 +16,7 @@ use std::time::Duration;
 /// Freeze (PLAN §3): version reported by `/global/health`.
 pub const FREEZE_VERSION: &str = "1.18.31";
 
-/// Pre-assembled payloads for config-derived routes (built by ocserve-cli's
+/// Pre-assembled payloads for config-derived routes (built by ocserve's
 /// `Runtime::load()`; kept crate-local so http doesn't depend on cli).
 /// JSON deep merge: objects merge recursively, everything else (arrays,
 /// scalars) replaces. Used by overlay layering + PATCH /config (W4).
@@ -52,7 +52,7 @@ pub fn config_write_path() -> std::path::PathBuf {
     }
 }
 
-/// Boot-injected config reloader (W4): Runtime::load lives in ocserve-cli —
+/// Boot-injected config reloader (W4): Runtime::load lives in ocserve —
 /// the closure avoids a crate cycle; None in tests. Returns derived payloads
 /// AND a rebuilt LLM registry (H2 — auth/provider/default-model edits apply
 /// without restart). Callers go through `watch::reconcile`, never the raw fn.
@@ -208,7 +208,7 @@ pub struct AppState {
     /// path; both paths serve serde-identical bytes (unit-tested).
     pub wire: parking_lot::RwLock<HashMap<&'static str, bytes::Bytes>>,
     pub wire_off: std::sync::atomic::AtomicBool,
-    /// Boot-injected config reloader (Runtime lives in ocserve-cli; the
+    /// Boot-injected config reloader (Runtime lives in ocserve; the
     /// closure avoids a crate cycle). None in tests → PATCH still writes
     /// the file, swap skipped (logged).
     pub reloader: parking_lot::RwLock<Option<ConfigReloader>>,

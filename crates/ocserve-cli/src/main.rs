@@ -201,7 +201,7 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
         .with_context(|| format!("create data dir {}", data_dir.display()))?;
 
     // fail-fast boot checks (SRE.md §1) — before binding
-    ocserve_cli::boot_checks(&data_dir)?;
+    ocserve::boot_checks(&data_dir)?;
 
     // L2 partition (SRE §5): run BEFORE any child spawn (MCP probe / plugin
     // sidecar) so every wrapper can move itself into kids/. Scoped to

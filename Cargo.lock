@@ -1379,7 +1379,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ocserve-cli"
+name = "ocserve"
 version = "0.1.0"
 dependencies = [
  "anyhow",

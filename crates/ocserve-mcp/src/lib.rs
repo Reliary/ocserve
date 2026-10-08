@@ -171,7 +171,7 @@ pub fn mcp_child_path(parent_path: &str, home: &str) -> String {
 /// Kept identical in ocserve-mcp + ocserve-plugin (no shared dep) — A3/L2.
 pub const OOM_CHILD_WRAPPER: &str = r#"echo 500 >/proc/self/oom_score_adj 2>/dev/null; [ -n "$OCSERVE_KIDS_CGROUP" ] && echo $$ >"$OCSERVE_KIDS_CGROUP/cgroup.procs" 2>/dev/null; exec "$@""#;
 
-/// L2 partition: path published by ocserve-cli's cgroup dance; children get
+/// L2 partition: path published by ocserve's cgroup dance; children get
 /// it as a per-Command env (race-free — no process-global set_var).
 static KIDS_CGROUP: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 pub fn set_kids_cgroup(p: impl Into<std::path::PathBuf>) {

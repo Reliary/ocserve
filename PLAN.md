@@ -75,7 +75,7 @@ Workspace crates (rust ≥1.86, edition 2024; release profile per `SRE.md §5`):
 | `ocserve-mcp` | MCP stdio + StreamableHTTP + legacy SSE client, OAuth token store |
 | `ocserve-plugin` | rquickjs host + shims; Bun sidecar fallback protocol |
 | `ocserve-importer` | streaming 20-session read-only importer |
-| `ocserve-cli` | `serve`, `import`, `doctor`, `bench` |
+| `ocserve` | `serve`, `import`, `doctor`, `bench` |
 
 ## 3. Contract freeze (before any endpoint code)
 

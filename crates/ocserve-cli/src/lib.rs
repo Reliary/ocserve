@@ -1,4 +1,4 @@
-//! ocserve-cli library surface: boot self-checks (SRE §1) exposed for tests.
+//! ocserve library surface: boot self-checks (SRE §1) exposed for tests.
 
 use anyhow::{Context, Result};
 

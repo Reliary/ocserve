@@ -23,7 +23,7 @@ BIN="${OCSERVE_BIN:-target/debug/ocserve}"
 SELF_TEST=0
 [ "${1:-}" = "--self-test" ] && SELF_TEST=1
 
-[ -x "$BIN" ] || { echo "replay-check: $BIN missing (cargo build -p ocserve-cli)" >&2; exit 2; }
+[ -x "$BIN" ] || { echo "replay-check: $BIN missing (cargo build -p ocserve)" >&2; exit 2; }
 
 DATA="$(mktemp -d "${TMPDIR:-/tmp}/ocserve-replay-check.XXXXXX")"
 CORPUS_COPY=""

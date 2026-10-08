@@ -1,8 +1,8 @@
 //! SRE §1 fail-fast: every boot check must FAIL when its precondition is broken
 //! (forced-failure tests — a check that can't fail is theatre, TESTING §1).
-//! Uses the REAL ocserve_cli::boot_checks (no mirrored logic).
+//! Uses the REAL ocserve::boot_checks (no mirrored logic).
 
-use ocserve_cli::boot_checks;
+use ocserve::boot_checks;
 use ocserve_store::{pragma, writer};
 
 /// Happy path passes.

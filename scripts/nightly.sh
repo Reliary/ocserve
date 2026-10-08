@@ -129,7 +129,7 @@ step "binary size ceiling" bash -c "$(declare -f size_gate); size_gate"
 step "zen free-tier gate (live trio)" \
   cargo test -p ocserve-llm --test zen_live -- --ignored
 step "models.dev live fetch" \
-  cargo test -p ocserve-cli live_fetch_contains_big_pickle -- --ignored
+  cargo test -p ocserve live_fetch_contains_big_pickle -- --ignored
 
 # 7. mutants (opt-in): survivor report is triaged like a defect (TESTING §9)
 if [ "$WITH_MUTANTS" = "1" ]; then

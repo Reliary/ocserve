@@ -3,7 +3,7 @@
 //! partition → OOMPolicy → MemoryMax backstop).
 //!
 //! Pure functions live here so every guard has a testable seam; the sampler
-//! (ocserve-cli main) supplies the observations.
+//! (ocserve main) supplies the observations.
 
 /// `OCSERVE_SIDECAR_RECYCLE_MB` parse: `0` disables, absent → default 450
 /// (warm-up peak measured 365 MB — the threshold must sit above it or every

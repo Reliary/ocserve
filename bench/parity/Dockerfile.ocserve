@@ -14,7 +14,7 @@ COPY . /src
 RUN --mount=type=cache,target=/src/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo build --release -p ocserve-cli \
+    cargo build --release -p ocserve \
     && mkdir -p /out \
     && cp /src/target/release/ocserve /out/ocserve
 
