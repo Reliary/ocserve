@@ -713,8 +713,8 @@ mod tests {
         );
     }
 
-    const STOP_FIXTURE: &[u8] = include_bytes!("../../../testdata/m2/llm_stream_stop.bin");
-    const REASONING_FIXTURE: &[u8] = include_bytes!("../../../testdata/m2/llm_stream_deepseek.bin");
+    const STOP_FIXTURE: &[u8] = include_bytes!("../testdata/llm_stream_stop.bin");
+    const REASONING_FIXTURE: &[u8] = include_bytes!("../testdata/llm_stream_deepseek.bin");
 
     /// K-PROVIDER part 1: recorded stream parses; text assembles byte-exact.
     #[test]

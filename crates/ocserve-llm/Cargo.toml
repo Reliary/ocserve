@@ -3,8 +3,12 @@ name = "ocserve-llm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
 description = "Provider clients: openai-compatible first; stream assembly + fuzz corpus"
 
 [dependencies]

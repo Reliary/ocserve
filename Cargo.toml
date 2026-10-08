@@ -14,23 +14,26 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.98"
-publish = false
+repository = "https://github.com/alderpath/ocserve"
+homepage = "https://github.com/alderpath/ocserve"
+keywords = ["opencode", "server", "sqlite", "sse", "api"]
+categories = ["web-programming::http-server", "database-implementations", "development-tools"]
 
 [workspace.dependencies]
 # internal
-ocserve-core = { path = "crates/ocserve-core" }
-ocserve-store = { path = "crates/ocserve-store" }
-ocserve-http = { path = "crates/ocserve-http" }
-ocserve-llm = { path = "crates/ocserve-llm" }
-ocserve-tools = { path = "crates/ocserve-tools" }
-ocserve-mcp = { path = "crates/ocserve-mcp" }
-ocserve-plugin = { path = "crates/ocserve-plugin" }
-ocserve-metrics = { path = "crates/ocserve-metrics" }
-ocserve-importer = { path = "crates/ocserve-importer" }
+ocserve-core = { path = "crates/ocserve-core", version = "0.1.0" }
+ocserve-store = { path = "crates/ocserve-store", version = "0.1.0" }
+ocserve-http = { path = "crates/ocserve-http", version = "0.1.0" }
+ocserve-llm = { path = "crates/ocserve-llm", version = "0.1.0" }
+ocserve-tools = { path = "crates/ocserve-tools", version = "0.1.0" }
+ocserve-mcp = { path = "crates/ocserve-mcp", version = "0.1.0" }
+ocserve-plugin = { path = "crates/ocserve-plugin", version = "0.1.0" }
+ocserve-metrics = { path = "crates/ocserve-metrics", version = "0.1.0" }
+ocserve-importer = { path = "crates/ocserve-importer", version = "0.1.0" }
 
 # runtime / web
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs", "io-util", "net"] }

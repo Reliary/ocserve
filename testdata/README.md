@@ -14,7 +14,7 @@ hook (`.githooks/pre-commit`).
 | `golden/manifest.json` | 31 GET routes: key-path projections + byte/status expectations, captured from upstream 1.18.31 | Yes — `ocserve replay --record` against any 1.18.31 server (see below) |
 | `golden/*.body` | Byte-exact response bodies for `bytes`-mode routes (health, 404 envelope, busy status, vcs) | Same recording flow; bodies are environment-normalized at record time |
 | `golden/message_page_contract.json`, `summarize_contract.json` | Structural notes for paging/compaction wire shapes | Same |
-| `m2/llm_stream_*.bin` | Recorded OpenAI-compatible SSE streams (text assembly + stop/reasoning parsing) | Not bit-identical (provider output varies); the *shape* is what tests assert |
+| `m2/llm_stream_*.bin` | Recorded OpenAI-compatible SSE streams — now living in `crates/ocserve-llm/testdata/` so the crate packages independently | Not bit-identical (provider output varies); the *shape* is what tests assert |
 | `m2/session_fixture.json`, `prompt_response.json`, `tool_fixture.json` | Prompt-contract captures: message/part shapes as upstream emits them | Yes — re-capture via a prompt against upstream |
 
 ## Privacy rules (binding)
