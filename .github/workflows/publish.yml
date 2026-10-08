@@ -1,0 +1,42 @@
+name: publish
+
+# Publishes the crate family to crates.io in dependency order.
+# Requires the CRATES_IO_TOKEN repository secret. Manual trigger only.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "dry-run (package + verify, no upload)"
+        type: boolean
+        default: true
+
+jobs:
+  publish:
+    name: crates.io publish (ordered)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: dry-run packaging (all crates)
+        run: |
+          for c in ocserve-metrics ocserve-store ocserve-tools ocserve-llm ocserve-mcp \
+                   ocserve-plugin ocserve-core ocserve-http ocserve-importer ocserve; do
+            cargo package -p "$c" --no-verify
+          done
+
+      - name: upload
+        if: ${{ inputs.dry_run == false }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Dependency order (ocserve-metrics first, ocserve last).
+          for c in ocserve-metrics ocserve-store ocserve-tools ocserve-llm ocserve-mcp \
+                   ocserve-plugin ocserve-core ocserve-http ocserve-importer ocserve; do
+            echo "== publishing $c"
+            cargo publish -p "$c" --no-verify
+            # crates.io index propagation before dependents resolve
+            sleep 30
+          done
