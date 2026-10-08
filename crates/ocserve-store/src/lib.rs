@@ -128,6 +128,68 @@ pub fn load_sessions_wire_bytes(
     Ok(std::sync::Arc::new(vec))
 }
 
+/// W4: session-list query (freeze ListQuery parity, handlers/session.ts +
+/// session.ts listByProject): limit defaults 100, `roots` filters
+/// `parent_id IS NULL`, `search` is a title LIKE, `start` a time_updated
+/// floor, `directory` an exact match unless `scope=project`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionListQuery {
+    pub limit: Option<usize>,
+    pub roots: bool,
+    pub search: Option<String>,
+    pub start: Option<i64>,
+    pub directory: Option<String>,
+    /// scope=project ⇒ ignore `directory` (freeze `scope !== "project"` gate).
+    pub scope_project: bool,
+}
+
+impl SessionListQuery {
+    /// True when the query is the bare list (no filters, no explicit limit).
+    /// Only this form uses the single-slot memo + the exact legacy bytes.
+    pub fn is_default(&self) -> bool {
+        self.limit.is_none()
+            && !self.roots
+            && self.search.is_none()
+            && self.start.is_none()
+            && self.directory.is_none()
+    }
+
+    /// Canonical memo key.
+    pub fn key(&self) -> String {
+        format!(
+            "l={:?}|r={}|s={:?}|t={:?}|d={:?}|p={}",
+            self.limit, self.roots, self.search, self.start, self.directory, self.scope_project
+        )
+    }
+}
+
+/// W4: parameterized session list → wire bytes. Freeze semantics + order
+/// (time_updated DESC). Empty result is `[]`.
+pub fn load_sessions_wire_bytes_filtered(
+    db: &std::path::Path,
+    q: &SessionListQuery,
+) -> anyhow::Result<std::sync::Arc<bytes::Bytes>> {
+    if q.is_default() {
+        return load_sessions_wire_bytes(db);
+    }
+    let enabled = list_memo_enabled();
+    let e0 = write_epoch();
+    if enabled {
+        let hit = {
+            let mut l = filtered_memo().lock();
+            l.get(&q.key(), e0, db)
+        };
+        if let Some(b) = hit {
+            return Ok(b);
+        }
+    }
+    let bytes = std::sync::Arc::new(build_sessions_wire_bytes_filtered(db, q)?);
+    if enabled && write_epoch() == e0 {
+        filtered_memo().lock().put(q.key(), bytes.clone(), e0, db);
+    }
+    Ok(bytes)
+}
+
 /// M1: the session-list wire body, serialized straight from the columns.
 ///
 /// Byte-for-byte what `serde_json::to_vec(&load_sessions_wire(db)?)` emits —
@@ -148,10 +210,67 @@ fn build_sessions_wire_bytes(db: &std::path::Path) -> anyhow::Result<bytes::Byte
                 tokens_cache_read, tokens_cache_write, time_created, time_updated
          FROM session ORDER BY time_updated DESC",
     )?;
+    write_session_rows(&mut stmt, &[])
+}
+
+/// W4: filtered list. Same column set + row serializer as the unfiltered
+/// path (byte parity by construction); filters pushed into SQL per freeze
+/// listByProject. `limit` defaults to 100 (freeze). Order time_updated DESC.
+fn build_sessions_wire_bytes_filtered(
+    db: &std::path::Path,
+    q: &SessionListQuery,
+) -> anyhow::Result<bytes::Bytes> {
+    let conn = pragma::open_reader(db)?;
+    let mut where_clauses: Vec<String> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if q.roots {
+        where_clauses.push("parent_id IS NULL".into());
+    }
+    if let Some(d) = &q.directory
+        && !q.scope_project
+    {
+        where_clauses.push("directory = ?".into());
+        params.push(Box::new(d.clone()));
+    }
+    if let Some(st) = q.start {
+        where_clauses.push("time_updated >= ?".into());
+        params.push(Box::new(st));
+    }
+    if let Some(se) = &q.search {
+        // freeze: like(title, %search%) — case-insensitive ASCII by SQLite
+        where_clauses.push("title LIKE ?".into());
+        params.push(Box::new(format!("%{se}%")));
+    }
+    let limit = q.limit.unwrap_or(100);
+    let where_sql = if where_clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_clauses.join(" AND "))
+    };
+    let sql = format!(
+        "SELECT id, project_id, directory, path, slug, title, version, agent, model, cost, \
+         summary_additions, summary_deletions, summary_files, \
+         tokens_input, tokens_output, tokens_reasoning, \
+         tokens_cache_read, tokens_cache_write, time_created, time_updated \
+         FROM session{where_sql} ORDER BY time_updated DESC LIMIT ?"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    params.push(Box::new(limit as i64));
+    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    write_session_rows(&mut stmt, &refs)
+}
+
+/// Shared row serializer: identical column order + wire format as the
+/// unfiltered path (M1 contract). Takes any prepared list statement whose
+/// projection matches the 20 columns above.
+fn write_session_rows(
+    stmt: &mut rusqlite::CachedStatement<'_>,
+    params: &[&dyn rusqlite::ToSql],
+) -> anyhow::Result<bytes::Bytes> {
     let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
     out.push(b'[');
     let mut first = true;
-    let mut rows = stmt.query([])?;
+    let mut rows = stmt.query(params)?;
     while let Some(row) = rows.next()? {
         if !first {
             out.push(b',');
@@ -2175,6 +2294,76 @@ fn search_memo() -> &'static parking_lot::Mutex<SearchMemoState> {
     static M: std::sync::OnceLock<parking_lot::Mutex<SearchMemoState>> = std::sync::OnceLock::new();
     M.get_or_init(|| {
         parking_lot::Mutex::new(SearchMemoState {
+            epoch: 0,
+            db: None,
+            entries: std::collections::VecDeque::new(),
+        })
+    })
+}
+
+/// W4: bounded param-keyed memo for filtered session lists (cap 16 keys;
+/// bare list keeps its own exact single slot). Epoch+db identity like the
+/// search memo.
+struct FilteredListMemo {
+    epoch: u64,
+    db: Option<std::path::PathBuf>,
+    entries: std::collections::VecDeque<(String, std::sync::Arc<bytes::Bytes>)>,
+}
+
+const FILTERED_LIST_CAP: usize = 16;
+
+impl FilteredListMemo {
+    fn get(
+        &mut self,
+        key: &str,
+        epoch: u64,
+        db: &std::path::Path,
+    ) -> Option<std::sync::Arc<bytes::Bytes>> {
+        if self.epoch != epoch {
+            self.entries.clear();
+            self.epoch = epoch;
+            self.db = None;
+        }
+        if self.db.as_deref().is_some_and(|d| d != db) {
+            self.entries.clear();
+            self.db = None;
+        }
+        self.entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    }
+    fn put(
+        &mut self,
+        key: String,
+        val: std::sync::Arc<bytes::Bytes>,
+        epoch: u64,
+        db: &std::path::Path,
+    ) {
+        if self.epoch != epoch {
+            self.entries.clear();
+            self.epoch = epoch;
+        }
+        if self.db.as_deref().is_some_and(|d| d != db) {
+            self.entries.clear();
+            self.db = None;
+        }
+        if self.db.is_none() {
+            self.db = Some(db.to_path_buf());
+        }
+        self.entries.retain(|(k, _)| k != &key);
+        self.entries.push_back((key, val));
+        while self.entries.len() > FILTERED_LIST_CAP {
+            self.entries.pop_front();
+        }
+    }
+}
+
+fn filtered_memo() -> &'static parking_lot::Mutex<FilteredListMemo> {
+    static M: std::sync::OnceLock<parking_lot::Mutex<FilteredListMemo>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        parking_lot::Mutex::new(FilteredListMemo {
             epoch: 0,
             db: None,
             entries: std::collections::VecDeque::new(),

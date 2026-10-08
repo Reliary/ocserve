@@ -19,6 +19,7 @@ that alone exceeds the entire budget. Corrected line items:
 | ~~rquickjs isolates~~ → **rejected at gate** (PLAN §10 gate result); Node sidecar lives *outside* this budget | 0 MB | child RSS scraped via `ocserve_sidecar_rss_bytes` (160 MB hard cap; measured 106 MB live 2026-10-04) |
 | zstd/sha256/import chunk buffers (≤1 MB × 2 concurrent) | 12 MB | fixed-size buffer pool, `BytesMut` reuse |
 | Allocator retention headroom | (unmeasured) | **glibc/system allocator — the old "mimalloc purge / MIMALLOC_PURGE_DELAY=500" row was FALSE (no `#[global_allocator]` exists in any crate; corrected 2026-10-04).** Wiring-vs-adopt decision deferred to bytehound profiling (phase 1); retention watched via soak `rss_delta` columns |
+| Web-UI asset cache (W3) | **0 at boot, ≤ 32 MB cap** | lazy byte-accounted FIFO (WEBUI-PLAN W3): allocates nothing until the first proxied asset fetch; 0 forever under `OCSERVE_UI=0`; per-entry cap 8 MB; `ocserve_webui_asset_cache_bytes` gauge |
 | **Unallocated headroom** | **~146 MB** | absorbs spikes; soak asserts the *slope*, not the peak |
 | **Total** | **300 MB** | |
 

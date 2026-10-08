@@ -110,13 +110,17 @@ step "backup drill (VACUUM INTO + integrity + counts)" bash -c "$(declare -f dri
 #      tripwire re-baselined from measurement, thresholds never moved to fit)
 #     K-PTY/K-REVERT/SDK-route batch: 21,124,176 B measured 2026-10-08
 #      (pty crate + compat routes) → ceiling 21,500,000 B unchanged (fits)
+#     K-WEBUI-PERF batch: 22,433,968 B measured 2026-10-08 (brotli + flate2
+#      linked for web-UI compression, WEBUI-PLAN W1) → ceiling 23,000,000 B
+#      (still ~8x smaller than upstream's 185 MB ELF; raised from measurement,
+#      never bypassed)
 size_gate() {
   local bin="target/release/ocserve"
   if [ ! -x "$bin" ]; then
     echo "release binary missing — building"
     cargo build --release || return 1
   fi
-  local sz ceiling=21500000
+  local sz ceiling=23000000
   sz="$(stat -c%s "$bin")"
   echo "size=${sz} ceiling=${ceiling}"
   [ "$sz" -le "$ceiling" ] || { echo "OVER SIZE CEILING"; return 1; }

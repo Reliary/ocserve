@@ -208,4 +208,19 @@ else
   echo "ok (no sdk route list)"
 fi
 
+echo "== guard: web-bundle routes bound (rule 15) =="
+# Method-aware, over the LIVE web-bundle route inventory (bench/webui-routes.txt).
+# Supersedes the method-blind SDK rule 14 for the web surface: the 2026-10-08
+# gap was /global/config, /vcs/*, /api/health falling through to the HTML proxy
+# because rule 14 read the SDK and ignored methods.
+if [ -f bench/webui-routes.txt ]; then
+  if out=$(python3 bench/webui/check-webui-routes.py bench/webui-routes.txt crates/ocserve-http/src/lib.rs PLAN.md 2>&1); then
+    echo "ok"
+  else
+    echo "$out"; echo "FAIL: web-bundle route unbound and uncited (rule 15)"; fail=1
+  fi
+else
+  echo "ok (no bundle route list)"
+fi
+
 exit $fail

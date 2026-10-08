@@ -137,12 +137,47 @@ pub async fn cors_gate(
     resp
 }
 
-/// The UI proxy decision, frozen at boot (env is read once — SRE fail-fast
-/// discipline; changing it = restart).
+/// Lazy, byte-accounted LRU for proxied static assets (WEBUI-PLAN W3).
+///
+/// Memory honesty (the user's question, 2026-10-08): this holds **zero bytes
+/// until the first asset is fetched through the proxy**, and zero forever if
+/// the web UI is never used (`OCSERVE_UI=0` disables the proxy entirely). The
+/// 32 MiB is a cap, not a reservation. Entries are whole assets (identity +
+/// negotiated encoding is served from the same stored body; compression for
+/// assets is done once when they enter the cache). Byte-bounded FIFO so a
+/// single huge asset cannot pin unbounded memory.
+pub const ASSET_CACHE_CAP: usize = 32 * 1024 * 1024;
+/// Largest single asset we will cache (a pathological upstream artifact
+/// larger than this streams through uncached rather than displacing the
+/// whole cache).
+pub const ASSET_ENTRY_CAP: usize = 8 * 1024 * 1024;
+
+#[derive(Clone)]
+pub struct AssetEntry {
+    pub body: bytes::Bytes, // identity bytes
+    pub br: bytes::Bytes,
+    pub gzip: bytes::Bytes,
+    pub content_type: String,
+    pub etag: String,
+}
+
+struct CacheState {
+    map: std::collections::HashMap<String, std::sync::Arc<AssetEntry>>,
+    order: std::collections::VecDeque<String>,
+    bytes: usize,
+}
+
+/// The UI proxy decision + lazy asset cache, frozen at boot (env is read
+/// once — SRE fail-fast discipline; changing it = restart).
 pub struct UiProxy {
     pub enabled: bool,
     pub upstream: String,
     client: reqwest::Client,
+    cache: parking_lot::Mutex<CacheState>,
+    /// OPT-IN prewarm (default off; OCSERVE_UI_PREWARM=1). When on, the entry
+    /// HTML's referenced assets are fetched once at boot so the first browser
+    /// load is warm. Off by default per WEBUI-PLAN W3.
+    pub prewarm: bool,
 }
 
 impl UiProxy {
@@ -154,7 +189,12 @@ impl UiProxy {
             .ok()
             .filter(|u| !u.is_empty())
             .unwrap_or_else(|| DEFAULT_UI_UPSTREAM.to_string());
-        Self::new(enabled, upstream)
+        let prewarm = std::env::var("OCSERVE_UI_PREWARM")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let mut p = Self::new(enabled, upstream);
+        p.prewarm = prewarm;
+        p
     }
 
     pub fn new(enabled: bool, upstream: String) -> Self {
@@ -166,7 +206,60 @@ impl UiProxy {
             enabled,
             upstream,
             client,
+            cache: parking_lot::Mutex::new(CacheState {
+                map: std::collections::HashMap::new(),
+                order: std::collections::VecDeque::new(),
+                bytes: 0,
+            }),
+            prewarm: false,
         }
+    }
+
+    /// Cache lookup. None = miss. Metrics are emitted by the caller (which
+    /// knows whether it is a hit or miss + the byte count).
+    fn cache_get(&self, key: &str) -> Option<std::sync::Arc<AssetEntry>> {
+        let mut c = self.cache.lock();
+        let e = c.map.get(key).cloned()?;
+        // refresh recency (FIFO with LRU-ish touch: move to back)
+        if let Some(pos) = c.order.iter().position(|k| k == key) {
+            let k = c.order.remove(pos).expect("position");
+            c.order.push_back(k);
+        }
+        Some(e)
+    }
+
+    /// Insert into the byte-bounded FIFO; evict from the front until it
+    /// fits. Oversized single entries are refused (streamed uncached).
+    fn cache_put(&self, key: String, entry: std::sync::Arc<AssetEntry>) {
+        let sz = entry.body.len() + entry.br.len() + entry.gzip.len();
+        if sz > ASSET_ENTRY_CAP {
+            return;
+        }
+        let mut c = self.cache.lock();
+        if c.map.contains_key(&key) {
+            return;
+        }
+        while c.bytes + sz > ASSET_CACHE_CAP {
+            let Some(front) = c.order.pop_front() else {
+                break;
+            };
+            if let Some(old) = c.map.remove(&front) {
+                c.bytes = c
+                    .bytes
+                    .saturating_sub(old.body.len() + old.br.len() + old.gzip.len());
+            }
+        }
+        c.bytes += sz;
+        c.map.insert(key.clone(), entry);
+        c.order.push_back(key);
+        ocserve_metrics::gauge("ocserve_webui_asset_cache_bytes", c.bytes as i64);
+    }
+
+    /// True when the request path is a cacheable static asset (content-hashed
+    /// name under /assets/). Only these are cached; HTML and API-ish proxied
+    /// paths stream through.
+    fn is_cacheable_asset(path: &str) -> bool {
+        path.starts_with("/assets/")
     }
 }
 
@@ -228,6 +321,18 @@ pub async fn ui_fallback(
         .map(|pq| pq.as_str())
         .unwrap_or("/");
     let url = format!("{}{}", ui.upstream.trim_end_matches('/'), path);
+    // cache key + validators captured before the body is consumed
+    let req_path = req.uri().path().to_string();
+    let req_headers_ae = req
+        .headers()
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let req_headers_inm = req
+        .headers()
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
 
     let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
@@ -264,20 +369,137 @@ pub async fn ui_fallback(
         .as_deref()
         .map(|c| c.contains("text/html"))
         .unwrap_or(false);
-    let bytes = resp.bytes().await.unwrap_or_default();
+    let upstream_cache_control = resp
+        .headers()
+        .get(reqwest::header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let is_asset = UiProxy::is_cacheable_asset(&req_path);
 
+    // W3: cacheable assets — serve from the lazy cache on hit (with ETag/304
+    // and negotiation), populate on miss.
+    if is_asset && status == StatusCode::OK {
+        let cache_key = req_path.to_string();
+        let ae = req_headers_ae.as_deref();
+        let inm = req_headers_inm.as_deref();
+        if let Some(entry) = ui.cache_get(&cache_key) {
+            ocserve_metrics::counter("ocserve_webui_asset_cache_hits_total", 1);
+            return asset_response(&entry, ae, inm, true);
+        }
+        ocserve_metrics::counter("ocserve_webui_asset_cache_misses_total", 1);
+        let bytes = resp.bytes().await.unwrap_or_default();
+        let ct = content_type
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".into());
+        // Compression is CPU-bound (brotli-q5 on a 2.8 MB bundle); run it off
+        // the async workers (AGENTS §2 / F1 convoy class) — never block a
+        // tokio worker on compression.
+        let entry = tokio::task::spawn_blocking(move || {
+            let etag = crate::compress::etag_for(&bytes);
+            std::sync::Arc::new(AssetEntry {
+                br: bytes::Bytes::from(crate::compress::compress(
+                    &bytes,
+                    crate::compress::Encoding::Brotli,
+                )),
+                gzip: bytes::Bytes::from(crate::compress::compress(
+                    &bytes,
+                    crate::compress::Encoding::Gzip,
+                )),
+                body: bytes,
+                content_type: ct,
+                etag,
+            })
+        })
+        .await
+        .unwrap_or_else(|_| {
+            std::sync::Arc::new(AssetEntry {
+                body: bytes::Bytes::new(),
+                br: bytes::Bytes::new(),
+                gzip: bytes::Bytes::new(),
+                content_type: "application/octet-stream".into(),
+                etag: "\"\"".into(),
+            })
+        });
+        // only cache non-empty results (a failed compression fallback is empty)
+        if !entry.body.is_empty() {
+            ui.cache_put(cache_key, entry.clone());
+        }
+        return asset_response(&entry, ae, inm, false);
+    }
+
+    // Non-asset (HTML, API-ish, any error status): stream through, no cache.
+    // CSP is injected on HTML (theme-preload hash); other content gets the
+    // base policy — exactly the pre-W3 behavior except the body is no longer
+    // fully buffered when it is large/streaming.
+    if is_html {
+        let bytes = resp.bytes().await.unwrap_or_default();
+        let csp_value = csp_for_html(&String::from_utf8_lossy(&bytes));
+        let mut out = Response::builder().status(status);
+        if let Some(ct) = &content_type {
+            out = out.header(header::CONTENT_TYPE, ct);
+        }
+        // pass upstream cache-control through if present (CN sends no-store)
+        if let Some(cc) = upstream_cache_control {
+            out = out.header(header::CACHE_CONTROL, cc);
+        }
+        out = out.header("content-security-policy", csp_value);
+        return out
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+    }
+
+    // stream everything else
     let mut out = Response::builder().status(status);
     if let Some(ct) = &content_type {
         out = out.header(header::CONTENT_TYPE, ct);
     }
-    let csp_value = if is_html {
-        csp_for_html(&String::from_utf8_lossy(&bytes))
-    } else {
-        csp("")
-    };
-    out = out.header("content-security-policy", csp_value);
-    out.body(Body::from(bytes))
+    if let Some(cc) = upstream_cache_control {
+        out = out.header(header::CACHE_CONTROL, cc);
+    }
+    out = out.header("content-security-policy", csp(""));
+    out.body(Body::from_stream(resp.bytes_stream()))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+/// Serve a cached asset with negotiation + validator; identity clients get
+/// byte-identical identity bytes.
+fn asset_response(
+    entry: &AssetEntry,
+    accept_encoding: Option<&str>,
+    if_none_match: Option<&str>,
+    cached: bool,
+) -> Response {
+    use axum::http::{StatusCode, header};
+    let _ = cached;
+    if crate::compress::if_none_match_matches(if_none_match, &entry.etag) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, &entry.etag)
+            .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+            .header(header::VARY, "Accept-Encoding")
+            .body(Body::empty())
+            .expect("static 304");
+    }
+    let enc = crate::compress::negotiate(accept_encoding);
+    let mut b = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, &entry.content_type)
+        .header(header::ETAG, &entry.etag)
+        // content-hashed filename → safe to cache forever (RFC 9111 §5.2.2)
+        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .header(header::VARY, "Accept-Encoding");
+    let body = match enc {
+        Some(crate::compress::Encoding::Brotli) => {
+            b = b.header(header::CONTENT_ENCODING, "br");
+            entry.br.clone()
+        }
+        Some(crate::compress::Encoding::Gzip) => {
+            b = b.header(header::CONTENT_ENCODING, "gzip");
+            entry.gzip.clone()
+        }
+        None => entry.body.clone(),
+    };
+    b.body(Body::from(body)).expect("static asset")
 }
 
 fn forward_headers(src: &HeaderMap) -> HeaderMap {
@@ -293,6 +515,71 @@ fn forward_headers(src: &HeaderMap) -> HeaderMap {
         out.insert(name.clone(), value.clone());
     }
     out
+}
+
+/// W3 opt-in prewarm: fetch the entry HTML, parse referenced /assets/*,
+/// fetch each once so the lazy cache is warm. Bounded (the app references a
+/// handful); best-effort — any network error returns without touching state.
+pub async fn prewarm_assets(st: &Arc<crate::AppState>) -> anyhow::Result<()> {
+    let ui = &st.ui;
+    if !ui.enabled {
+        return Ok(());
+    }
+    let base = ui.upstream.trim_end_matches('/');
+    let html = ui
+        .client
+        .get(format!("{base}/"))
+        .send()
+        .await?
+        .text()
+        .await?;
+    let mut assets: Vec<String> = Vec::new();
+    for part in html.split('"').filter(|s| s.starts_with("/assets/")) {
+        let a = part.split(['"', '?']).next().unwrap_or("");
+        if a.starts_with("/assets/") && !assets.iter().any(|x| x == a) {
+            assets.push(a.to_string());
+        }
+    }
+    for a in &assets {
+        // Route through our own handler path by constructing the URL and
+        // doing the same fetch+compress the cold path does.
+        let resp = ui.client.get(format!("{base}{a}")).send().await;
+        let Ok(resp) = resp else { continue };
+        if resp.status().as_u16() != 200 {
+            continue;
+        }
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let bytes = resp.bytes().await.unwrap_or_default();
+        if bytes.is_empty() || bytes.len() > ASSET_ENTRY_CAP {
+            continue;
+        }
+        let ct_c = ct.clone();
+        let entry = tokio::task::spawn_blocking(move || {
+            let etag = crate::compress::etag_for(&bytes);
+            std::sync::Arc::new(AssetEntry {
+                br: bytes::Bytes::from(crate::compress::compress(
+                    &bytes,
+                    crate::compress::Encoding::Brotli,
+                )),
+                gzip: bytes::Bytes::from(crate::compress::compress(
+                    &bytes,
+                    crate::compress::Encoding::Gzip,
+                )),
+                body: bytes,
+                content_type: ct_c,
+                etag,
+            })
+        })
+        .await?;
+        ui.cache_put(a.clone(), entry);
+        tracing::info!("ui prewarm: cached {a}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

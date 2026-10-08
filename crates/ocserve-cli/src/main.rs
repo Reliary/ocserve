@@ -663,6 +663,19 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     }
     let app = ocserve_http::router(state.clone());
 
+    // W3 opt-in prewarm (default off): fetch the entry HTML's referenced
+    // /assets/* through the proxy once so the first browser load hits the
+    // lazy cache. Bounded (a handful of assets); failures are logged, never
+    // fatal — the UI must boot with or without the upstream reachable.
+    if state.ui.enabled && state.ui.prewarm {
+        let st = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ocserve_http::ui::prewarm_assets(&st).await {
+                tracing::warn!("ui prewarm: {e:#}");
+            }
+        });
+    }
+
     let addr = format!("{hostname}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

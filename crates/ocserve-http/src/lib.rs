@@ -90,9 +90,11 @@ where
         .map_err(|e| anyhow::anyhow!("blocking task join: {e}"))?
 }
 
+pub mod compress;
 pub mod pty;
 pub mod tui;
 pub mod ui;
+pub mod vcs;
 
 /// Upstream error envelope: {"name":"NotFoundError","data":{"message":"..."}} (captured live).
 pub struct ApiError {
@@ -210,7 +212,7 @@ pub struct AppState {
     /// (refcount) + zero-copy Body — no per-request Value clone/serialize.
     /// Kill-switch: OCSERVE_WIRE_CACHE=0 (wire_off) falls back to the Value
     /// path; both paths serve serde-identical bytes (unit-tested).
-    pub wire: parking_lot::RwLock<HashMap<&'static str, bytes::Bytes>>,
+    pub wire: parking_lot::RwLock<HashMap<&'static str, WireEntry>>,
     pub wire_off: std::sync::atomic::AtomicBool,
     /// Boot-injected config reloader (Runtime lives in ocserve; the
     /// closure avoids a crate cycle). None in tests → PATCH still writes
@@ -301,22 +303,59 @@ pub struct Wires {
     pub llm: LlmRegistry,
 }
 
+/// One wire-cache entry: identity bytes, precomputed compressed variants,
+/// and a strong ETag over the identity body (WEBUI-PLAN W1/W2).
+///
+/// Compressed variants are built once per write-epoch (reload), never on the
+/// request path — the provider payload is 6.2 MB and brotli-q5 costs ~0.18 s.
+#[derive(Clone)]
+pub struct WireEntry {
+    pub identity: bytes::Bytes,
+    pub br: bytes::Bytes,
+    pub gzip: bytes::Bytes,
+    pub etag: String,
+}
+
 /// Serialize the hot payload fields once (reload-time). off => empty map
 /// (handlers fall back to the Value path).
-pub(crate) fn rebuild_wire(p: &Payloads, off: bool) -> HashMap<&'static str, bytes::Bytes> {
+pub(crate) fn rebuild_wire(p: &Payloads, off: bool) -> HashMap<&'static str, WireEntry> {
     let mut m = HashMap::new();
     if off {
         return m;
     }
     // serde_json::to_vec is exactly what axum's Json uses — byte-identical.
-    fn one<T: serde::Serialize>(
-        m: &mut HashMap<&'static str, bytes::Bytes>,
-        k: &'static str,
-        v: &T,
-    ) {
+    fn one<T: serde::Serialize>(m: &mut HashMap<&'static str, WireEntry>, k: &'static str, v: &T) {
         if let Ok(b) = serde_json::to_vec(v) {
-            m.insert(k, bytes::Bytes::from(b));
+            let identity = bytes::Bytes::from(b);
+            let etag = crate::compress::etag_for(&identity);
+            let br = bytes::Bytes::from(crate::compress::compress(
+                &identity,
+                crate::compress::Encoding::Brotli,
+            ));
+            let gzip = bytes::Bytes::from(crate::compress::compress(
+                &identity,
+                crate::compress::Encoding::Gzip,
+            ));
+            m.insert(
+                k,
+                WireEntry {
+                    identity,
+                    br,
+                    gzip,
+                    etag,
+                },
+            );
         }
+    }
+    // /global/config == /config minus instance-scoped keys (freeze probe).
+    {
+        let mut gc = p.config.clone();
+        if let Some(obj) = gc.as_object_mut() {
+            for k in ["agent", "command", "mode", "username"] {
+                obj.remove(k);
+            }
+        }
+        one(&mut m, "global_config", &gc);
     }
     one(&mut m, "config", &p.config);
     one(&mut m, "agent", &p.agent);
@@ -328,18 +367,57 @@ pub(crate) fn rebuild_wire(p: &Payloads, off: bool) -> HashMap<&'static str, byt
     m
 }
 
-/// Serve cached bytes as a JSON response; None = fall back to Value clone.
-fn wire_json(st: &AppState, key: &'static str) -> Option<axum::response::Response> {
+/// Serve cached bytes as a JSON response with negotiation + validators; None
+/// = fall back to the Value clone path (wire cache off / unknown key).
+/// Identity clients (no Accept-Encoding, no If-None-Match) receive the exact
+/// identity bytes and content-type as before (WEBUI-PLAN target 3).
+fn wire_json_h(
+    st: &AppState,
+    key: &'static str,
+    accept_encoding: Option<&str>,
+    if_none_match: Option<&str>,
+) -> Option<axum::response::Response> {
     if st.wire_off.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
-    let b = st.wire.read().get(key).cloned()?;
+    let e = st.wire.read().get(key).cloned()?;
+    let encoding = crate::compress::negotiate(accept_encoding);
+    // 304 short-circuit (RFC 9111): before any body work.
+    if crate::compress::if_none_match_matches(if_none_match, &e.etag) {
+        return Some(
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::NOT_MODIFIED)
+                .header(axum::http::header::ETAG, &e.etag)
+                .header(axum::http::header::VARY, "Accept-Encoding")
+                .body(axum::body::Body::empty())
+                .expect("static 304"),
+        );
+    }
+    let mut b = axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(axum::http::header::ETAG, &e.etag)
+        .header(axum::http::header::VARY, "Accept-Encoding");
+    let body = match encoding {
+        Some(crate::compress::Encoding::Brotli) => {
+            b = b.header(axum::http::header::CONTENT_ENCODING, "br");
+            e.br.clone()
+        }
+        Some(crate::compress::Encoding::Gzip) => {
+            b = b.header(axum::http::header::CONTENT_ENCODING, "gzip");
+            e.gzip.clone()
+        }
+        None => e.identity.clone(),
+    };
     Some(
-        axum::response::Response::builder()
-            .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(axum::body::Body::from(b))
+        b.body(axum::body::Body::from(body))
             .expect("static response"),
     )
+}
+
+/// Back-compat shim (tests + callers with no header context): identity only.
+#[cfg(test)]
+fn wire_json(st: &AppState, key: &'static str) -> Option<axum::response::Response> {
+    wire_json_h(st, key, None, None)
 }
 
 impl AppState {
@@ -459,39 +537,186 @@ async fn health() -> impl IntoResponse {
     Json(json!({"healthy": true, "version": FREEZE_VERSION}))
 }
 
-async fn get_config(State(st): State<Arc<AppState>>) -> axum::response::Response {
-    wire_json(&st, "config")
-        .unwrap_or_else(|| Json(st.payloads.read().config.clone()).into_response())
+async fn get_config(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let ae = headers
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    let inm = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    wire_json_h(&st, "config", ae, inm).unwrap_or_else(|| {
+        let v = st.payloads.read().config.clone();
+        let body = serde_json::to_vec(&v).unwrap_or_default();
+        let etag = crate::compress::etag_for(&body);
+        crate::compress::encode_response(
+            axum::http::StatusCode::OK,
+            "application/json",
+            bytes::Bytes::from(body),
+            Some(&etag),
+            ae,
+            inm,
+            &[],
+        )
+    })
 }
 
-async fn get_agent(State(st): State<Arc<AppState>>) -> axum::response::Response {
-    wire_json(&st, "agent")
-        .unwrap_or_else(|| Json(st.payloads.read().agent.clone()).into_response())
+async fn get_agent(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let ae = headers
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    let inm = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    wire_json_h(&st, "agent", ae, inm).unwrap_or_else(|| {
+        let v = st.payloads.read().agent.clone();
+        let body = serde_json::to_vec(&v).unwrap_or_default();
+        let etag = crate::compress::etag_for(&body);
+        crate::compress::encode_response(
+            axum::http::StatusCode::OK,
+            "application/json",
+            bytes::Bytes::from(body),
+            Some(&etag),
+            ae,
+            inm,
+            &[],
+        )
+    })
 }
 
-async fn get_command(State(st): State<Arc<AppState>>) -> axum::response::Response {
-    wire_json(&st, "command")
-        .unwrap_or_else(|| Json(st.payloads.read().command.clone()).into_response())
+async fn get_command(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let ae = headers
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    let inm = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    wire_json_h(&st, "command", ae, inm).unwrap_or_else(|| {
+        let v = st.payloads.read().command.clone();
+        let body = serde_json::to_vec(&v).unwrap_or_default();
+        let etag = crate::compress::etag_for(&body);
+        crate::compress::encode_response(
+            axum::http::StatusCode::OK,
+            "application/json",
+            bytes::Bytes::from(body),
+            Some(&etag),
+            ae,
+            inm,
+            &[],
+        )
+    })
 }
 
-async fn get_config_providers(State(st): State<Arc<AppState>>) -> axum::response::Response {
-    wire_json(&st, "config_providers")
-        .unwrap_or_else(|| Json(st.payloads.read().config_providers.clone()).into_response())
+async fn get_config_providers(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let ae = headers
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    let inm = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    wire_json_h(&st, "config_providers", ae, inm).unwrap_or_else(|| {
+        let v = st.payloads.read().config_providers.clone();
+        let body = serde_json::to_vec(&v).unwrap_or_default();
+        let etag = crate::compress::etag_for(&body);
+        crate::compress::encode_response(
+            axum::http::StatusCode::OK,
+            "application/json",
+            bytes::Bytes::from(body),
+            Some(&etag),
+            ae,
+            inm,
+            &[],
+        )
+    })
 }
 
-async fn get_provider(State(st): State<Arc<AppState>>) -> axum::response::Response {
-    wire_json(&st, "provider")
-        .unwrap_or_else(|| Json(st.payloads.read().provider.clone()).into_response())
+async fn get_provider(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let ae = headers
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    let inm = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    wire_json_h(&st, "provider", ae, inm).unwrap_or_else(|| {
+        let v = st.payloads.read().provider.clone();
+        let body = serde_json::to_vec(&v).unwrap_or_default();
+        let etag = crate::compress::etag_for(&body);
+        crate::compress::encode_response(
+            axum::http::StatusCode::OK,
+            "application/json",
+            bytes::Bytes::from(body),
+            Some(&etag),
+            ae,
+            inm,
+            &[],
+        )
+    })
 }
 
-async fn get_console(State(st): State<Arc<AppState>>) -> axum::response::Response {
-    wire_json(&st, "console")
-        .unwrap_or_else(|| Json(st.payloads.read().console.clone()).into_response())
+async fn get_console(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let ae = headers
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    let inm = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    wire_json_h(&st, "console", ae, inm).unwrap_or_else(|| {
+        let v = st.payloads.read().console.clone();
+        let body = serde_json::to_vec(&v).unwrap_or_default();
+        let etag = crate::compress::etag_for(&body);
+        crate::compress::encode_response(
+            axum::http::StatusCode::OK,
+            "application/json",
+            bytes::Bytes::from(body),
+            Some(&etag),
+            ae,
+            inm,
+            &[],
+        )
+    })
 }
 
-async fn get_capabilities(State(st): State<Arc<AppState>>) -> axum::response::Response {
-    wire_json(&st, "capabilities")
-        .unwrap_or_else(|| Json(st.payloads.read().capabilities.clone()).into_response())
+async fn get_capabilities(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let ae = headers
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    let inm = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    wire_json_h(&st, "capabilities", ae, inm).unwrap_or_else(|| {
+        let v = st.payloads.read().capabilities.clone();
+        let body = serde_json::to_vec(&v).unwrap_or_default();
+        let etag = crate::compress::etag_for(&body);
+        crate::compress::encode_response(
+            axum::http::StatusCode::OK,
+            "application/json",
+            bytes::Bytes::from(body),
+            Some(&etag),
+            ae,
+            inm,
+            &[],
+        )
+    })
 }
 
 /// v2-style location envelope shared by /api/* routes (captured live).
@@ -722,20 +947,130 @@ async fn get_permissions(State(st): State<Arc<AppState>>) -> Json<Value> {
 }
 
 /// GET /vcs — {branch, default_branch} (values cwd-dependent; keys golden).
-async fn vcs_info() -> impl IntoResponse {
-    let git = |args: &[&str]| -> Option<String> {
-        let out = std::process::Command::new("git").args(args).output().ok()?;
-        if !out.status.success() {
-            return None;
+async fn vcs_info(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let info = run_blocking(&st.db, move |_db| Ok::<_, anyhow::Error>(vcs::info(&dir)))
+        .await
+        .unwrap_or_else(|_| json!({"branch": null, "default_branch": null}));
+    Json(info)
+}
+
+/// GET /vcs/status → FileStatus[] (freeze shape; [] when not a git repo).
+async fn vcs_status(State(st): State<Arc<AppState>>) -> Response {
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    match run_blocking(&st.db, move |_db| Ok::<_, anyhow::Error>(vcs::status(&dir))).await {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(_) => axum::Json(Value::Array(vec![])).into_response(),
+    }
+}
+
+/// GET /vcs/diff?mode=git|branch[&context=N] → FileDiff[].
+/// Missing/other mode → 400 Effect Query envelope (freeze probe).
+async fn vcs_diff(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let mode = q.get("mode").map(String::as_str).unwrap_or("");
+    if mode != "git" && mode != "branch" {
+        return HttpError::Query {
+            message: format!("Expected \"git\" | \"branch\", got \"{mode}\"\n  at [\"mode\"]"),
         }
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (!s.is_empty()).then_some(s)
-    };
-    Json(json!({
-        "branch": git(&["rev-parse", "--abbrev-ref", "HEAD"]),
-        "default_branch": git(&["symbolic-ref", "refs/remotes/origin/HEAD"])
-            .map(|r| r.trim_start_matches("refs/remotes/origin/").to_string()),
-    }))
+        .into_response();
+    }
+    let context: Option<u32> = q.get("context").and_then(|v| v.parse().ok());
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let mode_owned = mode.to_string();
+    let v = run_blocking(&st.db, move |_db| {
+        Ok::<_, anyhow::Error>(vcs::diff(&dir, &mode_owned, context))
+    })
+    .await
+    .unwrap_or_else(|_| Value::Array(vec![]));
+    let ae = headers
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    let inm = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    let body = serde_json::to_vec(&v).unwrap_or_default();
+    let etag = crate::compress::etag_for(&body);
+    crate::compress::encode_response(
+        StatusCode::OK,
+        "application/json",
+        bytes::Bytes::from(body),
+        Some(&etag),
+        ae,
+        inm,
+        &[],
+    )
+}
+
+/// GET /vcs/diff/raw → raw patch text (empty string when clean).
+async fn vcs_diff_raw(State(st): State<Arc<AppState>>) -> Response {
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let text = run_blocking(&st.db, move |_db| {
+        Ok::<_, anyhow::Error>(vcs::diff_raw(&dir))
+    })
+    .await
+    .unwrap_or_default();
+    Response::builder()
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )
+        .header(axum::http::header::VARY, "Accept-Encoding")
+        .body(axum::body::Body::from(text))
+        .expect("static response")
+}
+
+/// GET /file/status → [] (freeze returns the changed-file set from the
+/// snapshot engine; with no snapshot engine the honest shape is empty —
+/// the web UI only checks length>0 for a dirty badge, which `vcs/status`
+/// now serves correctly).
+async fn file_status() -> impl IntoResponse {
+    axum::Json(Value::Array(vec![]))
+}
+
+/// GET /find/symbol → [] (freeze returns LSP symbols; no LSP server →
+/// empty, the same shape clients tolerate).
+async fn find_symbol() -> impl IntoResponse {
+    axum::Json(Value::Array(vec![]))
+}
+
+/// GET /global/config → the effective merged config (freeze shape: same
+/// keys as /config minus the per-instance `agent`/`command`/`mode`/`username`
+/// overrides — probed key diff 2026-10-08). Served from the wire cache.
+async fn global_config_get(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let ae = headers
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    let inm = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    // Freeze /global/config == /config with the instance-scoped keys absent.
+    // Build it once per reload into the wire cache under "global_config".
+    wire_json_h(&st, "global_config", ae, inm).unwrap_or_else(|| {
+        let mut v = st.payloads.read().config.clone();
+        if let Some(obj) = v.as_object_mut() {
+            for k in ["agent", "command", "mode", "username"] {
+                obj.remove(k);
+            }
+        }
+        let body = serde_json::to_vec(&v).unwrap_or_default();
+        let etag = crate::compress::etag_for(&body);
+        crate::compress::encode_response(
+            StatusCode::OK,
+            "application/json",
+            bytes::Bytes::from(body),
+            Some(&etag),
+            ae,
+            inm,
+            &[],
+        )
+    })
 }
 
 // ---- PERF-10X F9: paged /message wire memo ----
@@ -893,16 +1228,51 @@ fn page_response(
     })
 }
 
-async fn get_sessions(State(st): State<Arc<AppState>>) -> axum::response::Response {
+async fn get_sessions(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    // W4: freeze ListQuery parity (limit default 100, roots, search, start,
+    // directory, scope=project). The bare list keeps the exact single-slot
+    // memo path (byte-identical); filtered variants use a param-keyed memo.
     // Fresh DB rows (upstream semantics) — the boot map was stale after
-    // prompts (M2 finding); load_sessions_wire orders by time_updated DESC.
-    // F5-extends-F8: serialized once per write-epoch, then served as
-    // refcounted Bytes (zero serde per request on the hit path).
-    match run_blocking(&st.db, ocserve_store::load_sessions_wire_bytes).await {
-        Ok(b) => axum::response::Response::builder()
-            .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(axum::body::Body::from((*b).clone()))
-            .expect("static response"),
+    // prompts (M2 finding); store orders by time_updated DESC.
+    let query = ocserve_store::SessionListQuery {
+        limit: q
+            .get("limit")
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0),
+        roots: q.get("roots").map(|v| v == "true").unwrap_or(false),
+        search: q.get("search").filter(|s| !s.is_empty()).cloned(),
+        start: q.get("start").and_then(|v| v.parse::<i64>().ok()),
+        directory: q.get("directory").filter(|s| !s.is_empty()).cloned(),
+        scope_project: q.get("scope").map(|v| v == "project").unwrap_or(false),
+    };
+    let ae = headers
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    let inm = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    let qc = query.clone();
+    match run_blocking(&st.db, move |db| {
+        ocserve_store::load_sessions_wire_bytes_filtered(db, &qc)
+    })
+    .await
+    {
+        Ok(b) => {
+            let etag = crate::compress::etag_for(&b);
+            crate::compress::encode_response(
+                axum::http::StatusCode::OK,
+                "application/json",
+                (*b).clone(),
+                Some(&etag),
+                ae,
+                inm,
+                &[],
+            )
+        }
         Err(e) => {
             tracing::error!("session list read failed: {e:#}");
             Json(Vec::<serde_json::Value>::new()).into_response()
@@ -3945,6 +4315,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/lsp", get(lsp_list))
         .route("/project/{id}/directories", get(project_directories))
         .route("/vcs", get(vcs_info))
+        .route("/vcs/status", get(vcs_status))
+        .route("/vcs/diff", get(vcs_diff))
+        .route("/vcs/diff/raw", get(vcs_diff_raw))
+        .route("/file/status", get(file_status))
+        .route("/find/symbol", get(find_symbol))
+        .route("/global/config", get(global_config_get))
         .route(
             "/session/{id}/prompt_async",
             axum::routing::post(post_prompt_async),
@@ -4309,7 +4685,7 @@ mod f5_wire {
             let cached = w.get(k).unwrap_or_else(|| panic!("missing wire key {k}"));
             let want = serde_json::to_vec(v).unwrap();
             assert_eq!(
-                &cached[..],
+                &cached.identity[..],
                 &want[..],
                 "wire bytes for {k} must equal Value serialization"
             );
@@ -4317,7 +4693,7 @@ mod f5_wire {
         for (k, v) in [("agent", &p.agent), ("command", &p.command)] {
             let cached = w.get(k).unwrap_or_else(|| panic!("missing wire key {k}"));
             let want = serde_json::to_vec(v).unwrap();
-            assert_eq!(&cached[..], &want[..]);
+            assert_eq!(&cached.identity[..], &want[..]);
         }
     }
 
