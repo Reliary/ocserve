@@ -93,13 +93,13 @@ budget (11.2 ms) — arithmetic, not gaming. Dual reporting per §1-D.
 already runs at every writer open and `PRAGMA optimize` hourly
 (main.rs optimize tick) — analyze-if-stats-thin semantics, zero new code.
 
-**B1 — TRIGGERED AND SHIPPED (428d13f):** deep-page probe on the fixture =
+**B1 — TRIGGERED AND SHIPPED (cd3a6ab):** deep-page probe on the fixture =
 13 blob reads per deep page (245 parts, 13 >8 KiB) ≥ 1 ⇒ condition met.
 Process-global byte-capped FIFO (32 MiB, `REFINE_BLOB_CACHE_MB`, oversized
 entries never admitted); content-addressed keys = immutable = exact by
 construction.
 
-**temp_store — DONE (428d13f):** value was `2` (= MEMORY) miscommented as
+**temp_store — DONE (cd3a6ab):** value was `2` (= MEMORY) miscommented as
 FILE; set to `1` (FILE) per the S-A follow-through above.
 
 **C1+C4 A/B — FAIL KEEP-RULE, REVERTED.** Sandwich at VU50/ROUNDS=1 on
@@ -170,7 +170,7 @@ that baseline → GATED.
   together. Best joint = attempt 1: 97.7% @ p95 92.5 ms. Later attempts
   degraded with runner state (freeze itself fell 432->220 req/s, RSS
   7.6 GB) — all four recorded, none discarded.
-- **D**: thresholds re-derived pre-gated (edeac9f, refine <=65 /
+- **D**: thresholds re-derived pre-gated (7c1d031, refine <=65 /
   freeze <=1417 / err <=0.5, formula on run 132925); G1 gated ran with
   a STALE runner copy of thresholds (refine cells 25.97/32.95 pass;
   freeze 549/587 breached the old 208) — synced + one pre-declared
@@ -186,7 +186,7 @@ that baseline → GATED.
   → prepare_cached/PERSISTENT (session_wire 8→1 µs), mmap + page_size
   A/B'd to rejection — full table in STORAGE §1.2.
 - **Lean sweep Phase V (gate)**: A/B at G2 conditions, runs `20261007T224955Z`
-  (base `1f2df92`) vs `20261007T223621Z` (lean `1a30aa6`) — **CPU/req −14.4%**
+  (base `55c7262`) vs `20261007T223621Z` (lean `47cb9ea`) — **CPU/req −14.4%**
   (arm-level 0.2915→0.2496 ms/req; a first reading used per-mode arithmetic —
   corrected same-day, see BASELINE) against a pre-registered −10% gate, rps +11.7%/+4.3%,
   peak RSS −20.2% (77.8→62.1 MB), 0% errors. Freeze control arm moved only

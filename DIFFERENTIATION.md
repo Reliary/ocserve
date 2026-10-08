@@ -78,14 +78,14 @@ stria/relay guard+risk+dead via MCP (D6 exclusion), harness contract/ellipsis fo
 
 ## 5. Phasing (approved order)
 
-**Status 2026-10-03: P0–P2 shipped** (c697c76 P0 docs, 71f0e10 P1a replay-check,
-3b8b496 P1b loop intelligence, cc0cc9d P1c sift default-off, b7b45a5 P2 MCP trust).
+**Status 2026-10-03: P0–P2 shipped** (7396152 P0 docs, a58e7e6 P1a replay-check,
+4e6ae32 P1b loop intelligence, 6ae856b P1c sift default-off, 4ce87e8 P2 MCP trust).
 Arc49 sift gate **RAN and FAILED** (engagement 4/8 < 2/3; cost −58.9% and
 score non-regression passed) → `REFINE_SIFT` default stays OFF, results
 committed at `bench/sift-gate/results/` with forensics (models self-pipe
 below threshold; high-entropy output does not shrink).
 
-**Status 2026-10-04: P2b + evidence gates closed** (d376c11: TOFU pins
+**Status 2026-10-04: P2b + evidence gates closed** (166290e: TOFU pins
 persisted cross-restart + `REFINE_MCP_TRUST=enforce`; D2 mined → stays parked,
 0/4 mirage signal at n=4). **K-FORK shipped**: upstream `session.fork` ported
 (exclusive cut, remaps, zero-copy blob share) — the inversion memo's

@@ -58,7 +58,7 @@ MIN_MEM_KB=786432 recorded in the run log).
 Same runner/fixture/method as above unless noted. **New in this campaign:**
 allocation `LOAD_REF_CORES=0,4,3,7` (refine gains the previously
 unallocated physical core 3; freeze keeps [1,5], k6 keeps [2,6] — per-core
-comparisons remain the fair view), final binary at commit dac0fdd (S-A,
+comparisons remain the fair view), final binary at commit 7f48949 (S-A,
 F1, F3/F4, F5, F7/F8, F9/F9c, B1, temp_store FILE; C1/C4 reverted after a
 failed keep-rule A/B).
 
@@ -86,7 +86,7 @@ post-F9c.
 | search | 6,459 | 13.5 ms | ~0.94 (incl. FTS miss path) | ~5,486 |
 | session_list | 1,518 | 52 ms | 1.33 → wire-memo'd | ~145 (E0) |
 | message_page | 834 | 93 ms | **2.54 → F9 memoised** | 216 |
-| message_cursor | run1 invalid (0 reqs — filter blocked the priming page; fixed 99aa934) | — | — | — |
+| message_cursor | run1 invalid (0 reqs — filter blocked the priming page; fixed 52f15bf) | — | — | — |
 
 ## Open-model acceptance (arrival, rate=4,480, 60 s, 2 rounds) — four attempts
 
@@ -114,7 +114,7 @@ discarded.
   97.7% / 92.5 ms.
 - **C (10× vs freeze recorded 454): PASS on closed** — 20.3× (arrival
   best 9.6×, its own table stands).
-- **D (gates):** thresholds.json re-derived (edeac9f, pre-gated, formula:
+- **D (gates):** thresholds.json re-derived (7c1d031, pre-gated, formula:
   refine ≤65 ms / freeze ≤1417 ms / err ≤0.5%) from run 132925; GATED
   run recorded in the section below.
 - **Dual-variant (PERF-10X 1-D):** cache-off run (R4, all four kill
@@ -125,7 +125,7 @@ discarded.
 
 pre-C 2,612/2,868 → post-C 1,811/2,063 → pre-C 1,809/2,067 (VU50, one
 sandwich): post-C ties pre-C to 0.1% with the build proven to have
-applied both flag sets → **C1+C4 reverted** (83e42d3); C5 kept
+applied both flag sets → **C1+C4 reverted** (4acd0fd); C5 kept
 (trivial), C6 skipped (blocked p99 = 0.014 ms floor evidence), C7 size
 ceiling re-baselined to 21,500,000 from measurement.
 
@@ -133,7 +133,7 @@ ceiling re-baselined to 21,500,000 from measurement.
 
 - **G1** `20261007T155504Z`: refine cells **25.97 / 32.95 ms** (bound
   either generation: pass); freeze cells 549.6 / 587.6 ms breached the
-  **stale 208 ms** threshold — the committed re-derivation (edeac9f,
+  **stale 208 ms** threshold — the committed re-derivation (7c1d031,
   refine ≤65 / freeze ≤1417) had not been rsynced to the runner. Run
   recorded, not discarded: the gate machinery worked (k6 rc=99
   per-cell), the artifact was stale.
@@ -144,7 +144,7 @@ ceiling re-baselined to 21,500,000 from measurement.
   G1 and G2 recorded; G1's failure dispositioned as stale runner
   artifact, not a result).
 
-## Stmt/pragma audit confirmation (0f25f87 binary, VU50, ROUNDS=1, 4-thread)
+## Stmt/pragma audit confirmation (ac8bb70 binary, VU50, ROUNDS=1, 4-thread)
 
 `20261007T174649Z`: refine **9,228 / 9,099 req/s, p95 13.1 / 13.6 ms**
 (hot/spread), freeze 460 / 420, 0% errors, **0 breaches**, peak RSS
@@ -156,8 +156,8 @@ exercised through the real load-test spawn path).
 
 ## Lean sweep — Phase V A/B (pre-registered gate: CPU/req)
 
-Runs `20261007T224955Z` (base, pre-branch `1f2df92` binary) and
-`20261007T223621Z` (lean, `1a30aa6`). Same box, same pinning
+Runs `20261007T224955Z` (base, pre-branch `55c7262` binary) and
+`20261007T223621Z` (lean, `47cb9ea`). Same box, same pinning
 (refine `[0,4,3,7]`, freeze `[1,5]`, k6 `[2,6]`), VU50, ROUNDS=1,
 identical 201-session fixture, 0% errors both arms.
 

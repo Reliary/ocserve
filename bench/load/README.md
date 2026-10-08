@@ -65,7 +65,7 @@ deepest session** — then both arms derive from it: freeze gets it as its
 native `opencode.db`; refine gets `refine import`. The harness asserts
 **equal `GET /session` counts** or exits infra. Disk only (never tmpfs).
 Scoping (lever 3, proven empirically): freeze lists `listByProject(ctx.project.id)`
-and project ids are git-derived (stored refine-project id = commit `8b87603…`),
+and project ids are git-derived (stored refine-project id = commit `c663e47…`),
 so boot-time cwd can never match stored ids (first run: freeze=0) — the builder
 rewrites all selected sessions to the stable `global` project and boots both
 arms at `cwd=/`. The count-equality assertion still gates every run.

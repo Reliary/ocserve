@@ -86,7 +86,7 @@ build_providers/transform/parse pipeline itself, not from live data.
 | control: `REFINE_TRIM=0` (killswitch) | 237 MB | +70/0/0 | 307 MB |
 | control: 92-byte catalog | 18–19 MB | — | 19 MB |
 
-Fix shipped in commit `31b90c1`: `malloc_trim(0)` at boot, after every
+Fix shipped in commit `aeffd11`: `malloc_trim(0)` at boot, after every
 reconcile swap, and every `REFINE_TRIM_SECS` (default 300 s); `REFINE_TRIM=0`
 is the killswitch the lab control uses. `tests/trim_contract.rs` pins the
 killswitch contract in its own process (env-race rule, TESTING §1).

@@ -329,7 +329,10 @@ mod retry_policy_tests {
         let err = res.expect_err("a real failure must not be swallowed");
         assert_eq!(calls, 1, "no retry burn for non-contention errors");
         let msg = format!("{err:#}");
-        assert!(!msg.contains("database is locked"), "must be the real error");
+        assert!(
+            !msg.contains("database is locked"),
+            "must be the real error"
+        );
         assert!(msg.contains("disk I/O error"), "got: {msg}");
     }
 
@@ -338,11 +341,7 @@ mod retry_policy_tests {
         let mut calls = 0u32;
         let res = retry_busy("t", || {
             calls += 1;
-            if calls < 3 {
-                Err(busy())
-            } else {
-                Ok(())
-            }
+            if calls < 3 { Err(busy()) } else { Ok(()) }
         });
         assert!(res.is_ok());
         assert_eq!(calls, 3, "recovered on the 3rd attempt");
@@ -352,7 +351,8 @@ mod retry_policy_tests {
     fn busy_marker_must_match_the_sqlite_wording() {
         // the swallow is scoped to this exact substring: a mis-scoped check
         // would either hide real failures or burn the whole budget on them
-        let other = anyhow::anyhow!("database is locked by another process with a different reason");
+        let other =
+            anyhow::anyhow!("database is locked by another process with a different reason");
         let msg = format!("{}", other.root_cause());
         assert!(msg.contains("database is locked"), "marker check wording");
     }
