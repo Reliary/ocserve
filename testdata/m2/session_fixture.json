@@ -15,7 +15,7 @@
     "write": 0
    }
   },
-  "title": "refine-contract-probe",
+  "title": "ocserve-contract-probe",
   "version": "1.18.31",
   "time": {
    "created": 1790902617070,
@@ -46,7 +46,7 @@
      "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
      "messageID": "msg_0fa1e3f770014jHIfQNh0Lhiu3",
      "type": "text",
-     "text": "Reply with exactly: HELLO_REFINE"
+     "text": "Reply with exactly: HELLO_OCSERVE"
     }
    ]
   },
@@ -93,7 +93,7 @@
      "sessionID": "ses_f05e2bc11ffejuHHPavQoCO7HD",
      "messageID": "msg_0fa1e40320021uzxinLPieHWUJ",
      "type": "text",
-     "text": "HELLO_REFINE",
+     "text": "HELLO_OCSERVE",
      "time": {
       "start": 1790902684453,
       "end": 1790902684460

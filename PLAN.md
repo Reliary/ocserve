@@ -1,4 +1,4 @@
-# refine — Rust drop-in server for opencode v1
+# ocserve — Rust drop-in server for opencode v1
 
 Status: **plan, pre-implementation, adversarially stress-tested twice** (2026-10-01).
 Every claim is sourced from local trees/service/DB measurements, direct empirical tests, or a
@@ -17,7 +17,7 @@ Related: `~/src/opencode-v1-v2-diff.md` (v1 vs v2 source comparison).
 
 ## 1. Goal, scope, standards
 
-**refine** is a single native Rust binary replacing the local user service
+**ocserve** is a single native Rust binary replacing the local user service
 `opencode serve --port 4901` (Homebrew opencode 1.18.31) for one power user, keeping these
 clients working **unchanged**:
 
@@ -53,7 +53,7 @@ data migration beyond the 20-session import (§9).
 ## 2. Architecture
 
 ```
-                    ┌──────────────────────── refine (single static binary) ───────────────────────┐
+                    ┌──────────────────────── ocserve (single static binary) ───────────────────────┐
 opencode TUI  ──HTTP──▶ axum router ──▶ api/v1 handlers ──▶ SessionService ──▶ AgentRunner ──▶ ProviderClient
 oc-remote     ──HTTP──▶   │  auth       │  REST + SSE      │  EventBus      │  tools, perms   │  (reqwest, SSE parse)
                          │ (freeze C3)  │                  │  Store         │                 │
@@ -67,26 +67,26 @@ Workspace crates (rust ≥1.86, edition 2024; release profile per `SRE.md §5`):
 
 | Crate | Responsibility |
 |---|---|
-| `refine-core` | session domain, inbox admission, agent loop, compaction, event bus, permissions |
-| `refine-http` | axum router, auth, SSE writer (byte-golden frames), error envelope |
-| `refine-store` | single-writer store, role-scoped pools, blob store, FTS5, importer |
-| `refine-llm` | providers (openai-compatible first), auth.json, stream assembly + fuzz harness |
-| `refine-tools` | bash, read, write, edit, glob, grep, webfetch, task, question, todowrite |
-| `refine-mcp` | MCP stdio + StreamableHTTP + legacy SSE client, OAuth token store |
-| `refine-plugin` | rquickjs host + shims; Bun sidecar fallback protocol |
-| `refine-importer` | streaming 20-session read-only importer |
-| `refine-cli` | `serve`, `import`, `doctor`, `bench` |
+| `ocserve-core` | session domain, inbox admission, agent loop, compaction, event bus, permissions |
+| `ocserve-http` | axum router, auth, SSE writer (byte-golden frames), error envelope |
+| `ocserve-store` | single-writer store, role-scoped pools, blob store, FTS5, importer |
+| `ocserve-llm` | providers (openai-compatible first), auth.json, stream assembly + fuzz harness |
+| `ocserve-tools` | bash, read, write, edit, glob, grep, webfetch, task, question, todowrite |
+| `ocserve-mcp` | MCP stdio + StreamableHTTP + legacy SSE client, OAuth token store |
+| `ocserve-plugin` | rquickjs host + shims; Bun sidecar fallback protocol |
+| `ocserve-importer` | streaming 20-session read-only importer |
+| `ocserve-cli` | `serve`, `import`, `doctor`, `bench` |
 
 ## 3. Contract freeze (before any endpoint code)
 
 | Artifact | Freeze | Verification |
 |---|---|---|
 | Upstream server | opencode **1.18.31** (Homebrew, the version serving today) | `/global/health` → `{"healthy":true,"version":"1.18.31"}` (probed live) |
-| TUI | same Homebrew 1.18.31 | attach against refine in CI |
+| TUI | same Homebrew 1.18.31 | attach against ocserve in CI |
 | oc-remote | commit `bb43e7b` (v1.9.0 tree) | instrumented build in CI |
 | Wire surface | 162 paths in v1 tree `packages/sdk/openapi.json` ∩ 74 oc-remote calls; TUI-only `/tui/*` hit-set **captured** behind proxy at M1 (not assumed) | mechanical diff report |
 | SSE wire | raw bytes + headers: **no `id:`, no `retry:`**, `server.connected` then 10 s JSON `server.heartbeat` (first tick dropped), exact header set (`Cache-Control: no-cache, no-transform`, `X-Accel-Buffering: no`, `X-Content-Type-Options: nosniff`), `server.instance.disposed` on teardown | byte-golden capture |
-| Auth mode | **recorded from live instance**: `/config` answered 200 with no `Authorization` → freeze auth mode = `off`; refine supports `auth=off\|basic`, default off, replay tests both | capture across all 74 calls + SSE handshake |
+| Auth mode | **recorded from live instance**: `/config` answered 200 with no `Authorization` → freeze auth mode = `off`; ocserve supports `auth=off\|basic`, default off, replay tests both | capture across all 74 calls + SSE handshake |
 | Plugins | hook usage of 3 live plugins **plus** full upstream hook-name table (implemented / skipped+logged / doctor-fatal) — plugins update independently of opencode releases | static scan of installed bundles vs dispatcher table |
 
 Anything outside the freeze is out of MVP scope; upstream releases are adopted deliberately (§8).
@@ -140,7 +140,7 @@ Differential testing (McKeeman 1998; Roseau ICSME 2025):
 
 1. **Record** upstream 1.18.31: all REST pairs via logging proxy, **raw SSE frames + headers
    byte-golden**, auth presence per call, TUI attach endpoint hit-set, logcat/screenshot flows.
-2. **Replay** against refine: REST schema/status equality; SSE byte equality where deterministic,
+2. **Replay** against ocserve: REST schema/status equality; SSE byte equality where deterministic,
    normalized sequence equality where timestamps intervene.
 3. **Golden corpus**: fixture copy of the live DB containing exactly the 20 imported sessions.
 4. **Kill criteria (all green before MVP ships):**
@@ -152,7 +152,7 @@ Differential testing (McKeeman 1998; Roseau ICSME 2025):
    - TUI attach flows 100%; oc-remote nine flows 100%
    - provider stream fuzz: 10 k seeded chunk-boundary splits of recorded streams → assembled
      output byte-matches upstream
-5. **Ongoing**: every PR replays corpus against refine vs upstream container; nightly replays
+5. **Ongoing**: every PR replays corpus against ocserve vs upstream container; nightly replays
    against **latest** upstream release (triage report — adopt/ignore, never auto-merge) —
    **implemented by `scripts/drift-watch.sh`** (freeze control ×2 + latest npm arm, same
    config mounts, warmup-replayed first, drift/noise/anomaly set classification; nondeter-
@@ -209,14 +209,14 @@ recovery. **No savings percentages are claimed until the benchmark harness measu
   native `http.request`/`http.response`/`experimental.ws.*` hooks, session request kinds
   (`primary|compaction|title|generate`) including a native `compaction` hook slot, per-session
   `title`/`generate` hooks — are tracked as the **future plugin-parity surface**, not an
-  emergency upgrade. Refine's oc-remote primary client is v1-contract; the v2 server API is a
+  emergency upgrade. Ocserve's oc-remote primary client is v1-contract; the v2 server API is a
   deliberate divergence we will not mirror early.
 - **`compat-pluginsv2` adapter is the bridge strategy.** When a plugin we depend on ships
-  v2-only, refine implements upstream's own documented bridge shape: accept the v2
+  v2-only, ocserve implements upstream's own documented bridge shape: accept the v2
   registration surface (`Plugin.define({id, setup(ctx)})` + `ctx.session.hook(...)` +
   `ctx.tool.hook(...)` + `ctx.event.subscribe()` + `ctx.storage`/`options`) and map each
   domain hook to our v1-style dispatch (`hook_mutate` sites). Adapter lives in one file
-  (`crates/refine-plugin/src/compat_v2.rs` conceptually) so v2 drift is triaged as a mapping
+  (`crates/ocserve-plugin/src/compat_v2.rs` conceptually) so v2 drift is triaged as a mapping
   diff, not scattered edits. Maintenance cost = the shim + one nightly replay column; the
   rest of the pipeline (freeze, matrix, guards) is unchanged.
 - **Explicit non-goals at the v2 boundary** (recorded so they don't creep): mirroring v2's
@@ -260,11 +260,11 @@ Auth plugins: out (user decision). Dispatcher nevertheless carries the full upst
    (import audit of the frozen artifacts: `bun:sqlite`, `child_process`, `node:fs/crypto/url`,
    better-sqlite3/bun-branch detection, TTY UI modules → a dozen shims plus a *synchronous*
    SQLite bridge = deadlock-prone). Rejected before any rquickjs code was written.
-3. State under `~/.local/share/refine/plugin/{name}/`.
+3. State under `~/.local/share/ocserve/plugin/{name}/`.
 4. **Gate result (M4b, 2026-10)**: Node v25 sidecar (bun is not installed on this host;
    Node is, with `node:sqlite`) — NDJSON JSON-RPC over stdio, host files materialized next
    to the data dir, plugin chatter forced to stderr so framing cannot corrupt, RPC deadline
-   30 s, declared *outside* refine's 300 MB budget with child RSS scraped into metrics
+   30 s, declared *outside* ocserve's 300 MB budget with child RSS scraped into metrics
    (≤80 MB target). Extraction chain ported from `readV1Plugin`+`getLegacyPlugins`
    (PluginModule.server → default object.server → default fn → named fn exports); hook
    semantics = v1 sequential `fn(input, output)` mutation; `bun:sqlite` satisfied by a
@@ -281,7 +281,7 @@ Auth plugins: out (user decision). Dispatcher nevertheless carries the full upst
 5. MCP: stdio + StreamableHTTP + legacy SSE; tools/resources/prompts; change notifications;
    OAuth per spec; upstream namespacing `{server}_{tool}`; all 3 servers survive restart.
 
-## 11. v1→v2 gaps and refine's position
+## 11. v1→v2 gaps and ocserve's position
 
 | v2 improvement | Client-visible? | Decision |
 |---|---|---|
@@ -384,37 +384,37 @@ byte-golden capture of live `/global/event`; contentless-FTS retest under bundle
 ## 15. Open questions (originally "decide before M1" — statuses updated 2026-10-03)
 
 1. Plugin fallback boundary (B3): **ANSWERED** — sidecar RSS measured 121–151 MB under a
-   160 MB cap (MEMORY provenance; heap default 128 via `REFINE_PLUGIN_HEAP_MB`).
+   160 MB cap (MEMORY provenance; heap default 128 via `OCSERVE_PLUGIN_HEAP_MB`).
 2. Snapshot/revert for imported sessions: **OUT** — snapshot/git-revert engine is out of
    MVP (§2/§17); re-affirmed with evidence 2026-10-03 (session diff depends on it;
    oc-remote's REST diff caller is dead code). Reopen only as its own project.
-3. Network: **ANSWERED** — socat tailnet forwarder shipped (`refine-tailscale-forward.service`).
+3. Network: **ANSWERED** — socat tailnet forwarder shipped (`ocserve-tailscale-forward.service`).
 4. `native` CPU profile: **STILL OPEN** — portable default ships; decide if a native-tuned
    laptop build is worth the artifact matrix.
 5. Service cutover: **STILL OPEN, pending readiness report** — recommended shape unchanged
-   (`refine.service` takes 4901, Homebrew opencode stays installed as instant rollback);
+   (`ocserve.service` takes 4901, Homebrew opencode stays installed as instant rollback);
    gate on the migration-readiness checklist (T5) before scheduling.
 
 ### 15.5 Migration readiness snapshot (2026-10-03 — gates BEFORE cutover)
 
 | Item | Status | Evidence |
 |---|---|---|
-| Legacy delta-sync lag | **green** | `refine_sync_last_age` = 33 s (≤1×60 s tick), 198 msgs adopted, error counter never emitted |
+| Legacy delta-sync lag | **green** | `ocserve_sync_last_age` = 33 s (≤1×60 s tick), 198 msgs adopted, error counter never emitted |
 | Route table (post-disposition pass) | **green** | replay vs live **26/0** (5 honest defers printed); §17 rows all evidence-linked; K-OCREMOTE green |
 | Plugin stack | **green** | P0 battery + post-fix live run (sidecar RSS 185 MB under CPU storm vs 121 MB calm baseline — watch, under 160 MB boundary) |
-|24 h soak gate | **pending** | fresh sampler started 2026-10-03 14:51 (systemd timer, `~/.local/state/refine/soak/soak.csv`); gate = `scripts/soak-gate.sh` after 24 h — earliest cutover decision +24 h |
+|24 h soak gate | **pending** | fresh sampler started 2026-10-03 14:51 (systemd timer, `~/.local/state/ocserve/soak/soak.csv`); gate = `scripts/soak-gate.sh` after 24 h — earliest cutover decision +24 h |
 | Memory vs 750 M cap | **ok, tight high-water** | anon RSS 367 MB; cgroup current 632 MB / peak 740 MiB of 750 MiB — peak = page cache during the mutants+tests storm (reclaimable), zero swap |
 | Backup drill | **green** | nightly6/6 (VACUUM INTO integrity=ok, msg counts equal) |
 | oc-remote holes | **green** | none left unclassified; dead diff caller documented; SSE stub honest |
 | Armory (timers/watch) | **green** | soak/drift/nightly timers enabled (Persistent); pre-commit hook live; first mutants run grinding (529) |
-| Legacy untouched | **green** | :4901 untouched, forwarder active, refine = only writer of its own DB |
+| Legacy untouched | **green** | :4901 untouched, forwarder active, ocserve = only writer of its own DB |
 
 **Cutover preconditions:** soak-gate PASS (+24 h) → then §15.5 re-run → your go on §15.5 cutover shape.
 
 ## 16. Immediate stopgap (independent)
 
-Live 33 GB DB reclaim while refine is built: `VACUUM` (~21 GB back), rotate 577 MB logs, WAL
-checkpoint, raise `cache_size`, `swappiness` 150 → 10. Optional; not part of refine.
+Live 33 GB DB reclaim while ocserve is built: `VACUUM` (~21 GB back), rotate 577 MB logs, WAL
+checkpoint, raise `cache_size`, `swappiness` 150 → 10. Optional; not part of ocserve.
 
 ## 16.5. Client behavior discovered in the field (2026-10-02, oc-remote)
 
@@ -425,7 +425,7 @@ more servers"), all feeding **one `EventReducer` whose message/part maps are key
 never content; `ChatViewModel.kt:602-606` combines those flows without serverId
 filtering). Consequence: a session that exists on two servers (imported copy + live
 source) displays live events from **both** SSE streams in either server's view — the
-user watched a legacy session stream live while the bound REST connection (refine)
+user watched a legacy session stream live while the bound REST connection (ocserve)
 returned the frozen import snapshot. REST requests follow the bound connection; live
 content can come from the other. Implication for the delta bridge: REST freshness (K-SYNC)
 makes the fusion consistent instead of contradictory; until then, sends from a view write
@@ -451,7 +451,7 @@ around the first match with ellipses; hits ordered by message time DESC.
 ## 17. oc-remote route coverage (exhaustive client audit)
 
 Source: static extraction of all58 route templates + call graph from
-`~/src/oc-remote` (`OpenCodeApi.kt` + callers), diffed against refine's router.
+`~/src/oc-remote` (`OpenCodeApi.kt` + callers), diffed against ocserve's router.
 Status codes: **live** = implemented + tested this session; **probe-by-design** =
 the client probes for MiMoCode extensions; vanilla opencode also 404s, so our
 404 *is* freeze behavior; **out** = explicitly out of MVP scope with reason;
@@ -466,13 +466,13 @@ the client probes for MiMoCode extensions; vanilla opencode also 404s, so our
 | `/question`, `/question/{id}/reply|reject` | GET/POST | **live** — full question tool flow: QuestionGate rendezvous, asked/replied/rejected events, v1 output formatting, oc-remote empty-body reject; live tailnet E2E (`GOT=Blue`) |
 | `/session/{id}/task`, `/session/{id}/actors`, `/bash-interactive`, `/workflows` | GET | **probe-by-design** — no v1 route exists upstream either (verified in v1 httpapi groups); client tolerates the absence |
 | `/session/{id}/command` `/session/{id}/shell` | POST | **live** — command = v1 template expansion ($N/$ARGUMENTS/append rules) + session.error SSE on unknown; shell = direct bash exec (no model), synthetic-user + assistant/bash messages, cost 0 |
-| `/session/{id}/summarize` | POST | **live (W3)** — probe bytes: 200 `true`; probe shape: empty user marker (parts=[]) with last-user agent + summarize model, assistant summary follows; port = one transient text-only turn (refine-core::compact = v1 buildPrompt+serialize verbatim), sync, try_lock→409; divergences: no compaction-state/history filter, no info.summary marker (TESTING §1.6) |
+| `/session/{id}/summarize` | POST | **live (W3)** — probe bytes: 200 `true`; probe shape: empty user marker (parts=[]) with last-user agent + summarize model, assistant summary follows; port = one transient text-only turn (ocserve-core::compact = v1 buildPrompt+serialize verbatim), sync, try_lock→409; divergences: no compaction-state/history filter, no info.summary marker (TESTING §1.6) |
 | `PATCH /config` `PATCH /global/config` | PATCH | **live (W4)** — echo payload, shared-file default (overlay via env), reloader swap; see K-CONFIG |
-| `POST /mcp/{name}/connect\|disconnect` `DELETE /mcp/{name}/auth` `PUT/DELETE /auth/{providerID}` `GET /provider/auth` `POST /global/dispose` | mixed | **live (W5)** — see K-ADMIN; auth writes refine overlay; GET mcp auth/callback routes intentionally absent (no OAuth servers → SPA HTML, documented) |
+| `POST /mcp/{name}/connect\|disconnect` `DELETE /mcp/{name}/auth` `PUT/DELETE /auth/{providerID}` `GET /provider/auth` `POST /global/dispose` | mixed | **live (W5)** — see K-ADMIN; auth writes ocserve overlay; GET mcp auth/callback routes intentionally absent (no OAuth servers → SPA HTML, documented) |
 | `GET /event` | GET | **live (2026-10-03)** — alias of `/global/event` (upstream serves `/event`,`/global/event`,`/api/event` from ONE handler, public.ts:155); golden `event_alias_is_byte_identical_to_global_event` |
-| `/session/{id}/diff` | GET | **out — documented with evidence (2026-10-03)**: (a) oc-remote's `getSessionDiff` (OpenCodeApi.kt:453) has **zero callers** — dead client code; (b) the route is `summary.diff` off the **snapshot/revert engine** (handlers/session.ts:99, `info.revert.snapshot/diff`) which §2/§17 declare out of MVP; (c) the SSE path already works: refine emits `session.diff` with `diff:[]` (prompt.rs:1227, honest stub; EventReducer path tested). Reopen only with the snapshot engine as its own project |
+| `/session/{id}/diff` | GET | **out — documented with evidence (2026-10-03)**: (a) oc-remote's `getSessionDiff` (OpenCodeApi.kt:453) has **zero callers** — dead client code; (b) the route is `summary.diff` off the **snapshot/revert engine** (handlers/session.ts:99, `info.revert.snapshot/diff`) which §2/§17 declare out of MVP; (c) the SSE path already works: ocserve emits `session.diff` with `diff:[]` (prompt.rs:1227, honest stub; EventReducer path tested). Reopen only with the snapshot engine as its own project |
 | `/skill`, `/find/symbol`, `/file/status`, `/vcs`, `/vcs/status`, `/vcs/diff`, `/vcs/diff/raw`, `/vcs/apply` | GET/POST | **out (2026-10-03, evidence)** — zero oc-remote callers (grep of OpenCodeApi.kt = 0 hits; client calls only `/find/file`, already live); TUI-tolerated (no M1 attach hit); `/vcs/apply` additionally write-path (would need heal-loop integration, AGENTS §2.5) |
-| file watcher / `file.watched` events | — | **parked (2026-10-03, evidence)** — zero consumers in either client (oc-remote: no `file.*` event handling anywhere; refine bus unbounded-watched upstream). Reopen on TUI hit-set evidence or a consumer request |
+| file watcher / `file.watched` events | — | **parked (2026-10-03, evidence)** — zero consumers in either client (oc-remote: no `file.*` event handling anywhere; ocserve bus unbounded-watched upstream). Reopen on TUI hit-set evidence or a consumer request |
 | manifest defer dispositions (audit 2026-10-03) | — | `mcp` **flipped live** — re-recorded as connected-state `keys_subset` (status-keys only: improvement-safe, missing status = health-regression signal; M0 record captured pre-PATH-fix error state); `provider_auth` defer relabeled **`divergence:K-ADMIN-api-key-only`** (route live, shape diverges by design); `api_model|provider|skill|integration` relabeled **`out`** (M2 milestone labels were stale — never shipped, TUI-tolerated, not oc-remote). Replay after audit: **26 pass / 0 fail** |
 | `/pty` `/pty/{id}` (POST/PUT/DELETE), `/provider/{id}/oauth/*` | mixed | **out** — PTY host and provider OAuth are separate features (never in MVP scope); UI probes tolerate 404 |
 | `/session/{id}/share` (POST/DELETE), `/revert` `/unrevert` | POST | **out** — share/snapshot/git-revert infra explicitly out of MVP (PLAN §2); 404 tolerated by client |

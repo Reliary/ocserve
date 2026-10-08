@@ -2,7 +2,7 @@
 
 Plan written to disk in plan mode, 2026-10-07. Zero product code changed while
 writing it. One untracked file was created by mistake during a feasibility
-probe: `crates/refine-store/examples/splice_probe.rs` (does not compile).
+probe: `crates/ocserve-store/examples/splice_probe.rs` (does not compile).
 Kept as the Phase I probe; say the word and I delete it.
 
 ---
@@ -35,7 +35,7 @@ session_id=deep) > 0` before printing, and `--deep` must query
 
 ## 1. The ceiling arithmetic (read before any lever)
 
-Confirmation run `20261007T174649Z`, refine hot arm: 692,136 requests,
+Confirmation run `20261007T174649Z`, ocserve hot arm: 692,136 requests,
 300.4 s CPU, p50 2.99 ms, p95 13.06 ms, 2 pinned physical cores (4 threads).
 
 | quantity | value | source |
@@ -49,7 +49,7 @@ Two hard ceilings follow, and they decide which levers are worth building:
 1. **The k6 number is not the server's number.** 9,228 rps at 65% of 2 cores
    is a closed-model artifact, not capacity. Acceptance for this branch is
    therefore **CPU/req**, not rps — rps is reported but never gated.
-2. **Refine's CPU/req (0.434 ms) is already 2× lower than freeze's recorded
+2. **Ocserve's CPU/req (0.434 ms) is already 2× lower than freeze's recorded
    floor (≈0.95 ms/request).** Any *per-request* work removed here buys
    headroom, but the 10× headline cannot be re-earned from it.
 
@@ -180,7 +180,7 @@ Ordered by measured value, each with a keep-rule:
 - jemalloc **behind an env switch** (never a hard swap) — keep only if it
   wins a CPU/req A/B at fixed rung *and* RSS.
 - tokio worker count sweep (8 → 4 on this box) — keep only if measurable.
-- `REFINE_TRIM` / `MALLOC_ARENA_MAX` re-verify — one-line changes, keep the
+- `OCSERVE_TRIM` / `MALLOC_ARENA_MAX` re-verify — one-line changes, keep the
   measured winner.
 
 ### Phase IV — parked unless Phase II/III free real CPU

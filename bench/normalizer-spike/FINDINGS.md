@@ -88,13 +88,13 @@ transform RTT, host utime+stime). Medians of 5 runs:
 
 ## Integration gate (if adopted — separate decision)
 
-- K5b shim must replace/augment refine's shipped shim (default
+- K5b shim must replace/augment ocserve's shipped shim (default
   `NORMALIZER_SHIM` currently points at the shipped one, which fails bun —
   the experiment is explicit via env).
 - Release ceiling ≤ 10,485,760 B + build-time delta — **measured 2026-10-06
-  (STRESS Phase 3): linking rolldown reachable from `refine` = 20,309,584 B
+  (STRESS Phase 3): linking rolldown reachable from `ocserve` = 20,309,584 B
   (+10.39 MB, over ceiling by 9.82 MB; 455 s cold compile). FAIL as gated;
-  disposition = helper-binary architecture (D2) keeps `refine` at
+  disposition = helper-binary architecture (D2) keeps `ocserve` at
   9,918,024 B — see bench/normalizer-spike/STRESS-RESULTS.md.**
 - Load-path wiring: normalize-before-load with warm cache (measured
   warm ≈ 0), fallback to direct entry load if normalization fails.
@@ -113,7 +113,7 @@ Additive artifacts in the opencode cache: `index.normalized.mjs` +
 `index.normalized.mjs.hash` per plugin (removable; raw entries untouched).
 
 
-## D1 executed (2026-10-06) — normalizer linked into `refine`
+## D1 executed (2026-10-06) — normalizer linked into `ocserve`
 
 Decision: **D1**, superseding the D2 recommendation at the end of STRESS-RESULTS
 (user call after the size-context analysis: the linked binary measured
@@ -121,7 +121,7 @@ Decision: **D1**, superseding the D2 recommendation at the end of STRESS-RESULTS
 was re-baselined *from that measurement* to 20,971,520 B in `scripts/nightly.sh`
 with provenance, never moved to fit).
 
-Shipped: `crates/refine-plugin/src/normalize.rs` — sha256 content hash (entry bytes
+Shipped: `crates/ocserve-plugin/src/normalize.rs` — sha256 content hash (entry bytes
 + K5b shim + `normalize-v1` salt) warm-gating BOTH candidate destinations; rolldown
 build inside `spawn_blocking` (A2 worker-blocking class); conditional emit via a
 **code-text scanner** (chunk metadata `imports`/`dynamic_imports` provably misses
@@ -129,8 +129,8 @@ non-analyzable dynamic imports — rolldown `src/ast_scanner/impl_visit.rs:241` 
 metadata-only scanner would have misclassified magic-context as clean and shipped a
 broken plugin); `Sidecar::load_raw` insertion so boot AND respawn replay normalize
 (raw entry stored — A1; wipe-while-running self-heals at respawn and next boot);
-`REFINE_PLUGIN_NORMALIZE=0` checked before rolldown exists (R1 panic=abort gate);
-`refine_plugin_normalize_total{result}` + A2 log (destination, ms, RSS before→after)
+`OCSERVE_PLUGIN_NORMALIZE=0` checked before rolldown exists (R1 panic=abort gate);
+`ocserve_plugin_normalize_total{result}` + A2 log (destination, ms, RSS before→after)
 on built/error only; atomic pid-tmp + rename, hash-after-rename (guard rule 8).
 
 **Ground-truth correction (evidence over intuition, both directions):** codex-auth
@@ -149,7 +149,7 @@ cache is required (and correct); the "clean" assumption was the error.
 - spike leftovers in the reliary8 repo auto-removed by stale-pair cleanup (repo
   `git status` clean); `<data>/normalized/` holds exactly one key (path-hash).
 
-Residuals (accepted, not hidden): **R1** rolldown panic in-process aborts refine
+Residuals (accepted, not hidden): **R1** rolldown panic in-process aborts ocserve
 (`panic = "abort"`) — gated by the kill switch; S4 fed syntax errors/cycles/garbage/
 50 MB files with zero panics. **R2** beside-entry writes land in opencode's package
 cache — same trust boundary as executing those entries (derived, never fetched).
@@ -159,7 +159,7 @@ future plugin load failing module-not-found ⇒ scanner rule or retry, then.
 
 **Post-deploy incident (2026-10-06 11:00:16, during battery follow-up):** the unit
 OOM-bounced once. Attribution — **not D1**: bundle is byte-identical (K2/K3), normalize
-runs in refine-main not the sidecar; soak CSV shows the real mechanism: fresh sidecar
+runs in ocserve-main not the sidecar; soak CSV shows the real mechanism: fresh sidecar
 warm-up (365 MB @10:55) + magic-context `event`-hook embedding a large *synced* turn
 (6 msgs / 15 parts at 11:00:09) stacked bun to 614 MB anon → 750M cap → kernel killed
 bun (`oom_score_adj=500` = A3 correct). Gap: default `OOMPolicy=stop` then failed the

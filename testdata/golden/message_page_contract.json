@@ -5,7 +5,7 @@
   "X-Next-Cursor": "base64url(JSON {\"id\": <messageID>, \"time\": <time_created>}) \u2014 key order id,time; emitted ONLY when older messages exist beyond the page",
   "Link": "<{origin}{path}?limit={n}&before={cursor}>; rel=\"next\" \u2014 origin echoes request Host (x-forwarded-proto honored)",
   "Access-Control-Expose-Headers": "Link, X-Next-Cursor",
-  "Content-Length": "present upstream (buffered response); refine streams chunked (client-compatible divergence)"
+  "Content-Length": "present upstream (buffered response); ocserve streams chunked (client-compatible divergence)"
  },
  "cursor_follow": "limit=5 \u2192 X-Next-Cursor \u2192 limit=5&before=<cursor> \u2192 200, page strictly older than cursor id, next cursor continues",
  "rules": [
@@ -80,5 +80,5 @@
   "semantics": "map of NON-idle sessions only (idle entries deleted upstream session/status.ts); value = Info union {idle|busy|retry}; busy observed at +0.13s after prompt_async, drained to idle ~10s after completion",
   "note": "upstream probe required an explicit working model (opencode-go/mimo-v2.6-flash); upstream's own deepseek-v4-flash id was rejected by the long-running server's stale catalog (ProviderModelNotFoundError)"
  },
- "stream_note": "upstream buffers (Content-Length); refine streams \u2014 oc-remote reads bodyAsChannel to temp file either way (verified usage)"
+ "stream_note": "upstream buffers (Content-Length); ocserve streams \u2014 oc-remote reads bodyAsChannel to temp file either way (verified usage)"
 }

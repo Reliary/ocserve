@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# load-test — k6 concurrency/load suite: refine vs upstream freeze (MANUAL).
+# load-test — k6 concurrency/load suite: ocserve vs upstream freeze (MANUAL).
 #
 # What it measures (L1): server-side resource efficiency, throughput and
 # concurrency breakpoints of BOTH servers under identical READ load — zero
@@ -14,7 +14,7 @@
 #   - k6 targets ONLY 127.0.0.1:4930/4931 (fixture arms) — live :4912/:4901
 #     are health-asserted before/after and statically banned from k6 lines
 #     (check-guards rule 13)
-#   - arms boot in fixture homes; REFINE_LEGACY_SYNC=0; legacy db is
+#   - arms boot in fixture homes; OCSERVE_LEGACY_SYNC=0; legacy db is
 #     read-only snapshot source (mode=ro)
 #   - quiet-host gate (MAX_LOAD1, 3 consecutive) + parity-collision refusal
 #   - fixtures contain REAL session data: ephemeral, gitignored, removed
@@ -32,10 +32,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PORT_R=4930 # refine arm
+PORT_R=4930 # ocserve arm
 PORT_F=4931 # freeze (upstream) arm
 K6_IMG="${K6_IMG:-grafana/k6}"
-REFINE_BIN="${REFINE_BIN:-target/release/refine}"
+OCSERVE_BIN="${OCSERVE_BIN:-target/release/ocserve}"
 VENDOR="bench/parity/vendor/opencode"
 CFG="bench/parity/config"
 FIX="$PWD/bench/load/.fixtures"
@@ -111,7 +111,7 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -qE 'parity|stub|upstream'
 fi
 
 docker image inspect "$K6_IMG" >/dev/null 2>&1 || die2 "$K6_IMG image missing"
-[ -x "$REFINE_BIN" ] || die2 "$REFINE_BIN missing (cargo build --release)"
+[ -x "$OCSERVE_BIN" ] || die2 "$OCSERVE_BIN missing (cargo build --release)"
 [ -x "$VENDOR" ] || die2 "$VENDOR missing (stage it: see pair-check)"
 [ -f "$CFG/opencode.json" ] || die2 "fixture config missing: $CFG"
 [ -r "$LEGACY_DB" ] || die2 "legacy db not readable: $LEGACY_DB (set LEGACY_DB=)"
@@ -203,7 +203,7 @@ else
   eval "$(pick_cores "${LOAD_ARM_CLASS:-big}")" || die2 "CPU topology pick failed (set LOAD_*_CORES explicitly)"
 fi
 if [ -n "$REF_CORES" ]; then
-  say "cpu pinning: refine=[$REF_CORES] freeze=[$FREEZE_CORES] k6=[$K6_CORES] class=$ARM_CLASS"
+  say "cpu pinning: ocserve=[$REF_CORES] freeze=[$FREEZE_CORES] k6=[$K6_CORES] class=$ARM_CLASS"
 else
   say "cpu pinning: OFF (topology insufficient — unshared run, loadavg context only)"
   ARM_CLASS="off"
@@ -224,7 +224,7 @@ PY
 }
 PRE_4901=0; PRE_4912=0
 live_ok 4901 && PRE_4901=1 || say "WARN: live opencode :4901 not reachable before run"
-live_ok 4912 && PRE_4912=1 || say "WARN: live refine :4912 not reachable before run"
+live_ok 4912 && PRE_4912=1 || say "WARN: live ocserve :4912 not reachable before run"
 
 # ---------- co-tenant memory guard (never OOM the host's other work) ----------
 MIN_MEM_KB="${MIN_MEM_KB:-1572864}"
@@ -248,7 +248,7 @@ if [ "$need_build" = 1 ]; then
   python3 bench/load/make_fixture.py --source "$LEGACY_DB" \
     --dest "$FIX/snapshot.db" --sessions "$LOAD_SESSIONS" \
     --meta "$FIX/meta.json" --cwd "$PWD"
-  rm -rf "$FIX/home-freeze" "$FIX/home-refine" # knob change → derived homes stale
+  rm -rf "$FIX/home-freeze" "$FIX/home-ocserve" # knob change → derived homes stale
 fi
 
 META_CWD=$(python3 -c "import json;m=json.load(open('$FIX/meta.json'));print(m['cwd'])")
@@ -257,7 +257,7 @@ FILE_PATH=$(python3 -c "import json;print(json.load(open('$FIX/meta.json')).get(
 POOL=$(python3 -c "import json;print(json.load(open('$FIX/meta.json'))['pool_csv'])")
 
 # freeze home: config fresh each run, native db persists (created from snapshot once)
-HF="$FIX/home-freeze"; HR="$FIX/home-refine"
+HF="$FIX/home-freeze"; HR="$FIX/home-ocserve"
 mkdir -p "$HF/.config/opencode" "$HF/.local/share/opencode" "$HF/.local/state/opencode" "$HF/.cache/opencode"
 mkdir -p "$HR/.config/opencode" "$HR/.local/share/opencode" "$HR/.local/state/opencode" "$HR/.cache/opencode"
 cp "$CFG/opencode.json" "$HF/.config/opencode/opencode.json"
@@ -272,8 +272,8 @@ fi
 # serve-time (v9->v10 fts rebuild = ~5-9 min) which blows the health
 # timeout — stale dbs are wiped so import always runs on schema change.
 # Marker = idx_part_search_session (created by schema v10).
-if [ -f "$HR/.local/share/refine/refine.db" ]; then
-  have_marker="$(python3 - "$HR/.local/share/refine/refine.db" <<'PYM'
+if [ -f "$HR/.local/share/ocserve/ocserve.db" ]; then
+  have_marker="$(python3 - "$HR/.local/share/ocserve/ocserve.db" <<'PYM'
 import sqlite3, sys
 try:
     c = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
@@ -283,14 +283,14 @@ except Exception:
 PYM
 )"
   if [ "$have_marker" != "1" ]; then
-    say "== fixture: refine db schema stale (no v10 marker) — wipe + re-import =="
-    rm -f "$HR/.local/share/refine/refine.db" "$HR/.local/share/refine/refine.db-wal" "$HR/.local/share/refine/refine.db-shm"
+    say "== fixture: ocserve db schema stale (no v10 marker) — wipe + re-import =="
+    rm -f "$HR/.local/share/ocserve/ocserve.db" "$HR/.local/share/ocserve/ocserve.db-wal" "$HR/.local/share/ocserve/ocserve.db-shm"
   fi
 fi
-if [ ! -f "$HR/.local/share/refine/refine.db" ]; then
-  say "== fixture: refine import from snapshot (equivalent data by construction) =="
-  "$REPO/$REFINE_BIN" import --source "$FIX/snapshot.db" --limit 1000000 \
-    --data-dir "$HR/.local/share/refine" | tail -3 &
+if [ ! -f "$HR/.local/share/ocserve/ocserve.db" ]; then
+  say "== fixture: ocserve import from snapshot (equivalent data by construction) =="
+  "$REPO/$OCSERVE_BIN" import --source "$FIX/snapshot.db" --limit 1000000 \
+    --data-dir "$HR/.local/share/ocserve" | tail -3 &
   PID_IMPORT=$!
   wait "$PID_IMPORT"
   PID_IMPORT=""
@@ -299,7 +299,7 @@ fi
 # ---------- spawn arms ----------
 PID_F=""; PID_R=""; PID_IMPORT=""
 
-# Sweep orphaned `refine import` processes BEFORE the run. An import that
+# Sweep orphaned `ocserve import` processes BEFORE the run. An import that
 # hangs (contended lock, a fixture wiped under it) is not covered by the
 # arm cleanup below — it starts before PID_R exists — and it survives the
 # shell exiting, holding the write lock so every later run also hangs.
@@ -307,7 +307,7 @@ PID_F=""; PID_R=""; PID_IMPORT=""
 # each; the A/B could not start until they were killed.
 sweep_imports() {
   local pids
-  pids=$(pgrep -f "$HR/.local/share/refine|refine import --source $FIX" 2>/dev/null || true)
+  pids=$(pgrep -f "$HR/.local/share/ocserve|ocserve import --source $FIX" 2>/dev/null || true)
   [ -n "$pids" ] || return 0
   say "sweep: killing $stale import(s): $(echo "$pids" | tr '\n' ' ')"
   # shellcheck disable=SC2086
@@ -335,17 +335,17 @@ say "== spawn (cwd=$META_CWD) =="
 (
   cd "$META_CWD"
   setsid env HOME="$HR" OPENCODE_DISABLE_MODELS_FETCH=1 \
-    REFINE_DATA_DIR="$HR/.local/share/refine" REFINE_LEGACY_SYNC=0 \
-    REFINE_SEARCH_MEMO="${REFINE_SEARCH_MEMO:-1}" \
-    REFINE_LIST_MEMO="${REFINE_LIST_MEMO:-1}" \
-    REFINE_WIRE_CACHE="${REFINE_WIRE_CACHE:-1}" \
-    REFINE_PAGE_MEMO="${REFINE_PAGE_MEMO:-1}" \
-    "$REPO/$REFINE_BIN" serve --port "$PORT_R" >"$FIX/refine.log" 2>&1 &
-  echo $! > "$FIX/refine.pid"
+    OCSERVE_DATA_DIR="$HR/.local/share/ocserve" OCSERVE_LEGACY_SYNC=0 \
+    OCSERVE_SEARCH_MEMO="${OCSERVE_SEARCH_MEMO:-1}" \
+    OCSERVE_LIST_MEMO="${OCSERVE_LIST_MEMO:-1}" \
+    OCSERVE_WIRE_CACHE="${OCSERVE_WIRE_CACHE:-1}" \
+    OCSERVE_PAGE_MEMO="${OCSERVE_PAGE_MEMO:-1}" \
+    "$REPO/$OCSERVE_BIN" serve --port "$PORT_R" >"$FIX/ocserve.log" 2>&1 &
+  echo $! > "$FIX/ocserve.pid"
 ) &
 wait
-PID_F=$(cat "$FIX/freeze.pid"); PID_R=$(cat "$FIX/refine.pid")
-rm -f "$FIX/freeze.pid" "$FIX/refine.pid"
+PID_F=$(cat "$FIX/freeze.pid"); PID_R=$(cat "$FIX/ocserve.pid")
+rm -f "$FIX/freeze.pid" "$FIX/ocserve.pid"
 # pin AFTER spawn (taskset -pc on the running pid): one code path for every
 # topology outcome incl. pinning-off; a failed pin degrades loudly
 pin() { # $1=pid $2=cores
@@ -375,7 +375,7 @@ for _ in range(90):
 sys.exit(2)
 PY
 }
-wait_healthy "$PORT_R" refine || { tail -20 "$FIX/refine.log" >&2; exit 2; }
+wait_healthy "$PORT_R" ocserve || { tail -20 "$FIX/ocserve.log" >&2; exit 2; }
 wait_healthy "$PORT_F" freeze || { tail -20 "$FIX/freeze.log" >&2; exit 2; }
 say "both arms healthy on 1.18.31"
 
@@ -386,7 +386,7 @@ def count(port):
     d = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/session?limit=500", timeout=10))
     return len(d) if isinstance(d, list) else -1
 cr, cf = count(sys.argv[1]), count(sys.argv[2])
-print(f"sessions: refine={cr} freeze={cf}")
+print(f"sessions: ocserve={cr} freeze={cf}")
 if cr != cf or cr < 1:
     sys.exit(1)
 PY
@@ -404,7 +404,7 @@ m["targets"] = sys.argv[3]
 m["rounds"] = int(sys.argv[4])
 m["cores"] = {
     "class": sys.argv[8],
-    "refine": sys.argv[5],
+    "ocserve": sys.argv[5],
     "freeze": sys.argv[6],
     "k6": sys.argv[7],
 }
@@ -412,7 +412,7 @@ m["order"] = ""
 json.dump(m, open(sys.argv[2], "w"), indent=1)
 PY
 python3 bench/load/sampler.py --out "$RUN_DIR/samples.jsonl" --stop "$RUN_DIR/STOP" \
-  --pids "refine=$PID_R,freeze=$PID_F" --refine-url "http://127.0.0.1:$PORT_R" &
+  --pids "ocserve=$PID_R,freeze=$PID_F" --ocserve-url "http://127.0.0.1:$PORT_R" &
 SAMPLER_PID=$!
 
 # ---------- k6 runs ----------
@@ -424,7 +424,7 @@ t = json.load(open("bench/load/thresholds.json"))
 arm = sys.argv[1]
 err = t["err_rate_max"]
 p95 = t["p95_ms_max"]
-# per-arm bounds: refine and freeze baselines differ by ~20x — one shared
+# per-arm bounds: ocserve and freeze baselines differ by ~20x — one shared
 # value would either be vacuous for one arm or impossible for the other
 if isinstance(p95, dict):
     p95 = p95[arm]
@@ -469,10 +469,10 @@ k6_run() { # $1=file $2=script $3=arm $4..=env assignments (K=V)
 overall_rc=0
 ORDER=""
 for round in $(seq 1 "$ROUNDS"); do
-  if [ $((round % 2)) -eq 1 ]; then arms="refine freeze"; else arms="freeze refine"; fi
+  if [ $((round % 2)) -eq 1 ]; then arms="ocserve freeze"; else arms="freeze ocserve"; fi
   ORDER="$ORDER r$round:$(echo $arms | tr ' ' '-')"
   for arm in $arms; do
-    if [ "$arm" = refine ]; then port=$PORT_R; else port=$PORT_F; fi
+    if [ "$arm" = ocserve ]; then port=$PORT_R; else port=$PORT_F; fi
     # fault isolation: dead arm never gets averaged into fantasy numbers
     if ! python3 -c "
 import sys,urllib.request
@@ -520,7 +520,7 @@ say "report: $RUN_DIR/report.md"
 # ---------- isolation proof ----------
 if [ "$PRE_4901" = 1 ] || [ "$PRE_4912" = 1 ]; then
   if [ "$PRE_4901" = 1 ]; then live_ok 4901 && say "live opencode :4901 healthy after run" || { echo "INFRA: live :4901 unhealthy after run" >&2; overall_rc=2; }; fi
-  if [ "$PRE_4912" = 1 ]; then live_ok 4912 && say "live refine :4912 healthy after run" || { echo "INFRA: live :4912 unhealthy after run" >&2; overall_rc=2; }; fi
+  if [ "$PRE_4912" = 1 ]; then live_ok 4912 && say "live ocserve :4912 healthy after run" || { echo "INFRA: live :4912 unhealthy after run" >&2; overall_rc=2; }; fi
 else
   say "live services absent on this host (recorded — runner-box mode)"
 fi

@@ -9,7 +9,7 @@
 //!     import no bundler can analyze → stays runtime-resolved → needs the
 //!     entry's node_modules ancestry.
 //!   - treeshake OFF: top-level side effects ARE the registration contract.
-//!   - bun:sqlite aliased onto refine's node:sqlite shim (inlined as module).
+//!   - bun:sqlite aliased onto ocserve's node:sqlite shim (inlined as module).
 //!   - node builtins external (platform: node); everything else bundled.
 
 use anyhow::{bail, Context, Result};
@@ -24,12 +24,12 @@ use std::borrow::Cow;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
-/// Real refine shim — build-time include so drift is impossible.
+/// Real ocserve shim — build-time include so drift is impossible.
 const SHIM_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../crates/refine-plugin/src/host/shim-bun-sqlite.mjs"
+    "/../../crates/ocserve-plugin/src/host/shim-bun-sqlite.mjs"
 );
-const SHIM_ID: &str = "refine:bun-sqlite-shim";
+const SHIM_ID: &str = "ocserve:bun-sqlite-shim";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -76,7 +76,7 @@ fn default_out(entry: &str) -> PathBuf {
 
 fn normalize(entry: &Path, out: &Path) -> Result<()> {
     // NORMALIZER_SHIM env override = K5b experiment (spike variant shim);
-    // default = refine's shipped shim so the experiment is explicit.
+    // default = ocserve's shipped shim so the experiment is explicit.
     let shim_path = std::env::var("NORMALIZER_SHIM").unwrap_or_else(|_| SHIM_PATH.to_string());
     let shim_src =
         std::fs::read_to_string(&shim_path).with_context(|| format!("read shim {shim_path}"))?;
@@ -157,7 +157,7 @@ struct BunSqliteAlias {
 
 impl Plugin for BunSqliteAlias {
     fn name(&self) -> Cow<'static, str> {
-        Cow::Borrowed("refine-bun-sqlite-alias")
+        Cow::Borrowed("ocserve-bun-sqlite-alias")
     }
 
     fn resolve_id(

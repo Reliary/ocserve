@@ -1,0 +1,8 @@
+[Unit]
+Description=nightly verification program (audit/deny/fuzz/drill/size)
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h/src/ocserve
+ExecStart=%h/src/ocserve/scripts/nightly.sh

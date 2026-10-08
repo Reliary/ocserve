@@ -1,8 +1,0 @@
-[Unit]
-Description=nightly verification program (audit/deny/fuzz/drill/size)
-
-[Service]
-Type=oneshot
-Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
-WorkingDirectory=%h/src/refine
-ExecStart=%h/src/refine/scripts/nightly.sh

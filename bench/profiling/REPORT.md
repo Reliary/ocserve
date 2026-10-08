@@ -19,7 +19,7 @@ raw `.dat` kept out of repo (214 MB).
 
 ## Top allocation groups by size (symbolized)
 
-1. **`pcache1Alloc` → `for_each_message_json` (`refine_http::get_messages`,
+1. **`pcache1Alloc` → `for_each_message_json` (`ocserve_http::get_messages`,
    lib.rs:1041)** — SQLite page-cache pages allocated through glibc on the
    **fresh reader connection per `/message` fetch** (thread-per-fetch,
    `std::thread::spawn` frames visible in the same group). Biggest *bytes*.

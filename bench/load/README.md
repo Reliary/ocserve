@@ -1,4 +1,4 @@
-# bench/load — k6 load suite: refine vs upstream freeze (MANUAL)
+# bench/load — k6 load suite: ocserve vs upstream freeze (MANUAL)
 
 Pre-registration. Scenarios and claim rules below are fixed BEFORE any
 gated number is produced; results never outrun their evidence class.
@@ -49,7 +49,7 @@ big/little variance; it does not create a dedicated machine.
   / `:4901` are health-asserted before/after; `check-guards.sh` rule 13
   statically bans live ports on any k6-targeting line.
 - Arms boot in fixture homes (`plugin: []`, `mcp: {}` — bare cores),
-  `REFINE_LEGACY_SYNC=0`, models fetch off. Legacy db is a **read-only**
+  `OCSERVE_LEGACY_SYNC=0`, models fetch off. Legacy db is a **read-only**
   snapshot source (`mode=ro`).
 - **Fixture data is your real session content**: `bench/load/.fixtures/`
   is gitignored and ephemeral; remove with `scripts/load-test.sh --clean`.
@@ -62,10 +62,10 @@ big/little variance; it does not create a dedicated machine.
 `make_fixture.py` builds ONE subset snapshot from the legacy db —
 `LOAD_SESSIONS` (default 200) most-recent non-archived sessions **+ the
 deepest session** — then both arms derive from it: freeze gets it as its
-native `opencode.db`; refine gets `refine import`. The harness asserts
+native `opencode.db`; ocserve gets `ocserve import`. The harness asserts
 **equal `GET /session` counts** or exits infra. Disk only (never tmpfs).
 Scoping (lever 3, proven empirically): freeze lists `listByProject(ctx.project.id)`
-and project ids are git-derived (stored refine-project id = commit `c663e47…`),
+and project ids are git-derived (stored ocserve-project id = commit `c663e47…`),
 so boot-time cwd can never match stored ids (first run: freeze=0) — the builder
 rewrites all selected sessions to the stable `global` project and boots both
 arms at `cwd=/`. The count-equality assertion still gates every run.
@@ -75,7 +75,7 @@ arms at `cwd=/`. The count-equality assertion still gates every run.
 1. **Baseline run** (default): `--no-thresholds` — informational only.
 2. Derive from the baseline with declared intent (committed BEFORE any
    gated run — see `BASELINE.md` for the evidence):
-   `p95_ms_max` is **per-arm** (`{"refine": X, "freeze": Y}`) because the
+   `p95_ms_max` is **per-arm** (`{"ocserve": X, "freeze": Y}`) because the
    baselines differ ~12x — one shared bound would be vacuous for one arm
    and impossible for the other; each value = max(2 × that arm's worst
    pooled-p95 cell, +30 ms). `err_rate_max` = 0.005 (declared intent).

@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# refine uninstall — clean, idempotent, and it NEVER touches shared opencode
+# ocserve uninstall — clean, idempotent, and it NEVER touches shared opencode
 # state (config, auth, legacy db, model cache, plugin packages — the
 # 2026-10-05 blast-radius class; check-guards rule 11 guards this file).
 #
-#   (default)      remove the APPLICATION: refine* units/timers/drop-ins,
-#                  the binary, refine-derived .normalized.mjs artifacts.
+#   (default)      remove the APPLICATION: ocserve* units/timers/drop-ins,
+#                  the binary, ocserve-derived .normalized.mjs artifacts.
 #                  KEEP session history — printed with sizes + purge hint.
 #   --purge        also remove data/state: stats → confirm → optional
 #                  VACUUM INTO backup → delete.  (--yes for non-interactive;
 #                  --no-backup to skip the backup)
 #   --dry-run      full inventory, touches nothing
-#   --selftest     staged fake-HOME canary battery (refine gone, canaries
+#   --selftest     staged fake-HOME canary battery (ocserve gone, canaries
 #                  byte-identical, idempotent) — no systemd involvement
-#   REFINE_UNINSTALL_SYSTEMD=0   file operations only (used by --selftest)
+#   OCSERVE_UNINSTALL_SYSTEMD=0   file operations only (used by --selftest)
 #
 # Deliberately NOT done (documented in SRE §5): journal vacuum — the journal
 # is shared with opencode and unit logs age out via the retention floor.
@@ -43,34 +43,34 @@ require_home() {
     *) echo "REFUSING path outside HOME: $1" >&2; exit 3 ;;
   esac
 }
-# Data/state removal additionally demands "refine" in the path: a custom
-# REFINE_DATA_DIR without it is reported for manual removal, never deleted.
-require_refine_path() {
+# Data/state removal additionally demands "ocserve" in the path: a custom
+# OCSERVE_DATA_DIR without it is reported for manual removal, never deleted.
+require_ocserve_path() {
   require_home "$1"
   case "$1" in
-    *refine*) ;;
-    *) say "NOT removing $1 (path lacks 'refine' — remove manually if desired)"; return 1 ;;
+    *ocserve*) ;;
+    *) say "NOT removing $1 (path lacks 'ocserve' — remove manually if desired)"; return 1 ;;
   esac
 }
 
-snapshot_unit_env() { # $1=unit file → prints ExecStart / REFINE_DATA_DIR, %h expanded
+snapshot_unit_env() { # $1=unit file → prints ExecStart / OCSERVE_DATA_DIR, %h expanded
   [ -f "$1" ] || return 0
   local line
   line=$(grep -m1 '^ExecStart=' "$1" || true)
   [ -n "$line" ] && printf 'BIN=%s\n' "${line#ExecStart=}" | awk '{print $1}' | sed "s|%h|$HOME|"
-  line=$(grep -m1 '^Environment=REFINE_DATA_DIR=' "$1" || true)
+  line=$(grep -m1 '^Environment=OCSERVE_DATA_DIR=' "$1" || true)
   [ -n "$line" ] && printf '%s\n' "${line#Environment=}" | sed "s|%h|$HOME|"
 }
 
-unit_data_dir() { # best-effort REFINE_DATA_DIR from the installed unit
-  local f="$HOME/.config/systemd/user/refine.service"
+unit_data_dir() { # best-effort OCSERVE_DATA_DIR from the installed unit
+  local f="$HOME/.config/systemd/user/ocserve.service"
   if [ -f "$f" ]; then
-    grep -m1 '^Environment=REFINE_DATA_DIR=' "$f" 2>/dev/null \
-      | sed "s|^Environment=REFINE_DATA_DIR=||; s|%h|$HOME|" || true
+    grep -m1 '^Environment=OCSERVE_DATA_DIR=' "$f" 2>/dev/null \
+      | sed "s|^Environment=OCSERVE_DATA_DIR=||; s|%h|$HOME|" || true
   fi
 }
 
-derived_files() { # refine-created artifacts inside shared dirs (basename-gated)
+derived_files() { # ocserve-created artifacts inside shared dirs (basename-gated)
   find "$HOME/.cache/opencode/packages" -type f \
     \( -name '*.normalized.mjs' -o -name '*.normalized.mjs.hash' \) 2>/dev/null || true
   python3 - <<'PY'
@@ -128,7 +128,7 @@ PY
 sweep_orphans() {
   local data=$1 p
   for p in $(pgrep -f -- "$data/plugin-host/host.mjs" 2>/dev/null; \
-             pgrep -f -- '/tmp/refine-repl' 2>/dev/null); do
+             pgrep -f -- '/tmp/ocserve-repl' 2>/dev/null); do
     [ "$p" = "$$" ] && continue
     [ "$p" = "$PPID" ] && continue
     kill "$p" 2>/dev/null && say "swept orphan plugin host pid $p" || true
@@ -138,33 +138,33 @@ sweep_orphans() {
 # --- staged canary battery ---------------------------------------------------
 run_selftest() {
   local fake rc=0
-  fake=$(mktemp -d "${TMPDIR:-/tmp}/refine-uninstall-st.XXXXXX")
-  mkdir -p "$fake/.config/systemd/user/refine.service.d" \
-           "$fake/.local/share/refine/plugin-host" \
-           "$fake/.local/state/refine/soak" \
+  fake=$(mktemp -d "${TMPDIR:-/tmp}/ocserve-uninstall-st.XXXXXX")
+  mkdir -p "$fake/.config/systemd/user/ocserve.service.d" \
+           "$fake/.local/share/ocserve/plugin-host" \
+           "$fake/.local/state/ocserve/soak" \
            "$fake/.local/bin" \
            "$fake/.cache/opencode/packages/@x/pkg/node_modules/@x/pkg/dist" \
            "$fake/.config/opencode" \
            "$fake/.cache/opencode" \
            "$fake/.local/share/opencode" \
            "$fake/src/reliary8/opencode-plugin/dist" \
-           "$fake/src/refine/target/release"
-  # refine artifacts
-  printf 'ExecStart=%%h/src/refine/target/release/refine serve --port 4912\nEnvironment=REFINE_DATA_DIR=%%h/.local/share/refine\n' \
-    > "$fake/.config/systemd/user/refine.service"
-  printf 'timer' > "$fake/.config/systemd/user/refine-nightly.timer"
-  printf 'drop'  > "$fake/.config/systemd/user/refine.service.d/extra.conf"
-  printf 'BIN=%s\n' "$fake/.local/bin/refine" > "$fake/.local/share/refine/install-receipt"
-  printf 'ELF-binary' > "$fake/.local/bin/refine"
-  printf 'ELF-dev'    > "$fake/src/refine/target/release/refine"
-  python3 - "$fake/.local/share/refine/refine.db" <<'PY'
+           "$fake/src/ocserve/target/release"
+  # ocserve artifacts
+  printf 'ExecStart=%%h/src/ocserve/target/release/ocserve serve --port 4912\nEnvironment=OCSERVE_DATA_DIR=%%h/.local/share/ocserve\n' \
+    > "$fake/.config/systemd/user/ocserve.service"
+  printf 'timer' > "$fake/.config/systemd/user/ocserve-nightly.timer"
+  printf 'drop'  > "$fake/.config/systemd/user/ocserve.service.d/extra.conf"
+  printf 'BIN=%s\n' "$fake/.local/bin/ocserve" > "$fake/.local/share/ocserve/install-receipt"
+  printf 'ELF-binary' > "$fake/.local/bin/ocserve"
+  printf 'ELF-dev'    > "$fake/src/ocserve/target/release/ocserve"
+  python3 - "$fake/.local/share/ocserve/ocserve.db" <<'PY'
 import sqlite3, sys
 c = sqlite3.connect(sys.argv[1])
 c.execute("create table session (id text)")
 c.execute("insert into session values ('s1')")
 c.commit(); c.close()
 PY
-  # canaries (shared opencode state + non-refine units)
+  # canaries (shared opencode state + non-ocserve units)
   printf 'config-canary'   > "$fake/.config/opencode/opencode.json"
   printf 'auth-canary'     > "$fake/.local/share/opencode/auth.json"
   printf 'models-canary'   > "$fake/.cache/opencode/models.json"
@@ -184,18 +184,18 @@ PY
     > "$fake/.config/opencode/opencode.json"
 
   say "== selftest: default run (history must survive) =="
-  if ! HOME="$fake" REFINE_UNINSTALL_SYSTEMD=0 "$SELF_BIN"; then echo "FAIL: default run rc!=0"; rc=1; fi
+  if ! HOME="$fake" OCSERVE_UNINSTALL_SYSTEMD=0 "$SELF_BIN"; then echo "FAIL: default run rc!=0"; rc=1; fi
   check() { # must-exist $1, must-be-gone $2, label $3
     if [ ! -e "$1" ]; then echo "FAIL($3): missing $1"; rc=1; fi
     if [ -e "$2" ]; then echo "FAIL($3): should be gone: $2"; rc=1; fi
   }
   # units/drop-ins/binary(receipt)/derived gone
-  check "$fake/.local/share/refine/refine.db" \
-        "$fake/.config/systemd/user/refine.service" "units"
-  [ -e "$fake/.config/systemd/user/refine-nightly.timer" ] && { echo "FAIL: timer remains"; rc=1; }
-  [ -e "$fake/.config/systemd/user/refine.service.d" ] && { echo "FAIL: drop-in dir remains"; rc=1; }
-  [ -e "$fake/.local/bin/refine" ] && { echo "FAIL: receipt binary remains"; rc=1; }
-  [ -e "$fake/src/refine/target/release/refine" ] || { echo "FAIL: dev-build binary must be KEPT"; rc=1; }
+  check "$fake/.local/share/ocserve/ocserve.db" \
+        "$fake/.config/systemd/user/ocserve.service" "units"
+  [ -e "$fake/.config/systemd/user/ocserve-nightly.timer" ] && { echo "FAIL: timer remains"; rc=1; }
+  [ -e "$fake/.config/systemd/user/ocserve.service.d" ] && { echo "FAIL: drop-in dir remains"; rc=1; }
+  [ -e "$fake/.local/bin/ocserve" ] && { echo "FAIL: receipt binary remains"; rc=1; }
+  [ -e "$fake/src/ocserve/target/release/ocserve" ] || { echo "FAIL: dev-build binary must be KEPT"; rc=1; }
   [ -e "$fake/.cache/opencode/packages/@x/pkg/node_modules/@x/pkg/dist/index.normalized.mjs" ] && { echo "FAIL: derived remains"; rc=1; }
   [ -e "$fake/src/reliary8/opencode-plugin/dist/index.normalized.mjs" ] && { echo "FAIL: path-plugin derived remains"; rc=1; }
   # canaries byte-identical
@@ -209,16 +209,16 @@ PY
     esac
   done
   # history kept (default)
-  [ -e "$fake/.local/share/refine/refine.db" ] || { echo "FAIL: default run must KEEP history"; rc=1; }
-  [ -e "$fake/.local/state/refine/soak" ] || { echo "FAIL: default run must KEEP state"; rc=1; }
+  [ -e "$fake/.local/share/ocserve/ocserve.db" ] || { echo "FAIL: default run must KEEP history"; rc=1; }
+  [ -e "$fake/.local/state/ocserve/soak" ] || { echo "FAIL: default run must KEEP state"; rc=1; }
 
   say "== selftest: idempotent second run =="
-  HOME="$fake" REFINE_UNINSTALL_SYSTEMD=0 "$SELF_BIN" || { echo "FAIL: second run rc!=0"; rc=1; }
+  HOME="$fake" OCSERVE_UNINSTALL_SYSTEMD=0 "$SELF_BIN" || { echo "FAIL: second run rc!=0"; rc=1; }
 
   say "== selftest: purge --yes (history goes, canaries stay) =="
-  HOME="$fake" REFINE_UNINSTALL_SYSTEMD=0 "$SELF_BIN" --purge --yes || { echo "FAIL: purge rc!=0"; rc=1; }
-  [ -e "$fake/.local/share/refine" ] && { echo "FAIL: purge left data dir"; rc=1; }
-  [ -e "$fake/.local/state/refine" ] && { echo "FAIL: purge left state dir"; rc=1; }
+  HOME="$fake" OCSERVE_UNINSTALL_SYSTEMD=0 "$SELF_BIN" --purge --yes || { echo "FAIL: purge rc!=0"; rc=1; }
+  [ -e "$fake/.local/share/ocserve" ] && { echo "FAIL: purge left data dir"; rc=1; }
+  [ -e "$fake/.local/state/ocserve" ] && { echo "FAIL: purge left state dir"; rc=1; }
   [ "$(cat "$fake/.local/share/opencode/auth.json")" = "auth-canary" ] || { echo "FAIL: purge ate auth"; rc=1; }
   grep -q 'reliary8' "$fake/.config/opencode/opencode.json" || { echo "FAIL: purge ate config"; rc=1; }
   [ "$(cat "$fake/.config/systemd/user/opencode.service")" = "oc-unit-canary" ] || { echo "FAIL: purge ate opencode unit"; rc=1; }
@@ -234,23 +234,23 @@ PY
 HOME_DIR=${HOME:?HOME unset}
 UNIT_DIR="$HOME_DIR/.config/systemd/user"
 shopt -s nullglob
-UNITS=("$UNIT_DIR"/refine*.service "$UNIT_DIR"/refine*.timer)
-DROPINS=("$UNIT_DIR"/refine*.service.d)
+UNITS=("$UNIT_DIR"/ocserve*.service "$UNIT_DIR"/ocserve*.timer)
+DROPINS=("$UNIT_DIR"/ocserve*.service.d)
 shopt -u nullglob
 DATA_DIR=$(unit_data_dir)
-DATA_DIR=${DATA_DIR:-${REFINE_DATA_DIR:-$HOME_DIR/.local/share/refine}}
+DATA_DIR=${DATA_DIR:-${OCSERVE_DATA_DIR:-$HOME_DIR/.local/share/ocserve}}
 DATA_DIR=${DATA_DIR/#%h/$HOME_DIR}
-STATE_DIR=${XDG_STATE_HOME:-$HOME_DIR/.local/state}/refine
+STATE_DIR=${XDG_STATE_HOME:-$HOME_DIR/.local/state}/ocserve
 RECEIPT_BIN=""
 [ -f "$DATA_DIR/install-receipt" ] && RECEIPT_BIN=$(grep -m1 '^BIN=' "$DATA_DIR/install-receipt" | cut -d= -f2- || true)
 UNIT_BIN=""
-[ -f "$UNIT_DIR/refine.service" ] && UNIT_BIN=$(snapshot_unit_env "$UNIT_DIR/refine.service" | sed -n 's/^BIN=//p' | head -1)
+[ -f "$UNIT_DIR/ocserve.service" ] && UNIT_BIN=$(snapshot_unit_env "$UNIT_DIR/ocserve.service" | sed -n 's/^BIN=//p' | head -1)
 BIN=${RECEIPT_BIN:-$UNIT_BIN}
 
 SD=1
 command -v systemctl >/dev/null 2>&1 || SD=0
 if [ "$SD" = 1 ] && ! systemctl --user show-environment >/dev/null 2>&1; then SD=0; fi
-if [ "${REFINE_UNINSTALL_SYSTEMD:-1}" = 0 ]; then SD=0; fi
+if [ "${OCSERVE_UNINSTALL_SYSTEMD:-1}" = 0 ]; then SD=0; fi
 
 if [ "$DRY" = 1 ]; then
   say "== dry-run inventory (nothing will be touched) =="
@@ -263,7 +263,7 @@ if [ "$DRY" = 1 ]; then
   case "$BIN" in */target/*) say "  dev build (kept on real uninstall)";; esac
   say "data (kept unless --purge):"
   [ -d "$DATA_DIR" ] && du -sh "$DATA_DIR" 2>/dev/null | sed 's/^/  /' || say "  (none)"
-  db_stats "$DATA_DIR/refine.db"
+  db_stats "$DATA_DIR/ocserve.db"
   [ -d "$STATE_DIR" ] && du -sh "$STATE_DIR" 2>/dev/null | sed 's/^/  /' || true
   say "derived artifacts to remove (always):"
   derived_files | sed 's/^/  /'
@@ -275,7 +275,7 @@ fi
 # --- purge confirm (before any destructive step) -----------------------------
 if [ "$PURGE" = 1 ] && [ "$YES" != 1 ]; then
   say "--purge will DESTROY session history:"
-  db_stats "$DATA_DIR/refine.db"
+  db_stats "$DATA_DIR/ocserve.db"
   if [ -t 0 ]; then
     printf 'remove history too? [y/N] '
     read -r reply
@@ -296,8 +296,8 @@ if [ "$SD" = 1 ]; then
     esac
   done
   systemctl --user reset-failed >/dev/null 2>&1 || true
-  if systemctl --user is-active refine.service >/dev/null 2>&1; then
-    echo "refuse: refine.service still active after stop — investigate before uninstall" >&2
+  if systemctl --user is-active ocserve.service >/dev/null 2>&1; then
+    echo "refuse: ocserve.service still active after stop — investigate before uninstall" >&2
     exit 1
   fi
   sweep_orphans "$DATA_DIR"
@@ -306,11 +306,11 @@ fi
 # --- remove unit files --------------------------------------------------------
 for u in "${UNITS[@]}"; do
   require_home "$u"
-  case "$u" in *refine*) rm -f "$u"; say "removed unit: $u" ;; esac
+  case "$u" in *ocserve*) rm -f "$u"; say "removed unit: $u" ;; esac
 done
 for d in "${DROPINS[@]}"; do
   require_home "$d"
-  case "$d" in *refine*) rm -rf "$d"; say "removed drop-ins: $d" ;; esac
+  case "$d" in *ocserve*) rm -rf "$d"; say "removed drop-ins: $d" ;; esac
 done
 [ "$SD" = 1 ] && systemctl --user daemon-reload
 
@@ -333,9 +333,9 @@ fi
 
 # --- history ------------------------------------------------------------------
 if [ "$PURGE" = 1 ]; then
-  if [ "$BACKUP" = 1 ] && [ -f "$DATA_DIR/refine.db" ]; then
-    DEST="$HOME_DIR/refine-backup-$(date +%Y%m%d-%H%M%S).db"
-    python3 - "$DATA_DIR/refine.db" "$DEST" <<'PY' || { echo "backup failed — aborting purge" >&2; exit 1; }
+  if [ "$BACKUP" = 1 ] && [ -f "$DATA_DIR/ocserve.db" ]; then
+    DEST="$HOME_DIR/ocserve-backup-$(date +%Y%m%d-%H%M%S).db"
+    python3 - "$DATA_DIR/ocserve.db" "$DEST" <<'PY' || { echo "backup failed — aborting purge" >&2; exit 1; }
 import sqlite3, sys
 src, dest = sys.argv[1], sys.argv[2]
 c = sqlite3.connect(src)
@@ -345,7 +345,7 @@ print(f"backup: {dest}")
 PY
   fi
   for target in "$DATA_DIR" "$STATE_DIR"; do
-    if require_refine_path "$target"; then
+    if require_ocserve_path "$target"; then
       rm -rf "$target"
       say "removed: $target"
     fi
@@ -353,7 +353,7 @@ PY
 else
   say ""
   say "history KEPT: $DATA_DIR"
-  db_stats "$DATA_DIR/refine.db"
+  db_stats "$DATA_DIR/ocserve.db"
   say "  full wipe later: scripts/uninstall.sh --purge"
 fi
 

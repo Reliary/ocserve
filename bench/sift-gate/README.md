@@ -5,8 +5,8 @@ not change these criteria (anti-fitting, TESTING §1).
 
 ## Conditions
 
-- **baseline**: `REFINE_SIFT` unset (current default: off)
-- **gate**: `REFINE_SIFT=auto` (reliary sift --stdin at the provider boundary)
+- **baseline**: `OCSERVE_SIFT` unset (current default: off)
+- **gate**: `OCSERVE_SIFT=auto` (reliary sift --stdin at the provider boundary)
 
 Model: `opencode-go/mimo-v2.6-flash` (both conditions). Same host, same
 driver, same prompts, same fixtures. Runs are **interleaved** (standing
@@ -15,7 +15,7 @@ with first-mover alternating by `(task+seed) % 2`.
 
 ## Battery
 
-3 tasks × 3 seeds × 2 conditions = 18 runs. One fresh refine process per run
+3 tasks × 3 seeds × 2 conditions = 18 runs. One fresh ocserve process per run
 (cwd = pristine fixture copy, throwaway data dir, port unique). A run is one
 `prompt_async` (the agent tool-loop runs inside it).
 
@@ -40,7 +40,7 @@ both attempts logged.
 4. **No silent blowups**: zero panics/restarts; every run's sift outcome
    (`compressed`/`raw`) and byte totals recorded from `/metrics`.
 
-If gate passes → flip `REFINE_SIFT` default to `auto` in a follow-up commit
+If gate passes → flip `OCSERVE_SIFT` default to `auto` in a follow-up commit
 with tests updated. If it fails → default stays off, results committed as-is.
 
 ## Known limits (recorded, not criteria)

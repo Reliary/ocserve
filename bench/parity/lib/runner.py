@@ -4,7 +4,7 @@ S3 SSE fan-out → S4 post-load idle → result.json.
 
 Usage:
   ROUND=m1u python3 lib/runner.py --arm upstream      # start + run + down
-  ROUND=m1u python3 lib/runner.py --arm refine --no-down
+  ROUND=m1u python3 lib/runner.py --arm ocserve --no-down
 
 Assumes images are built (`docker compose build` via run.sh preflight).
 Each scenario is independently fault-isolated: a failure records `null`
@@ -31,10 +31,10 @@ from sampler import Sampler  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))          # .../lib
 BENCH = os.path.dirname(HERE)                              # .../parity
-REPO = os.path.dirname(os.path.dirname(BENCH))             # refine repo root
+REPO = os.path.dirname(os.path.dirname(BENCH))             # ocserve repo root
 
-PORTS = {"upstream": 4921, "refine": 4922}
-SERVICES = {"upstream": "upstream", "refine": "refine"}
+PORTS = {"upstream": 4921, "ocserve": 4922}
+SERVICES = {"upstream": "upstream", "ocserve": "ocserve"}
 
 
 def env_num(name: str, default: float) -> float:
@@ -305,9 +305,9 @@ def run(arm: str, round_id: str, no_down: bool) -> dict:
     try:
         sha_out = subprocess.run(["git", "-C", REPO, "rev-parse", "--short", "HEAD"],
                                  capture_output=True, text=True, timeout=10)
-        res["refine_git_sha"] = sha_out.stdout.strip() or None
+        res["ocserve_git_sha"] = sha_out.stdout.strip() or None
     except Exception:
-        res["refine_git_sha"] = None
+        res["ocserve_git_sha"] = None
 
     # ---- start containers ----
     t_up = time.monotonic()
@@ -555,11 +555,11 @@ def run_s5(base: str, arm: str, s5_secs: float, sampler, out_dir: str) -> dict:
     socks0 = count_sockets(port)
     out["sockets_before"] = socks0
     out["metrics_before"] = {k: m0.get(k) for k in
-                             ("refine_event_ring_lag_total",
-                              "refine_event_ring_evicted_total",
-                              "refine_event_ring_bytes",
-                              "refine_event_ring_depth",
-                              "refine_sse_clients")}
+                             ("ocserve_event_ring_lag_total",
+                              "ocserve_event_ring_evicted_total",
+                              "ocserve_event_ring_bytes",
+                              "ocserve_event_ring_depth",
+                              "ocserve_sse_clients")}
 
     readers = []
     for mode, n in (("live", live_n), ("slow", slow_n), ("stalled", stalled_n)):
@@ -638,20 +638,20 @@ def run_s5(base: str, arm: str, s5_secs: float, sampler, out_dir: str) -> dict:
     m1 = scrape_metrics(port)
     out["sockets_after"] = socks1
     out["metrics_after"] = {k: m1.get(k) for k in
-                            ("refine_event_ring_lag_total",
-                             "refine_event_ring_evicted_total",
-                             "refine_event_ring_bytes",
-                             "refine_event_ring_depth",
-                             "refine_sse_clients")}
+                            ("ocserve_event_ring_lag_total",
+                             "ocserve_event_ring_evicted_total",
+                             "ocserve_event_ring_bytes",
+                             "ocserve_event_ring_depth",
+                             "ocserve_sse_clients")}
     out["metrics_phase_a"] = {k: m_a.get(k) for k in
-                              ("refine_event_ring_bytes",
-                               "refine_event_ring_depth")}
+                              ("ocserve_event_ring_bytes",
+                               "ocserve_event_ring_depth")}
     out["metrics_phase_b"] = {k: m_b.get(k) for k in
-                              ("refine_event_ring_bytes",
-                               "refine_event_ring_depth")}
+                              ("ocserve_event_ring_bytes",
+                               "ocserve_event_ring_depth")}
     out["metrics_phase_c"] = {k: m_c.get(k) for k in
-                              ("refine_event_ring_bytes",
-                               "refine_event_ring_depth")}
+                              ("ocserve_event_ring_bytes",
+                               "ocserve_event_ring_depth")}
 
     def delta(k):
         a, b = out["metrics_before"].get(k), out["metrics_after"].get(k)
@@ -659,8 +659,8 @@ def run_s5(base: str, arm: str, s5_secs: float, sampler, out_dir: str) -> dict:
             return None
         return b - a
 
-    out["ring_lag_delta"] = delta("refine_event_ring_lag_total")
-    out["ring_evicted_delta"] = delta("refine_event_ring_evicted_total")
+    out["ring_lag_delta"] = delta("ocserve_event_ring_lag_total")
+    out["ring_evicted_delta"] = delta("ocserve_event_ring_evicted_total")
     # factual booleans only (no invented thresholds):
     out["assert_lag_or_evict_fired"] = bool(
         (out["ring_lag_delta"] or 0) > 0 or (out["ring_evicted_delta"] or 0) > 0)
@@ -687,7 +687,7 @@ def run_s5(base: str, arm: str, s5_secs: float, sampler, out_dir: str) -> dict:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arm", choices=["upstream", "refine"], required=True)
+    ap.add_argument("--arm", choices=["upstream", "ocserve"], required=True)
     ap.add_argument("--round", default=os.environ.get("ROUND"))
     ap.add_argument("--no-down", action="store_true")
     args = ap.parse_args()

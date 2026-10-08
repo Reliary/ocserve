@@ -3,7 +3,7 @@
 
 Criteria are pre-registered in bench/sift-gate/README.md (written before any
 run). This driver only executes: 3 tasks x 3 seeds x {baseline, gate},
-interleaved, one fresh refine process per run (cwd = pristine fixture copy,
+interleaved, one fresh ocserve process per run (cwd = pristine fixture copy,
 throwaway data dir), opencode-go/mimo-v2.6-flash both conditions.
 
 Usage (repo root):  python3 bench/sift-gate/run_gate.py
@@ -26,12 +26,12 @@ import urllib.error
 import urllib.request
 import uuid
 
-REFINE = os.environ.get("REFINE_BIN", "target/debug/refine")
-if not os.path.isabs(REFINE):
+OCSERVE = os.environ.get("OCSERVE_BIN", "target/debug/ocserve")
+if not os.path.isabs(OCSERVE):
     # boot() sets cwd=workdir — resolve the binary NOW, not at spawn time
-    REFINE = os.path.join(
+    OCSERVE = os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-        REFINE,
+        OCSERVE,
     )
 MODEL = {"providerID": "opencode-go", "modelID": "mimo-v2.6-flash"}
 BASE_PORT = 4930
@@ -113,15 +113,15 @@ def prepare_workdir(task: str, run_id: str) -> str:
 
 
 def boot(port: int, cwd: str, data_dir: str, sift: bool):
-    env = {k: v for k, v in os.environ.items() if k != "REFINE_SIFT"}
-    env["REFINE_DATA_DIR"] = data_dir
-    env["REFINE_LEGACY_SYNC"] = "0"
+    env = {k: v for k, v in os.environ.items() if k != "OCSERVE_SIFT"}
+    env["OCSERVE_DATA_DIR"] = data_dir
+    env["OCSERVE_LEGACY_SYNC"] = "0"
     env["PATH"] = os.path.expanduser("~/.local/bin") + ":" + env.get("PATH", "")
     if sift:
-        env["REFINE_SIFT"] = "auto"
+        env["OCSERVE_SIFT"] = "auto"
     log = open(os.path.join(data_dir, "serve.log"), "w")
     proc = subprocess.Popen(
-        [REFINE, "serve", "--port", str(port)],
+        [OCSERVE, "serve", "--port", str(port)],
         cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT,
         start_new_session=True,  # own group → stop() can killpg the tree
     )
@@ -143,7 +143,7 @@ def wait_health(port: int, proc, timeout=25.0) -> bool:
 
 def stop(proc, log):
     if proc.poll() is None:
-        # kill the whole GROUP — terminate() alone left refine's plugin-host
+        # kill the whole GROUP — terminate() alone left ocserve's plugin-host
         # node child orphaned (census 2026-10-04: 34 hosts / 717MB wasted).
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -237,10 +237,10 @@ def wait_done(port: int, sid: str, deadline: float):
 def parse_metrics(text: str) -> dict:
     out = {"compressed": 0, "raw": 0, "bytes_in": 0, "bytes_out": 0}
     for line in text.splitlines():
-        m = re.match(r'refine_sift_total\{outcome="(\w+)"\} (\d+)', line)
+        m = re.match(r'ocserve_sift_total\{outcome="(\w+)"\} (\d+)', line)
         if m:
             out[m.group(1)] = int(m.group(2))
-        m = re.match(r'refine_sift_bytes_total\{direction="(\w+)"\} (\d+)', line)
+        m = re.match(r'ocserve_sift_bytes_total\{direction="(\w+)"\} (\d+)', line)
         if m:
             out["bytes_" + ("in" if m.group(1) == "in" else "out")] = int(m.group(2))
     return out
@@ -298,7 +298,7 @@ def fetch_metrics_text(port: int) -> str:
 def run_one(task: str, seed: int, cond: str, port: int, attempt: int) -> dict:
     run_id = f"{task}-s{seed}-{cond}-a{attempt}"
     workdir = prepare_workdir(task, run_id)
-    data_dir = os.path.join(workdir, ".refine-data")
+    data_dir = os.path.join(workdir, ".ocserve-data")
     os.makedirs(data_dir, exist_ok=True)
     row = {
         "run": run_id, "task": task, "seed": seed, "cond": cond,
@@ -375,8 +375,8 @@ def run_one(task: str, seed: int, cond: str, port: int, attempt: int) -> dict:
 
 
 def main() -> int:
-    if not os.path.exists(REFINE):
-        print(f"missing binary {REFINE} (cargo build -p refine-cli)", file=sys.stderr)
+    if not os.path.exists(OCSERVE):
+        print(f"missing binary {OCSERVE} (cargo build -p ocserve-cli)", file=sys.stderr)
         return 2
     os.makedirs(RESULTS, exist_ok=True)
     os.makedirs(WORK_ROOT, exist_ok=True)

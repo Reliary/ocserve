@@ -13,7 +13,7 @@ that never change a wire byte.
 **Compatibility-first rules:**
 1. Responses, events, part shapes, config keys, and hook orderings match upstream unless
    the item appears in §6 divergence ledger.
-2. Refine's sessions stay **stateless rows** — compaction adds no resident session state
+2. Ocserve's sessions stay **stateless rows** — compaction adds no resident session state
    (MEMORY invariant); all new state is indexed columns.
 3. Bounded by construction (AGENTS §2.3): every new buffer (conversation string, scans,
    write batches) declares its bound next to its creation.
@@ -48,7 +48,7 @@ iterates again on the compacted history. After the loop: `compaction.prune` fork
   `nextPrompt` + optional `"The following is the conversation history:\n\n" +
   conversation` when `cfg.compaction.prompt` (`compaction.ts:430-447`).
 - `conversation = msgs.map(serialize).filter(Boolean).join("\n\n")` (`:380`).
-- **`serialize` format** (`compaction.ts:54-92`) — byte format refine must reproduce:
+- **`serialize` format** (`compaction.ts:54-92`) — byte format ocserve must reproduce:
   `[User]: text` + `[Attached mime: filename]` lines; assistant `[Assistant]: `,
   `[Assistant reasoning]: `, `[Assistant tool call]: name({args})` +
   `[Tool result]: output` (a part with `time.compacted` renders as
@@ -100,7 +100,7 @@ The algorithm every model request (and `/message` reads? — see §8) filters th
 `reserved` (`overflow.ts:16`). There is **no `cfg.compaction.prompt` key** —
 `compacting.prompt` is the HOOK output (resolved §8.3: schema read at the
 freeze tag confirms five keys only).
-Both servers read the same config file → **zero new config surface for refine**.
+Both servers read the same config file → **zero new config surface for ocserve**.
 
 ## 3. Wire/compat surfaces (the freeze list)
 
@@ -108,21 +108,21 @@ Both servers read the same config file → **zero new config surface for refine*
 |---|---|
 | `compaction` part | `{type:"compaction", id, sessionID, messageID, auto, tail_start_id?, summary?}` — client parses `{id, sessionID, messageID, auto}` (Part.kt:164-169) and tolerates extra fields (proven against upstream daily) |
 | replay/summary messages | new ids, `mode:"compaction"`/`summary:true` assistant with zeroed tokens/cost |
-| `session.compacted` SSE | refine emits on compaction (since P0e); **upstream v1 has zero in-tree publishers** — client handler is `Unit` (EventReducer:216) → harmless superset, kept for plugin listeners (magic-context registers it) — §6 divergence |
+| `session.compacted` SSE | ocserve emits on compaction (since P0e); **upstream v1 has zero in-tree publishers** — client handler is `Unit` (EventReducer:216) → harmless superset, kept for plugin listeners (magic-context registers it) — §6 divergence |
 | transient `session.error` before retry | mirror error-path publish (`processor.ts:631`) |
 | manual `POST /session/{id}/summarize` | response stays byte `true`; body behavior upgraded from marker-only to the real engine (`auto=false`) — closes the A7 divergence (today's button relieves nothing) |
 | hook order | `experimental.session.compacting` fires inside create (P0c invariant: prompt override + context append; exactly-1 marker); **replay/clone persistence bypasses `chat.message`** (upstream never routes replay through prompt.ts:1000) — re-assert P0c exactly-once |
 | config | upstream `compaction.*` keys only |
 
-## 4. Refine architecture
+## 4. Ocserve architecture
 
 - **Trigger** (post-finalize, `prompt.rs`): usage totals already in memory at finalize
   (token columns persisted, schema.rs:28-32) — `is_overflow(count, limit)` pure fn; no
-  DB read (§5 P5). Error path: new **overflow classifier** in `refine-llm` mapping
+  DB read (§5 P5). Error path: new **overflow classifier** in `ocserve-llm` mapping
   provider error bodies → `ContextOverflow` (OnceLock patterns, P6) feeding the
   prompt-loop retry; fixtures synthesized by the stub.
 - **Schema v8 projection** `compaction(session_id, part_id, user_msg_id, tail_start_id,
-  summary_msg_id, auto, time)` — maintained by `refine-store` part helpers exactly like
+  summary_msg_id, auto, time)` — maintained by `ocserve-store` part helpers exactly like
   `part_search` (guards rule 4 extends to compaction parts). Purpose: assembly needs the
   *last* compaction anchor + tail **before** a forward streaming pass; without it every
   prompt pays a full `msg_part` type scan. Rows: rare (one per compaction) → tiny.
@@ -148,7 +148,7 @@ Both servers read the same config file → **zero new config surface for refine*
 | P3 | **Replay clone = one write transaction** (N rows, 1 fsync) | upstream N × `updatePart` (N writes; partial-failure possible) | atomicity test: injected write failure ⇒ zero partial replay rows; emitted SSE frames identical to row-by-row |
 | P4 | **Idempotent prune** — skip parts already carrying `time.compacted` | upstream re-writes marks it already set (dirty-page churn) | selection equivalence vs reference walk; no-op update test |
 | P5 | Trigger reads in-memory usage totals (finalize path) — no extra DB round-trip | upstream re-fetches after stream | covered by e2e (no query assertion needed — noted for review) |
-| P6 | Overflow classifier patterns `OnceLock`-compiled | n/a (refine-only surface) | classifier unit tests: positive fixtures (context-length bodies), negatives (rate-limit/401/500 must NOT compact) |
+| P6 | Overflow classifier patterns `OnceLock`-compiled | n/a (ocserve-only surface) | classifier unit tests: positive fixtures (context-length bodies), negatives (rate-limit/401/500 must NOT compact) |
 | P7 | Prune-equivalent scan windowed in SQL (last 2 user turns + budgets) instead of materializing all messages | upstream walks full `msgs` array | selection equivalence (same part set as reference) |
 | P8 | Serialize uses raw stored JSON slices for tool inputs where shapes allow (no parse→re-emit) | upstream `JSON.stringify(part.state.input)` | byte-format golden for `serialize()` output on fixture sessions |
 
@@ -164,7 +164,7 @@ post-hoc only; a preflight changes failure modes — §6 D5).
 |---|---|---|
 | D1 | **doom-window** (amended K-AUTONOMY): more than 3 automatic compactions *within 30 minutes* → `session.error` (`ContextOverflowError`) then stop compacting — the current answer is kept if one exists; pending-check with no answer errors the prompt. Compactions spaced outside the window (hours-apart overnight refills) NEVER trip. The original flat per-prompt count of 3 killed healthy long turns — the real doom signature is *frequency*, not lifetime | upstream has no hard counter (only the summarize-overflow fail-hard); safety + stall-watchdog precedent; overnight-run requirement |
 | D2 | conversation byte cap + tail-weighted truncation (P2) | AGENTS bounded-by-construction; upstream unbounded |
-| D3 | overflow classifier = our own unit with fixtures | upstream classifies inside provider SDKs; refine has no typed error map — false± each get tests |
+| D3 | overflow classifier = our own unit with fixtures | upstream classifies inside provider SDKs; ocserve has no typed error map — false± each get tests |
 | D4 | config trust: your models declare `limit.context = 1_000_000` (A9) → triggers land late, mostly on the error path — **same as upstream on the same config** | freeze-faithful; optional doctor warning parked, not in M6 |
 | D5 | no pre-flight token check | mirror upstream call sites (processor:493/629 only) |
 | D6 | `session.compacted` emitted by us, zero upstream publishers | client handler `Unit` (safe), plugin listeners benefit; revert to silence if a client ever chokes |
@@ -225,7 +225,7 @@ byte invalidates from that block onward):
   this is the plugin's responsibility (magic-context appends live memory; if
   it ever timestamps, every request busts its own prefix). Divergence risk
   documented, not suppressible from core.
-- `refine_llm_cache_tokens_total{provider,dir="read"}` exposes cache-read
+- `ocserve_llm_cache_tokens_total{provider,dir="read"}` exposes cache-read
   token accrual per request (Usage.parsed `prompt_tokens_details.cached_tokens`).
   Session rows already carried `tokens_cache_read` (finalize) — metrics close
   the gap. Cache-**write** tokens are not parsed by our client (Usage has no
@@ -239,7 +239,7 @@ mmap off untouched). Compaction table rows are tiny/inline; prune marks
 seq+state (`Ready|Pending|SummaryExit`); the newest-message query runs only
 when projection rows exist. Round-1 opens = preflight + `load_messages` =
 **2 (pre-M6 parity)**. Engine rounds add their own readers (rare, bounded).
-Regression net: `refine-store` `preflight.rs` 4 tests incl. the row-gate
+Regression net: `ocserve-store` `preflight.rs` 4 tests incl. the row-gate
 control (a summary with no projection rows must stay `Ready`).
 
 **Governance decay (arXiv 2606.22528):** the paper's *Constraint Pinning*
@@ -248,7 +248,7 @@ does this by construction (system prompt re-sent verbatim every request,
 never compacted). Conversation-carried constraints survive only via the
 `SUMMARY_TEMPLATE` **Important Details** section; reassembly keeps
 anchor+summary+tail, not the raw oldest turn → residual gap named here,
-mitigation = template + system pinning. `refine_compaction_total{auto}`
+mitigation = template + system pinning. `ocserve_compaction_total{auto}`
 counts every completed compaction (success or overflow-stop) — closes the
 rate–distortion survey's "repeated compaction is almost never measured"
 gap (arXiv 2607.08032) for the soak to trend.

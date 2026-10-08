@@ -1,4 +1,4 @@
-# R3 spike — DETACHED from the refine workspace (empty [workspace] below):
+# R3 spike — DETACHED from the ocserve workspace (empty [workspace] below):
 # spikes never merge their deps into the main build; integration gate is a
 # separate decision (binary ceiling 10,485,760 B + build-time delta).
 [workspace]

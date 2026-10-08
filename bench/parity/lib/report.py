@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Aggregate round results → report.md (medians + spread, no invented gates).
 
-Pairing: rounds named <tag>u / <tag>r (upstream/refine). Warmup pairs are
+Pairing: rounds named <tag>u / <tag>r (upstream/ocserve). Warmup pairs are
 listed but excluded from medians when their tag starts with 'warm'.
 A missing result file or a `null` metric stays `null` (decidability).
 """
@@ -56,20 +56,20 @@ def main():
         print("no results under .runs/", file=sys.stderr)
         sys.exit(1)
     rounds = sorted({r for r, _ in runs})
-    # storm rounds (s5*) carry STUB_FORCE_WORDS/REFINE_EVENT_RING_MB env —
+    # storm rounds (s5*) carry STUB_FORCE_WORDS/OCSERVE_EVENT_RING_MB env —
     # they must NOT contaminate the perf medians (S1 latencies there are
     # artificially big by design); they feed the S5 section only
     measured = [r for r in rounds
                 if not r.startswith("warm") and not r.startswith("s5")]
     warmups = [r for r in rounds if r.startswith("warm")]
-    arms = ["upstream", "refine"]
+    arms = ["upstream", "ocserve"]
 
     def pair_tags():
         """m1u/m1r → (m1, m1u, m1r): arm-runs have DISTINCT round ids."""
         tags = {}
         for r in measured:
             tag, arm_suf = r[:-1], r[-1]
-            arm = "upstream" if arm_suf == "u" else "refine"
+            arm = "upstream" if arm_suf == "u" else "ocserve"
             tags.setdefault(tag, {})[arm] = r
         return tags
 
@@ -129,9 +129,9 @@ def main():
         return g
 
     lines = []
-    lines.append("# Parity report — upstream opencode vs refine\n")
-    meta = runs[(rounds[-1], "refine" if (rounds[-1], "refine") in runs else rounds[-1] and "upstream")]
-    lines.append(f"- refine sha: `{meta.get('refine_git_sha')}`  "
+    lines.append("# Parity report — upstream opencode vs ocserve\n")
+    meta = runs[(rounds[-1], "ocserve" if (rounds[-1], "ocserve") in runs else rounds[-1] and "upstream")]
+    lines.append(f"- ocserve sha: `{meta.get('ocserve_git_sha')}`  "
                  f"rounds: {len(measured)} measured (+{len(warmups)} warmup)  "
                  f"generated: {meta.get('finished_utc')}")
     lines.append(f"- quiet-host gate: load1 ≤ {meta.get('max_load1')} "
@@ -161,11 +161,11 @@ def main():
         ("S2 command p95 (s)", s2_p95("command"), ""),
     ]
 
-    lines.append("| metric | upstream | spread | refine | spread | Δ(ref/up−1) |")
+    lines.append("| metric | upstream | spread | ocserve | spread | Δ(ref/up−1) |")
     lines.append("|---|---:|---:|---:|---:|---:|")
     for label, getter, _u in metrics:
         up = series(measured, "upstream", getter)
-        rf = series(measured, "refine", getter)
+        rf = series(measured, "ocserve", getter)
         up_m, rf_m = med(up), med(rf)
         delta = None
         if up_m not in (None, 0) and rf_m is not None:
@@ -176,11 +176,11 @@ def main():
 
     # seed parity per pair
     lines.append("## Seed parity (byte-identical histories across arms?)\n")
-    lines.append("| pair | upstream digests | refine digests | identical |")
+    lines.append("| pair | upstream digests | ocserve digests | identical |")
     lines.append("|---|---:|---:|---|")
     for tag, arms_map in sorted(pair_tags().items()):
         u = runs.get((arms_map.get("upstream", ""), "upstream"))
-        f = runs.get((arms_map.get("refine", ""), "refine"))
+        f = runs.get((arms_map.get("ocserve", ""), "ocserve"))
         if not u or not f:
             continue
         du, df = u.get("seed_digests"), f.get("seed_digests")
@@ -229,7 +229,7 @@ def main():
             ("storm writes / p95 (s)",
              lambda d: f"{s5get(d, ['storm_writes'])} / {s5get(d, ['storm_latency', 'p95'])}"),
             ("ring bytes A→B→C",
-             lambda d: "→".join(str(s5get(d, [k, "refine_event_ring_bytes"]))
+             lambda d: "→".join(str(s5get(d, [k, "ocserve_event_ring_bytes"]))
                                 for k in ("metrics_phase_a", "metrics_phase_b", "metrics_phase_c"))),
             ("anon curve start→A→B→C (MB)",
              lambda d: "→".join(

@@ -33,7 +33,7 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-# intra-workspace path deps (refine-* = { path }) are wildcard-shaped by
+# intra-workspace path deps (ocserve-* = { path }) are wildcard-shaped by
 # design; registry version wildcards stay denied
 allow-wildcard-paths = true
 highlight = "all"

@@ -1,6 +1,6 @@
-# Parity harness — upstream opencode vs refine, identical workloads
+# Parity harness — upstream opencode vs ocserve, identical workloads
 
-Runs **opencode 1.18.31** (the freeze binary) and **refine** in Docker
+Runs **opencode 1.18.31** (the freeze binary) and **ocserve** in Docker
 containers against the same seeded workloads and reports resource usage and
 latency side by side. Local tool first (CI can reuse the compose later).
 
@@ -12,7 +12,7 @@ cd bench/parity
 # report: .runs/report.md      raw: .runs/<round>/<arm>/{result.json,sampler.csv}
 ```
 
-First run builds images (refine compiles in-container, ~5 min cold, cached
+First run builds images (ocserve compiles in-container, ~5 min cold, cached
 after) and stages `vendor/opencode` from the brew freeze binary.
 
 Knobs (env): `ROUNDS=3`, `MAX_LOAD1=1.5` (quiet-host gate), `S0_IDLE_S=45`,
@@ -62,7 +62,7 @@ Models the multi-connection OOM shape (several oc-remote clients + TUI):
 backpressure parks the server's writer — the backgrounded-phone case).
 Phases:60s subscribers-only → sustained prompt writes (big stub frames via
 `STUB_FORCE_WORDS=20000`, `STUB_TOK_PER_SEC=6000`; ring budget forced to
-4MB via `REFINE_EVENT_RING_MB=4` so eviction/lag occur at reachable event
+4MB via `OCSERVE_EVENT_RING_MB=4` so eviction/lag occur at reachable event
 volumes) →60s settle. Storm rounds are tagged `s5*` and **excluded from
 the perf medians** (their S1 latencies are artificially large by design).
 
@@ -72,7 +72,7 @@ at phase marks, storm write p95, ring-bytes A→B→C.
 
 Mechanism note: upstream gives every `/event` subscriber an **unbounded
 queue** (`event.ts:25` `Queue.unbounded` + `offerUnsafe`) — a stalled
-client grows memory forever. refine's bus is one shared ring bounded by
+client grows memory forever. ocserve's bus is one shared ring bounded by
 **count and bytes** (worst = max(32MB, largest frame)); lagging receivers
 get `Lagged` → disconnect; publishers never block.
 
@@ -101,7 +101,7 @@ get `Lagged` → disconnect; publishers never block.
 
 ## Antagonism record (bugs this harness hit before shipping)
 
-1. Host-built refine needs `GLIBC_2.39`; bookworm has 2.36 → refine is
+1. Host-built ocserve needs `GLIBC_2.39`; bookworm has 2.36 → ocserve is
    built **inside** the container (multi-stage), not `COPY`ed from the host.
    The freeze binary only needs `GLIBC_2.17` → vendored copy is fine.
 2. BuildKit `RUN --mount=type=bind` is read-only → can't create cache
@@ -117,9 +117,9 @@ get `Lagged` → disconnect; publishers never block.
 ## Layout
 
 ```
-compose.yaml           services: upstream | refine | stub (internal net)
+compose.yaml           services: upstream | ocserve | stub (internal net)
 Dockerfile.upstream    bookworm-slim + vendor/opencode (freeze 1.18.31)
-Dockerfile.refine      rust:1-bookworm build → bookworm-slim runtime
+Dockerfile.ocserve      rust:1-bookworm build → bookworm-slim runtime
 Dockerfile.stub        python:3.12-slim + stub.py
 config/                identical fixtures mounted into both arms
 lib/sampler.py         cgroup-v2 sampler (1 Hz CSV + summaries)

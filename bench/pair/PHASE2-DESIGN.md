@@ -1,14 +1,14 @@
 # Phase 2 (PRE-REGISTERED — not built): stub-driven prompt flows for pair-check
 
 Status: DESIGN ONLY (2026-10-06). Phase 1 (`scripts/pair-check.sh` + the
-`replay --pair` engine) is the live GET-route freeze↔refine differential.
+`replay --pair` engine) is the live GET-route freeze↔ocserve differential.
 This file pre-registers Phase 2 before any of it is built, per TESTING §2.
 
 ## Why
 
 Phase 1's first run found three D-PAIR rows that are **state-shaped**, not
 wire-shaped: `session_list` (freeze omits agent/model/summary until a first
-prompt), `project`/`project_current` (project-state rows vs refine's
+prompt), `project`/`project_current` (project-state rows vs ocserve's
 synthetic rows), and partly `provider` (registry provenance). All three
 would likely converge if both arms could run an **identical real prompt**
 against a **deterministic** backend — which the parity harness already has:
@@ -26,7 +26,7 @@ message only, paced token streaming).
    text, same tool-free flow, same persisted parts shape.
 3. **New manifest entry kinds** (requires a record mode — `replay.rs` is
    compare-only today): `prompt_flow` entries asserting STRUCTURED outcomes
-   across freeze and refine: final assistant text equality (stub-derived ⇒
+   across freeze and ocserve: final assistant text equality (stub-derived ⇒
    byte-comparable), part count/type sequence, finish reason, usage shape
    (pacing/latency explicitly NOT compared).
 4. **Re-evaluate D-PAIR-3** (session_list) after the seed prompt: if rows
@@ -42,7 +42,7 @@ message only, paced token streaming).
   cannot reproduce (project-state rows still divergent after identical
   prompts) → D-PAIR-1 stays allowlisted permanently; document as
   environmental and stop — no custom state emulators.
-- **K2c**: freeze's prompt route requires capabilities refine hasn't
+- **K2c**: freeze's prompt route requires capabilities ocserve hasn't
   ported (route 404 / schema mismatch) → scope Phase 2 to the routes
   both serve; the rest reverts to the recorded-corpus deferral ledger.
 

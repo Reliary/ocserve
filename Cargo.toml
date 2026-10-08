@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/refine-core",
-    "crates/refine-store",
-    "crates/refine-http",
-    "crates/refine-llm",
-    "crates/refine-tools",
-    "crates/refine-mcp",
-    "crates/refine-plugin",
-    "crates/refine-importer",
-    "crates/refine-metrics",
-    "crates/refine-cli",
+    "crates/ocserve-core",
+    "crates/ocserve-store",
+    "crates/ocserve-http",
+    "crates/ocserve-llm",
+    "crates/ocserve-tools",
+    "crates/ocserve-mcp",
+    "crates/ocserve-plugin",
+    "crates/ocserve-importer",
+    "crates/ocserve-metrics",
+    "crates/ocserve-cli",
 ]
 
 [workspace.package]
@@ -22,15 +22,15 @@ publish = false
 
 [workspace.dependencies]
 # internal
-refine-core = { path = "crates/refine-core" }
-refine-store = { path = "crates/refine-store" }
-refine-http = { path = "crates/refine-http" }
-refine-llm = { path = "crates/refine-llm" }
-refine-tools = { path = "crates/refine-tools" }
-refine-mcp = { path = "crates/refine-mcp" }
-refine-plugin = { path = "crates/refine-plugin" }
-refine-metrics = { path = "crates/refine-metrics" }
-refine-importer = { path = "crates/refine-importer" }
+ocserve-core = { path = "crates/ocserve-core" }
+ocserve-store = { path = "crates/ocserve-store" }
+ocserve-http = { path = "crates/ocserve-http" }
+ocserve-llm = { path = "crates/ocserve-llm" }
+ocserve-tools = { path = "crates/ocserve-tools" }
+ocserve-mcp = { path = "crates/ocserve-mcp" }
+ocserve-plugin = { path = "crates/ocserve-plugin" }
+ocserve-metrics = { path = "crates/ocserve-metrics" }
+ocserve-importer = { path = "crates/ocserve-importer" }
 
 # runtime / web
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs", "io-util", "net"] }

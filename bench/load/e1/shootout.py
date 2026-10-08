@@ -215,7 +215,7 @@ def main():
         pass
     battery = ['the', 'and', 'error', 'panic', 'OpenCode', 'error in', 'not found',
                'session', 'thread', 'failed', 'retry', '"error in"', 'over 100',
-               'buffer', 'index', 'cache', 'refine', 'stream', 'a', 'zz', 'e']
+               'buffer', 'index', 'cache', 'ocserve', 'stream', 'a', 'zz', 'e']
     diffs = 0
     for term in battery:
         needle = f'"{term}"'

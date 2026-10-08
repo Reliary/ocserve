@@ -1,4 +1,4 @@
-# AGENTS.md — refine
+# AGENTS.md — ocserve
 
 Binding instructions for every agent (and human) working on this repository. The companion
 documents are **specification, not suggestion** — code that contradicts them is wrong even if
@@ -30,7 +30,7 @@ are the bar — "mostly passing" does not exit.
 ## 2. Hard rules (CI enforces all of these; violating them blocks the commit)
 
 1. **Anti-theater** (`TESTING.md §1`): bug fixes land test-first with a negative control;
-   mutation survivors in `refine-store`/`refine-core`/SSE encoder are must-fix; divergence
+   mutation survivors in `ocserve-store`/`ocserve-core`/SSE encoder are must-fix; divergence
    from upstream is a *named exception test*, never a skipped assertion.
 2. **No unmeasured claims**: never write a percentage, speedup, or "savings" figure anywhere
    (code, docs, commit messages) that wasn't produced by a committed, repeatable benchmark
@@ -38,7 +38,7 @@ are the bar — "mostly passing" does not exit.
 3. **Bounded by construction**: every channel, cache, pool, queue, buffer, and intern table
    declares its bound at creation, in code next to the bound. An unbounded collection on a
    request/event/storage path is a defect, not a style choice.
-4. **No `unwrap`/`expect`/panic in server paths** (`refine-*` runtime crates): fail fast with
+4. **No `unwrap`/`expect`/panic in server paths** (`ocserve-*` runtime crates): fail fast with
    context (error + route/session), because `panic = abort` turns panics into outages.
    Tests may unwrap.
 5. **Storage discipline** (`STORAGE.md`): pragmas only via the shared `open()` routine; never
@@ -57,8 +57,8 @@ are the bar — "mostly passing" does not exit.
    banned-string check runs pre-commit.
 10. **Unsafe**: `forbid(unsafe_code)` per crate unless a crate explicitly opts into a
     reviewed `unsafe` module (justify in the crate README; blob/zstd interop likely candidates).
-11. **Non-refine services are read-only**: agents and scripts may *inspect* any host service
-    (`status`/`cat`/`show`/`is-active`/health) but only ever mutate `refine*` units — no
+11. **Non-ocserve services are read-only**: agents and scripts may *inspect* any host service
+    (`status`/`cat`/`show`/`is-active`/health) but only ever mutate `ocserve*` units — no
     drop-ins, env changes, starts/stops/restarts of other units (opencode included).
     Experiments against other services run in disposable containers (`check-guards.sh`
     rule 6 enforces the script side; incident 2026-10-05, TESTING §1.6).
@@ -74,7 +74,7 @@ feat(store): chunked zstd blob writer with fsync+rename protocol   # PLAN §5, T
 fix(sse): drop subscriber on ring overflow                         # PLAN §4 divergence D-slowclient
 test(harness): byte-golden comparison for first SSE frames         # TESTING §6
 docs(storage): role-scoped cache sizes                             # MEMORY §1
-chore(ci): mutation gate for refine-core                           # TESTING §1
+chore(ci): mutation gate for ocserve-core                           # TESTING §1
 ```
 
 **Atomicity rules:**

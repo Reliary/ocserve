@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Wire-corpus replay gate (DIFFERENTIATION.md §5 P1a / D4).
 #
-# Boots refine on an ephemeral port with a throwaway data dir, runs the
+# Boots ocserve on an ephemeral port with a throwaway data dir, runs the
 # differential wire-corpus replay against it, and exits non-zero on any FAIL.
 # Use it after config/route-affecting changes: `./scripts/replay-check.sh`.
 #
@@ -13,17 +13,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PORT="${REFINE_CHECK_PORT:-4919}"
-BIN="${REFINE_BIN:-target/debug/refine}"
+PORT="${OCSERVE_CHECK_PORT:-4919}"
+BIN="${OCSERVE_BIN:-target/debug/ocserve}"
 SELF_TEST=0
 [ "${1:-}" = "--self-test" ] && SELF_TEST=1
 
-[ -x "$BIN" ] || { echo "replay-check: $BIN missing (cargo build -p refine-cli)" >&2; exit 2; }
+[ -x "$BIN" ] || { echo "replay-check: $BIN missing (cargo build -p ocserve-cli)" >&2; exit 2; }
 
-DATA="$(mktemp -d "${TMPDIR:-/tmp}/refine-replay-check.XXXXXX")"
+DATA="$(mktemp -d "${TMPDIR:-/tmp}/ocserve-replay-check.XXXXXX")"
 CORPUS_COPY=""
 cleanup() {
-  # Kill the PROCESS GROUP (spawned via setsid) — refine's plugin-host node
+  # Kill the PROCESS GROUP (spawned via setsid) — ocserve's plugin-host node
   # child dies with it. Plain $PID kill orphaned 34 node hosts / 717MB over
   # repeated runs (census 2026-10-04).
   if [ -n "${PID:-}" ]; then
@@ -35,11 +35,11 @@ cleanup() {
 }
 trap cleanup EXIT
 # Hygiene: sweep stale replay plugin-hosts from prior crashed runs (the
-# /tmp/refine-repl prefix is refine-plugin's throwaway host dir — never a
+# /tmp/ocserve-repl prefix is ocserve-plugin's throwaway host dir — never a
 # production path).
-pkill -f "/tmp/refine-repl" 2>/dev/null || true
+pkill -f "/tmp/ocserve-repl" 2>/dev/null || true
 
-setsid env REFINE_DATA_DIR="$DATA" REFINE_LEGACY_SYNC=0 "$BIN" serve \
+setsid env OCSERVE_DATA_DIR="$DATA" OCSERVE_LEGACY_SYNC=0 "$BIN" serve \
   --port "$PORT" >/dev/null 2>&1 &
 PID=$!
 
@@ -74,10 +74,10 @@ urllib.request.urlopen(req, timeout=5).read()
 PY
 }
 
-run_replay() { # $1 = optional REFINE_CORPUS dir; returns replay exit code
+run_replay() { # $1 = optional OCSERVE_CORPUS dir; returns replay exit code
   local out rc=0
   if [ -n "${1:-}" ]; then
-    out="$(REFINE_CORPUS="$1" "$BIN" replay --target "http://127.0.0.1:$PORT" 2>&1)" || rc=$?
+    out="$(OCSERVE_CORPUS="$1" "$BIN" replay --target "http://127.0.0.1:$PORT" 2>&1)" || rc=$?
   else
     out="$("$BIN" replay --target "http://127.0.0.1:$PORT" 2>&1)" || rc=$?
   fi
@@ -95,7 +95,7 @@ if [ "$SELF_TEST" = "1" ]; then
     exit 3
   fi
   echo "== self-test: sabotaged corpus must FAIL =="
-  CORPUS_COPY="$(mktemp -d "${TMPDIR:-/tmp}/refine-corpus.XXXXXX")"
+  CORPUS_COPY="$(mktemp -d "${TMPDIR:-/tmp}/ocserve-corpus.XXXXXX")"
   cp -r testdata/golden/. "$CORPUS_COPY/"
   # corrupt a byte-mode body (global_health is recorded byte-exact)
   printf 'CORRUPTED' >> "$CORPUS_COPY/global_health.body"

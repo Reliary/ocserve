@@ -2,23 +2,23 @@
 # pair gate. Every entry must cite a named pair-finding row (D-PAIR-N,
 # guarded by check-guards rule 12). Remove entries as their rows are fixed.
 #
-# D-PAIR-1 (project, project_current): refine synthesizes `global`+`current`
+# D-PAIR-1 (project, project_current): ocserve synthesizes `global`+`current`
 #   project rows carrying time.initialized + worktree but no vcs; freeze
 #   emits state-tracked rows (random id, vcs:"git", created/updated only).
 #   Fixture HOME has no project-state history and the recorded corpus came
 #   from real state — three different row models. Real-env recorded replay
 #   stays green (production compat unaffected). Fix path: port upstream
-#   project row shape + vcs emission + investigate refine's $[1] row.
+#   project row shape + vcs emission + investigate ocserve's $[1] row.
 # D-PAIR-2 (provider): freeze serves model metadata from its INTERNAL
 #   registry compiled into the binary (proof: 215 providers with fetch
-#   disabled and no models.json written); refine serves from the
+#   disabled and no models.json written); ocserve serves from the
 #   models.json catalog copy — the file is 2026-10-06 content, freeze's
 #   registry is 1.18.31-era, so variant/family keypaths differ
 #   (variants.reasoningEffort vs family). Fix path: pin the fixture
 #   catalog to the freeze-era api.json snapshot, or port the registry.
 # D-PAIR-3 (session_list): the fixture pair cannot run prompts (stub
 #   provider host unreachable from the host), so freeze rows omit
-#   agent/model/summary until a first prompt while refine always emits
+#   agent/model/summary until a first prompt while ocserve always emits
 #   them. Fix path: Phase 2 — host-reachable deterministic stub + an
 #   identical seed prompt on both arms (see PHASE2-DESIGN.md).
 project          # D-PAIR-1 see header

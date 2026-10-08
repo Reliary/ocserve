@@ -1,0 +1,81 @@
+# ocserve — systemd user unit (SRE.md §5 / MEMORY.md sidecar boundary).
+# Install (preferred, but NEVER automatic — the service is an optional overlay
+# and foreground `ocserve serve` is fully supported):  scripts/install.sh
+#   [--dry-run|--bin-only]  — renders this template, enables, health-probes.
+# Uninstall (keeps session history by default):  scripts/uninstall.sh [--purge]
+# Manual alternative: cp deploy/ocserve.service ~/.config/systemd/user/ &&
+#   systemctl --user daemon-reload && systemctl --user enable --now ocserve.service
+[Unit]
+Description=ocserve (opencode-compatible server, freeze 1.18.31)
+After=network.target
+# StartLimit* belong HERE ([Unit]) — as [Service] options systemd ignores
+# them (observed: bind-fail restart loop reached 1582 without tripping).
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+ExecStart=%h/src/ocserve/target/release/ocserve serve --port 4912
+WorkingDirectory=%h/src/ocserve
+Environment=OCSERVE_DATA_DIR=%h/.local/share/ocserve
+Environment=RUST_LOG=ocserve=info
+# MIMALLOC_* env removed 2026-10-04: no allocator is linked (dead config).
+# Re-add with real allocator wiring if/when profiling justifies it.
+Restart=on-failure
+RestartSec=5
+# Combined cgroup budget: ocserve ≤300MB + node plugin sidecar ≤160MB +
+# streaming-generation burst margin. Measured 2026-10: cgroup steady
+# 341-347MB (ocserve + sidecar); a first-run long generation tripped a 480M
+# cap → oom-kill → clean systemd restart (fail-fast worked; cap too tight
+# for allocator page retention during delta bursts). Children share this
+# cgroup, so MemoryMax must cover the sidecar or systemd OOM-kills plugins.
+# 2026-10-02: raised 600M→750M — W5 battery (MCP reconnect ×2 + auth
+# PUT/DELETE reloads + search + sidecar + embedding model) hit the 600M
+# cap exactly (systemd: kernel OOM kill, peak 600M; steady post-restart
+# is ~412MB cgroup). Provenance: journal 19:20:09 oom-kill.
+# 2026-10-05 (measured, interim): 7 kernel memcg kills in one day at 750M.
+# Measured composition: warm main ~500MB + reload build ~237MB transient
+# (A2 log: 301→538 on one reload; warm reload = kill — journal 17:01:33)
+# + children ~214MB (plugin host 145 + bh 78) → predicted peak ~951MB.
+# 1024M buys measured margin; Phase-B attribution (K-OOM-RESILIENCE) may
+# shrink the baseline and justify lowering again.
+# 2026-10-05 tiny-footprint decision (antagonised): arena-reset restart +
+# 1536M covers the measured step pattern (base 264 + 4 x ~220MB real-catalog
+# reloads + ~200 kids = 1344 < 1536; a 5th update self-heals via OOM+restart).
+# NOT 2048: goal is a tiny footprint — Phase B (lab profile + tunables/
+# allocator verdict) drives this back toward <=750M once reload steps stop
+# retaining (acceptance: idle cgroup <=460, reload net-growth <=20MB).
+# Single glibc arena (B2 verdict 2026-10-05, bench/profiling/OOM-RELOAD-REPORT):
+# the catalog-reload RSS step (+220MB first reload, converging) was arena
+# FRAGMENTATION of serde churn, not a leak (bytehound: 24.3M temporary allocs,
+# leaked-at-exit = live payload only). Lab A/B: plain [220,68,1]/526MB,
+# arena2 identical, arena1 [69,0,1]/308MB — single-arena reuse kills the step;
+# reload wall-time unchanged (~2.7s). Children inherit it (node/python glibc
+# malloc use is light — monitored by soak kids column).
+Environment=MALLOC_ARENA_MAX=1
+# A3 child-first OOM containment (2026-10-06 incident): default OOMPolicy=stop
+# bounced the unit after the kernel correctly killed only the sidecar child.
+OOMPolicy=continue
+# Cap back to the documented size (measured: idle ~280 + converged reload
+# ~333 main + kids <=200 = ~533 worst -> 750M has proven burst margin; the
+# old 750M OOMs are explained and fixed, no longer a cap-size problem).
+# 2026-10-08: raised 750M->1024M — STRUCTURAL over-commit, not a leak: the
+# C3 cgroup partition allows kids/ up to 700M (OCSERVE_KIDS_MEMORY_MAX_MB,
+# sized for the measured 614M sidecar warm-up) while main runs 130-180M
+# typical (455M peak during the v10 migration). 700+130 > 750, so the unit
+# cap could never hold both ceilings — journal 10-07/10-08 shows 6+ kernel
+# OOM SIGKILLs of the sidecar at cold start (magic-context warm-up) with
+# memory.peak pinned at exactly 786,432,000. Kids ceiling stays 700M;
+# 1024M = kids 700 + main ~250 allowance + slab. Kill switch evidence kept:
+# bytehound proved fragmentation-not-leak, so this is spike headroom.
+MemoryMax=1024M
+MemorySwapMax=0
+ProtectSystem=strict
+# ocserve's own data dir is required; the opencode/plugin paths are optional
+# ("-path" = ignore when absent) so a fresh machine without opencode still boots.
+ReadWritePaths=%h/.local/share/ocserve -%h/.local/share/opencode -%h/.cache/opencode -%h/.config/opencode -%h/src/reliary8
+NoNewPrivileges=true
+PrivateTmp=false
+
+[Install]
+WantedBy=default.target

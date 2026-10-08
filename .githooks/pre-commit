@@ -36,11 +36,11 @@ done < <(git diff --cached --name-only --diff-filter=ACM)
 [ "$rc" -eq 0 ] || { echo "pre-commit: banned-string check failed"; exit 1; }
 
 # 2. docs-required: any staged behavior (crates/**.rs) must carry its matrix row
-if [ "${REFINE_SKIP_DOCS:-0}" != "1" ]; then
+if [ "${OCSERVE_SKIP_DOCS:-0}" != "1" ]; then
   if git diff --cached --name-only | grep -q '^crates/.*\.rs$'; then
     if ! git diff --cached --name-only | grep -q '^TRACEABILITY\.md$'; then
       echo "docs-required: staged crates/*.rs but TRACEABILITY.md not staged"
-      echo "(matrix row for the requirement/test ID — REFINE_SKIP_DOCS=1 only for test-only/refactor commits)"
+      echo "(matrix row for the requirement/test ID — OCSERVE_SKIP_DOCS=1 only for test-only/refactor commits)"
       exit 1
     fi
   fi

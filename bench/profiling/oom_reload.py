@@ -2,7 +2,7 @@
 """OOM-reload lab (K-OOM-RESILIENCE Phase B1): leak-vs-fragmentation verdict
 for the hourly-catalog-reload RSS step, plus glibc-tunables A/B.
 
-Isolated fake HOME (no MCP/plugin children — bytehound stays in refine),
+Isolated fake HOME (no MCP/plugin children — bytehound stays in ocserve),
 FULL-SIZE real models catalog as fixtures (a tiny fixture would make the
 profile lie), forced real-content reloads by swapping fixture content.
 A2's reconcile INFO log ("hot-reload ok … rss X → Y") is the step metric.
@@ -32,7 +32,7 @@ PROFILE = (sys.argv[3] if len(sys.argv) > 3 else "0") == "1"
 
 ROOT = "/tmp/opencode/oom-lab"
 _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-REFINE = os.environ.get("REFINE_BIN", os.path.join(_REPO, "target/debug/refine"))
+OCSERVE = os.environ.get("OCSERVE_BIN", os.path.join(_REPO, "target/debug/ocserve"))
 BH_SO = os.environ.get(
     "BYTEHOUND_LIB", "/tmp/opencode/bytehound/target/release/libbytehound.so"
 )
@@ -65,7 +65,7 @@ for d in (
     os.path.join(home, ".local/share/opencode"),
 ):
     os.makedirs(d, exist_ok=True)
-# minimal config → no MCP/plugin children (keeps bytehound on refine alone)
+# minimal config → no MCP/plugin children (keeps bytehound on ocserve alone)
 json.dump({}, open(os.path.join(home, ".config/opencode/opencode.json"), "w"))
 json.dump(
     {"recent": [], "favorite": [], "variant": "default"},
@@ -95,8 +95,8 @@ env = dict(os.environ)
 env.update(
     {
         "HOME": home,
-        "REFINE_DATA_DIR": data,
-        "REFINE_LEGACY_SYNC": "0",
+        "OCSERVE_DATA_DIR": data,
+        "OCSERVE_LEGACY_SYNC": "0",
         "OPENCODE_DISABLE_MODELS_FETCH": "1",  # never touch the real cache
         "MEMORY_PROFILER_LOG": "warn",
     }
@@ -123,13 +123,13 @@ elif VARIANT == "a1mmap":
     env["MALLOC_MMAP_THRESHOLD_"] = "131072"
 elif VARIANT == "notrim":  # negative control for the trim fix
     env["MALLOC_ARENA_MAX"] = "1"
-    env["REFINE_TRIM"] = "0"
+    env["OCSERVE_TRIM"] = "0"
 
 log_path = os.path.join(work, "lab.log")
 logf = open(log_path, "w")
 os.chdir(work)  # bytehound dat lands in CWD
 proc = subprocess.Popen(
-    [REFINE, "serve", "--port", str(PORT)], env=env, stdout=logf, stderr=logf
+    [OCSERVE, "serve", "--port", str(PORT)], env=env, stdout=logf, stderr=logf
 )
 print(f"variant={VARIANT} profile={PROFILE} pid={proc.pid}", flush=True)
 

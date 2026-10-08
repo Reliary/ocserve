@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# pair-check — LIVE freeze ↔ refine direct differential (manual tool).
+# pair-check — LIVE freeze ↔ ocserve direct differential (manual tool).
 #
 # What it is: dual-arm integration test against the upstream freeze. Vendored
-# opencode 1.18.31 and $REFINE_BIN boot with IDENTICAL fixture environments
+# opencode 1.18.31 and $OCSERVE_BIN boot with IDENTICAL fixture environments
 # (bench/parity/config copied into per-arm temp HOMEs), same cwd (repo root),
-# same seed — then `refine replay --pair` compares every manifest route
+# same seed — then `ocserve replay --pair` compares every manifest route
 # DIRECTLY between the two live servers. That direct diff is the GATE.
 # Recorded-corpus freshness prints as info only: the recorded corpus came
 # from the real user environment, so fixture-env noise is expected (drift
@@ -22,14 +22,14 @@
 #                                         # session planted on ONE arm must
 #                                         # make the gate fail (red→green)
 #
-# Allowlist (only with a named divergence row): REFINE_PAIR_ALLOW=file of
+# Allowlist (only with a named divergence row): OCSERVE_PAIR_ALLOW=file of
 # `name # D-ROW reason` lines — read by the replay engine, never silently.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PORT_F=4926
 PORT_R=4927
-REFINE_BIN="${REFINE_BIN:-target/release/refine}"
+OCSERVE_BIN="${OCSERVE_BIN:-target/release/ocserve}"
 SELF_TEST=0
 [ "${1:-}" = "--self-test" ] && SELF_TEST=1
 
@@ -43,13 +43,13 @@ cleanup() {
 }
 trap cleanup EXIT
 # stale pair hosts from prior crashed runs (same class as replay-check)
-pkill -f "/tmp/refine-pair" 2>/dev/null || true
+pkill -f "/tmp/ocserve-pair" 2>/dev/null || true
 
 say() { printf '%s\n' "$*"; }
 die2() { echo "pair-check: $*" >&2; exit 2; }
 
 # ---------- preflight ----------
-[ -x "$REFINE_BIN" ] || die2 "$REFINE_BIN missing (cargo build --release)"
+[ -x "$OCSERVE_BIN" ] || die2 "$OCSERVE_BIN missing (cargo build --release)"
 VENDOR="bench/parity/vendor/opencode"
 if [ ! -x "$VENDOR" ]; then
   src=$(command -v opencode 2>/dev/null || true)
@@ -88,8 +88,8 @@ PY
 
 CFG="$PWD/bench/parity/config"
 [ -f "$CFG/opencode.json" ] || die2 "fixture config missing: $CFG"
-HF=$(mktemp -d "${TMPDIR:-/tmp}/refine-pair-freeze.XXXXXX")
-HR=$(mktemp -d "${TMPDIR:-/tmp}/refine-pair-refine.XXXXXX")
+HF=$(mktemp -d "${TMPDIR:-/tmp}/ocserve-pair-freeze.XXXXXX")
+HR=$(mktemp -d "${TMPDIR:-/tmp}/ocserve-pair-ocserve.XXXXXX")
 for h in "$HF" "$HR"; do
   mkdir -p "$h/.config/opencode" "$h/.local/share/opencode" "$h/.local/state/opencode" "$h/.cache/opencode"
   cp "$CFG/opencode.json" "$h/.config/opencode/opencode.json"
@@ -97,7 +97,7 @@ for h in "$HF" "$HR"; do
   cp "$CFG/model.json" "$h/.local/state/opencode/model.json"
   # Symmetric catalog: freeze serves ~215 providers from its INTERNAL
   # registry even with fetch off (proven: no models.json written), while
-  # refine's registry is catalog-backed — so BOTH arms get the same real
+  # ocserve's registry is catalog-backed — so BOTH arms get the same real
   # models cache copied in (fetch stays disabled on both = hermetic).
   REAL_CACHE="$HOME/.cache/opencode/models.json"
   if [ -f "$REAL_CACHE" ]; then
@@ -111,8 +111,8 @@ setsid env HOME="$HF" OPENCODE_DISABLE_MODELS_FETCH=1 \
   "$VENDOR" serve --port "$PORT_F" --hostname 127.0.0.1 >"$HF/freeze.log" 2>&1 &
 PID_F=$!
 setsid env HOME="$HR" OPENCODE_DISABLE_MODELS_FETCH=1 \
-  REFINE_DATA_DIR="$HR/.local/share/refine" REFINE_LEGACY_SYNC=0 \
-  "$REFINE_BIN" serve --port "$PORT_R" >"$HR/refine.log" 2>&1 &
+  OCSERVE_DATA_DIR="$HR/.local/share/ocserve" OCSERVE_LEGACY_SYNC=0 \
+  "$OCSERVE_BIN" serve --port "$PORT_R" >"$HR/ocserve.log" 2>&1 &
 PID_R=$!
 
 wait_health() { # $1 port $2 label
@@ -136,7 +136,7 @@ sys.exit(2)
 PY
 }
 wait_health "$PORT_F" freeze || { tail -20 "$HF/freeze.log" >&2; exit 2; }
-wait_health "$PORT_R" refine || { tail -20 "$HR/refine.log" >&2; exit 2; }
+wait_health "$PORT_R" ocserve || { tail -20 "$HR/ocserve.log" >&2; exit 2; }
 say "both arms healthy on 1.18.31"
 
 seed() { # $1 port — identical seed on both (recorded corpus assumed sessions)
@@ -152,18 +152,18 @@ urllib.request.urlopen(req, timeout=5).read()
 PY
 }
 seed "$PORT_F" || die2 "seed freeze failed"
-seed "$PORT_R" || die2 "seed refine failed"
+seed "$PORT_R" || die2 "seed ocserve failed"
 
 run_pair() { # → prints engine output; returns its rc
   local rc=0
   # Divergences pass ONLY via the allowlist file (name # D-PAIR-… reason) —
   # read by the engine; every entry must cite a named pair-finding row.
   if [ -f bench/pair/allow.txt ]; then
-    REFINE_PAIR_ALLOW="$PWD/bench/pair/allow.txt" \
-      "$REFINE_BIN" replay --target "http://127.0.0.1:$PORT_F" \
+    OCSERVE_PAIR_ALLOW="$PWD/bench/pair/allow.txt" \
+      "$OCSERVE_BIN" replay --target "http://127.0.0.1:$PORT_F" \
         --pair "http://127.0.0.1:$PORT_R" 2>&1 || rc=$?
   else
-    "$REFINE_BIN" replay --target "http://127.0.0.1:$PORT_F" \
+    "$OCSERVE_BIN" replay --target "http://127.0.0.1:$PORT_F" \
       --pair "http://127.0.0.1:$PORT_R" 2>&1 || rc=$?
   fi
   return "$rc"
@@ -177,9 +177,9 @@ if [ "$SELF_TEST" = 1 ]; then
     say "self-test: clean pair FAILED (rc=$rc) — gate red before sabotage"
     exit 3
   fi
-  say "== self-test: diverged config on refine must FAIL the gate =="
+  say "== self-test: diverged config on ocserve must FAIL the gate =="
   # Sabotage the gated route itself (config is NOT allowlisted): add a key
-  # to refine's fixture config AFTER boot — H1's 2s poller hot-reloads the
+  # to ocserve's fixture config AFTER boot — H1's 2s poller hot-reloads the
   # payload, so /config keys diverge while freeze stays untouched.
   python3 - "$HR/.config/opencode/opencode.json" <<'PY'
 import json, sys
@@ -188,7 +188,7 @@ c = json.load(open(p))
 c["pairselftest"] = True
 json.dump(c, open(p, "w"), indent=2)
 PY
-  sleep 5  # REFINE_CONFIG_POLL_MS=2000 default ×2 + margin
+  sleep 5  # OCSERVE_CONFIG_POLL_MS=2000 default ×2 + margin
   rc=0; out="$(run_pair)" || rc=$?
   printf '%s\n' "$out" | grep -E 'PAIR-DIVERGE|compared' | tail -4 || true
   if [ "$rc" -eq 0 ]; then
@@ -205,5 +205,5 @@ fi
 
 rc=0; run_pair || rc=$?
 if live_ok 4901; then say "live opencode :4901 still healthy"; else say "WARN: live opencode :4901 not reachable (was it up before?)"; fi
-if live_ok 4912; then say "live refine :4912 still healthy"; else say "WARN: live refine :4912 not reachable"; fi
+if live_ok 4912; then say "live ocserve :4912 still healthy"; else say "WARN: live ocserve :4912 not reachable"; fi
 exit "$rc"

@@ -19,8 +19,8 @@ import sys
 import time
 
 HOME = os.path.expanduser("~")
-REFINE = os.path.expanduser("~/src/refine")
-HOST = f"{REFINE}/crates/refine-plugin/src/host/host.mjs"
+OCSERVE = os.path.expanduser("~/src/ocserve")
+HOST = f"{OCSERVE}/crates/ocserve-plugin/src/host/host.mjs"
 DENO = "/home/linuxbrew/.linuxbrew/bin/deno"
 BUN = f"{HOME}/.bun/bin/bun"
 MC = (f"{HOME}/.cache/opencode/packages/@cortexkit/"
@@ -38,7 +38,7 @@ SPAWNS = {
 }
 RAW_MAGIC = {"bun": f"{MC}/index.js", "node": f"{MC}/index.js",
              "deno": f"{MC}/index.deno.js"}
-INPUT = {"directory": REFINE, "projectID": "global",
+INPUT = {"directory": OCSERVE, "projectID": "global",
          "serverUrl": "http://127.0.0.1:9"}
 
 

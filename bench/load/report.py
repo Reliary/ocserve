@@ -37,7 +37,7 @@ def main() -> int:
     args = ap.parse_args()
     d = args.dir
     lines: list[str] = []
-    lines.append("# Load report — refine vs upstream (k6 L1, fixture arms)")
+    lines.append("# Load report — ocserve vs upstream (k6 L1, fixture arms)")
     lines.append("")
     meta = {}
     if os.path.exists(f"{d}/meta.json"):
@@ -52,7 +52,7 @@ def main() -> int:
     if cores:
         lines.append(
             f"- cpu pinning (operator directive): class={cores.get('class')} · "
-            f"refine=[{cores.get('refine')}] freeze=[{cores.get('freeze')}] "
+            f"ocserve=[{cores.get('ocserve')}] freeze=[{cores.get('freeze')}] "
             f"k6=[{cores.get('k6')}] — each arm owns whole physical cores "
             f"(both SMT threads), k6 on separate cores"
         )
@@ -82,7 +82,7 @@ def main() -> int:
     peak_rss = {}
     cpu_delta = {}
     for row in samples:
-        for arm in ("refine", "freeze"):
+        for arm in ("ocserve", "freeze"):
             st = row.get(arm) or {}
             rss, cpu = st.get("rss"), st.get("cpu")
             if rss:
@@ -100,7 +100,7 @@ def main() -> int:
         base = os.path.basename(path).replace(".summary.json", "")
         # file naming: <round>-<arm>-<mode>-<script>
         parts = base.split("-")
-        arm = next((p for p in parts if p in ("refine", "freeze")), "?")
+        arm = next((p for p in parts if p in ("ocserve", "freeze")), "?")
         mode = next((p for p in parts if p in ("spread", "hot", "arrival")), "?")
         script = "arrival" if "arrival" in base else "read-hot"
         try:
@@ -113,7 +113,7 @@ def main() -> int:
         failed = k6_metric(s, "http_req_failed")
         # k6 v2 flat export: failed RATE lives in .value (the .passes field
         # counts FAILED requests — verified against raw run1 exports where
-        # refine value=0.1077 matched 516/4790 exactly)
+        # ocserve value=0.1077 matched 516/4790 exactly)
         if "rate" not in failed and "value" in failed:
             failed = dict(failed, rate=failed["value"])
         peak = peak_rss.get(arm)
@@ -164,7 +164,7 @@ def main() -> int:
 
     lines.append("## Sampler peaks")
     lines.append("")
-    for arm in ("refine", "freeze"):
+    for arm in ("ocserve", "freeze"):
         if arm in peak_rss:
             cpu = None
             if arm in cpu_delta and arm + "_start" in cpu_delta:
@@ -173,15 +173,15 @@ def main() -> int:
                 f"- {arm}: peak RSS {round(peak_rss[arm]/1048576,1)} MB, "
                 f"cpu {cpu if cpu is not None else '—'} s over sampled window"
             )
-    # refine-side gauges from last sample with metrics
+    # ocserve-side gauges from last sample with metrics
     last_m = {}
     for row in reversed(samples):
-        if row.get("refine_metrics"):
-            last_m = row["refine_metrics"]
+        if row.get("ocserve_metrics"):
+            last_m = row["ocserve_metrics"]
             break
     if last_m:
         lines.append(
-            f"- refine end-state gauges: "
+            f"- ocserve end-state gauges: "
             + ", ".join(f"{k}={v:g}" for k, v in sorted(last_m.items()))
         )
     lines.append("")

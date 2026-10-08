@@ -1379,6 +1379,193 @@ dependencies = [
 ]
 
 [[package]]
+name = "ocserve-cli"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "metrics",
+ "ocserve-core",
+ "ocserve-http",
+ "ocserve-importer",
+ "ocserve-mcp",
+ "ocserve-metrics",
+ "ocserve-plugin",
+ "ocserve-store",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "ocserve-core"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "hex",
+ "ocserve-llm",
+ "ocserve-mcp",
+ "ocserve-metrics",
+ "ocserve-plugin",
+ "ocserve-store",
+ "ocserve-tools",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ocserve-http"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "futures-util",
+ "hex",
+ "http-body-util",
+ "libc",
+ "metrics",
+ "ocserve-core",
+ "ocserve-llm",
+ "ocserve-mcp",
+ "ocserve-metrics",
+ "ocserve-plugin",
+ "ocserve-store",
+ "ocserve-tools",
+ "parking_lot",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+]
+
+[[package]]
+name = "ocserve-importer"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "ocserve-store",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "ocserve-llm"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures-core",
+ "futures-util",
+ "ocserve-metrics",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ocserve-mcp"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "ocserve-metrics",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ocserve-metrics"
+version = "0.0.1"
+
+[[package]]
+name = "ocserve-plugin"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "ocserve-metrics",
+ "parking_lot",
+ "rolldown",
+ "rolldown_common",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ocserve-store"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "hex",
+ "parking_lot",
+ "r2d2",
+ "r2d2_sqlite",
+ "rusqlite",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
+name = "ocserve-tools"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2249,193 +2436,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
-]
-
-[[package]]
-name = "refine-cli"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "metrics",
- "refine-core",
- "refine-http",
- "refine-importer",
- "refine-mcp",
- "refine-metrics",
- "refine-plugin",
- "refine-store",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "sha1",
- "tempfile",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "refine-core"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "futures-util",
- "hex",
- "parking_lot",
- "refine-llm",
- "refine-mcp",
- "refine-metrics",
- "refine-plugin",
- "refine-store",
- "refine-tools",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "refine-http"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "bytes",
- "futures-util",
- "hex",
- "http-body-util",
- "libc",
- "metrics",
- "parking_lot",
- "refine-core",
- "refine-llm",
- "refine-mcp",
- "refine-metrics",
- "refine-plugin",
- "refine-store",
- "refine-tools",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
-]
-
-[[package]]
-name = "refine-importer"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "refine-store",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "refine-llm"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "bytes",
- "futures-core",
- "futures-util",
- "refine-metrics",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "refine-mcp"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "parking_lot",
- "refine-metrics",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "refine-metrics"
-version = "0.0.1"
-
-[[package]]
-name = "refine-plugin"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "parking_lot",
- "refine-metrics",
- "rolldown",
- "rolldown_common",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "refine-store"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "bytes",
- "hex",
- "parking_lot",
- "r2d2",
- "r2d2_sqlite",
- "rusqlite",
- "rustc-hash",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "tracing",
- "zstd",
-]
-
-[[package]]
-name = "refine-tools"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
 ]
 
 [[package]]

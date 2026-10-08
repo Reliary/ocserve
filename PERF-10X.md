@@ -1,4 +1,4 @@
-# PERF-10X — make refine ≥10× faster than upstream opencode (L1 read paths)
+# PERF-10X — make ocserve ≥10× faster than upstream opencode (L1 read paths)
 
 Pre-registered contract. Derived from baseline `bench/load/.runs/20261006T225404Z`
 (env + numbers + confounds: `bench/load/BASELINE.md`) and `bench/load/thresholds.json`.
@@ -6,13 +6,13 @@ Status labels are current as of the commit carrying this file; update on state c
 
 ## 0. Target
 
-| | freeze 1.18.31 (recorded) | refine (baseline) | refine (goal) |
+| | freeze 1.18.31 (recorded) | ocserve (baseline) | ocserve (goal) |
 |---|---:|---:|---:|
 | throughput @25VU closed | 424–454 rps | 53–60 rps | **≥4,480 rps plateau** (ladder, below) |
 | pooled p95 | 91.8–103.9 ms | 1198–1256 ms | **≤104 ms at plateau** |
 | error rate | 0.0000 | 0.0000 | ≤0.005 |
 
-**"10×" definition (locked):** refine plateau **≥4,480 rps** = 10× freeze's *recorded*
+**"10×" definition (locked):** ocserve plateau **≥4,480 rps** = 10× freeze's *recorded*
 454 rps @25-VU closed baseline. Freeze re-run same configs = context, **no denominator shift**.
 
 ## 1. Acceptance (pre-registered)
@@ -25,7 +25,7 @@ Status labels are current as of the commit carrying this file; update on state c
 - **C:** A+B + all gates green (46 suites, guards, replay 26/0, pair 22/0), thresholds
   re-derived from the **final binary's** baseline and committed before any `GATED=1` run.
 - **D — cache honesty:** every report that includes memoized paths also carries the
-  cache-off variant (`REFINE_SEARCH_MEMO=0` / `REFINE_LIST_MEMO=0`) + the fixed-query
+  cache-off variant (`OCSERVE_SEARCH_MEMO=0` / `OCSERVE_LIST_MEMO=0`) + the fixed-query
   caveat (k6 repeats `"the"`; real interactive hit rates are lower).
 - **Stop rule:** if ceiling < A/B → ship the honest frontier (rps, p95, per-route, both
   models, cache on/off) + named next levers. No threshold-gaming, no claim laundering.
@@ -38,7 +38,7 @@ Status labels are current as of the commit carrying this file; update on state c
   says FILE — code/comment mismatch; sorts never hit disk).
 - Deep-session page service: msg-select 0.000 s + 51 part-queries **0.011 s** → the
   1.2 s tails are **queueing**, not query cost.
-- Convoy root: `worker_threads(8)` hardcoded; `spawn_blocking` ×1 in refine-http;
+- Convoy root: `worker_threads(8)` hardcoded; `spawn_blocking` ×1 in ocserve-http;
   all store calls block tokio workers inline (search holds a worker 1–7 s → every
   other route queues behind it — matches MS/tokio starvation signature: tail explodes,
   CPU ≪100%).
@@ -81,7 +81,7 @@ Schema step + idempotent boot backfill (W1 pattern).
 
 **F5 — pre-serialized wire bytes (definite).** `payloads` → `Arc<Bytes>` serialized at
 reload; handlers serve `Body::from(Bytes)` (zero-copy). serde deterministic ⇒ corpus
-byte modes stay byte-identical. Kill: `REFINE_WIRE_CACHE=0`.
+byte modes stay byte-identical. Kill: `OCSERVE_WIRE_CACHE=0`.
 
 **F3** bulk page-parts (`message_id IN (…)` 51→1). **F4** pool `/message`'s per-request
 `std::thread::spawn` → spawn_blocking. **F7/F8** write-epoch memoization (single writer,
@@ -95,7 +95,7 @@ already runs at every writer open and `PRAGMA optimize` hourly
 
 **B1 — TRIGGERED AND SHIPPED (cd3a6ab):** deep-page probe on the fixture =
 13 blob reads per deep page (245 parts, 13 >8 KiB) ≥ 1 ⇒ condition met.
-Process-global byte-capped FIFO (32 MiB, `REFINE_BLOB_CACHE_MB`, oversized
+Process-global byte-capped FIFO (32 MiB, `OCSERVE_BLOB_CACHE_MB`, oversized
 entries never admitted); content-addressed keys = immutable = exact by
 construction.
 
@@ -110,33 +110,33 @@ measurement proven valid (release `sqlite3.o` rebuilt 09:39, after the
 config at 09:31 ⇒ CFLAGS reached sqlite3.c; full Rust recompile also
 observed). Keep-rule "A/B measurable" not met ⇒ `.cargo/config.toml`
 removed. A1's 40% lead over A2 (identical binary) = the fixture
-asymmetry in warm-page-cache form: A1's refine db was still resident
-from its own import; B/A2 read cold (refine db 1.7 GB vs freeze 485 MB —
+asymmetry in warm-page-cache form: A1's ocserve db was still resident
+from its own import; B/A2 read cold (ocserve db 1.7 GB vs freeze 485 MB —
 freeze held ~470 req/s across all three runs, the stable control). C5
 (worker floor) kept as declared-trivial (no-op at 8 logical cores on
 .227). C6 already skipped with floor-probe evidence. C2 (PGO) parked
 pending Phase-III plateau — revisit only if the ladder stalls short of A.
 
-**E0 — FOUND (initially mis-searched at `refine-src`; the `.227` checkout
-is `~/src/refine`) — RESULT: the config mystery is SOLVED and F1's
+**E0 — FOUND (initially mis-searched at `ocserve-src`; the `.227` checkout
+is `~/src/ocserve`) — RESULT: the config mystery is SOLVED and F1's
 hypothesis is PROVEN.** Run `20261007T004510Z` (config-route isolation,
-single round, both arms, pinned homogeneous cores): **refine 9,655 req/s,
+single round, both arms, pinned homogeneous cores): **ocserve 9,655 req/s,
 p50 0.90 ms, p95 4.42 ms** vs **freeze 3,152 req/s, p50 4.31 ms, p95
 11.14 ms**, 0% errors both arms. The baseline's config p95 of 998 ms was
 therefore ~99.6% queueing (convoy behind the multi-second search/page
-work on shared workers) — the route itself was always ~4 ms. Refine is
+work on shared workers) — the route itself was always ~4 ms. Ocserve is
 3.1× faster than freeze on this isolated route. Remaining E0 steps
 as separate run dirs... FULL TABLE (chain `e0-chain.log`, k6 summary
 extraction from the per-route logs — pre-F1 binary, both arms, pinned):
 
-| route | refine req/s | refine p95 | freeze req/s | freeze p95 |
+| route | ocserve req/s | ocserve p95 | freeze req/s | freeze p95 |
 |---|---:|---:|---:|---:|
 | config | 9,656 | 4.42 ms | 3,152 | 11.14 ms |
 | search (selective query) | 5,422 | 7.85 ms | 5,486 | 7.86 ms |
 | session_list | 1,099 | 31.6 ms | 145 | 172.0 ms |
 | message_page | **incomplete** (chain log truncated before k6 summary; progress lines only) — superseded by Phase III per-route tables |
 
-Reading: refine already led config (2.8×) and session_list (7.6× rps,
+Reading: ocserve already led config (2.8×) and session_list (7.6× rps,
 5.4× p95); search tied at ~5.4k req/s both arms (selective query — the
 6-7 s figure in E1 was the `"the"` match-set pathology, not this shape);
 the pooled-baseline pain (config p95 998 ms) was queueing behind those
@@ -162,7 +162,7 @@ that baseline → GATED.
 
 ## 4b. Phase-III results (2026-10-07, full tables in bench/load/BASELINE.md addendum)
 
-- **A PASS**: closed pooled ladder 50/75/150 @4-threads = refine
+- **A PASS**: closed pooled ladder 50/75/150 @4-threads = ocserve
   9,234/8,140 req/s, p95 25.3/32.4 ms vs freeze 466/367 — 19.8-22.2x;
   vs freeze recorded 454 = **20.3x** (acceptance C passes on closed).
 - **B FAIL as pre-registered**: four arrival attempts at rate=4,480,
@@ -170,9 +170,9 @@ that baseline → GATED.
   together. Best joint = attempt 1: 97.7% @ p95 92.5 ms. Later attempts
   degraded with runner state (freeze itself fell 432->220 req/s, RSS
   7.6 GB) — all four recorded, none discarded.
-- **D**: thresholds re-derived pre-gated (7c1d031, refine <=65 /
+- **D**: thresholds re-derived pre-gated (7c1d031, ocserve <=65 /
   freeze <=1417 / err <=0.5, formula on run 132925); G1 gated ran with
-  a STALE runner copy of thresholds (refine cells 25.97/32.95 pass;
+  a STALE runner copy of thresholds (ocserve cells 25.97/32.95 pass;
   freeze 549/587 breached the old 208) — synced + one pre-declared
   cooldown re-run (G2), both recorded.
 - **Dual-variant (1-D)**: cache-off (all kill switches, VU75, 4T):
@@ -210,7 +210,7 @@ that baseline → GATED.
   74 µs vs JSON build 238 µs, and the JSON half went 412→238 µs. Byte-exact
   vs the DOM path over adversarial columns and on the real corpus
   (201 sessions, 105,475 bytes); a planted extra member reddens 3 of 5 tests.
-- **Lean sweep L1 (zero-parse splice)**: `refine_store::splice` compacts
+- **Lean sweep L1 (zero-parse splice)**: `ocserve_store::splice` compacts
   stored JSON in one byte pass into a reused buffer and splices the three
   column keys, replacing parse→merge→serialize. Byte-identical to the DOM
   path proven over the whole corpus: **218,393 rows, 0 refused, 0

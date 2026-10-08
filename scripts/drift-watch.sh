@@ -20,12 +20,12 @@
 # Usage: scripts/drift-watch.sh [--selftest] [--freeze-only]
 #   --selftest    offline unit checks of the pure helpers (guard rule 5)
 #   --freeze-only control arm only (validate the harness; no npm/docker build)
-# Env: FROZEN (default 1.18.31 = PLAN §3 freeze), REFINE_BIN, DRIFT_PORT_F
+# Env: FROZEN (default 1.18.31 = PLAN §3 freeze), OCSERVE_BIN, DRIFT_PORT_F
 #      (4923), DRIFT_PORT_L (4924), FREEZE_RUNS (2), DRIFT_REPORT_DIR
-# schedule: this host uses `refine-drift-watch.timer` (systemd --user, 06:00,
+# schedule: this host uses `ocserve-drift-watch.timer` (systemd --user, 06:00,
 # Persistent); elsewhere: cron `0 6 * * * cd <repo> && scripts/drift-watch.sh >> bench/drift/cron.log 2>&1`
 # Env vars are operator-trusted inputs (set them like PATH — only from your own
-# shell/cron): REFINE_BIN executes a binary, DRIFT_REPORT_DIR writes files.
+# shell/cron): OCSERVE_BIN executes a binary, DRIFT_REPORT_DIR writes files.
 # Exit: 0 = report written (drift found is INFORMATION, not failure)
 #       1 = harness failure (npm/docker/health/replay crash/nondeterminism)
 set -euo pipefail
@@ -33,7 +33,7 @@ cd "$(dirname "$0")/.."
 umask 077  # reports/dotfiles carry config key-paths — owner-only (review L5)
 
 FROZEN="${FROZEN:-1.18.31}"
-REFINE_BIN="${REFINE_BIN:-}"
+OCSERVE_BIN="${OCSERVE_BIN:-}"
 PORT_F="${DRIFT_PORT_F:-4923}"
 PORT_L="${DRIFT_PORT_L:-4924}"
 FREEZE_RUNS="${FREEZE_RUNS:-2}"
@@ -122,7 +122,7 @@ report_write() {
     echo "- POST/SSE/agent-loop drift: owned by golden tests + field reports."
     echo "- kill criterion: if >20% of observed divergences are unrecordable by"
     echo "  this corpus → shift to contract-by-probe."
-    echo "- read-only: this report never modifies refine, the freeze, or config."
+    echo "- read-only: this report never modifies ocserve, the freeze, or config."
   } >"$file"
 }
 
@@ -186,10 +186,10 @@ run_selftest() {
 cleanup() { docker rm -f "$NAME_FREEZE" "$NAME_LATEST" >/dev/null 2>&1 || true; }
 
 resolve_bin() {
-  if [ -n "$REFINE_BIN" ]; then :; \
-  elif command -v refine >/dev/null 2>&1; then REFINE_BIN="$(command -v refine)"; \
-  elif [ -x target/release/refine ]; then REFINE_BIN="$PWD/target/release/refine"; \
-  else echo "harness failure: no refine binary (build target/release/refine or set REFINE_BIN)"; exit 1; fi
+  if [ -n "$OCSERVE_BIN" ]; then :; \
+  elif command -v ocserve >/dev/null 2>&1; then OCSERVE_BIN="$(command -v ocserve)"; \
+  elif [ -x target/release/ocserve ]; then OCSERVE_BIN="$PWD/target/release/ocserve"; \
+  else echo "harness failure: no ocserve binary (build target/release/ocserve or set OCSERVE_BIN)"; exit 1; fi
 }
 
 wait_health() {
@@ -229,7 +229,7 @@ start_container() { # $1 name  $2 image  $3 host-port
 
 replay_once() { # $1 url  $2 outfile → echoes "pass fail defer"; crash if no summary
   local rc=0
-  "$REFINE_BIN" replay --target "$1" >"$2" 2>&1 || rc=$?
+  "$OCSERVE_BIN" replay --target "$1" >"$2" 2>&1 || rc=$?
   if ! grep -q '^replay ' "$2"; then
     echo "harness failure: replay produced no summary (rc=$rc):"
     tail -n 5 "$2"

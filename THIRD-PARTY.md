@@ -2,7 +2,7 @@
 
 ## opencode
 
-`refine` is an independent reimplementation of the opencode server API
+`ocserve` is an independent reimplementation of the opencode server API
 (clean wire compatibility; original Rust source). The upstream project is
 distributed under the MIT License, whose terms (retained below) permit
 derivative works, modification, and redistribution provided the copyright

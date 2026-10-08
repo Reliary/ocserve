@@ -1,0 +1,9 @@
+[Unit]
+Description=ocserve 24h soak sampler (TESTING §8; fresh CSV per run)
+After=ocserve.service
+
+[Service]
+Type=simple
+Environment=SOAK_OUT=%h/.local/state/ocserve/soak/soak.csv
+WorkingDirectory=%h/src/ocserve
+ExecStart=%h/src/ocserve/scripts/soak.sh http://127.0.0.1:4912 60 24

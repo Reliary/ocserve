@@ -97,7 +97,7 @@ def collect_samples() -> list[tuple[str, bytes]]:
             print(f"t1 regeneration failed: {e}")
 
     # live inline tool outputs (≤ inline cap) from the real DB
-    db = os.path.expanduser("~/.local/share/refine/refine.db")
+    db = os.path.expanduser("~/.local/share/ocserve/ocserve.db")
     if os.path.exists(db):
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         rows = conn.execute(

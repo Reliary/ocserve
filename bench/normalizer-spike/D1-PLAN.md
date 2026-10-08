@@ -1,4 +1,4 @@
-# D1 execution plan — rolldown normalizer linked into refine (2026-10-06)
+# D1 execution plan — rolldown normalizer linked into ocserve (2026-10-06)
 
 Decision record: D1 (bundle it, raise ceiling) — STRESS-RESULTS.md §Phase 3
 dispositions; user confirmation after ELI5 + size-context analysis (20.3 MB
@@ -41,16 +41,16 @@ final-pass additions live in the session record and are dispositioned here.
   **Never** direct `fs::write` to a final normalized path → new guard rule 8.
 - **CPU**: whole normalize in `spawn_blocking` (A2 bug class); rolldown on a
   current-thread runtime inside (spike pattern).
-- **Kill switch** `REFINE_PLUGIN_NORMALIZE=0` → `Skipped` (rolldown never
+- **Kill switch** `OCSERVE_PLUGIN_NORMALIZE=0` → `Skipped` (rolldown never
   executed → panic residual gated) — A3.
-- **Metric**: `refine_metrics::labeled_counter("refine_plugin_normalize_total",
+- **Metric**: `ocserve_metrics::labeled_counter("ocserve_plugin_normalize_total",
   &format!("result=\"{}\"", r), 1)` with r ∈ warm|built|error|disabled|passthrough.
 - **A2 log** on `built`/`error` only: destination, ms, RSS before→after.
 - **Suffix guard**: entry ending `.normalized.mjs` → passthrough, no rebuild.
 - **Rejected**: load-retry on error-string matching (3 runtime dialects) →
   named residual: future module-not-found load failure ⇒ scanner rule or retry.
-- **Deps**: rolldown, rolldown_common, sha2, refine-metrics added to
-  refine-plugin (no cycles; cargo check proves).
+- **Deps**: rolldown, rolldown_common, sha2, ocserve-metrics added to
+  ocserve-plugin (no cycles; cargo check proves).
 
 ## Sequence (each gated)
 

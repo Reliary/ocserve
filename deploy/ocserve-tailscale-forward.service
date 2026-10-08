@@ -1,0 +1,23 @@
+# Tailnet exposure for ocserve — mirrors the proven opencode-tailscale-forward
+# pattern on this host: ocserve stays loopback-only; socat publishes
+# tailscale-IP:4912 → 127.0.0.1:4912. Tailscale's WireGuard + ACLs gate
+# access (ocserve's recorded auth mode is off — same posture as upstream).
+# Install: cp deploy/ocserve-tailscale-forward.service ~/.config/systemd/user/ \
+#   && systemctl --user daemon-reload && systemctl --user enable --now ocserve-tailscale-forward
+[Unit]
+Description=ocserve Tailscale forwarder
+After=network.target ocserve.service
+Requires=ocserve.service
+PartOf=ocserve.service
+
+[Service]
+Type=simple
+# wait for ocserve to accept connections (upstream pattern: 30 x 1s)
+ExecStartPre=/usr/bin/bash -c 'for _ in {1..30}; do timeout 1 bash -c "</dev/tcp/127.0.0.1/4912" && exit 0; sleep 1; done; exit 1'
+ExecStart=/usr/bin/socat TCP-LISTEN:4912,bind=100.68.229.86,fork,reuseaddr TCP:127.0.0.1:4912
+Restart=on-failure
+RestartSec=5
+SuccessExitStatus=143
+
+[Install]
+WantedBy=default.target

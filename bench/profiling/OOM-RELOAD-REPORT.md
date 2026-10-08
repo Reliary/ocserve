@@ -6,7 +6,7 @@ last at 21:13:19 before this fix)?
 
 ## Method (`oom_reload.py`, re-runnable)
 
-Isolated fake HOME (no MCP/plugin children → bytehound stays in refine),
+Isolated fake HOME (no MCP/plugin children → bytehound stays in ocserve),
 **full-size real catalog fixtures** (a tiny fixture would make the profile
 lie — 5,319,988 bytes, one field mutated so content-hash differs = the exact
 production trigger), forced reloads via fixture swap, step metric = A2's
@@ -42,7 +42,7 @@ at current load; soak `kids`/slope columns monitor this).
 ## Production confirmation (after unit wiring)
 
 Unit: `Environment=MALLOC_ARENA_MAX=1` + `MemoryMax=750M` (both live and
-`deploy/refine.service`; stale dead MIMALLOC env removed from the live unit):
+`deploy/ocserve.service`; stale dead MIMALLOC env removed from the live unit):
 
 - idle main **231.7 MB**, cgroup **402 MB** (budget: combined ≤460 ✓)
 - reload #1 (cold): `rss 231.7 → 322.2` (**+90**, 735 ms)
@@ -64,7 +64,7 @@ Unit: `Environment=MALLOC_ARENA_MAX=1` + `MemoryMax=750M` (both live and
 ## Follow-ups
 
 - Tomorrow's hourly catalog reloads should log ≤+90 cold (on a restarted
-  process) then ~0; `refine_config_reload_total{result}` + A2 lines watch it.
+  process) then ~0; `ocserve_config_reload_total{result}` + A2 lines watch it.
 - Catalog growth (5.3 → 6–8 MB over months) raises the cold parse transient —
   re-check boot margin if it does.
 - bytehound `.dat` lives in `/tmp/opencode/oom-lab/work/` (ephemeral);
@@ -83,11 +83,11 @@ build_providers/transform/parse pipeline itself, not from live data.
 | arena1 only | 237 MB | +70/0/0 | 307 MB |
 | arena1 + LD_PRELOAD `malloc_trim(0)` shim | 91 MB | +3/0/−1 | 91 MB |
 | **arena1 + `watch::trim_heap()` (shipped)** | **89 MB** | **+3/0/+2** | **94 MB** |
-| control: `REFINE_TRIM=0` (killswitch) | 237 MB | +70/0/0 | 307 MB |
+| control: `OCSERVE_TRIM=0` (killswitch) | 237 MB | +70/0/0 | 307 MB |
 | control: 92-byte catalog | 18–19 MB | — | 19 MB |
 
 Fix shipped in commit `aeffd11`: `malloc_trim(0)` at boot, after every
-reconcile swap, and every `REFINE_TRIM_SECS` (default 300 s); `REFINE_TRIM=0`
+reconcile swap, and every `OCSERVE_TRIM_SECS` (default 300 s); `OCSERVE_TRIM=0`
 is the killswitch the lab control uses. `tests/trim_contract.rs` pins the
 killswitch contract in its own process (env-race rule, TESTING §1).
 

@@ -3,7 +3,7 @@
 
 Per tick: loadavg1 (self-contamination record), per-arm process RSS + CPU
 ticks (both arms are bare processes — fixture has plugin:[] so no children),
-and refine-side gauges (upstream has no /metrics — parity's rule: cross-arm
+and ocserve-side gauges (upstream has no /metrics — parity's rule: cross-arm
 metrics come from what each side can honestly expose).
 
 Stops when the stopfile disappears. Final line = VmHWM peaks.
@@ -56,11 +56,11 @@ def metrics_snapshot(url: str) -> dict:
             continue
         name, _, val = line.partition(" ")
         if name in (
-            "refine_rss_bytes",
-            "refine_writer_queue_depth",
-            "refine_sse_clients",
-            "refine_prompt_locks",
-            "refine_db_opens_total",
+            "ocserve_rss_bytes",
+            "ocserve_writer_queue_depth",
+            "ocserve_sse_clients",
+            "ocserve_prompt_locks",
+            "ocserve_db_opens_total",
         ):
             try:
                 out[name] = float(val)
@@ -74,7 +74,7 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--stop", required=True)
     ap.add_argument("--pids", required=True, help="label=pid,label=pid")
-    ap.add_argument("--refine-url", default="")
+    ap.add_argument("--ocserve-url", default="")
     args = ap.parse_args()
     pids: dict[str, int] = {}
     for kv in args.pids.split(","):
@@ -106,8 +106,8 @@ def main() -> int:
                 if label not in start_cpu and cpu is not None:
                     start_cpu[label] = cpu
                 row[label] = {"cpu": cpu, "rss": rss}
-            if args.refine_url:
-                row["refine_metrics"] = metrics_snapshot(args.refine_url)
+            if args.ocserve_url:
+                row["ocserve_metrics"] = metrics_snapshot(args.ocserve_url)
             samples.append(row)
             f.write(json.dumps(row) + "\n")
             f.flush()

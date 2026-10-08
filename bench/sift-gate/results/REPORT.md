@@ -1,6 +1,6 @@
 # sift-at-boundary gate — results (2026-10-03)
 
-**Verdict: FAIL** (1/4 criteria unmet) → per pre-registration, `REFINE_SIFT`
+**Verdict: FAIL** (1/4 criteria unmet) → per pre-registration, `OCSERVE_SIFT`
 default stays **OFF**. Results committed as-is (README §Gate).
 
 | criterion | required | measured | result |
@@ -13,7 +13,7 @@ default stays **OFF**. Results committed as-is (README §Gate).
 18 runs (3 tasks × 3 seeds × 2 conditions) interleaved, first-mover alternating;
 2 pre-registered infra retries (t2-s2-gate timed out twice at 600 s → cell of
 record missing; t2-s3-gate attempt 1 timed out, attempt 2 succeeded). Model
-`opencode-go/mimo-v2.6-flash` both conditions, one fresh refine process per run.
+`opencode-go/mimo-v2.6-flash` both conditions, one fresh ocserve process per run.
 
 ## Paired WC ratios (gate / baseline)
 
@@ -34,7 +34,7 @@ fixed in all runs; t3: all runs exited 0 with correct counts).
 1. **Models self-limit output — the dominant cause (t1-s2, t1-s3).**
    The model piped its own test runs (`| grep -E "^(FAIL|ERROR):"`,
    `| tail -15/60`) so every bash output stayed under the 4 KiB threshold
-   (max observed 3,312 B). `refine_sift_*` never fired (bytes_in=0). The
+   (max observed 3,312 B). `ocserve_sift_*` never fired (bytes_in=0). The
    agent behaving well is what starves the feature — not a sift defect.
 2. **High-entropy unique-line output does not shrink (t3-s2, t3-s3).**
    `app.py`'s `[load NNNNN] … checksum=N` lines are all distinct; sift's

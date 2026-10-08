@@ -1,4 +1,4 @@
-# DIFFERENTIATION.md — refine vs upstream opencode
+# DIFFERENTIATION.md — ocserve vs upstream opencode
 
 Standing contract: **what we build differently, why the evidence says so, and what we
 refuse to build.** Precedence: TESTING gates > PLAN > this doc > code. A claim in this
@@ -27,10 +27,10 @@ trajectories, single-run pass@1 varies 2.2–6.0pp, sd>1.5pp even at temp 0);
 |---|---|---|---|
 | D1 | Loop intelligence (repeat/oscillation/spiral/error-storm) | upstream `DOOM_LOOP_THRESHOLD=3` → `permission.ask` (processor.ts:29,356-383); IALs 2607.01641; degradation up to 30% of hard-task steps (2604.13759); detectors without a second LLM work (2608.02464) | **build (P1b)** — parity class = same permission name `doom_loop`; extensions distinguished by additive `metadata.class` only |
 | D2 | Verification grounding (file-delta/test-status as progress oracle) | progress mirage 2607.25152 (56% of self-claimed wins ≤0 real delta); Aria 2607.06341 | **stays parked — evidence gate NOT cleared (2026-10-03)**: mined live DB (read-only) — 4 sessions hold all 2,214 edit/write calls; 4/4 end on an edit with no verify command after, but **0/4 final texts claim success** (no mirage signal); n=4 proves nothing either way → needs a larger corpus before build |
-| D3 | MCP trust layer (static description scan, TOFU pinning, drift alerts, observe-only runtime flags) | OWASP MCP03; 2601.17549; 2510.16558 (67,057 servers, DSN'26); Microsoft disclosure 2026-06-30 | **shipped (P2+P2b)** — boot-time scan, TOFU pins **persisted to data_dir/mcp-pins.json** (cross-restart rug-pull trips at next boot; corrupt file re-pins without failing boot), runtime response **guard** (observe default; `REFINE_MCP_TRUST=enforce` withholds flagged responses and drops flagged tools from the schema), additive `trust` (+`dropped_tools`) on /mcp; tolerance probed |
+| D3 | MCP trust layer (static description scan, TOFU pinning, drift alerts, observe-only runtime flags) | OWASP MCP03; 2601.17549; 2510.16558 (67,057 servers, DSN'26); Microsoft disclosure 2026-06-30 | **shipped (P2+P2b)** — boot-time scan, TOFU pins **persisted to data_dir/mcp-pins.json** (cross-restart rug-pull trips at next boot; corrupt file re-pins without failing boot), runtime response **guard** (observe default; `OCSERVE_MCP_TRUST=enforce` withholds flagged responses and drops flagged tools from the schema), additive `trust` (+`dropped_tools`) on /mcp; tolerance probed |
 | D4 | Replay-as-CI | 2602.07150 + our own interleaved-bench rule | **build (P1a)** |
 | D5 | Server-side memory | Mem0/A-MEM/MemoryAgentBench; precision critique 2605.11325 | **excluded** — magic-context plugin owns injection on the live config; revisit only if drift watch flags a v1 drop |
-| D6 | Index-backed tools | MCP parity — works on upstream too | **excluded** — user's reliary8 MCP is the indexing solution; refine's MCP hub reaches it on both sides |
+| D6 | Index-backed tools | MCP parity — works on upstream too | **excluded** — user's reliary8 MCP is the indexing solution; ocserve's MCP hub reaches it on both sides |
 | D7 | Trace-mining → guard candidates | Self-Harness 2606.09498; we already do this manually (TESTING §1.6) | process, not code |
 
 ## 3. Non-goals (graveyard — do not re-propose)
@@ -43,7 +43,7 @@ trajectories, single-run pass@1 varies 2.2–6.0pp, sd>1.5pp even at temp 0);
 6. **Format coercion / schema gating** — SYNTHESIS What-To-Kill #1/#2; 49-token tool JSON isn't worth cache-invalidating system prompts.
 7. **Chasing v2 plugins/routes** — §8 bridge plan; drift watch flags the trigger.
 8. **Vector-DB memory v1** — FTS-first (trigram), precision over dumping (2605.11325).
-9. **reasoning/history IR compression in refine** — moot: `to_provider_messages` re-sends only `type=="text"` (prompt.rs:152-158); stored reasoning never reaches the provider.
+9. **reasoning/history IR compression in ocserve** — moot: `to_provider_messages` re-sends only `type=="text"` (prompt.rs:152-158); stored reasoning never reaches the provider.
 
 ## 4. Local primitives rolled in
 
@@ -59,7 +59,7 @@ Roll-in rules (P1c):
   client/oc-remote always sees upstream-faithful raw output.
 - bash/shell/command tool outputs only; **never** read/grep (model must see file bytes it
   will edit); MCP tool outputs = parked flag.
-- Enabled via env `REFINE_SIFT` (`auto` = `reliary sift --stdin` with
+- Enabled via env `OCSERVE_SIFT` (`auto` = `reliary sift --stdin` with
   `~/.local/bin` prepended, or an explicit binary path); default **OFF** until the
   Arc49-style gate passes (interleaved, score median non-regression, WC ≥15%).
 - Bench precondition (parked, bench repo): llm-replay records per condition and must
@@ -74,19 +74,19 @@ Rejected local primitives (evidence): reasoning-compress (§3.9), conversation/c
 rewrites (SYNTHESIS #3), quali (Python seam, SYNTHESIS Seam 2, no loop bench),
 stria/relay guard+risk+dead via MCP (D6 exclusion), harness contract/ellipsis formats
 (format coercion, SYNTHESIS #1), B-cell memory (D5 exclusion), gate.js turn-counting
-(refine owns the loop).
+(ocserve owns the loop).
 
 ## 5. Phasing (approved order)
 
 **Status 2026-10-03: P0–P2 shipped** (7396152 P0 docs, a58e7e6 P1a replay-check,
 4e6ae32 P1b loop intelligence, 6ae856b P1c sift default-off, 4ce87e8 P2 MCP trust).
 Arc49 sift gate **RAN and FAILED** (engagement 4/8 < 2/3; cost −58.9% and
-score non-regression passed) → `REFINE_SIFT` default stays OFF, results
+score non-regression passed) → `OCSERVE_SIFT` default stays OFF, results
 committed at `bench/sift-gate/results/` with forensics (models self-pipe
 below threshold; high-entropy output does not shrink).
 
 **Status 2026-10-04: P2b + evidence gates closed** (166290e: TOFU pins
-persisted cross-restart + `REFINE_MCP_TRUST=enforce`; D2 mined → stays parked,
+persisted cross-restart + `OCSERVE_MCP_TRUST=enforce`; D2 mined → stays parked,
 0/4 mirage signal at n=4). **K-FORK shipped**: upstream `session.fork` ported
 (exclusive cut, remaps, zero-copy blob share) — the inversion memo's
 "prefix-frozen forking" primitive turned out to be freeze parity oc-remote
@@ -99,4 +99,4 @@ self-test proves both exits) → `P1b` loop intelligence → `P1c` sift-at-bound
 
 Standing gates: every code commit = fmt + clippy -D + full tests + guards + matrix;
 negative control per new guard; no perf/accuracy claim without an interleaved bench
-(2.7× variance rule); new config keys typed in `refine.toml` (unknown-key = fatal).
+(2.7× variance rule); new config keys typed in `ocserve.toml` (unknown-key = fatal).

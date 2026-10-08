@@ -4,7 +4,7 @@
 Design (antagonism record):
 - The reply is a pure function of the LAST user message only — normalize
   string content and `[{type:text,...}]` parts to one string, hash it, and
-  derive both wording and length from the hash. Upstream and refine send
+  derive both wording and length from the hash. Upstream and ocserve send
   different system prompts, tool schemas and message wrappers; as long as
   the user text is identical, the completion is byte-identical across
   arms, so seeded histories stay logically equal.

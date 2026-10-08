@@ -4,7 +4,7 @@
 Both load-test arms derive from ONE snapshot so their data volumes are
 equivalent BY CONSTRUCTION:
   - freeze arm: snapshot installed as its native ~/.local/share/opencode/opencode.db
-  - refine arm: `refine import --source <snapshot> --limit <big>`
+  - ocserve arm: `ocserve import --source <snapshot> --limit <big>`
 
 Rules:
   - source is opened mode=ro (never written — the live install is sacred);
@@ -77,7 +77,7 @@ def main() -> int:
 
     # Scoping (lever 3 — proven empirically 2026-10-06): freeze lists by
     # listByProject(ctx.project.id) and project ids are GIT-DERIVED (the
-    # stored refine-project id is literally commit 8b87603…, our M0) — so a
+    # stored ocserve-project id is literally commit 8b87603…, our M0) — so a
     # boot-time cwd never matches stored project ids (first run showed
     # freeze=0). The only STABLE id is the literal 'global' project
     # (worktree '/'), which already holds 186/201 selected sessions: rewrite

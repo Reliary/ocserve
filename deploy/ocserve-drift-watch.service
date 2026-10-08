@@ -1,0 +1,7 @@
+[Unit]
+Description=upstream drift watch (PLAN §6/§8, K-DRIFT)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/src/ocserve
+ExecStart=%h/src/ocserve/scripts/drift-watch.sh

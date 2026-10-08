@@ -62,9 +62,9 @@ data: {"id":"1662e144-901f-4183-aa77-6d338d6eb036","object":"chat.completion.chu
 
 data: {"id":"1662e144-901f-4183-aa77-6d338d6eb036","object":"chat.completion.chunk","created":1790902909,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"content":"_","reasoning_content":null},"logprobs":null,"finish_reason":null}],"usage":null}
 
-data: {"id":"1662e144-901f-4183-aa77-6d338d6eb036","object":"chat.completion.chunk","created":1790902909,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"content":"REF","reasoning_content":null},"logprobs":null,"finish_reason":null}],"usage":null}
+data: {"id":"1662e144-901f-4183-aa77-6d338d6eb036","object":"chat.completion.chunk","created":1790902909,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"content":"OCS","reasoning_content":null},"logprobs":null,"finish_reason":null}],"usage":null}
 
-data: {"id":"1662e144-901f-4183-aa77-6d338d6eb036","object":"chat.completion.chunk","created":1790902909,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"content":"INE","reasoning_content":null},"logprobs":null,"finish_reason":null}],"usage":null}
+data: {"id":"1662e144-901f-4183-aa77-6d338d6eb036","object":"chat.completion.chunk","created":1790902909,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"content":"ERVE","reasoning_content":null},"logprobs":null,"finish_reason":null}],"usage":null}
 
 data: {"id":"1662e144-901f-4183-aa77-6d338d6eb036","object":"chat.completion.chunk","created":1790902909,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"content":"","reasoning_content":null},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":40,"completion_tokens":34,"total_tokens":74,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":27},"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":40}}
 

@@ -58,7 +58,7 @@ post-hoc shim variant fixed it. If K5b fails: spike dead per original K5.
 
 ## Non-criteria (recorded, not gating)
 
-- Binary-size/build-time impact on refine itself: spike crate is detached
+- Binary-size/build-time impact on ocserve itself: spike crate is detached
   from the workspace; integration-phase gate = release ≤ 10,485,760 B
   (existing ceiling) + build-time delta reported.
 - Sourcemap/debuggability of outputs.

@@ -7,7 +7,7 @@
 # missing binary) is a non-zero step, never a silent skip.
 #
 # Usage: scripts/nightly.sh [--with-mutants]
-#   --with-mutants  also run cargo-mutants on refine-store/refine-core
+#   --with-mutants  also run cargo-mutants on ocserve-store/ocserve-core
 #                   (hours of CPU — manual/weekly; NEVER during benchmark
 #                   sessions: interleaved-comparison rule)
 # Log:  bench/drift/nightly-<ts>.log (gitignored)  Exit: 0 all steps ok
@@ -39,7 +39,7 @@ step "cargo audit" cargo audit
 step "cargo deny" cargo deny check
 
 # 2. crash protocol: SIGKILL fuzz on the blob/DB writer (M0 decisive test)
-step "crash fuzz (SIGKILL blob/DB)" cargo test -p refine-store --test crash_fuzz
+step "crash fuzz (SIGKILL blob/DB)" cargo test -p ocserve-store --test crash_fuzz
 
 # 2b. CORPUS GATES — the byte-parity differentials for the read-path fast
 #     paths. These are env-gated and would otherwise never run: no CI exists
@@ -54,24 +54,24 @@ step "crash fuzz (SIGKILL blob/DB)" cargo test -p refine-store --test crash_fuzz
 # A skipped gate is worse than no gate: it looks green while proving
 # nothing. So the step FAILS if the env var could not be set (missing db).
 step "corpus: splice byte-parity over live db" \
-  env REFINE_SPLICE_DB="${REFINE_DATA_DIR:-$HOME/.local/share/refine}/refine.db" \
-      cargo test -p refine-store --test splice_parity -- --nocapture
+  env OCSERVE_SPLICE_DB="${OCSERVE_DATA_DIR:-$HOME/.local/share/ocserve}/ocserve.db" \
+      cargo test -p ocserve-store --test splice_parity -- --nocapture
 step "corpus: session-list wire parity over live db" \
-  env REFINE_LIST_PARITY_DB="${REFINE_DATA_DIR:-$HOME/.local/share/refine}/refine.db" \
-      cargo test -p refine-store --test list_wire_parity -- --nocapture
+  env OCSERVE_LIST_PARITY_DB="${OCSERVE_DATA_DIR:-$HOME/.local/share/ocserve}/ocserve.db" \
+      cargo test -p ocserve-store --test list_wire_parity -- --nocapture
 
 # 3. provider stream fuzz: 10k seeded chunk-boundary splits vs whole-buffer
-step "stream chunk-split fuzz" cargo test -p refine-llm chunk_split_fuzz
+step "stream chunk-split fuzz" cargo test -p ocserve-llm chunk_split_fuzz
 
 # 4. backup drill: online VACUUM INTO while serving, then integrity +
 #    row-count check on the COPY (live service never written)
 drill() {
   local tmp bin
   tmp="$(mktemp -d)"
-  bin="target/release/refine"
-  [ -x "$bin" ] || bin="$(command -v refine || true)"
-  if [ -z "$bin" ]; then echo "no refine binary"; return 1; fi
-  local db="${REFINE_DATA_DIR:-$HOME/.local/share/refine}/refine.db"
+  bin="target/release/ocserve"
+  [ -x "$bin" ] || bin="$(command -v ocserve || true)"
+  if [ -z "$bin" ]; then echo "no ocserve binary"; return 1; fi
+  local db="${OCSERVE_DATA_DIR:-$HOME/.local/share/ocserve}/ocserve.db"
   [ -f "$db" ] || { echo "no db at $db"; return 1; }
   # live count FIRST (backup may only grow, never lose, committed rows)
   local live
@@ -104,12 +104,12 @@ step "backup drill (VACUUM INTO + integrity + counts)" bash -c "$(declare -f dri
 #    20,999,792 B measured 2026-10-07 → ceiling 21,500,000 B
 #      (+F78/B1/S-A code and x86-64-v3 C-track; PERF-10X C7 standing rule —
 #       measured, provenance comment, ceiling moved, never bypassed)
-#      D1: rolldown linked into refine as the plugin normalizer
+#      D1: rolldown linked into ocserve as the plugin normalizer
 #      (decision record: bench/normalizer-spike/D1-PLAN.md — user call after
 #      Phase-3 probe; 20.3 MB still 9x smaller than upstream's 185 MB ELF;
 #      tripwire re-baselined from measurement, thresholds never moved to fit)
 size_gate() {
-  local bin="target/release/refine"
+  local bin="target/release/ocserve"
   if [ ! -x "$bin" ]; then
     echo "release binary missing — building"
     cargo build --release || return 1
@@ -125,11 +125,11 @@ step "binary size ceiling" bash -c "$(declare -f size_gate); size_gate"
 # 6. zen free-tier gate (live trio, 3 requests): positive + text-only
 #    (compaction shape) + negative (malformed session id — proves the wall
 #    still exists). Evidence ledger: bench/zen-probe/FINDINGS.md; production
-#    counts flips via refine_zen_freetier_total (K-MODEL-STATE).
+#    counts flips via ocserve_zen_freetier_total (K-MODEL-STATE).
 step "zen free-tier gate (live trio)" \
-  cargo test -p refine-llm --test zen_live -- --ignored
+  cargo test -p ocserve-llm --test zen_live -- --ignored
 step "models.dev live fetch" \
-  cargo test -p refine-cli live_fetch_contains_big_pickle -- --ignored
+  cargo test -p ocserve-cli live_fetch_contains_big_pickle -- --ignored
 
 # 7. mutants (opt-in): survivor report is triaged like a defect (TESTING §9)
 if [ "$WITH_MUTANTS" = "1" ]; then
@@ -144,7 +144,7 @@ if [ "$WITH_MUTANTS" = "1" ]; then
     #529-mutant run filled the16G ramdisk and died with ENOSPC mid-build
     mkdir -p target/mutants-tmp
     step "cargo mutants (store+core)" env TMPDIR="$PWD/target/mutants-tmp" \
-      cargo mutants -p refine-store -p refine-core --timeout 120 \
+      cargo mutants -p ocserve-store -p ocserve-core --timeout 120 \
       -- -- --skip chunk_split --skip sigkill
   else
     echo "FAIL: --with-mutants but cargo-mutants not installed" | tee -a "$LOG"

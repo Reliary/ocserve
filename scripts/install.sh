@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# refine install — explicit, preferred, NEVER implicit (SRE §5).
+# ocserve install — explicit, preferred, NEVER implicit (SRE §5).
 #
-# The systemd service is an optional overlay: foreground `refine serve` is the
+# The systemd service is an optional overlay: foreground `ocserve serve` is the
 # contract (tests/replay/harnesses rely on it) and gains zero requirements
 # from this script. Nothing in the build, tests, or doctor ever invokes this.
 #
-# Default = full install (build-if-needed → render deploy/refine.service →
+# Default = full install (build-if-needed → render deploy/ocserve.service →
 # enable → health-probe). Opt-outs:
 #   --bin-only   place/report the binary only; do not touch systemd
 #   --dry-run    print exactly what would change; touch nothing
-#   --bin PATH   binary to run in place (default: target/release/refine)
+#   --bin PATH   binary to run in place (default: target/release/ocserve)
 # Non-systemd hosts fall back to bin-only with a note.
-# Never sudo, never touches non-refine units (check-guards rule 6).
+# Never sudo, never touches non-ocserve units (check-guards rule 6).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO=$PWD
@@ -40,7 +40,7 @@ if [ "$SD" = 0 ]; then
 fi
 
 # --- resolve binary (used in place; no copying) -----------------------------
-SRC=${SRC:-$REPO/target/release/refine}
+SRC=${SRC:-$REPO/target/release/ocserve}
 if [ ! -x "$SRC" ]; then
   if [ "$DRY" = 1 ]; then
     say "[dry-run] cargo build --release   # $SRC missing"
@@ -70,9 +70,9 @@ say "binary: $SRC"
 
 # --- render the template (single source of truth) ---------------------------
 UNIT_DIR="$HOME/.config/systemd/user"
-TEMPLATE="$REPO/deploy/refine.service"
-LIVE="$UNIT_DIR/refine.service"
-RENDERED=$(mktemp "${TMPDIR:-/tmp}/refine-unit.XXXXXX")
+TEMPLATE="$REPO/deploy/ocserve.service"
+LIVE="$UNIT_DIR/ocserve.service"
+RENDERED=$(mktemp "${TMPDIR:-/tmp}/ocserve-unit.XXXXXX")
 trap 'rm -f "$RENDERED"' EXIT
 python3 - "$TEMPLATE" "$RENDERED" "$BIN_U" "$CWD_U" <<'PY'
 import re, sys
@@ -96,20 +96,20 @@ else
 fi
 
 if [ "$DRY" = 1 ]; then
-  say "[dry-run] would: write unit, daemon-reload, enable --now refine.service, health-probe :4912"
-  say "[dry-run] receipt: ~/.local/share/refine/install-receipt (BIN=$SRC)"
+  say "[dry-run] would: write unit, daemon-reload, enable --now ocserve.service, health-probe :4912"
+  say "[dry-run] receipt: ~/.local/share/ocserve/install-receipt (BIN=$SRC)"
   exit 0
 fi
 
 # --- install ----------------------------------------------------------------
-mkdir -p "$UNIT_DIR" "$(dirname "$HOME/.local/share/refine/install-receipt")"
-printf 'BIN=%s\nINSTALLED=%s\n' "$SRC" "$(date -Is)" > "$HOME/.local/share/refine/install-receipt"
+mkdir -p "$UNIT_DIR" "$(dirname "$HOME/.local/share/ocserve/install-receipt")"
+printf 'BIN=%s\nINSTALLED=%s\n' "$SRC" "$(date -Is)" > "$HOME/.local/share/ocserve/install-receipt"
 cp "$RENDERED" "$LIVE"
 systemctl --user daemon-reload
-if systemctl --user is-active refine.service >/dev/null 2>&1; then
-  systemctl --user restart refine.service
+if systemctl --user is-active ocserve.service >/dev/null 2>&1; then
+  systemctl --user restart ocserve.service
 else
-  systemctl --user enable --now refine.service
+  systemctl --user enable --now ocserve.service
 fi
 
 # --- health probe -----------------------------------------------------------
@@ -132,8 +132,8 @@ say ""
 say "installed (service = optional overlay; foreground serve still works untouched):"
 say "  unit:     $LIVE"
 say "  binary:   $SRC"
-say "  data:     ~/.local/share/refine   (sessions live here)"
-say "  overrides: systemctl --user edit refine   (MemoryMax, OOMPolicy…)"
-say "  kill switches: REFINE_PLUGIN_NORMALIZE=0  REFINE_SIDECAR_RECYCLE_MB=0  REFINE_CGROUP_PARTITION=0"
-say "  optional timers (source checkout): systemctl --user enable refine-nightly.timer"
+say "  data:     ~/.local/share/ocserve   (sessions live here)"
+say "  overrides: systemctl --user edit ocserve   (MemoryMax, OOMPolicy…)"
+say "  kill switches: OCSERVE_PLUGIN_NORMALIZE=0  OCSERVE_SIDECAR_RECYCLE_MB=0  OCSERVE_CGROUP_PARTITION=0"
+say "  optional timers (source checkout): systemctl --user enable ocserve-nightly.timer"
 say "  uninstall (keeps history): scripts/uninstall.sh   [--purge for full wipe]"

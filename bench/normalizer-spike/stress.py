@@ -16,9 +16,9 @@ import threading
 import time
 
 HOME = os.path.expanduser("~")
-REFINE = os.path.expanduser("~/src/refine")
+OCSERVE = os.path.expanduser("~/src/ocserve")
 HERE = os.path.dirname(os.path.abspath(__file__))
-HOST = f"{REFINE}/crates/refine-plugin/src/host/host.mjs"
+HOST = f"{OCSERVE}/crates/ocserve-plugin/src/host/host.mjs"
 NORM = f"{HERE}/target/release/normalizer-spike"
 DENO = "/home/linuxbrew/.linuxbrew/bin/deno"
 BUN = f"{HOME}/.bun/bin/bun"
@@ -37,7 +37,7 @@ SPAWNS = {
 }
 RAW_MAGIC = {"bun": f"{MC}/index.js", "node": f"{MC}/index.js",
              "deno": f"{MC}/index.deno.js"}
-INPUT = {"directory": REFINE, "projectID": "global",
+INPUT = {"directory": OCSERVE, "projectID": "global",
          "serverUrl": "http://127.0.0.1:9"}
 
 
@@ -438,7 +438,7 @@ def s4():
     has_node_after = shutil.which("node", path=env["PATH"]) is not None
     print(f"5 bun-absent PATH selection: "
           f"{'PASS' if not has_bun_after and has_node_after else 'FAIL'} "
-          f"(env probe; refine's plugin_runtime() unit-tested on this rule)")
+          f"(env probe; ocserve's plugin_runtime() unit-tested on this rule)")
 
     # 6: adversarial normalizer inputs -> Err, not panic
     ad = os.path.join(HERE, "adversarial")

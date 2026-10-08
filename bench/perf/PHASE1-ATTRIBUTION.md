@@ -10,7 +10,7 @@ Phase II. Everything here is measured, not estimated.
   `yarn` on PATH for the WebUI build). **LD_PRELOAD over glibc** on the
   `.227` runner against the **debug** binary (release is `strip=true`, so no
   symbols) — the same method as `bench/profiling/REPORT.md`.
-- Scenario: `crates/refine-store/examples/page_prof.rs`, 20 warmup + **400
+- Scenario: `crates/ocserve-store/examples/page_prof.rs`, 20 warmup + **400
   measured iterations** of the real production mix against the real fixture:
   page of 50 messages (`for_each_message_json` full assembly), session-list
   wire bytes, `session_exists`, and one search. Non-empty deep session is
@@ -18,7 +18,7 @@ Phase II. Everything here is measured, not estimated.
 - Attribution: bytehound's REST API (`/data/{id}/allocation_groups`) grouped
   by backtrace, then each frame resolved through `nm -n` on the PIE with the
   load base derived from `_start`, walking outward to the first frame that is
-  `refine_*` / `serde_json` / `rusqlite` / `sqlite3`. gimli/`alloc`/`std`/
+  `ocserve_*` / `serde_json` / `rusqlite` / `sqlite3`. gimli/`alloc`/`std`/
   libc/bytehound frames are plumbing and are skipped.
 
 ## I2 — corrected store baseline (real 32,341-message session, 109,083 parts)

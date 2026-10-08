@@ -1,10 +1,10 @@
-# Load baseline — refine vs upstream freeze (.227 runner, 2026-10-06)
+# Load baseline — ocserve vs upstream freeze (.227 runner, 2026-10-06)
 
 **Run**: `bench/load/.runs/20261006T225404Z` (report regenerated locally with
 the v2-aware report.py). Environment: `cachyos-x8664`, i7-1165G7 4C/8T
-homogeneous, pinning `refine=[0,4] freeze=[1,5] k6=[2,6]` (1 whole physical
+homogeneous, pinning `ocserve=[0,4] freeze=[1,5] k6=[2,6]` (1 whole physical
 core each), quiet gate 2.5 passed (load 0.00), ROUNDS=2 interleaved
-(r1 refine→freeze, r2 freeze→refine), real fixture: 201 sessions /
+(r1 ocserve→freeze, r2 freeze→ocserve), real fixture: 201 sessions /
 48,505 msgs / 178,141 parts + the 32k-msg deep session, zero provider
 traffic. Co-tenants: `llama-server` 4.5 GB resident (MemAvailable min
 0.8 GB during run; guard refused <1.5 GB at start with operator override
@@ -12,16 +12,16 @@ MIN_MEM_KB=786432 recorded in the run log).
 
 ## Headline (n=1: capacity + error-rate valid; latency deltas INDICATIVE)
 
-| | freeze (1.18.31) | refine | note |
+| | freeze (1.18.31) | ocserve | note |
 |---|---:|---:|---|
 | error rate | **0.0000** (all 4 runs) | **0.0000** (all 4 runs) | after session_status fix |
 | throughput | 424–454 req/s | 53–60 req/s | ~7–8× at 25 VUs |
-| pooled p50 | 22.7–25.4 ms | **10.1–12.9 ms** | refine faster at the median |
-| pooled p95 | 91.8–103.9 ms | 1198–1256 ms | refine's tail is the gap |
-| peak RSS | 662.9 MB | **284.6 MB** | refine leaner |
+| pooled p50 | 22.7–25.4 ms | **10.1–12.9 ms** | ocserve faster at the median |
+| pooled p95 | 91.8–103.9 ms | 1198–1256 ms | ocserve's tail is the gap |
+| peak RSS | 662.9 MB | **284.6 MB** | ocserve leaner |
 | CPU (window) | 660 s | 1068 s | whole-sample window, both r's |
 
-## Where refine's tail lives (per-endpoint p95, informational)
+## Where ocserve's tail lives (per-endpoint p95, informational)
 
 - **search** 1357–2462 ms (freeze 69–76 ms) — largest gap
 - **message_page / message_cursor** ~1200 ms (freeze 84–114 ms)
@@ -35,7 +35,7 @@ MIN_MEM_KB=786432 recorded in the run log).
    before publishing arm-to-arm latency deltas.
 2. **Storage-cache asymmetry**: same data, different representation —
    freeze's native db is 485 MB (fits the ~0.8–1.0 GB available page
-   cache next to llama-server), refine's schema is 1.7 GB (mostly cold
+   cache next to llama-server), ocserve's schema is 1.7 GB (mostly cold
    reads). Part of the tail is page-cache misses; this is also a *real*
    product property (storage efficiency → cache fit) but it is not a
    pure code-path measurement.
@@ -46,8 +46,8 @@ MIN_MEM_KB=786432 recorded in the run log).
 
 - run1: all 8 k6 invocations died at `new Trend` (k6 v2 moved Trend to
   `k6/metrics`; barrel export is null) — zero data.
-- run2: 10.8% "failures" on refine were **both arms lacking the
-  per-session status API** — refine 404s honestly, freeze 200s SPA
+- run2: 10.8% "failures" on ocserve were **both arms lacking the
+  per-session status API** — ocserve 404s honestly, freeze 200s SPA
   catch-all HTML (status-code checks passed on an error page); endpoint
   corrected to the global `GET /session/status`.
 
@@ -56,7 +56,7 @@ MIN_MEM_KB=786432 recorded in the run log).
 # Phase-III campaign addendum — 2026-10-07 (PERF-10X)
 
 Same runner/fixture/method as above unless noted. **New in this campaign:**
-allocation `LOAD_REF_CORES=0,4,3,7` (refine gains the previously
+allocation `LOAD_REF_CORES=0,4,3,7` (ocserve gains the previously
 unallocated physical core 3; freeze keeps [1,5], k6 keeps [2,6] — per-core
 comparisons remain the fair view), final binary at commit 7f48949 (S-A,
 F1, F3/F4, F5, F7/F8, F9/F9c, B1, temp_store FILE; C1/C4 reverted after a
@@ -64,7 +64,7 @@ failed keep-rule A/B).
 
 ## The optimization ladder (all zero-error, both arms)
 
-| stage | binary | refine hot | refine spread | notes |
+| stage | binary | ocserve hot | ocserve spread | notes |
 |---|---|---:|---:|---|
 | original baseline (06-22:54) | pre-work | 53–60 | — | p95 1,198–1,256 ms |
 | post F1–F8 (A/B, 2 threads) | prec | 1,809 | 2,067 | p95 101/91 ms |
@@ -80,7 +80,7 @@ post-F9c.
 
 ## Route isolation (LOAD_ROUTES, single-route runs; cpu from report)
 
-| route | refine solo req/s | p95 | cpu ms/req | freeze req/s |
+| route | ocserve solo req/s | p95 | cpu ms/req | freeze req/s |
 |---|---:|---:|---:|---:|
 | config | 24,308 | 4.4 ms | **0.011** (wire cache) | 4,395 |
 | search | 6,459 | 13.5 ms | ~0.94 (incl. FTS miss path) | ~5,486 |
@@ -115,7 +115,7 @@ discarded.
 - **C (10× vs freeze recorded 454): PASS on closed** — 20.3× (arrival
   best 9.6×, its own table stands).
 - **D (gates):** thresholds.json re-derived (7c1d031, pre-gated, formula:
-  refine ≤65 ms / freeze ≤1417 ms / err ≤0.5%) from run 132925; GATED
+  ocserve ≤65 ms / freeze ≤1417 ms / err ≤0.5%) from run 132925; GATED
   run recorded in the section below.
 - **Dual-variant (PERF-10X 1-D):** cache-off run (R4, all four kill
   switches, VU75, 4 threads): 2,198/2,708 req/s, p95 116/106 ms — the
@@ -131,14 +131,14 @@ ceiling re-baselined to 21,500,000 from measurement.
 
 ## GATED runs (acceptance D)
 
-- **G1** `20261007T155504Z`: refine cells **25.97 / 32.95 ms** (bound
+- **G1** `20261007T155504Z`: ocserve cells **25.97 / 32.95 ms** (bound
   either generation: pass); freeze cells 549.6 / 587.6 ms breached the
   **stale 208 ms** threshold — the committed re-derivation (7c1d031,
-  refine ≤65 / freeze ≤1417) had not been rsynced to the runner. Run
+  ocserve ≤65 / freeze ≤1417) had not been rsynced to the runner. Run
   recorded, not discarded: the gate machinery worked (k6 rc=99
   per-cell), the artifact was stale.
 - **G2** `20261007T163704Z` (pre-declared single re-run after cooldown,
-  same config, committed thresholds): **0 breaches — PASS**. refine
+  same config, committed thresholds): **0 breaches — PASS**. ocserve
   8,988/7,948 req/s, p95 25.96/33.08 ms (<=65), freeze 477/432, p95
   497/568 ms (<=1417), 0% errors all cells. Acceptance D: GREEN (both
   G1 and G2 recorded; G1's failure dispositioned as stale runner
@@ -146,7 +146,7 @@ ceiling re-baselined to 21,500,000 from measurement.
 
 ## Stmt/pragma audit confirmation (ac8bb70 binary, VU50, ROUNDS=1, 4-thread)
 
-`20261007T174649Z`: refine **9,228 / 9,099 req/s, p95 13.1 / 13.6 ms**
+`20261007T174649Z`: ocserve **9,228 / 9,099 req/s, p95 13.1 / 13.6 ms**
 (hot/spread), freeze 460 / 420, 0% errors, **0 breaches**, peak RSS
 182.7 MB. vs G2 (8,988/7,948 @ 25.96/33.08): p95 roughly halved,
 throughput at or above — no regression from the stmt/pragma changes, and
@@ -158,7 +158,7 @@ exercised through the real load-test spawn path).
 
 Runs `20261007T224955Z` (base, pre-branch `55c7262` binary) and
 `20261007T223621Z` (lean, `47cb9ea`). Same box, same pinning
-(refine `[0,4,3,7]`, freeze `[1,5]`, k6 `[2,6]`), VU50, ROUNDS=1,
+(ocserve `[0,4,3,7]`, freeze `[1,5]`, k6 `[2,6]`), VU50, ROUNDS=1,
 identical 201-session fixture, 0% errors both arms.
 
 | | base | lean | delta |
@@ -186,11 +186,11 @@ while serving +7.7% more requests).
 > ms/req) in the same rounds.
 
 **Co-tenant validity:** the freeze control arm ran in both rounds and moved
-only −1.5% / −3.1%, so the refine delta is not machine drift.
+only −1.5% / −3.1%, so the ocserve delta is not machine drift.
 
 **Honest caveats.**
 1. Two runs, not four. The 2nd/3rd interleaved rounds were cut when the
-   harness consumed the time budget (a bare `REFINE_BIN` in its import path,
+   harness consumed the time budget (a bare `OCSERVE_BIN` in its import path,
    then two orphaned imports pegging a core for 121 minutes while holding the
    write lock). One interleaved pair satisfies the methodology; a wider
    spread is not measured.

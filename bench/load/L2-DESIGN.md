@@ -24,7 +24,7 @@ serialization bind, and when does the documented flood behavior fire.
    memory slope per arm.
 4. Target facts to confirm/refute: per-session prompt lock serializes
    turns (same-session arrival > 1 in flight must queue or 409),
-   cross-session scales until CPU/memory, refine's 64-lock flood → 503
+   cross-session scales until CPU/memory, ocserve's 64-lock flood → 503
    behavior under `prompt_locks` cap.
 
 ## Kill criteria (pre-registered)
@@ -32,7 +32,7 @@ serialization bind, and when does the documented flood behavior fire.
 - **K-L2a**: stub pacing dominates acceptance latency (>50% of p95 is
   wait-for-stub, not server) even at high `STUB_TOK_PER_SEC` → measure
   acceptance before enqueue only, else abort the phase.
-- **K-L2b**: freeze lacks the prompt route shape refine needs (404/schema
+- **K-L2b**: freeze lacks the prompt route shape ocserve needs (404/schema
   drift on the async path) → scope to routes both serve; record as D-row.
 - **K-L2c**: fixture sessions can't hold locks (state shape mismatch,
   cf. D-PAIR-3) → fix the fixture first; no measuring on misaligned data.

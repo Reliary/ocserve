@@ -1,4 +1,4 @@
-# Parity harness: upstream opencode 1.18.31 vs refine, identical workloads.
+# Parity harness: upstream opencode 1.18.31 vs ocserve, identical workloads.
 # Ports published on loopback only; live services (:4901/:4912) untouched.
 # Round data lives under ./.runs/$ROUND (fresh per round, wiped by run.sh).
 name: parity
@@ -38,23 +38,23 @@ services:
       - ./config/model.json:/root/.local/state/opencode/model.json:ro
       - ./.runs/${ROUND:?round required}/upstream:/root/.local/share/opencode
 
-  refine:
+  ocserve:
     build:
       context: ../..
-      dockerfile: bench/parity/Dockerfile.refine
+      dockerfile: bench/parity/Dockerfile.ocserve
     <<: *shared
     environment:
-      REFINE_LEGACY_SYNC: "0"
+      OCSERVE_LEGACY_SYNC: "0"
       # S5 storm: byte budget tunable so reachable event volumes can force
-      # eviction/lag (default stays32MB — see refine-core event.rs)
-      REFINE_EVENT_RING_MB: ${REFINE_EVENT_RING_MB:-32}
+      # eviction/lag (default stays32MB — see ocserve-core event.rs)
+      OCSERVE_EVENT_RING_MB: ${OCSERVE_EVENT_RING_MB:-32}
     ports:
       - "127.0.0.1:4922:4922"
     volumes:
       - ./config/opencode.json:/root/.config/opencode/opencode.json:ro
       - ./config/auth.json:/root/.local/share/opencode/auth.json:ro
       - ./config/model.json:/root/.local/state/opencode/model.json:ro
-      - ./.runs/${ROUND:?round required}/refine:/data
+      - ./.runs/${ROUND:?round required}/ocserve:/data
 
 networks:
   parity:

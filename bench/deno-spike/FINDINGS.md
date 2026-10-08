@@ -1,7 +1,7 @@
 # Deno-as-sidecar spike — findings (2026-10-06)
 
 Question: can Deno (one Rust-authored, checksum-provisionable runtime) replace the
-bun/node duality as refine's plugin host? Pre-registered kill criteria from the
+bun/node duality as ocserve's plugin host? Pre-registered kill criteria from the
 research plan: (1) `bun:sqlite` resolves, (2) N-API addons actually load, (3)
 warm-up RSS ≤ node's, (4) hooks pass conformance.
 
@@ -40,8 +40,8 @@ warm-up RSS ≤ node's, (4) hooks pass conformance.
   novel scheme would need the same triage. `--node-modules-dir=manual` fixes the
   first class; the rewrite fixes `bun:` only, not other exotic schemes.
 - Deno 2.9.7 (v8 15.0.245.2) installed via brew for the spike at
-  `/home/linuxbrew/.linuxbrew/bin/deno` — **not yet a refine dependency**;
-  `REFINE_PLUGIN_RUNTIME` only knows bun|node today.
+  `/home/linuxbrew/.linuxbrew/bin/deno` — **not yet a ocserve dependency**;
+  `OCSERVE_PLUGIN_RUNTIME` only knows bun|node today.
 
 ## Performance (added 2026-10-06 — memory was never the whole story)
 
@@ -80,7 +80,7 @@ better candidate than deno on these numbers.
 
 ## Repro
 
-Scripts in this directory (spike-only, not wired into refine):
+Scripts in this directory (spike-only, not wired into ocserve):
 - `importmap.json` (tried, insufficient — recorded for the negative result)
 - `drive3.py` / `drive4.py` — full run + RSS sampling
 - Patched files live in the opencode cache as `dist/index.deno.js` +

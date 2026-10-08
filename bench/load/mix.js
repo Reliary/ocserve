@@ -119,7 +119,7 @@ export function doIteration() {
       break;
     case 'session_status':
       // GLOBAL status (W2 golden {}|busy map). The per-session variant
-      // does NOT exist on either server: refine 404s honestly (unregistered
+      // does NOT exist on either server: ocserve 404s honestly (unregistered
       // route), freeze returns 200 SPA catch-all HTML — a status-code-only
       // check counted that as a pass on run1 (recorded lesson).
       req('session_status', 'GET', '/session/status');

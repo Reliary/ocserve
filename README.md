@@ -1,7 +1,7 @@
-# refine
+# ocserve
 
 A compatible reimplementation of the opencode server API, written in Rust.
-`refine` serves the same wire contract as upstream opencode (freeze:
+`ocserve` serves the same wire contract as upstream opencode (freeze:
 **1.18.31**) so existing clients — the TUI, mobile apps, anything speaking the
 API — work unmodified. It is built for a small, bounded footprint (memory,
 storage, boot time) and is verified by differential replay against the frozen
@@ -15,7 +15,7 @@ attribution notice and the compatibility framing.
 
 ```sh
 cargo build --release
-./target/release/refine serve --port 4912      # foreground; data in ~/.local/share/refine
+./target/release/ocserve serve --port 4912      # foreground; data in ~/.local/share/ocserve
 ```
 
 Optional systemd user service (never installed implicitly):
@@ -52,5 +52,5 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings \
 ## Repository hygiene
 
 `git config core.hooksPath .githooks` enables the commit gate (banned-string +
-docs-required checks). Host services other than refine's own are read-only to
+docs-required checks). Host services other than ocserve's own are read-only to
 scripts in this repo (`AGENTS.md` §2.11).

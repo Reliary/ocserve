@@ -1,6 +1,6 @@
-# refine — memory management spec ("so lightweight")
+# ocserve — memory management spec ("so lightweight")
 
-Companion to `PLAN.md`. Hard contract: **RSS < 300 MB steady-state (refine process only;
+Companion to `PLAN.md`. Hard contract: **RSS < 300 MB steady-state (ocserve process only;
 +80 MB if the Node plugin sidecar is active — declared boundary, both measured),
 zero swap growth over 24 h**.
 
@@ -16,14 +16,14 @@ that alone exceeds the entire budget. Corrected line items:
 | tokio: 8 workers × 1 MB stacks + blocking pool 8 × 1 MB | 16 MB | `thread_stack_size(1MB)`, `max_blocking_threads(8)` |
 | hyper/reqwest/rustls: ≤16 pooled conns | 12 MB | `pool_max_idle_per_host(4)`, `pool_idle_timeout`, global conn semaphore |
 | SSE fanout: bounded per-subscriber ring (4096 events × ~300 B avg) + disk spill pointer | 2 MB | `broadcast` capacity bound; overflow policy below |
-| ~~rquickjs isolates~~ → **rejected at gate** (PLAN §10 gate result); Node sidecar lives *outside* this budget | 0 MB | child RSS scraped via `refine_sidecar_rss_bytes` (160 MB hard cap; measured 106 MB live 2026-10-04) |
+| ~~rquickjs isolates~~ → **rejected at gate** (PLAN §10 gate result); Node sidecar lives *outside* this budget | 0 MB | child RSS scraped via `ocserve_sidecar_rss_bytes` (160 MB hard cap; measured 106 MB live 2026-10-04) |
 | zstd/sha256/import chunk buffers (≤1 MB × 2 concurrent) | 12 MB | fixed-size buffer pool, `BytesMut` reuse |
 | Allocator retention headroom | (unmeasured) | **glibc/system allocator — the old "mimalloc purge / MIMALLOC_PURGE_DELAY=500" row was FALSE (no `#[global_allocator]` exists in any crate; corrected 2026-10-04).** Wiring-vs-adopt decision deferred to bytehound profiling (phase 1); retention watched via soak `rss_delta` columns |
 | **Unallocated headroom** | **~146 MB** | absorbs spikes; soak asserts the *slope*, not the peak |
 | **Total** | **300 MB** | |
 
 Node plugin sidecar (PLAN §10 gate result — quickjs rejected on import audit): declared
-*outside* refine's 300 MB; `refine_sidecar_rss_bytes` scraped from the child each sample
+*outside* ocserve's 300 MB; `ocserve_sidecar_rss_bytes` scraped from the child each sample
 interval so the combined number is always visible.
 
 **Measured boundary (2026-10, 4 configured plugins, node v25.9.0, this host):** node
@@ -31,21 +31,21 @@ baseline 40 MB (`--max-old-space-size=64 --max-semi-space-size=2`, isolated prob
 context-mode 59 MB, reliary8 54 MB alone) → **146 MB combined sidecar steady-state**,
 uncapped same configuration was 148 MB (the heap cap contains growth, not baseline).
 Live cgroup series under load (release build, systemd unit): **steady 341-347 MB**
-(refine + sidecar together). **Orphan incident (2026-10-04): replay/gate tooling left 34
-plugin-host nodes / 717 MB orphaned when the parent refine exited without reaping —
+(ocserve + sidecar together). **Orphan incident (2026-10-04): replay/gate tooling left 34
+plugin-host nodes / 717 MB orphaned when the parent ocserve exited without reaping —
 fixed in the tooling (setsid + group-kill in `replay-check.sh`, `start_new_session` +
 killpg in `run_gate.py`); service-side reap-on-exit ships with phase 1.**
 A first-run long generation burst tripped a 480M cap →
 systemd oom-kill → clean restart; the unit cap was raised to **600M** with the
-margin documented in `deploy/refine.service` (fail-fast worked; the cap was tight
+margin documented in `deploy/ocserve.service` (fail-fast worked; the cap was tight
 for allocator page retention during delta bursts).
 The original ≤80 MB target is **not achievable with these artifacts** on any single
 node process; boundary set to measured + headroom: sidecar **hard cap 160 MB** (systemd
-`MemoryMax` in the unit), combined refine+sidecar budget **460 MB**.
+`MemoryMax` in the unit), combined ocserve+sidecar budget **460 MB**.
 
 **Bun runtime (2026-10-05, TI-86 pass):** the plugin host now prefers **bun**
 (`~/.bun/bin/bun --smol`; upstream's own plugin runtime — real `bun:sqlite`, native
-hash/crypto, TS plugins load without the Node loader shim). `REFINE_PLUGIN_RUNTIME=node`
+hash/crypto, TS plugins load without the Node loader shim). `OCSERVE_PLUGIN_RUNTIME=node`
 forces the old path (lab A/B control); Node remains the fallback when bun is absent.
 **Live A/B, same 3 plugins, same box — honest settled numbers (30 s snapshots lie):**
 steady state is a **wash** — bun and node both settle ≈97–101 MB (3–5 min). The
@@ -58,13 +58,13 @@ Hook dispatch verified under bun end-to-end (chat.message ×2, transform ×2,
 text.complete ×2; live prompt answered). `MemoryMax` headroom absorbs the warm-up
 peak; cold-start budget note: first 3–5 min after boot may sit ~260 MB sidecar.
 Node 128 MB heap cap no longer applies under bun (`--smol` instead);
-`REFINE_PLUGIN_HEAP_MB` is the Node-fallback knob.
+`OCSERVE_PLUGIN_HEAP_MB` is the Node-fallback knob.
 
 **OOM postmortem (2026-10-05, kernel memcg kills ×6: 10:36/11:16/12:20/14:12/15:12/16:05):**
 the *unit* cap is what binds (main + ALL children), and the measured warm daytime
 composition blew past the old budget: **main ≈ 487 MB (flat plateau) + plugin host ≈
 145 MB + browser-harness python ×2 ≈ 78 MB ≈ 680 MB against `MemoryMax=750M`** —
-~118 MB headroom, and `refine_sidecar_rss_bytes` counts the plugin host only (bh/shim
+~118 MB headroom, and `ocserve_sidecar_rss_bytes` counts the plugin host only (bh/shim
 invisible to the old soak). Spike classes: catalog reload (their opencode writes
 `models.json` ~hourly; write → kill +6 s — the reload parsed the 5.3 MB file **twice**,
 now once via `Runtime.catalog`) and activity-composite crossings (morning kills; node
@@ -104,7 +104,7 @@ heap limit`, child zombie, every subsequent hook `Broken pipe` — fail-open hid
 inside prompts). Controlled re-measure (4/5 plugins loading — gemini fails
 independently —10s+ settle, trigger+event exercised): RSS **flat 144-148 MB at
 64/128/192/256** — the V8 cap never binds baseline RSS (native/WASM dominates), so
-headroom is free. Default raised to **128** (`REFINE_PLUGIN_HEAP_MB` overrides), and
+headroom is free. Default raised to **128** (`OCSERVE_PLUGIN_HEAP_MB` overrides), and
 `Sidecar::ensure_alive` now respawns + replays all loads on the next RPC after any
 death (`sidecar_respawns_after_death_and_reloads_plugins`). The160 MB systemd
 `MemoryMax` remains the hard boundary. Any future plugin
@@ -161,7 +161,7 @@ tokio::runtime::Builder::new_multi_thread()
   repeated identifiers (tool names, agent names) with a hard intern-table cap.
 - Collections: `SmallVec` for ≤4-element hot vectors; bounded `LruCache` (never `HashMap`
   that only grows); caches hold `Weak` where ownership allows (no `Arc` cycles).
-- `clippy::unwrap_used` denied in `refine-http`/`refine-core` (panic=abort ⇒ a panic is an
+- `clippy::unwrap_used` denied in `ocserve-http`/`ocserve-core` (panic=abort ⇒ a panic is an
   outage — fail fast with context, not silently die on a poisoned row).
 
 ## 5. Measurement and gates
@@ -174,7 +174,7 @@ tokio::runtime::Builder::new_multi_thread()
   - every sample < 300 MB; `VmSwap` == 0; slope after hour 1 < 1 MB/h;
   - `sum(sqlite cache_size) ≤ 32 MB` asserted at boot.
 - Reload gate (`bench/profiling/oom_reload.py`, run on allocator/reload
-  changes): full-catalog boot settle ≤ 120 MB; `REFINE_TRIM=0` control must
+  changes): full-catalog boot settle ≤ 120 MB; `OCSERVE_TRIM=0` control must
   show the unfixed behavior (boot ≥ 230 MB) — a control that stops stepping
   means the lab lost its trigger, not that the bug vanished.
 - Weekly `dhat` profile run attributes any growth to a call site (advisory, then gate).
@@ -207,7 +207,7 @@ building). Ordered by measured leverage:
    4 MB × threads, actually touch).
 3. ~~History byte budget~~ **SHIPPED** — `PROMPT_HISTORY_MAX_BYTES = 8 MB`,
    tail-weighted (oldest dropped first, newest exchange always kept),
-   `refine_history_truncated_total{dropped}` + warn log; under-budget =
+   `ocserve_history_truncated_total{dropped}` + warn log; under-budget =
    byte-identical. Tests: `history_budget_tests` ×3. Divergence: TESTING §1.6
    D-PROMPT-BUDGET.
 4. **Service-side plugin-host reap** — re-verified COVERED without new code:
@@ -217,7 +217,7 @@ building). Ordered by measured leverage:
 5. **Allocator decision** — glibc adopted honestly (§2); wire mimalloc ONLY
    if the post-fix soak still shows step-retention (pre-fix morning soak
    had +76/+58 MB steps — unproven after the drain fix).
-6. Gauges: `refine_db_bytes`, opencode-mirror RSS column in soak (native
+6. Gauges: `ocserve_db_bytes`, opencode-mirror RSS column in soak (native
    opencode = the future-usage ceiling model, currently ~1.7 GB RSS).
 7. Per-prompt rss_delta stays last-prompt-honest (concurrent prompts
    contaminate it — documented, not "fixed" by bucketing).

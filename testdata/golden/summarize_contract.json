@@ -19,5 +19,5 @@
   "agent resolution: last user message's info.agent ?? defaultAgent (probe seed had no agent \u2192 default = plan on upstream)",
   "4-message shape [user, assistant, user, assistant] confirmed on both probes"
  ],
- "summarize_prompt": "v1 core buildPrompt: conversation wrap + 'Create a new anchored summary...' + SUMMARY_TEMPLATE (ported verbatim in refine-core/src/compact.rs)"
+ "summarize_prompt": "v1 core buildPrompt: conversation wrap + 'Create a new anchored summary...' + SUMMARY_TEMPLATE (ported verbatim in ocserve-core/src/compact.rs)"
 }

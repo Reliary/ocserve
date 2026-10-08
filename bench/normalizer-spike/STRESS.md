@@ -50,7 +50,7 @@ Per cell, 50 ms sampler thread:
      (no fallback in spike; proves integration fallback is mandatory)
   3. Entry content edit → warm cache must go cold (re-normalize) → restore
   4. Delete outputs+hash while host running → respawn path rebuilds
-  5. bun absent from PATH → selection falls to node (refine's
+  5. bun absent from PATH → selection falls to node (ocserve's
      plugin_runtime preference, re-asserted at driver level)
   6. Normalizer input adversarial: syntax-error entry, import cycle,
      binary garbage as .js, 50 MB file → normalize returns Err (NOT a
@@ -74,7 +74,7 @@ or kill: **bun+norm default, node+raw fallback, deno proven third.**
 
 ## Non-goals
 
-- No refine code changes (spike layer only; adoption = separate decision).
+- No ocserve code changes (spike layer only; adoption = separate decision).
 - No live-fire against opencode cache beyond the additive .normalized.mjs
   artifacts already in place.
 

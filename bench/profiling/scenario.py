@@ -25,7 +25,7 @@ ROOT = "/tmp/opencode/bh-run"
 # No baked-in home paths (pre-commit banned-string rule): binary resolved
 # relative to this file (repo layout), profiler lib via env override.
 _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-REFINE = os.environ.get("REFINE_BIN", os.path.join(_REPO, "target/debug/refine"))
+OCSERVE = os.environ.get("OCSERVE_BIN", os.path.join(_REPO, "target/debug/ocserve"))
 BH_SO = os.environ.get("BYTEHOUND_LIB", "/tmp/opencode/bytehound/target/release/libbytehound.so")
 
 # ---- fake provider (SSE, final-answer only) ----
@@ -104,14 +104,14 @@ env = dict(os.environ)
 env.update(
     {
         "HOME": home,
-        "REFINE_DATA_DIR": data,
-        "REFINE_LEGACY_SYNC": "0",
+        "OCSERVE_DATA_DIR": data,
+        "OCSERVE_LEGACY_SYNC": "0",
         "LD_PRELOAD": BH_SO,
         "MEMORY_PROFILER_LOG": "warn",
     }
 )
-proc = subprocess.Popen([REFINE, "serve", "--port", "14999"], env=env)
-print(f"refine pid {proc.pid}", flush=True)
+proc = subprocess.Popen([OCSERVE, "serve", "--port", "14999"], env=env)
+print(f"ocserve pid {proc.pid}", flush=True)
 
 BASE = "http://127.0.0.1:14999"
 
@@ -149,9 +149,9 @@ print("healthy", flush=True)
 # ---- seed: session + 500 msgs × ~2KB parts (~1MB history) ----
 st, s = req("POST", "/session", {"directory": work})
 sid = s["id"]
-db = sqlite3.connect(f"file:{data}/refine.db?mode=ro", uri=True)  # exists post-boot
+db = sqlite3.connect(f"file:{data}/ocserve.db?mode=ro", uri=True)  # exists post-boot
 db.close()
-db = sqlite3.connect(f"{data}/refine.db")
+db = sqlite3.connect(f"{data}/ocserve.db")
 now = int(time.time() * 1000)
 db.execute("BEGIN")
 for i in range(500):

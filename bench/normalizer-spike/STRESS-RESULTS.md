@@ -65,7 +65,7 @@ id-matched multiplexer; hosts were never at fault.
 3. Entry content edit → cache goes cold → rebuild → stable warm after.
 4. Outputs deleted while host running → respawn path rebuilds.
 5. bun absent from PATH → selection falls to node (env probe; the
-   preference rule itself is unit-tested in refine).
+   preference rule itself is unit-tested in ocserve).
 6. Adversarial normalizer inputs (syntax error, import cycle, binary
    garbage, 50 MB file): graceful `rc=1` diagnostic or valid bundle —
    **zero panics**.
@@ -74,17 +74,17 @@ id-matched multiplexer; hosts were never at fault.
 
 | measurement | value |
 |---|---|
-| baseline `refine` release | **9,918,024 B** / 502 deps / cached build 0.32 s |
+| baseline `ocserve` release | **9,918,024 B** / 502 deps / cached build 0.32 s |
 | probe with rolldown reachable from main | **20,309,584 B** (+10.39 MB) / cold dep compile 455 s |
-| ceiling (nightly `size_gate`, stats `target/release/refine`) | 10,485,760 B → **over by 9,823,824 B** |
+| ceiling (nightly `size_gate`, stats `target/release/ocserve`) | 10,485,760 B → **over by 9,823,824 B** |
 | slimming options | rolldown features = `serde`/`testing` only — **no slim path** |
 | revert | tree = HEAD, binary restored to exactly 9,918,024 B |
 
 Disposition options (user decision, all honest):
 - **D1 — raise the ceiling** to ~21 MB (gate is self-imposed from a
   2026-10-03 measurement; provenance rule allows an evidenced raise).
-- **D2 — helper binary architecture** (recommended): `refine` spawns
-  `refine-normalize <entry>` when the content-hash is stale; the main
+- **D2 — helper binary architecture** (recommended): `ocserve` spawns
+  `ocserve-normalize <entry>` when the content-hash is stale; the main
   binary links nothing rolldown-related (stays ~9.9 MB, passes gate as
   measured), helper rides the release package (~10–20 MB, exact number
   measured at adoption). Bonus: a rolldown crash lands in the helper
@@ -109,7 +109,7 @@ Normalization's measured benefits: +memory on bun, +load/CPU on node
 eliminated.
 
 **Recommendation: D2.** It satisfies every pre-registered gate without
-moving goalposts — `refine` stays at 9,918,024 B, the helper isolates
+moving goalposts — `ocserve` stays at 9,918,024 B, the helper isolates
 the 10.4 MB dependency, and the measured wins become available. D1 is the
 fallback if single-binary distribution matters more than the ceiling.
 
@@ -127,5 +127,5 @@ execution plan + attack ledger: `D1-PLAN.md`; build evidence: FINDINGS "D1 execu
 
 **Repro note:** re-running this lab's batteries regenerates *beside-entry* artifacts
 (`index.normalized.mjs{,.hash}`) in plugin directories — lab-only, removable. The
-production emitter (`refine` D1 conditional rule) writes self-contained bundles to
+production emitter (`ocserve` D1 conditional rule) writes self-contained bundles to
 `<data>/normalized/<path-hash>/` and removes stale beside-entry pairs automatically.

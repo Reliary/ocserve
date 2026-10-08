@@ -1,9 +1,0 @@
-[Unit]
-Description=refine 24h soak sampler (TESTING §8; fresh CSV per run)
-After=refine.service
-
-[Service]
-Type=simple
-Environment=SOAK_OUT=%h/.local/state/refine/soak/soak.csv
-WorkingDirectory=%h/src/refine
-ExecStart=%h/src/refine/scripts/soak.sh http://127.0.0.1:4912 60 24

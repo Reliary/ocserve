@@ -145,18 +145,18 @@ session-id-format + tools recipe fully neutralizes the gate for the whole
 currently-free set. The other four walls are opencode-side (geo, upstream
 endpoints, backend errors), not ours to fix.
 
-## Port probe ladder (Phase 1 of the refine port — 2026-10-05)
+## Port probe ladder (Phase 1 of the ocserve port — 2026-10-05)
 
-Question: what does *refine's* wire actually need? (`replica-refine.js`
-mirrors refine's reqwest body/headers; B-series ran through refine's real
-client in `crates/refine-llm/tests/`.)
+Question: what does *ocserve's* wire actually need? (`replica-ocserve.js`
+mirrors ocserve's reqwest body/headers; B-series ran through ocserve's real
+client in `crates/ocserve-llm/tests/`.)
 
 | # | Delta from the failing baseline | Result |
 |---|---|---|
-| P1 | refine as-is (reqwest UA, tools, 26-hex session, no auth yet) | 403 |
+| P1 | ocserve as-is (reqwest UA, tools, 26-hex session, no auth yet) | 403 |
 | P2 | + `x-opencode-client`/`-request`/`-project` | 403 |
 | P3/P3B | + composite UA (with / without the extra headers) | **200 / 200** |
-| P5 | exact refine wire: auth `Bearer public` + tools + composite UA | **200** |
+| P5 | exact ocserve wire: auth `Bearer public` + tools + composite UA | **200** |
 | P6 | P5 without tools (compaction shape) | 403 |
 | P7 | P5 with reqwest UA (only UA swapped) | **403** ⇒ UA load-bearing |
 | P8 | P6 + tools + `tool_choice:"none"` | **200** ⇒ compaction fix |
@@ -164,7 +164,7 @@ client in `crates/refine-llm/tests/`.)
 | B2 | B1 with 1 real name (`bash`) | 403 |
 | B3/B4 | 2 fake names / 6 fake names | 403 / 403 ⇒ **names, not count** |
 | B5 | 6 real names, **no max_tokens** | **200** ⇒ max_tokens NOT required |
-| B6 | refine's real 8 builtin names | **200** ⇒ production shape passes |
+| B6 | ocserve's real 8 builtin names | **200** ⇒ production shape passes |
 | B7 | 2 known names (`bash`,`read`) | **200** ⇒ threshold ≥2 known names |
 
 **Final discriminator set for any client (supersedes the E-series
@@ -176,12 +176,12 @@ name casing (reqwest lowercase works), and `accept-encoding` are all
 irrelevant. Text-only authenticated calls must carry the tools array with
 `tool_choice:"none"` (P8).
 
-## Port implementation (refine side)
+## Port implementation (ocserve side)
 
 Shipped with this investigation's follow-up commits: keyless endpoint
-(`REFINE_ZEN_KEYLESS=0` reverts), composite UA on `opencode.ai` bases
-only, zen text-only fallback tools + `tool_choice:none` (refine-core
-`zen.rs`), `refine_zen_freetier_total` gate metric, and the nightly live
+(`OCSERVE_ZEN_KEYLESS=0` reverts), composite UA on `opencode.ai` bases
+only, zen text-only fallback tools + `tool_choice:none` (ocserve-core
+`zen.rs`), `ocserve_zen_freetier_total` gate metric, and the nightly live
 trio (`zen_live.rs`: positive / text-only / negative — anti-theater pair:
 the negative proves the wall still exists).
 
@@ -198,4 +198,4 @@ the negative proves the wall still exists).
   read-only throughout (AGENTS §2 rule 11, added by this investigation's Phase 0).
 - Wire artifacts (pcaps, flows, MITM dumps) shredded at teardown; authorization values
   never enter committed files.
-- User decision: **report only** — no refine port in this pass.
+- User decision: **report only** — no ocserve port in this pass.
