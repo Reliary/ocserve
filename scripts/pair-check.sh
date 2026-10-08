@@ -27,6 +27,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Position-independent corpus (same reason as replay-check.sh): the binary's
+# default corpus path is compile-time baked; name it explicitly.
+export OCSERVE_CORPUS="${OCSERVE_CORPUS:-$PWD/testdata/golden}"
+
 PORT_F=4926
 PORT_R=4927
 OCSERVE_BIN="${OCSERVE_BIN:-target/release/ocserve}"

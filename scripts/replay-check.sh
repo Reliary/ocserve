@@ -13,6 +13,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Position-independent corpus: the binary's default is compile-time baked
+# (CARGO_MANIFEST_DIR), so a moved/renamed checkout breaks replay with a
+# bare "read manifest.json". The gate always names its corpus explicitly.
+export OCSERVE_CORPUS="${OCSERVE_CORPUS:-$PWD/testdata/golden}"
+
 PORT="${OCSERVE_CHECK_PORT:-4919}"
 BIN="${OCSERVE_BIN:-target/debug/ocserve}"
 SELF_TEST=0
