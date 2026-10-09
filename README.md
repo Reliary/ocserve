@@ -44,8 +44,9 @@ Then point any opencode client at it:
 
 ```sh
 opencode attach http://localhost:4096     # the real TUI
-# or open http://localhost:4096 in a browser — ocserve proxies the opencode
-# web app same-origin, exactly like upstream's `opencode serve` does
+# or open http://localhost:4096 in a browser — ocserve serves the opencode
+# web app itself (embedded, version-matched to the frozen server), exactly
+# like upstream's `opencode serve` does
 ```
 
 Data lives in `~/.local/share/ocserve` (`OCSERVE_DATA_DIR` overrides). It reads
@@ -79,7 +80,8 @@ explicitly cited: **187 implemented, 1 cited, 0 gaps**.
 (the record is returned but no remote backend exists), provider OAuth login,
 and `POST /vcs/apply` (the worktree write path). Session revert stores a marker
 but does not restore files (`D-REVERT-NOSNAP` — no snapshot engine). Unmatched
-paths behave like upstream: they serve the proxied web app, not a 404.
+paths get the version-matched web app (embedded; the Cloudflare proxy is a
+fallback), not a 404.
 
 **Contract**: wire-compatible with upstream **1.18.31**. A future upstream
 release may change the API; `ocserve` pins the freeze and tracks upstream drift

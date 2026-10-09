@@ -43,3 +43,12 @@ originate from the upstream project's MIT-licensed source
 templates) or are captured from its wire responses; the notice above covers
 them. They are embedded so the built-in commands and skills behave
 byte-equivalently to the frozen upstream.
+
+## Embedded web UI
+
+`bench/webui/app/<tag>.pack.zst` is the built `packages/app` web client,
+captured from the pinned upstream build through its public HTTP interface
+(`scripts/extract-app.sh`) and embedded via `include_bytes!` so ocserve serves
+the fully version-matched UI offline (upstream parity: the upstream binary
+embeds its own `app/dist`). It is MIT-licensed upstream code, covered by the
+opencode notice above; regenerated only on a deliberate upstream version bump.

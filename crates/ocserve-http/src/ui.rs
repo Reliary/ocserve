@@ -178,6 +178,10 @@ pub struct UiProxy {
     /// HTML's referenced assets are fetched once at boot so the first browser
     /// load is warm. Off by default per WEBUI-PLAN W3.
     pub prewarm: bool,
+    /// Serve the embedded pinned build first (default on; upstream parity).
+    /// `OCSERVE_DISABLE_EMBEDDED_WEB_UI=1` forces the proxy (mirrors upstream's
+    /// `OPENCODE_DISABLE_EMBEDDED_WEB_UI`).
+    pub embedded: bool,
 }
 
 impl UiProxy {
@@ -192,8 +196,12 @@ impl UiProxy {
         let prewarm = std::env::var("OCSERVE_UI_PREWARM")
             .map(|v| v == "1")
             .unwrap_or(false);
+        let embedded = std::env::var("OCSERVE_DISABLE_EMBEDDED_WEB_UI")
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("off"))
+            .unwrap_or(true);
         let mut p = Self::new(enabled, upstream);
         p.prewarm = prewarm;
+        p.embedded = embedded;
         p
     }
 
@@ -212,6 +220,7 @@ impl UiProxy {
                 bytes: 0,
             }),
             prewarm: false,
+            embedded: true,
         }
     }
 
@@ -314,6 +323,12 @@ pub async fn ui_fallback(
             axum::Json(serde_json::json!({"error": "Not Found"})),
         )
             .into_response();
+    }
+    // Embedded-first (upstream serveUIEffect priority, P6): serve the pinned
+    // version-matched build; the proxy is the fallback (and only reachable
+    // when OCSERVE_DISABLE_EMBEDDED_WEB_UI=1 or the pack is absent).
+    if ui.embedded && crate::embedded_ui::available() {
+        return embedded_response(req.uri().path());
     }
     let path = req
         .uri()
@@ -515,6 +530,35 @@ fn forward_headers(src: &HeaderMap) -> HeaderMap {
         out.insert(name.clone(), value.clone());
     }
     out
+}
+
+/// Serve one path from the embedded, version-matched build (P6). Mirrors
+/// upstream `serveEmbeddedUIEffect` + `embeddedUIResponse`: exact asset hit,
+/// SPA fallback to index.html for non-assets, JSON 404 for an unknown asset
+/// (never a network fall-through — the air-gapped property). HTML gets the
+/// theme-preload CSP hash exactly as the proxy path does.
+fn embedded_response(path: &str) -> Response {
+    let Some((resolved, body)) = crate::embedded_ui::lookup(path) else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "Not Found"})),
+        )
+            .into_response();
+    };
+    let ct = crate::embedded_ui::mime_for(resolved);
+    let mut out = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, ct);
+    if ct.starts_with("text/html") {
+        out = out.header(
+            "content-security-policy",
+            csp_for_html(&String::from_utf8_lossy(body)),
+        );
+    } else {
+        out = out.header("content-security-policy", csp(""));
+    }
+    out.body(Body::from(body.to_vec()))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
 /// W3 opt-in prewarm: fetch the entry HTML, parse referenced /assets/*,

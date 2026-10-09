@@ -1532,6 +1532,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

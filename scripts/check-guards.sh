@@ -163,9 +163,10 @@ echo "== guard: full API coverage (rule 16, spec-driven) =="
 # Supersedes rules 14 + 15 + the web-bundle extractor with ONE generated check
 # over the frozen server's own OpenAPI contract (bench/openapi/1.18.31.json,
 # served at /doc). Every operation must be bound in the router or carry an
-# exact `METHOD /path` citation in PLAN.md. Cannot drift the way three
-# hand-maintained route lists did (the /pty/shells and /session/{id}/diff
-# gaps, 2026-10-08/09).
+# exact `METHOD /path` citation in PLAN.md. Citations match on whole-token
+# boundaries (a substring test vacuously cited `POST /mcp` as a prefix of
+# `POST /mcp/{name}/connect`). Cannot drift the way three hand-maintained
+# route lists did (the /pty/shells and /session/{id}/diff gaps).
 if [ -f bench/openapi/1.18.31.json ]; then
   # NB: check-coverage.py exits 1 when gaps exist; with `set -o pipefail`
   # a `if $(... | grep)` construct would inherit that nonzero and report ok
@@ -179,6 +180,20 @@ if [ -f bench/openapi/1.18.31.json ]; then
   fi
 else
   echo "ok (no vendored spec)"
+fi
+
+echo "== guard: embedded UI version-skew (rule 17) =="
+# The pinned web UI must call only routes present in the frozen spec (same
+# tag); a mismatch means the extraction captured the wrong build. Replaces the
+# old Cloudflare-latest webui-routes.txt. Planted control: sabotaged spec → red.
+if [ -f bench/webui/app/1.18.31.pack.zst ] && [ -f bench/openapi/1.18.31.json ]; then
+  if out=$(python3 bench/webui/check-app-skew.py bench/webui/app/1.18.31.pack.zst bench/openapi/1.18.31.json 2>&1); then
+    echo "ok"
+  else
+    echo "$out"; echo "FAIL: embedded UI calls a route absent from the frozen spec (rule 17)"; fail=1
+  fi
+else
+  echo "ok (no embedded app pack)"
 fi
 
 exit $fail

@@ -117,13 +117,17 @@ step "backup drill (VACUUM INTO + integrity + counts)" bash -c "$(declare -f dri
 #     K-TUI-SURFACE batch: 23,341,872 B measured 2026-10-09 (full v2 /api/*
 #      surface ~90 route handlers + /doc embedded spec; the generated
 #      coverage guard requires every op bound) → ceiling 24,000,000 B
+#     P6 embedded web UI: 28,473,616 B measured 2026-10-09 (the pinned
+#      1.18.31 app pack, zstd 5.08 MB, embedded via include_bytes! — upstream
+#      parity: upstream embeds its whole app/dist too; still ~6.5x smaller
+#      than upstream's 185 MB ELF) → ceiling 30,000,000 B
 size_gate() {
   local bin="target/release/ocserve"
   if [ ! -x "$bin" ]; then
     echo "release binary missing — building"
     cargo build --release || return 1
   fi
-  local sz ceiling=24000000
+  local sz ceiling=30000000
   sz="$(stat -c%s "$bin")"
   echo "size=${sz} ceiling=${ceiling}"
   [ "$sz" -le "$ceiling" ] || { echo "OVER SIZE CEILING"; return 1; }

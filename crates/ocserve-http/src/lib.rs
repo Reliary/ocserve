@@ -92,6 +92,7 @@ where
 
 pub mod compress;
 pub mod doc;
+pub mod embedded_ui;
 pub mod pty;
 pub mod tui;
 pub mod ui;

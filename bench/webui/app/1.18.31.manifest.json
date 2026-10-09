@@ -1,0 +1,325 @@
+{
+ "files": {
+  "/apple-touch-icon-v3.png": {
+   "bytes": 1541,
+   "sha256": "2f2d5687a641f7fc1c3931072249a5984660375c091064fe8b374e4e43a8656c"
+  },
+  "/assets/Inter.ttf": {
+   "bytes": 874708,
+   "sha256": "0be2399ea925f1f83ff974764761da9860ec50742ed29a5d4c1ffd0c5c7ac3a8"
+  },
+  "/assets/JetBrainsMonoNerdFontMono-Regular.woff2": {
+   "bytes": 1060580,
+   "sha256": "587236ebb19a2da874c459d14bbe7785a5eb7e1d87969db9574454d09ea50d1c"
+  },
+  "/assets/KaTeX_AMS-Regular-BQhdFMY1.woff2": {
+   "bytes": 28076,
+   "sha256": "0cdd387c9590a1a9f9794560022dbb59654a7d86f187aa0c81495ad42d3a7308"
+  },
+  "/assets/KaTeX_AMS-Regular-DMm9YOAa.woff": {
+   "bytes": 33516,
+   "sha256": "30da91e84c893f875e252689faebdc590b2871145e8adc7f9a9d4dbd8ce0b251"
+  },
+  "/assets/KaTeX_AMS-Regular-DRggAlZN.ttf": {
+   "bytes": 63632,
+   "sha256": "68534840bcfdd2bffb6f0e8deb48684dd01e7f04ea2813267577afb906de1d13"
+  },
+  "/assets/KaTeX_Caligraphic-Bold-ATXxdsX0.ttf": {
+   "bytes": 12368,
+   "sha256": "07d8e303ce4fc12b4bb54f1004170dd190a1f3db45d400fe68060df3e0897268"
+  },
+  "/assets/KaTeX_Caligraphic-Bold-BEiXGLvX.woff": {
+   "bytes": 7716,
+   "sha256": "1ae6bd7475590e97e7f145a89e09ccde322f7a6bc0b91607b1c8b8ee28290fed"
+  },
+  "/assets/KaTeX_Caligraphic-Bold-Dq_IR9rO.woff2": {
+   "bytes": 6912,
+   "sha256": "de7701e42cf1f4cf0b766c03fb27977207eee2f4fd5d76fa82188406da43ea4c"
+  },
+  "/assets/KaTeX_Caligraphic-Regular-CTRA-rTL.woff": {
+   "bytes": 7656,
+   "sha256": "3398dd02302557a793f2863f88e02d96ce10df2abffa07c8e9fa90775116e65c"
+  },
+  "/assets/KaTeX_Caligraphic-Regular-Di6jR-x-.woff2": {
+   "bytes": 6908,
+   "sha256": "5d53e70ad607c2352162dec9e0923fb54ecdafaccbf604cd8dcf7d00facb989b"
+  },
+  "/assets/KaTeX_Caligraphic-Regular-wX97UBjC.ttf": {
+   "bytes": 12344,
+   "sha256": "ed0b74372feefcbb9c0666b2e210da37b7e49fa7fbbf3eeb11db5f693dacfbb7"
+  },
+  "/assets/KaTeX_Fraktur-Bold-BdnERNNW.ttf": {
+   "bytes": 19584,
+   "sha256": "9163df9c7122432e6495b4229fa9071cf9ae86a758ae5efc4924ec2e1a6dbce1"
+  },
+  "/assets/KaTeX_Fraktur-Bold-BsDP51OF.woff": {
+   "bytes": 13296,
+   "sha256": "9be7ceb88004ab8ad124082246fbfcca4091e36385d4ec6ed1df67375dad50fb"
+  },
+  "/assets/KaTeX_Fraktur-Bold-CL6g_b3V.woff2": {
+   "bytes": 11348,
+   "sha256": "74444efd593c005e3f4573b44524704c0af0a937fe911cca9e94068d0d140d3f"
+  },
+  "/assets/KaTeX_Fraktur-Regular-CB_wures.ttf": {
+   "bytes": 19572,
+   "sha256": "1e6f9579e90e2cac37f8f60a597c436e075c114385652b7cbeb0dec0421291b3"
+  },
+  "/assets/KaTeX_Fraktur-Regular-CTYiF6lA.woff2": {
+   "bytes": 11316,
+   "sha256": "51814d270d06ff0255dba0799994fa4d8c84d11f09951d47595f4abb1f3602dc"
+  },
+  "/assets/KaTeX_Fraktur-Regular-Dxdc4cR9.woff": {
+   "bytes": 13208,
+   "sha256": "5e28753be717dac97f559f49bc10be9cf3c124ddcabda6659d11cb68febc6463"
+  },
+  "/assets/KaTeX_Main-Bold-Cx986IdX.woff2": {
+   "bytes": 25324,
+   "sha256": "0f60d1b897938ec918c8ce073092411baf9438f6739465693ff18b0f9d20b021"
+  },
+  "/assets/KaTeX_Main-Bold-Jm3AIy58.woff": {
+   "bytes": 29912,
+   "sha256": "c76c5d696297d51b9cb1639c7da4334f0e7dec81b42b11213b5e25ef671bb822"
+  },
+  "/assets/KaTeX_Main-Bold-waoOVXN0.ttf": {
+   "bytes": 51336,
+   "sha256": "138ac28d1663b3037e9c5f52371fa5c63d8324f4a38d22cd573e6ea3a3fd0cf8"
+  },
+  "/assets/KaTeX_Main-BoldItalic-DxDJ3AOS.woff2": {
+   "bytes": 16780,
+   "sha256": "99cd42a3c072d918f2f44984a807cf7aa16e13545fd0875fc07c6c65f99e715b"
+  },
+  "/assets/KaTeX_Main-BoldItalic-DzxPMmG6.ttf": {
+   "bytes": 32968,
+   "sha256": "70ee1f64a20f2048c21940ef46d0144fd215baa953ca69afd1e31e98544f708f"
+  },
+  "/assets/KaTeX_Main-BoldItalic-SpSLRI95.woff": {
+   "bytes": 19412,
+   "sha256": "a6f7ec0d846ac7ad975adb8959c37ed49b94acbc4ae436db9ce9e20287e4a64c"
+  },
+  "/assets/KaTeX_Main-Italic-3WenGoN9.ttf": {
+   "bytes": 33580,
+   "sha256": "0d85ae7cc30f23790a7f1a58c4a112fdca8aae769b6ba11429af1d98b1b6cb3a"
+  },
+  "/assets/KaTeX_Main-Italic-BMLOBm91.woff": {
+   "bytes": 19676,
+   "sha256": "f1d6ef86f3b11a528bd5185199bd2443ecb2b0dead96d88674b5a2c12be24bdf"
+  },
+  "/assets/KaTeX_Main-Italic-NWA7e6Wa.woff2": {
+   "bytes": 16988,
+   "sha256": "97479ca6cce906abc961ecac96faa5f9ca2e61b8e7670d475826bcdee9a7c267"
+  },
+  "/assets/KaTeX_Main-Regular-B22Nviop.woff2": {
+   "bytes": 26272,
+   "sha256": "c2342cd8b869e01752a9321dc17213fc40d4d04c79688c1d43f2cf316abd7866"
+  },
+  "/assets/KaTeX_Main-Regular-Dr94JaBh.woff": {
+   "bytes": 30772,
+   "sha256": "c6368d87e8a1a3a5d337623d83d8dc4b868f242a9ad476237d6f8d1e0f168cdc"
+  },
+  "/assets/KaTeX_Main-Regular-ypZvNtVU.ttf": {
+   "bytes": 53580,
+   "sha256": "d0332f52868370fd83ae7fa46470f90c8f2eab2fcf12bc4f88080b340c95a830"
+  },
+  "/assets/KaTeX_Math-BoldItalic-B3XSjfu4.ttf": {
+   "bytes": 31196,
+   "sha256": "f9377ab0271cda59af24bcffbd46a4d0c8a3572ffafdbb38de2ad5ea7b0d5ee5"
+  },
+  "/assets/KaTeX_Math-BoldItalic-CZnvNsCZ.woff2": {
+   "bytes": 16400,
+   "sha256": "dc47344dbb6cb5b655c8460d561f4df5f501b90c804ad3c6cec65fe322351ab1"
+  },
+  "/assets/KaTeX_Math-BoldItalic-iY-2wyZ7.woff": {
+   "bytes": 18668,
+   "sha256": "850c0af5c2238497febaf5e461d880bf458c341f42f4f330f1b1ab5698b1998e"
+  },
+  "/assets/KaTeX_Math-Italic-DA0__PXp.woff": {
+   "bytes": 18748,
+   "sha256": "8a8d244581371912b8f3f5a23e2437cb2a59cd9bcaebb0346e722c05737a2571"
+  },
+  "/assets/KaTeX_Math-Italic-flOr_0UB.ttf": {
+   "bytes": 31308,
+   "sha256": "08ce98e51b04d58945a301e639e02b6998af29fdfd61a7b8afdd07bbfc479d4a"
+  },
+  "/assets/KaTeX_Math-Italic-t53AETM-.woff2": {
+   "bytes": 16440,
+   "sha256": "7af58c5ec8f132a2ddde9027c6d7814decce4d3b822a11192a42a20e2e973264"
+  },
+  "/assets/KaTeX_SansSerif-Bold-CFMepnvq.ttf": {
+   "bytes": 24504,
+   "sha256": "1ece03f79f95277d57dc7f6b435a74e1379b0d46104a8530286b60ff49369ea0"
+  },
+  "/assets/KaTeX_SansSerif-Bold-D1sUS0GD.woff2": {
+   "bytes": 12216,
+   "sha256": "e99ae51144bf1232efcc1bfe5add36262c6866b0faab24fa75740e1b98577a62"
+  },
+  "/assets/KaTeX_SansSerif-Bold-DbIhKOiC.woff": {
+   "bytes": 14408,
+   "sha256": "ece03cfd83e22c212cdef66feb8442d25a083beb988db3f1883f3f9738d750ba"
+  },
+  "/assets/KaTeX_SansSerif-Italic-C3H0VqGB.woff2": {
+   "bytes": 12028,
+   "sha256": "00b26ac825e2095056396e0553b8ac26d3f8ad158c3826e28b4c45b385c4714a"
+  },
+  "/assets/KaTeX_SansSerif-Italic-DN2j7dab.woff": {
+   "bytes": 14112,
+   "sha256": "91ee67500cc0129aa0ace3ac5c61ff1692102f0f31d02b69347fba35dcb75bf2"
+  },
+  "/assets/KaTeX_SansSerif-Italic-YYjJ1zSn.ttf": {
+   "bytes": 22364,
+   "sha256": "3931dd81faed86ba021bb2bbdc36f5bed9a38d6b4f4077aca59b265aa1b02083"
+  },
+  "/assets/KaTeX_SansSerif-Regular-BNo7hRIc.ttf": {
+   "bytes": 19436,
+   "sha256": "f36ea897e19f4a2e571d1e900e4e3710e438deb05a842486045ba0a3e616a4ad"
+  },
+  "/assets/KaTeX_SansSerif-Regular-CS6fqUqJ.woff": {
+   "bytes": 12316,
+   "sha256": "11e4dc8a6471ff6d6ee561d53d10fde8f7489e798257ff449c5d37c197435605"
+  },
+  "/assets/KaTeX_SansSerif-Regular-DDBCnlJ7.woff2": {
+   "bytes": 10344,
+   "sha256": "68e8c73ef42afd3ccec58bf0fba302cce448938e7fc020a5e31f8a952eee1342"
+  },
+  "/assets/KaTeX_Script-Regular-C5JkGWo-.ttf": {
+   "bytes": 16648,
+   "sha256": "1c67f068fea8bb09bf099c088b1cf64bd27516a6e07f4684344873564bb66a67"
+  },
+  "/assets/KaTeX_Script-Regular-D3wIWfF6.woff2": {
+   "bytes": 9644,
+   "sha256": "036d4e95149b69ff9bcc0cd55771efeb25ffa3947293e69acd78d5ac328c684b"
+  },
+  "/assets/KaTeX_Script-Regular-D5yQViql.woff": {
+   "bytes": 10588,
+   "sha256": "d96cdf2b3bdd4d64a8fd5f74a4c467f123a8a73931cd435889f08ffaf9bf947a"
+  },
+  "/assets/KaTeX_Size1-Regular-C195tn64.woff": {
+   "bytes": 6496,
+   "sha256": "c943cc986384f59e86bea5fd7dc50a9c4dfe567a7c05eb40d6790720dead97c9"
+  },
+  "/assets/KaTeX_Size1-Regular-Dbsnue_I.ttf": {
+   "bytes": 12228,
+   "sha256": "95b6d2f1a50173bfedb8c63e1d1c99b10427d0a4df4201cb44513b226951a22b"
+  },
+  "/assets/KaTeX_Size1-Regular-mCD8mA8B.woff2": {
+   "bytes": 5468,
+   "sha256": "6b47c40166b6dbe21a5dfca7718413f2147fd2399be1ba605d8ad39cedf25dfe"
+  },
+  "/assets/KaTeX_Size2-Regular-B7gKUWhC.ttf": {
+   "bytes": 11508,
+   "sha256": "a6b2099fb555c60e3a0db3a08842ebf1d732c6eb4e4bf44913613bed4fc4e39b"
+  },
+  "/assets/KaTeX_Size2-Regular-Dy4dx90m.woff2": {
+   "bytes": 5208,
+   "sha256": "d04c54219f9eaec6d4d4fd42dfb28785975a4794d6b2fc71e566b9cd6db842dd"
+  },
+  "/assets/KaTeX_Size2-Regular-oD1tc_U0.woff": {
+   "bytes": 6188,
+   "sha256": "2014c523c3210bcc166648c4d4cc57f05b747df07a24277bf71c51e67dc79e3d"
+  },
+  "/assets/KaTeX_Size3-Regular-CTq5MqoE.woff": {
+   "bytes": 4420,
+   "sha256": "6ab6b62e9b62dae2c00dd90f791bd10950be0ecc3490d7d6045f51c2e8fe0949"
+  },
+  "/assets/KaTeX_Size3-Regular-DgpXs0kz.ttf": {
+   "bytes": 7588,
+   "sha256": "500e04d54f0d51666332c9d2089aa803be22aa878eca539e59fa53c6e522b082"
+  },
+  "/assets/KaTeX_Size4-Regular-BF-4gkZK.woff": {
+   "bytes": 5980,
+   "sha256": "99f9c6750b489c9462bf04900bd3f939df9b829339daaaaa99ef5495cdddea58"
+  },
+  "/assets/KaTeX_Size4-Regular-DWFBv043.ttf": {
+   "bytes": 10364,
+   "sha256": "c647367d1dd4e162468717d020e1fc0f1dc5c26ebfdffbe55261713bf88c5877"
+  },
+  "/assets/KaTeX_Size4-Regular-Dl5lxZxV.woff2": {
+   "bytes": 4928,
+   "sha256": "a4af7d414440a1c1790825cfb700cf9cf43b0f2c4b04f0ebc523011ad9853ec0"
+  },
+  "/assets/KaTeX_Typewriter-Regular-C0xS9mPB.woff": {
+   "bytes": 16028,
+   "sha256": "e14fed02b1aba7ce9f5afd5844b5d0321b22351febc720e0de8b8723527609f7"
+  },
+  "/assets/KaTeX_Typewriter-Regular-CO6r4hn1.woff2": {
+   "bytes": 13568,
+   "sha256": "71d517d67827787cfabdf186914cc3358eda539e37931941f2b2fd4a21f68c0b"
+  },
+  "/assets/KaTeX_Typewriter-Regular-D3Ib7_Hf.ttf": {
+   "bytes": 27556,
+   "sha256": "f01f3e87d9c6a61c0c081ceb577abd864eb00a612f7ac1620dd6915fad2ef5aa"
+  },
+  "/assets/android-studio-t3zZ7G0e.svg": {
+   "bytes": 41292,
+   "sha256": "f76ba7c1ab61c457744979d2207583b48c2d6a5a789d6f58c281d3459e4f0c15"
+  },
+  "/assets/antigravity-m-mWKI7R.svg": {
+   "bytes": 8032,
+   "sha256": "7e7a2768f04e789e09c3c63b83d406d0c31370387a4a88b99ee2901d30a9ac8f"
+  },
+  "/assets/audio": {
+   "bytes": 2884,
+   "sha256": "732a788aef669f044760cb3cbdbd700ad5805522f42cc26425268635b49717b0"
+  },
+  "/assets/home-CFGvK6P5.png": {
+   "bytes": 191086,
+   "sha256": "cba92c4fce60e7c2f04756e8397919634383607f26c35b2f7ab5287d50c40cde"
+  },
+  "/assets/index-DLiUNAg_.css": {
+   "bytes": 482489,
+   "sha256": "deca26a5c1d635fd592671e2cade5dafa63b1047693e01be4923721a0e62a6b4"
+  },
+  "/assets/index-Kw4ozAkJ.js": {
+   "bytes": 2740171,
+   "sha256": "6e380c0b34bfc7aae1df84942e9da4af5223f8a698150d1557d14db337644f6b"
+  },
+  "/assets/introducing-tabs-BDG1jhHE.mp4": {
+   "bytes": 1367486,
+   "sha256": "0049d461906c7c59a4b979100b60c3a0c9477de413f95858a6f58055448ec938"
+  },
+  "/assets/markdown.worker-Bu_Dc9RP.js": {
+   "bytes": 533159,
+   "sha256": "e8e5160b497c4cd35812ea5da0dd3e383da129f0279bbbc17cad61d3772373e9"
+  },
+  "/assets/sprite-CMBzwCGs.svg": {
+   "bytes": 282211,
+   "sha256": "c26813a011258f9f1380b341f87554ed28857765af53b11581c76dcb01d37f81"
+  },
+  "/assets/sprite-Fb-TFjRY.svg": {
+   "bytes": 943958,
+   "sha256": "a7c09fdeea203b6dbf1f5607e988c81e0815bdc03e595cff842c9b03f4676517"
+  },
+  "/assets/tabs-BFWcS4qR.png": {
+   "bytes": 167248,
+   "sha256": "5a66404c2cdc8c07e3c63bc2235878157f820c31174f4ab0077a2011b3c3f041"
+  },
+  "/assets/vscode-C5BXgFjm.svg": {
+   "bytes": 6463,
+   "sha256": "f8f462a86b877b0f3fc307ba8600c595fdb1cfee9cc40ae229806cdac2b47d95"
+  },
+  "/assets/worker-CU6mbanM.js": {
+   "bytes": 206861,
+   "sha256": "d011186aebaecbe704fb56486c68f70a918d6aa46c3368f5de6047448316651b"
+  },
+  "/favicon-96x96-v3.png": {
+   "bytes": 536,
+   "sha256": "aa34092540de60c889610edfa3c25316e215f12d88af29cfba530d09aee7265c"
+  },
+  "/favicon-v3.ico": {
+   "bytes": 15086,
+   "sha256": "808e1ca7659cb52e0240aac075ccecdf5539047da02150f2b95e0aa78a44056f"
+  },
+  "/favicon-v3.svg": {
+   "bytes": 612,
+   "sha256": "e29bbe33380ad1c1ada9134b52f229d30e9776d60481512c9d81f2bb6f37def9"
+  },
+  "/index.html": {
+   "bytes": 2884,
+   "sha256": "732a788aef669f044760cb3cbdbd700ad5805522f42cc26425268635b49717b0"
+  },
+  "/site.webmanifest": {
+   "bytes": 487,
+   "sha256": "d4d6004b68d40d1858e956b5a1a9185a8bcae08b19282ac02d847c2838195e01"
+  }
+ },
+ "tag": "1.18.31"
+}

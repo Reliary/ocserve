@@ -41,6 +41,7 @@ base64.workspace = true
 hex.workspace = true
 flate2 = "1"
 brotli = "8"
+zstd.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -1,10 +1,17 @@
 # Web UI performance + scaling — pre-registered plan
 
-Status: **executing** (2026-10-08). Driver: the web UI is the primary
+Status: **complete** (2026-10-09). Driver: the web UI is the primary
 surface for the hosted app and a common complaint against opencode is that
 it is slow; the user also observed that **many sessions / large git diffs**
 slow upstream down. This program fixes both, with the honesty rule that no
 number ships unless a committed, repeatable measurement produced it.
+
+Delivered: W1 compression (boot wire 9.10 MB → 1.03 MB br), W2 validators
+(ETag/304, immutable assets), W3 lazy byte-bounded asset cache (0 at boot),
+W4 session-list scaling (freeze ListQuery parity), W5 route closure + `/vcs/*`,
+and **P6 embedded version-matched UI** (embedded-first, proxy fallback;
+`bench/webui/app/1.18.31.pack.zst`). Guards: rule 16 (spec coverage) + rule 17
+(embedded-UI skew) supersede the old rule 15.
 
 ## Baseline (measured 2026-10-08, this box, ocserve :4912 vs freeze :4901)
 
@@ -86,10 +93,11 @@ wrong. The old guard (rule 14, SDK list) missed them because it is
   (`mode=git|branch`, `context` passthrough, 10 MB total-patch cap parity),
   `/vcs/diff/raw`. `vcs.apply` stays out (0 call sites, write path — PLAN
   §17 citation).
-- **W6 Guard.** Rule 15: method-aware binding over `bench/webui-routes.txt`
-  with a v2-exempt list (`/api/*`, `/sync/*`, `/experimental/project|worktree`),
-  each exempt entry exact-URL cited in PLAN §17. Planted control red→green.
-  Tests for negotiation, 304, SSE-exclusion, cache bounds, vcs shapes.
+- **W6 Guard (superseded 2026-10-09).** Rule 15's Cloudflare-latest
+  `bench/webui-routes.txt` is replaced by rule 16 (spec-driven coverage over
+  the frozen contract, exact-citation) + rule 17 (the embedded pinned UI's
+  routes must be a subset of the frozen spec — `bench/webui/check-app-skew.py`).
+  This tracks the *version-matched* bundle rather than CF's newest.
 
 ## Targets / kill criteria (measured before claiming)
 
