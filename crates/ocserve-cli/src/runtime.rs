@@ -274,15 +274,19 @@ fn side_kind(kind: &str) -> &str {
 /// Transform a config-defined model block (different shape: {limit,name,...}).
 fn transform_config_model(pid: &str, mid: &str, m: &Value) -> Value {
     // Freeze always emits `limit.context`+`limit.output` (provider.ts:1609
-    // defaults both to 0); the v1 spec marks them required. Carrying the raw
-    // config block verbatim left `{}` for models with no limit → spec
-    // violation (caught by P4 on the live config, 2026-10-09).
+    // defaults both to 0); the v1 spec marks them required. `input` is
+    // OPTIONAL and omitted when absent (freeze live shape: {context,output}).
+    // Carrying the raw config block verbatim left `{}` for models with no
+    // limit → spec violation (caught by P4 on the live config, 2026-10-09);
+    // always-emitting `input: null` then diverged from freeze (pair, same day).
     let src = m.get("limit");
-    let limit = json!({
+    let mut limit = json!({
         "context": src.and_then(|l| l.get("context")).cloned().unwrap_or(json!(0)),
-        "input": src.and_then(|l| l.get("input")).cloned(),
         "output": src.and_then(|l| l.get("output")).cloned().unwrap_or(json!(0)),
     });
+    if let Some(input) = src.and_then(|l| l.get("input")) {
+        limit["input"] = input.clone();
+    }
     json!({
         "id": mid,
         "providerID": pid,
