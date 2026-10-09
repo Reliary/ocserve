@@ -144,6 +144,11 @@ step "zen free-tier gate (live trio)" \
 step "models.dev live fetch" \
   cargo test -p ocserve live_fetch_contains_big_pickle -- --ignored
 
+# 6b. permission differential (K-PERMISSION, guard rule 18's live half): boots
+#     freeze + ocserve under one fixture and replays the committed permission
+#     oracle vectors. Behavioural layer the route/shape guards cannot see.
+step "permission differential (freeze vs ocserve)" ./scripts/permission-check.sh
+
 # 7. mutants (opt-in): survivor report is triaged like a defect (TESTING §9)
 if [ "$WITH_MUTANTS" = "1" ]; then
   if command -v cargo-mutants >/dev/null 2>&1; then
