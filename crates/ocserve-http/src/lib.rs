@@ -2776,6 +2776,29 @@ fn resolve_model(st: &Arc<AppState>, payload: &Value, session_id: &str) -> (Stri
     st.llm.read().default_model.clone()
 }
 
+/// Agent permission rules (v1 wire shape → evaluator Rule list). One owner so
+/// the prompt loop and the v2 permission oracle cannot drift.
+pub(crate) fn agent_rules(st: &Arc<AppState>, agent: &str) -> Vec<ocserve_tools::Rule> {
+    st.payloads
+        .read()
+        .agent
+        .iter()
+        .find(|a| a["name"].as_str() == Some(agent))
+        .and_then(|a| a["permission"].as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    Some(ocserve_tools::Rule {
+                        permission: r["permission"].as_str()?.to_string(),
+                        pattern: r["pattern"].as_str()?.to_string(),
+                        action: r["action"].as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Resolve agent/model/system/endpoint/rules into a runnable prompt context.
 /// Shared by POST /message (sync) and POST /prompt_async (backgrounded).
 pub(crate) fn build_prompt_context(
@@ -2815,25 +2838,7 @@ pub(crate) fn build_prompt_context(
         .get(&(pid.clone(), mid.clone()))
         .copied();
     // agent permission rules (v1 wire shape → evaluator)
-    let rules: Vec<ocserve_tools::Rule> = st
-        .payloads
-        .read()
-        .agent
-        .iter()
-        .find(|a| a["name"].as_str() == Some(agent.as_str()))
-        .and_then(|a| a["permission"].as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|r| {
-                    Some(ocserve_tools::Rule {
-                        permission: r["permission"].as_str()?.to_string(),
-                        pattern: r["pattern"].as_str()?.to_string(),
-                        action: r["action"].as_str()?.to_string(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let rules = agent_rules(st, &agent);
     let model_limit = st
         .llm
         .read()

@@ -60,6 +60,18 @@ impl PermissionGate {
         (rx, guard)
     }
 
+    /// Register a pending ask that is NOT tied to a handler frame — the entry
+    /// lives until `reply`/timeout (the v2 permission oracle's `ask`, whose
+    /// request must survive the create handler returning). No waiter exists, so
+    /// the receiver is dropped; `reply` keys on the entry's PRESENCE, not on a
+    /// successful oneshot send, so this still resolves cleanly.
+    pub fn register_persistent(&self, id: &str, request: Value) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending.lock().insert(id.to_string(), tx);
+        self.requests.lock().insert(id.to_string(), request);
+        drop(rx);
+    }
+
     /// K-ALWAYS: load the session's persisted always-grants into memory
     /// (once per session per process; prompt lock serializes prompts so the
     /// read-then-insert cannot race itself).
@@ -86,11 +98,16 @@ impl PermissionGate {
         self.pending.lock().len()
     }
 
-    /// Resolve a pending ask from a client reply. Unknown id → false.
+    /// Resolve a pending ask from a client reply. Returns true when the id was
+    /// pending (the request existed), regardless of whether a waiter was
+    /// listening — the v2 oracle registers asks with no waiter.
     pub fn reply(&self, id: &str, reply: &str) -> bool {
         self.requests.lock().remove(id);
         match self.pending.lock().remove(id) {
-            Some(tx) => tx.send(reply.to_string()).is_ok(),
+            Some(tx) => {
+                let _ = tx.send(reply.to_string());
+                true
+            }
             None => false,
         }
     }

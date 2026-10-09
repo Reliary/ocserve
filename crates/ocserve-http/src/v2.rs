@@ -1511,7 +1511,7 @@ pub async fn permission_create(
 ) -> Result<Json<Value>, ApiError> {
     let action = body.get("action").and_then(|v| v.as_str());
     let resources = body.get("resources").and_then(|v| v.as_array());
-    let (Some(_action), Some(resources)) = (action, resources) else {
+    let (Some(action), Some(resources)) = (action, resources) else {
         let key = if action.is_none() {
             "action"
         } else {
@@ -1526,9 +1526,64 @@ pub async fn permission_create(
             message: "Expected array, got false\n  at [\"save\"]".into(),
         });
     }
+    // The v2 create IS the permission oracle: it returns the evaluated effect
+    // (upstream PermissionV2.ask) with NO tool execution. It must evaluate the
+    // session agent's ruleset — the previous hardcoded `effect:"allow"` was
+    // semantically empty (found live 2026-10-09: freeze edit /etc/passwd → ask,
+    // ocserve → allow). Agent precedence: payload `agent` → session stored →
+    // default. Combined effect: any deny → deny, else any ask → ask, else allow
+    // (upstream evaluateInput).
+    let agent = body
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| session_agent(&st, &id));
+    let rules = crate::agent_rules(&st, &agent);
+    let mut effect = "allow";
+    for r in resources {
+        let Some(res) = r.as_str() else { continue };
+        match ocserve_tools::evaluate(action, res, &rules).as_str() {
+            "deny" => {
+                effect = "deny";
+                break;
+            }
+            "ask" if effect != "deny" => effect = "ask",
+            _ => {}
+        }
+    }
     let pid = format!("per_{}", ocserve_core::ids::ascending_tail());
-    let _ = (st, id, resources);
-    Ok(Json(json!({"data": {"id": pid, "effect": "allow"}})))
+    // `ask` registers a real pending request (upstream `create`); other effects
+    // do not. The request body mirrors the v1 event shape so GET /permission
+    // and the reply routes see it.
+    if effect == "ask" {
+        let request = json!({
+            "id": pid,
+            "sessionID": id,
+            "action": action,
+            "resources": resources,
+            "patterns": resources,
+            "always": resources,
+            "metadata": body.get("metadata").cloned().unwrap_or(json!({})),
+        });
+        st.gate.register_persistent(&pid, request);
+    }
+    Ok(Json(json!({"data": {"id": pid, "effect": effect}})))
+}
+
+/// Session's stored agent, else the runtime default. Read-only, best-effort.
+fn session_agent(st: &Arc<AppState>, session_id: &str) -> String {
+    if let Ok(conn) = ocserve_store::pragma::open_reader(&st.db)
+        && let Ok(Some(raw)) = conn.query_row(
+            "SELECT agent FROM session WHERE id = ?1",
+            [session_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        && !raw.is_empty()
+    {
+        return raw;
+    }
+    st.llm.read().default_agent.clone()
 }
 
 /// DELETE /experimental/worktree — 400 WorktreeRemoveInput required.

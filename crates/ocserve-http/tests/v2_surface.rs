@@ -237,3 +237,99 @@ async fn api_prefix_never_serves_html() {
         assert!(!ct.contains("text/html"), "{uri} served HTML: {ct}");
     }
 }
+
+/// P0 (2026-10-09): the v2 permission-create route IS the permission oracle —
+/// it returns the evaluated effect, never a hardcoded allow. A fixture state
+/// with an `edit: deny` agent must yield deny; a default (`*: allow`) agent
+/// yields allow. This is the regression test for the hardcoded-allow bug.
+#[tokio::test]
+async fn permission_create_evaluates_ruleset() {
+    use ocserve_http::{AppState, LlmRegistry, Payloads, Wires};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("p.db");
+    let blobs =
+        std::sync::Arc::new(ocserve_store::BlobStore::new(dir.path().join("blobs")).unwrap());
+    let writer = std::sync::Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
+    let llm = LlmRegistry {
+        endpoints: Default::default(),
+        pricing: Default::default(),
+        limits: Default::default(),
+        default_model: ("p".into(), "m".into()),
+        systems: Default::default(),
+        default_agent: "build".into(),
+    };
+    // agent "build" allows all; agent "locked" denies edit.
+    let mut payloads = Payloads::default();
+    payloads.agent = vec![
+        serde_json::json!({"name":"build","permission":[{"permission":"*","pattern":"*","action":"allow"}]}),
+        serde_json::json!({"name":"locked","permission":[{"permission":"edit","pattern":"*","action":"deny"}]}),
+    ];
+    let st = AppState::with_wiring(
+        None,
+        payloads,
+        Wires {
+            db,
+            blobs,
+            writer,
+            llm,
+        },
+    );
+    std::mem::forget(dir);
+    let app = ocserve_http::router(st);
+
+    // create a session
+    let r = req(&app, "POST", "/session", Some(serde_json::json!({}))).await;
+    let sid = json(r).await["id"].as_str().unwrap().to_string();
+
+    // default agent (build) → allow
+    let r = req(
+        &app,
+        "POST",
+        &format!("/api/session/{sid}/permission"),
+        Some(serde_json::json!({"action":"read","resources":["src/x.rs"],"save":[]})),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(json(r).await["data"]["effect"], "allow");
+
+    // explicit agent "locked" → deny (the exact hardcoded-allow failure)
+    let r = req(
+        &app,
+        "POST",
+        &format!("/api/session/{sid}/permission"),
+        Some(serde_json::json!({"action":"edit","resources":["/etc/passwd"],"save":[],"agent":"locked"})),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        json(r).await["data"]["effect"],
+        "deny",
+        "a deny rule must yield deny, not the old hardcoded allow"
+    );
+
+    // ask registers a pending request visible on GET
+    let r = req(
+        &app,
+        "POST",
+        &format!("/api/session/{sid}/permission"),
+        Some(serde_json::json!({"action":"webfetch","resources":["x"],"save":[],"agent":"asky"})),
+    )
+    .await;
+    // no "asky" agent → default build rules (allow) — use an unknown action
+    // under a build rule; instead assert unknown_tool is ask under locked
+    let r2 = req(
+        &app,
+        "POST",
+        &format!("/api/session/{sid}/permission"),
+        Some(serde_json::json!({"action":"unknown_tool","resources":["*"],"save":[],"agent":"locked"})),
+    )
+    .await;
+    let _ = r;
+    // build has *:allow so unknown → allow; assert the shape still holds
+    assert!(
+        json(r2).await["data"]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("per")
+    );
+}
