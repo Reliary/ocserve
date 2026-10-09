@@ -89,15 +89,20 @@ fn project_model_v2(v1: &Value) -> Value {
     let id = v1.get("id").cloned().unwrap_or(Value::Null);
     let provider_id = v1.get("providerID").cloned().unwrap_or(Value::Null);
     let api = v1.get("api").cloned().unwrap_or(json!({}));
-    // v2 api: {id, type, package, url[, settings]} — carry npm as package.
-    let mut v2api = json!({"id": id});
+    // v2 `ModelApi` is a discriminated union (spec 1.18.31):
+    //   {id, type:"aisdk", package, url[, settings]}  — npm-backed
+    //   {id, type:"native", url, settings}            — built-in
+    // The v1 entry carries `npm` when npm-backed; presence picks the arm.
+    let npm = api
+        .get("npm")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let mut v2api = match npm {
+        Some(pkg) => json!({"id": id, "type": "aisdk", "package": pkg}),
+        None => json!({"id": id, "type": "native", "settings": {}}),
+    };
     if let Some(url) = api.get("url") {
         v2api["url"] = url.clone();
-    }
-    if let Some(npm) = api.get("npm").and_then(|v| v.as_str())
-        && !npm.is_empty()
-    {
-        v2api["package"] = json!(npm);
     }
     // capabilities boolean map → v2 {tools, input[], output[]}
     let caps = v1.get("capabilities").cloned().unwrap_or(json!({}));
@@ -136,11 +141,25 @@ fn project_model_v2(v1: &Value) -> Value {
         }
     }]);
     let limit = v1.get("limit").cloned().unwrap_or(json!({}));
-    // variants: v2 uses an array of variant names/objects
+    // variants: v2 `ModelV2Info.variants` is an array of
+    // `{id, headers, body}` objects (spec 1.18.31). The v1 entry keys
+    // variants by name; each becomes one object carrying its own body when
+    // the v1 variant has one.
     let variants: Vec<Value> = v1
         .get("variants")
         .and_then(|v| v.as_object())
-        .map(|m| m.keys().map(|k| json!(k)).collect())
+        .map(|m| {
+            m.iter()
+                .map(|(k, vv)| {
+                    let body = vv
+                        .get("body")
+                        .or_else(|| vv.get("settings"))
+                        .cloned()
+                        .unwrap_or(json!({}));
+                    json!({"id": k, "headers": {}, "body": body})
+                })
+                .collect()
+        })
         .unwrap_or_default();
     let released = v1
         .get("release_date")

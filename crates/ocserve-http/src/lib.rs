@@ -3402,16 +3402,17 @@ async fn list_directory(
         };
         let ignored =
             name.starts_with('.') || name == "node_modules" || name == "target" || name == ".git";
+        // Freeze FileNode = {name,path,absolute,type,ignored} with
+        // `additionalProperties:false` (spec probed 2026-10-09). ocserve
+        // previously added `size`/`modified`, which freeze never emits and
+        // no client can depend on — the spec-validation oracle (P4) caught
+        // it. Emit exactly the freeze keys.
         nodes.push(json!({
             "name": name,
             "path": rel,
             "type": if is_dir { "directory" } else { "file" },
             "absolute": path.to_string_lossy(),
             "ignored": ignored,
-            "size": meta.as_ref().filter(|m| m.is_file()).map(|m| m.len()),
-            "modified": meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| {
-                t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_millis() as i64)
-            }),
         }));
     }
     // directories first, then name (browser expectations), bounded

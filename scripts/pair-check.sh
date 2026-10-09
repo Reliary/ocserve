@@ -208,6 +208,24 @@ PY
 fi
 
 rc=0; run_pair || rc=$?
+
+# P4: calibrated spec validation on BOTH live arms. Freeze must validate
+# clean (0 violations) — that proves the oracle is fair; ocserve must too.
+# This is the shape gate rule 16 cannot give (bound != correct shape). Runs
+# last so a spec violation never masks a wire divergence.
+say "== spec validation: freeze (oracle fairness) =="
+if python3 bench/openapi/spec-validate.py "http://127.0.0.1:$PORT_F" >>"$HF/p4.log" 2>&1; then
+  tail -1 "$HF/p4.log"
+else
+  echo "  FAIL: freeze violates its own spec — oracle mis-calibrated"; tail -5 "$HF/p4.log"; rc=1
+fi
+say "== spec validation: ocserve =="
+if python3 bench/openapi/spec-validate.py "http://127.0.0.1:$PORT_R" >>"$HR/p4.log" 2>&1; then
+  tail -1 "$HR/p4.log"
+else
+  echo "  FAIL: ocserve response violates the contract"; tail -8 "$HR/p4.log"; rc=1
+fi
+
 if live_ok 4901; then say "live opencode :4901 still healthy"; else say "WARN: live opencode :4901 not reachable (was it up before?)"; fi
 if live_ok 4912; then say "live ocserve :4912 still healthy"; else say "WARN: live ocserve :4912 not reachable"; fi
 exit "$rc"
