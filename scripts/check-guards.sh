@@ -159,68 +159,26 @@ else
   echo "ok"
 fi
 
-echo "== guard: v1 SDK routes all bound (rule 14) =="
-# The 2026-10-08 crash class: a v1 SDK route we don't implement falls through
-# the catch-all to the app.opencode.ai proxy, which returns HTML where the
-# client expects JSON (web UI settings: e.shells.reduce on an HTML string).
-# Every URL in the frozen v1 SDK surface must be bound in the router or be a
-# NAMED deferral whose exact URL string appears in PLAN.md §17.
-# Matching: router path extraction handles multi-line .route( calls and
-# treats a router wildcard segment ({id}) as matching any literal segment
-# (e.g. /mcp/{name}/{action} covers /mcp/x/disconnect).
-SDK_URLS="$(dirname "$0")/../bench/sdk-routes.txt"
-if [ -f "$SDK_URLS" ]; then
-  missing=$(python3 - "$SDK_URLS" crates/ocserve-http/src/lib.rs PLAN.md <<'PYEOF'
-import re, sys
-urls_file, router_file, plan_file = sys.argv[1], sys.argv[2], sys.argv[3]
-router = open(router_file, encoding="utf-8").read()
-plan = open(plan_file, encoding="utf-8").read()
-# every .route("...") path (whitespace incl. newlines between args)
-paths = re.findall(r'\.route\(\s*"([^"]+)"', router)
-def segs(p): return [x for x in p.split("/") if x != ""]
-def covers(route, url):
-    r, u = segs(route), segs(url)
-    if len(r) != len(u): return False
-    for a, b in zip(r, u):
-        if a.startswith("{") and a.endswith("}"):
-            continue  # wildcard segment covers any single segment
-        if a != b: return False
-    return True
-missing = []
-for raw in open(urls_file, encoding="utf-8"):
-    url = raw.strip()
-    if not url: continue
-    if url in router: continue           # verbatim presence (comments ok)
-    if any(covers(r, url) for r in paths):
-        continue
-    if url in plan:                      # named deferral, exact URL cited
-        continue
-    missing.append(url)
-print("\n".join(missing))
-PYEOF
-)
-  if [ -n "$missing" ]; then
-    echo "$missing"; echo "FAIL: v1 SDK route unbound and not a named deferral (rule 14)"; fail=1
+echo "== guard: full API coverage (rule 16, spec-driven) =="
+# Supersedes rules 14 + 15 + the web-bundle extractor with ONE generated check
+# over the frozen server's own OpenAPI contract (bench/openapi/1.18.31.json,
+# served at /doc). Every operation must be bound in the router or carry an
+# exact `METHOD /path` citation in PLAN.md. Cannot drift the way three
+# hand-maintained route lists did (the /pty/shells and /session/{id}/diff
+# gaps, 2026-10-08/09).
+if [ -f bench/openapi/1.18.31.json ]; then
+  # NB: check-coverage.py exits 1 when gaps exist; with `set -o pipefail`
+  # a `if $(... | grep)` construct would inherit that nonzero and report ok
+  # vacuously. Capture full output and test for the GAP marker explicitly.
+  cov_out=$(python3 bench/openapi/check-coverage.py bench/openapi/1.18.31.json crates/ocserve-http/src/lib.rs PLAN.md 2>&1) || true
+  gaps=$(printf '%s\n' "$cov_out" | grep '^  GAP' || true)
+  if [ -n "$gaps" ]; then
+    echo "$gaps"; echo "FAIL: spec operation unbound and uncited (rule 16)"; fail=1
   else
     echo "ok"
   fi
 else
-  echo "ok (no sdk route list)"
-fi
-
-echo "== guard: web-bundle routes bound (rule 15) =="
-# Method-aware, over the LIVE web-bundle route inventory (bench/webui-routes.txt).
-# Supersedes the method-blind SDK rule 14 for the web surface: the 2026-10-08
-# gap was /global/config, /vcs/*, /api/health falling through to the HTML proxy
-# because rule 14 read the SDK and ignored methods.
-if [ -f bench/webui-routes.txt ]; then
-  if out=$(python3 bench/webui/check-webui-routes.py bench/webui-routes.txt crates/ocserve-http/src/lib.rs PLAN.md 2>&1); then
-    echo "ok"
-  else
-    echo "$out"; echo "FAIL: web-bundle route unbound and uncited (rule 15)"; fail=1
-  fi
-else
-  echo "ok (no bundle route list)"
+  echo "ok (no vendored spec)"
 fi
 
 exit $fail

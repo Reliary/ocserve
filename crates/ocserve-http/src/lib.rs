@@ -91,9 +91,11 @@ where
 }
 
 pub mod compress;
+pub mod doc;
 pub mod pty;
 pub mod tui;
 pub mod ui;
+pub mod v2;
 pub mod vcs;
 
 /// Upstream error envelope: {"name":"NotFoundError","data":{"message":"..."}} (captured live).
@@ -537,6 +539,14 @@ async fn health() -> impl IntoResponse {
     Json(json!({"healthy": true, "version": FREEZE_VERSION}))
 }
 
+/// `GET /doc` — serve the vendored OpenAPI contract (freeze parity).
+async fn get_doc() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        crate::doc::SPEC_JSON,
+    )
+}
+
 async fn get_config(
     State(st): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -720,17 +730,12 @@ async fn get_capabilities(
 }
 
 /// v2-style location envelope shared by /api/* routes (captured live).
-fn api_location(st: &AppState) -> Value {
+pub(crate) fn api_location(st: &AppState) -> Value {
     let dir = st.paths["directory"].as_str().unwrap_or("/");
     json!({
         "directory": dir,
         "project": {"id": "global", "directory": "/"},
     })
-}
-
-/// GET /api/location — captured shape (keys golden: directory/project/{id,directory}).
-async fn get_api_location(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(api_location(&st))
 }
 
 /// GET /api/agent — v2-shaped agent list (permission triple renamed to
@@ -798,11 +803,6 @@ async fn get_api_command(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         })
         .collect();
     Json(json!({"location": api_location(&st), "data": data}))
-}
-
-/// GET /api/reference — always empty (no references configured).
-async fn get_api_reference(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(json!({"location": api_location(&st), "data": []}))
 }
 
 /// Empty-shape routes captured live: {}, [].
@@ -1516,6 +1516,12 @@ async fn post_session(
     State(st): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(create_session_record(&st, &body)?))
+}
+
+/// Shared session creation — `POST /session` (v1) and `POST /api/session`
+/// (v2) both land here. Returns (id, info); the caller shapes the envelope.
+pub(crate) fn create_session_record(st: &Arc<AppState>, body: &Value) -> Result<Value, ApiError> {
     let id = ocserve_core::ids::ses_id();
     let now = now_ms();
     let worktree = st.paths["worktree"].as_str().unwrap_or("/").to_string();
@@ -1531,7 +1537,13 @@ async fn post_session(
     } else {
         title
     };
-    let info = json!({
+    let agent = body
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("build");
+    let model = body.get("model").cloned().unwrap_or(Value::Null);
+    let mut info = json!({
         "id": id,
         "projectID": "global",
         "directory": worktree,
@@ -1544,6 +1556,12 @@ async fn post_session(
         "tokens": {"input": 0, "output": 0, "reasoning": 0,
                    "cache": {"read": 0, "write": 0}},
     });
+    if body.get("agent").is_some() {
+        info["agent"] = json!(agent);
+    }
+    if model.is_object() {
+        info["model"] = model;
+    }
     ocserve_store::insert_session(&st.writer, &info).map_err(|e| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         name: "InternalError",
@@ -1554,7 +1572,7 @@ async fn post_session(
         "session.created",
         json!({"sessionID": id, "info": info}),
     ));
-    Ok(Json(info))
+    Ok(info)
 }
 
 /// POST /session/{id}/fork — freeze session.fork (groups/session.ts:248,
@@ -2036,6 +2054,43 @@ async fn post_summarize(
         json!({"sessionID": sid}),
     ));
     Ok(Json(json!(true)))
+}
+
+/// Shared compaction trigger used by both the v1 summarize route and the v2
+/// `/api/session/{id}/compact` route (single owner of the summarize flow).
+pub(crate) async fn run_compact(
+    st: &Arc<AppState>,
+    ctx: &ocserve_core::prompt::PromptContext,
+    writer: &ocserve_store::Writer,
+    sid: &str,
+) -> anyhow::Result<()> {
+    let agent = ctx.agent.clone();
+    let prompt_payload = json!({
+        "model": {"providerID": ctx.provider_id, "modelID": ctx.model_id},
+        "agent": agent,
+        "parts": [],
+    });
+    ocserve_core::compaction::persist_anchor(ctx, writer, sid, &agent, false, false).await?;
+    ocserve_core::prompt::run_prompt_with(
+        ctx,
+        writer,
+        sid,
+        &prompt_payload,
+        ocserve_core::prompt::RunOpts {
+            persist_user: false,
+            skip_history: false,
+            prelude: None,
+            tools_enabled: false,
+            ..Default::default()
+        },
+    )
+    .await?;
+    st.bus.publish(ocserve_core::event::frame(
+        st.paths["directory"].as_str().unwrap_or("/"),
+        "session.compacted",
+        json!({"sessionID": sid}),
+    ));
+    Ok(())
 }
 
 /// W5 admin bundle — POST /mcp/{name}/connect|disconnect (the client's
@@ -2654,7 +2709,7 @@ fn resolve_model(st: &Arc<AppState>, payload: &Value, session_id: &str) -> (Stri
 
 /// Resolve agent/model/system/endpoint/rules into a runnable prompt context.
 /// Shared by POST /message (sync) and POST /prompt_async (backgrounded).
-fn build_prompt_context(
+pub(crate) fn build_prompt_context(
     st: &Arc<AppState>,
     payload: &Value,
     session_id: &str,
@@ -2846,7 +2901,7 @@ impl Drop for LockRelease {
 /// dropping release — normal end, `?`, panic, or task abort — evicts the map
 /// entry. Concurrent holders/waiters each hold their own release (count > 2)
 /// so live entries are never evicted.
-async fn lock_session(st: &Arc<AppState>, sid: &str) -> Result<LockRelease, ApiError> {
+pub(crate) async fn lock_session(st: &Arc<AppState>, sid: &str) -> Result<LockRelease, ApiError> {
     let lock = {
         let mut map = st.prompt_locks.lock();
         if map.len() >= 64 && !map.contains_key(sid) {
@@ -2867,7 +2922,7 @@ async fn lock_session(st: &Arc<AppState>, sid: &str) -> Result<LockRelease, ApiE
     })
 }
 
-fn prompt_err(e: anyhow::Error) -> ApiError {
+pub(crate) fn prompt_err(e: anyhow::Error) -> ApiError {
     let msg = format!("{e:#}");
     if msg.starts_with("Session not found") {
         ApiError::not_found(msg)
@@ -3395,7 +3450,7 @@ static WALK_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> = std::sync:
 /// Blocking body of `GET /find/file` — a bounded, single-threaded directory
 /// walk. Existing bounds kept exactly (20,000 dirs visited, stop once the
 /// result set reaches 4×limit); only the *thread* it runs on changed.
-fn walk_files(
+pub(crate) fn walk_files(
     base: &std::path::Path,
     query: &str,
     want_type: &str,
@@ -3730,7 +3785,7 @@ fn emit_session_error_event(st: &Arc<AppState>, sid: &str, message: &str) {
 
 /// Busy rejection (v1 mapBusy → SessionBusyError): command/shell never queue
 /// — they fail fast when the session is mid-prompt (upstream semantics).
-fn session_busy(id: &str) -> ApiError {
+pub(crate) fn session_busy(id: &str) -> ApiError {
     ApiError {
         status: StatusCode::CONFLICT,
         name: "SessionBusyError",
@@ -4113,7 +4168,7 @@ fn evt_id(kind: &str) -> String {
 /// - first frame: server.connected WITHOUT directory/project wrapper
 /// - then 10s JSON heartbeats
 /// - frames wrapped: {"directory":..,"project":..,"payload":..} (except server.connected)
-async fn global_event(State(st): State<Arc<AppState>>) -> Response {
+pub(crate) async fn global_event(State(st): State<Arc<AppState>>) -> Response {
     let connected = Event::default().data(
         json!({"payload":{"id":evt_id("connected"),"type":"server.connected","properties":{}}})
             .to_string(),
@@ -4252,6 +4307,7 @@ async fn auth_gate(
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/global/health", get(health))
+        .route("/doc", get(get_doc))
         .route("/config", get(get_config))
         .route("/config/providers", get(get_config_providers))
         .route("/provider", get(get_provider))
@@ -4297,14 +4353,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         // (public.ts:155) — same handler here; oc-remote uses /global/event, TUI/SDK
         // probes hit /event (was a tolerated 404; now freeze-faithful)
         .route("/event", get(global_event))
+        .route("/api/event", get(global_event))
         .route("/metrics", get(metrics))
-        // TUI-attach probes (captured live; PLAN §2 hit-set expansion)
-        .route("/api/location", get(get_api_location))
-        .route("/api/agent", get(get_api_agent))
-        .route("/api/command", get(get_api_command))
-        .route("/api/reference", get(get_api_reference))
+        // TUI-attach probes (captured live; PLAN §2 hit-set expansion).
+        // The /api/* routes are registered in the v2 block below.
         .route("/experimental/resource", get(experimental_resource))
-        .route("/experimental/workspace", get(experimental_workspace))
+        .route(
+            "/experimental/workspace",
+            get(experimental_workspace).post(v2::workspace_create),
+        )
         // TUI attach calls this at boot (observed live 2026-10-08); freeze
         // answers [] with 200 under an empty workspace state.
         .route(
@@ -4441,6 +4498,210 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/permission/{id}/reply",
             axum::routing::post(post_permission_reply),
+        )
+        // ---- v2 `/api/*` surface (1.18.31 TUI + web UI DataProvider) ----
+        // Location-scoped collections: {location, data}.
+        .route("/api/health", get(v2::health))
+        .route("/api/location", get(v2::location))
+        .route("/api/agent", get(get_api_agent))
+        .route("/api/model", get(v2::list_models))
+        .route("/api/provider", get(v2::list_providers))
+        .route("/api/provider/{providerID}", get(v2::get_provider))
+        .route("/api/skill", get(v2::list_skills))
+        .route("/skill", get(v2::list_skills_raw))
+        .route("/vcs/apply", axum::routing::post(v2::vcs_apply))
+        .route("/api/command", get(get_api_command))
+        .route("/api/integration", get(v2::list_integrations))
+        .route("/api/integration/{integrationID}", get(v2::get_integration))
+        .route("/api/reference", get(v2::list_references))
+        .route("/api/fs/find", get(v2::fs_find))
+        .route("/api/fs/list", get(v2::fs_list))
+        .route("/api/fs/read/{*path}", get(v2::fs_read))
+        // Sessions.
+        .route(
+            "/api/session",
+            get(v2::list_sessions).post(v2::create_session),
+        )
+        .route("/api/session/active", get(v2::active_sessions))
+        .route("/api/session/{sessionID}", get(v2::get_session))
+        .route("/api/session/{sessionID}/message", get(v2::list_messages))
+        .route(
+            "/api/session/{sessionID}/message/{messageID}",
+            get(v2::get_message),
+        )
+        .route("/api/session/{sessionID}/context", get(v2::session_context))
+        .route("/api/session/{sessionID}/history", get(v2::session_history))
+        .route(
+            "/api/session/{sessionID}/agent",
+            axum::routing::post(v2::switch_agent),
+        )
+        .route(
+            "/api/session/{sessionID}/model",
+            axum::routing::post(v2::switch_model),
+        )
+        .route(
+            "/api/session/{sessionID}/prompt",
+            axum::routing::post(v2::prompt),
+        )
+        .route(
+            "/api/session/{sessionID}/interrupt",
+            axum::routing::post(v2::interrupt),
+        )
+        .route(
+            "/api/session/{sessionID}/compact",
+            axum::routing::post(v2::compact),
+        )
+        .route(
+            "/api/session/{sessionID}/wait",
+            axum::routing::post(v2::wait),
+        )
+        .route(
+            "/api/session/{sessionID}/revert/stage",
+            axum::routing::post(v2::revert_stage),
+        )
+        .route(
+            "/api/session/{sessionID}/revert/clear",
+            axum::routing::post(v2::revert_clear),
+        )
+        .route(
+            "/api/session/{sessionID}/revert/commit",
+            axum::routing::post(v2::revert_commit),
+        )
+        .route(
+            "/api/session/{sessionID}/permission/{requestID}/reply",
+            axum::routing::post(v2::permission_reply),
+        )
+        .route(
+            "/api/session/{sessionID}/question/{requestID}/reply",
+            axum::routing::post(v2::question_reply),
+        )
+        .route(
+            "/api/session/{sessionID}/question/{requestID}/reject",
+            axum::routing::post(v2::question_reject),
+        )
+        // Permissions / questions.
+        .route("/api/permission/saved", get(v2::permission_saved))
+        .route(
+            "/api/permission/saved/{id}",
+            axum::routing::delete(v2::permission_saved_delete),
+        )
+        .route("/api/permission/request", get(v2::permission_request))
+        .route("/api/question/request", get(v2::question_request))
+        .route(
+            "/api/session/{sessionID}/question",
+            get(v2::session_question),
+        )
+        .route(
+            "/api/session/{sessionID}/permission/{requestID}",
+            get(v2::session_permission_one),
+        )
+        .route(
+            "/api/session/{sessionID}/permission",
+            get(v2::session_permission).post(v2::permission_create),
+        )
+        // pty under /api (same implementation).
+        .route("/api/pty", get(v2::pty_list).post(v2::pty_create))
+        .route(
+            "/api/pty/{ptyID}",
+            get(v2::pty_get).put(v2::pty_update).delete(v2::pty_remove),
+        )
+        .route(
+            "/api/pty/{ptyID}/connect-token",
+            axum::routing::post(v2::pty_connect_token),
+        )
+        .route("/api/pty/{ptyID}/connect", get(pty::connect))
+        // v1 path the TUI session view calls (SidebarFiles crash path).
+        .route("/session/{sessionID}/diff", get(v2::session_diff))
+        .route(
+            "/session/{sessionID}/share",
+            axum::routing::post(v2::session_share).delete(v2::session_unshare),
+        )
+        // Experimental action stubs (freeze-probed shapes).
+        .route("/experimental/console/orgs", get(v2::console_orgs))
+        .route(
+            "/experimental/console/switch",
+            axum::routing::post(v2::console_switch),
+        )
+        .route(
+            "/experimental/workspace/adapter",
+            get(v2::workspace_adapter),
+        )
+        .route(
+            "/experimental/workspace/sync-list",
+            axum::routing::post(v2::workspace_sync_list),
+        )
+        .route(
+            "/experimental/workspace/warp",
+            axum::routing::post(v2::workspace_warp),
+        )
+        .route(
+            "/experimental/worktree",
+            get(v2::worktree_list).post(v2::worktree_create),
+        )
+        .route(
+            "/experimental/worktree",
+            axum::routing::delete(v2::worktree_remove),
+        )
+        .route(
+            "/experimental/worktree/reset",
+            axum::routing::post(v2::worktree_reset),
+        )
+        .route("/api/session/{sessionID}/event", get(v2::session_event))
+        .route(
+            "/project/{projectID}",
+            axum::routing::patch(v2::patch_project),
+        )
+        // Sync / integration / credential / upgrade (mostly cited or
+        // no-backend; freeze-probed shapes).
+        .route("/sync/start", axum::routing::post(v2::sync_start))
+        .route("/sync/replay", axum::routing::post(v2::sync_replay))
+        .route("/sync/history", axum::routing::post(v2::sync_history))
+        .route("/sync/steal", axum::routing::post(v2::sync_steal))
+        .route("/project/git/init", axum::routing::post(v2::git_init))
+        .route("/global/upgrade", axum::routing::post(v2::global_upgrade))
+        .route(
+            "/api/integration/{integrationID}/connect/key",
+            axum::routing::post(v2::integration_connect_key),
+        )
+        .route(
+            "/api/integration/{integrationID}/connect/oauth",
+            axum::routing::post(v2::integration_connect_oauth),
+        )
+        .route(
+            "/api/integration/attempt/{attemptID}",
+            get(v2::integration_attempt_get).delete(v2::integration_attempt_delete),
+        )
+        .route(
+            "/api/integration/attempt/{attemptID}/complete",
+            axum::routing::post(v2::integration_attempt_complete),
+        )
+        .route(
+            "/api/credential/{credentialID}",
+            axum::routing::patch(v2::credential_update).delete(v2::credential_remove),
+        )
+        .route(
+            "/experimental/control-plane/move-session",
+            axum::routing::post(v2::control_move_session),
+        )
+        .route(
+            "/experimental/project/{projectID}/copy",
+            axum::routing::post(v2::project_copy_create).delete(v2::project_copy_remove),
+        )
+        .route(
+            "/experimental/project/{projectID}/copy/generate-name",
+            axum::routing::post(v2::project_copy_generate_name),
+        )
+        .route(
+            "/experimental/project/{projectID}/copy/refresh",
+            axum::routing::post(v2::project_copy_refresh),
+        )
+        .route(
+            "/experimental/session/{sessionID}/background",
+            axum::routing::post(v2::session_background),
+        )
+        .route(
+            "/experimental/workspace/{id}",
+            axum::routing::delete(v2::workspace_delete),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -4709,5 +4970,32 @@ mod f5_wire {
         st.wire_off
             .store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(wire_json(&st, "config").is_some(), "on => Bytes path");
+    }
+}
+
+#[cfg(test)]
+mod doc_contract {
+    /// P0: `/doc` serves the vendored OpenAPI contract byte-for-byte; it must
+    /// be valid JSON with the expected shape (162 paths / 188 ops). This is the
+    /// oracle P4 validation and the P1 coverage guard read.
+    #[test]
+    fn spec_is_valid_and_complete() {
+        let d: serde_json::Value =
+            serde_json::from_str(crate::doc::SPEC_JSON).expect("vendored spec must be valid JSON");
+        assert_eq!(d["openapi"], "3.1.0");
+        let paths = d["paths"].as_object().expect("paths object");
+        assert_eq!(paths.len(), 162, "frozen 1.18.31 has 162 paths");
+        let ops: usize = paths
+            .values()
+            .map(|v| {
+                v.as_object()
+                    .unwrap()
+                    .keys()
+                    .filter(|k| matches!(k.as_str(), "get" | "post" | "put" | "delete" | "patch"))
+                    .count()
+            })
+            .sum();
+        assert_eq!(ops, 188, "frozen 1.18.31 has 188 operations");
+        assert!(d["components"]["schemas"].as_object().unwrap().len() >= 400);
     }
 }

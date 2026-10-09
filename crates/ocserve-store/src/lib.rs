@@ -1378,6 +1378,50 @@ pub fn prune_events(
     Ok(aged + capped)
 }
 
+/// Load a session's durable events (newest first, capped) projected to the v2
+/// `DurableEvent` shape: `{id,type,durable:{aggregateID,seq,version},data}`.
+/// ocserve persists the v1 event envelope; this is a faithful re-projection
+/// for `/api/session/{id}/history` (semantics are a subset of upstream's
+/// full event-sourcing — documented divergence).
+pub fn load_session_events(
+    db: &std::path::Path,
+    session_id: &str,
+    limit: i64,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let conn = pragma::open_reader(db)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT seq, type, payload, time_created FROM event \
+         WHERE session_id = ?1 ORDER BY seq DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map((session_id, limit), |r| {
+        let seq: i64 = r.get(0)?;
+        let ty: String = r.get(1)?;
+        let payload: String = r.get(2)?;
+        let _t: i64 = r.get(3)?;
+        Ok((seq, ty, payload))
+    })?;
+    let mut out = Vec::new();
+    for row in rows.flatten() {
+        let (seq, ty, payload) = row;
+        let data: serde_json::Value =
+            serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+        // The stored payload is the v1 event envelope; its `properties` carry
+        // the session-level event body when present. Fall back to the whole
+        // payload so clients always receive an object.
+        let body = data
+            .pointer("/properties")
+            .cloned()
+            .unwrap_or_else(|| data.clone());
+        out.push(serde_json::json!({
+            "id": format!("evt_{seq}"),
+            "type": ty,
+            "durable": {"aggregateID": session_id, "seq": seq, "version": 1},
+            "data": body,
+        }));
+    }
+    Ok(out)
+}
+
 /// Retention with the production bounds (boot + import + throttled append).
 pub fn enforce_event_retention(conn: &rusqlite::Connection) -> anyhow::Result<usize> {
     let now = std::time::SystemTime::now()

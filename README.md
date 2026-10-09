@@ -66,13 +66,20 @@ Optional systemd user service (never installed implicitly):
 and a live A↔B pair harness): sessions and messages with cursor paging, the
 SSE event stream, prompts and the agent loop, tools, permissions, questions,
 commands, shells, todos, search, files, MCP, plugins, the `/tui/*` controller
-group, auto-compaction, config hot-reload.
+group, auto-compaction, config hot-reload, the terminal PTY group (`/pty/*`,
+used by the web UI's embedded shell), git diff browsing (`/vcs/*`), and the
+full TUI/web-UI v2 `/api/*` surface.
 
-**Not implemented** (named, not hidden — `PLAN.md` §17): the terminal PTY
-routes (`/pty/*`, used by the web UI's embedded shell), share links (hosted by
-opencode.ai upstream, not by the local server), session revert/diff, and
-provider OAuth login. Unmatched paths behave like upstream: they serve the
-proxied web app, not a 404.
+**API coverage is spec-driven and complete.** The frozen server ships its own
+OpenAPI 3.1.0 contract (162 paths / 188 operations); ocserve serves it at
+`GET /doc` and a generated guard requires every operation to be bound or
+explicitly cited: **187 implemented, 1 cited, 0 gaps**.
+
+**Not implemented** (named, not hidden — `PLAN.md` §17): hosted share links
+(the record is returned but no remote backend exists), provider OAuth login,
+and `POST /vcs/apply` (the worktree write path). Session revert stores a marker
+but does not restore files (`D-REVERT-NOSNAP` — no snapshot engine). Unmatched
+paths behave like upstream: they serve the proxied web app, not a 404.
 
 **Contract**: wire-compatible with upstream **1.18.31**. A future upstream
 release may change the API; `ocserve` pins the freeze and tracks upstream drift

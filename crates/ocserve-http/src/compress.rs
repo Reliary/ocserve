@@ -85,7 +85,9 @@ fn consider(best: &mut Option<(Encoding, f32)>, enc: Encoding, q: f32) {
     // strictly higher q still wins.
     let better = match best {
         None => true,
-        Some((cur, bq)) => q > *bq || (q == *bq && *cur == Encoding::Gzip && enc == Encoding::Brotli),
+        Some((cur, bq)) => {
+            q > *bq || (q == *bq && *cur == Encoding::Gzip && enc == Encoding::Brotli)
+        }
     };
     if better {
         *best = Some((enc, q));
@@ -229,7 +231,10 @@ mod tests {
         assert_eq!(negotiate(Some("br")), Some(Encoding::Brotli));
         // br preferred on tie regardless of header order (quality tie-break)
         assert_eq!(negotiate(Some("br, gzip")), Some(Encoding::Brotli));
-        assert_eq!(negotiate(Some("gzip, deflate, br, zstd")), Some(Encoding::Brotli));
+        assert_eq!(
+            negotiate(Some("gzip, deflate, br, zstd")),
+            Some(Encoding::Brotli)
+        );
         // explicit q wins
         assert_eq!(
             negotiate(Some("br;q=0.5, gzip;q=1.0")),
