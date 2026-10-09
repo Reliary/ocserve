@@ -681,6 +681,11 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
         .await
         .with_context(|| format!("bind {addr} (port in use?)"))?;
     tracing::info!("ocserve serving on http://{addr} (freeze {FREEZE_VERSION})");
+    // Onboarding: name both client entry points the URL is good for, so a
+    // first-run user knows what to do with it (the port question came up
+    // twice in practice).
+    tracing::info!("  TUI:     opencode attach http://{addr}");
+    tracing::info!("  web UI:  open http://{addr}");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
