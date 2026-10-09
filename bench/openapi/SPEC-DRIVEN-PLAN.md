@@ -14,6 +14,13 @@ instead of hand-maintained route lists.
   falls through the UI catch-all to SPA HTML (same silent-failure class as the
   `/pty/shells` crash).
 
+## Status (2026-10-09): complete — 188 ops → 187 implemented, 1 cited, 0 gaps
+
+Guard rule 16 (generated) wired with planted control; `/doc` live; the real
+`opencode attach` acceptance passes with zero HTML-served routes. P4 (jsonschema
+validation) and P6's freeze-bundle default are tracked follow-ups; the route
+closure + guard + acceptance (the maintenance-collapse core) are done.
+
 ## Phases
 
 ### P0 — Contract + self-description
