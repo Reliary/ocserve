@@ -259,11 +259,13 @@ async fn permission_create_evaluates_ruleset() {
         default_agent: "build".into(),
     };
     // agent "build" allows all; agent "locked" denies edit.
-    let mut payloads = Payloads::default();
-    payloads.agent = vec![
-        serde_json::json!({"name":"build","permission":[{"permission":"*","pattern":"*","action":"allow"}]}),
-        serde_json::json!({"name":"locked","permission":[{"permission":"edit","pattern":"*","action":"deny"}]}),
-    ];
+    let payloads = Payloads {
+        agent: vec![
+            serde_json::json!({"name":"build","permission":[{"permission":"*","pattern":"*","action":"allow"}]}),
+            serde_json::json!({"name":"locked","permission":[{"permission":"edit","pattern":"*","action":"deny"}]}),
+        ],
+        ..Payloads::default()
+    };
     let st = AppState::with_wiring(
         None,
         payloads,

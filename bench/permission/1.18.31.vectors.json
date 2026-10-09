@@ -1,0 +1,150 @@
+{
+ "note": "permission oracle vectors \u2014 never hand-edit",
+ "source": "generated from http://127.0.0.1:5168 by gen-vectors.py (warm-up gated)",
+ "vectors": [
+  {
+   "action": "read",
+   "agent": "build",
+   "effect": "allow",
+   "resources": [
+    "src/main.rs"
+   ]
+  },
+  {
+   "action": "read",
+   "agent": "build",
+   "effect": "allow",
+   "resources": [
+    "secrets.env"
+   ]
+  },
+  {
+   "action": "read",
+   "agent": "build",
+   "effect": "allow",
+   "resources": [
+    ".env.local"
+   ]
+  },
+  {
+   "action": "read",
+   "agent": "build",
+   "effect": "allow",
+   "resources": [
+    ".env.example"
+   ]
+  },
+  {
+   "action": "edit",
+   "agent": "build",
+   "effect": "ask",
+   "resources": [
+    "src/main.rs"
+   ]
+  },
+  {
+   "action": "edit",
+   "agent": "build",
+   "effect": "ask",
+   "resources": [
+    "/etc/passwd"
+   ]
+  },
+  {
+   "action": "bash",
+   "agent": "build",
+   "effect": "ask",
+   "resources": [
+    "git status"
+   ]
+  },
+  {
+   "action": "bash",
+   "agent": "build",
+   "effect": "ask",
+   "resources": [
+    "rm -rf /"
+   ]
+  },
+  {
+   "action": "glob",
+   "agent": "build",
+   "effect": "allow",
+   "resources": [
+    "**/*.rs"
+   ]
+  },
+  {
+   "action": "grep",
+   "agent": "build",
+   "effect": "allow",
+   "resources": [
+    "TODO"
+   ]
+  },
+  {
+   "action": "webfetch",
+   "agent": "build",
+   "effect": "deny",
+   "resources": [
+    "https://example.com"
+   ]
+  },
+  {
+   "action": "todowrite",
+   "agent": "build",
+   "effect": "allow",
+   "resources": [
+    "*"
+   ]
+  },
+  {
+   "action": "external_directory",
+   "agent": "build",
+   "effect": "ask",
+   "resources": [
+    "/etc/*"
+   ]
+  },
+  {
+   "action": "unknown_tool_xyz",
+   "agent": "build",
+   "effect": "allow",
+   "resources": [
+    "*"
+   ]
+  },
+  {
+   "action": "edit",
+   "agent": "plan",
+   "effect": "ask",
+   "resources": [
+    "src/main.rs"
+   ]
+  },
+  {
+   "action": "bash",
+   "agent": "plan",
+   "effect": "ask",
+   "resources": [
+    "ls"
+   ]
+  },
+  {
+   "action": "edit",
+   "agent": "general",
+   "effect": "ask",
+   "resources": [
+    "src/main.rs"
+   ]
+  },
+  {
+   "action": "read",
+   "agent": "general",
+   "effect": "allow",
+   "resources": [
+    "src/main.rs"
+   ]
+  }
+ ]
+}

@@ -7,6 +7,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
+pub mod bash_patterns;
+pub mod permission_asks;
+
 /// v1 Wildcard.match: glob → regex, `\`→`/`, trailing " *" tail optional.
 pub fn wildcard_match(s: &str, pattern: &str) -> bool {
     let s = s.replace('\\', "/");

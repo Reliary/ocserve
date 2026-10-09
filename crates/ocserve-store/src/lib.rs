@@ -1655,9 +1655,8 @@ pub fn persist_prompt_model(
     }])
 }
 
-/// Persisted "always" permission keys for a session (column `permission`,
-/// JSON array of the gate's `"<permission>:<resource>"` keys). Missing row
-/// or column → empty (callers treat missing session as "no grants").
+/// Persisted "always" grants for a session (column `permission`, JSON array of
+/// `"<permission>\t<pattern>"` strings). Missing row/column → empty.
 pub fn session_always_keys(db: &std::path::Path, session_id: &str) -> anyhow::Result<Vec<String>> {
     let conn = pragma::open_reader(db)?;
     let raw: Option<Option<String>> = conn
@@ -1673,18 +1672,22 @@ pub fn session_always_keys(db: &std::path::Path, session_id: &str) -> anyhow::Re
     }
 }
 
-/// Append a granted-always key (idempotent; prompt lock serializes writers).
+/// Append a granted-always rule (idempotent; prompt lock serializes writers).
+/// Stored as `"<permission>\t<pattern>"` (tab keeps patterns with spaces, e.g.
+/// `git status *`, unambiguous).
 pub fn session_grant_always(
     writer: &Writer,
     db: &std::path::Path,
     session_id: &str,
-    key: &str,
+    permission: &str,
+    pattern: &str,
 ) -> anyhow::Result<()> {
+    let key = format!("{permission}\t{pattern}");
     let mut keys = session_always_keys(db, session_id)?;
-    if keys.iter().any(|k| k == key) {
+    if keys.iter().any(|k| k == &key) {
         return Ok(());
     }
-    keys.push(key.to_string());
+    keys.push(key);
     writer.write(vec![WriteOp::Sql {
         sql: "UPDATE session SET permission = ?2 WHERE id = ?1".into(),
         params: vec![session_id.into(), serde_json::to_string(&keys)?.into()],

@@ -67,6 +67,19 @@ pub fn asks_enabled() -> bool {
     )
 }
 
+/// Whether a hard permission deny stops the turn. Upstream stops on deny
+/// unless `experimental.continue_loop_on_deny` is true (processor.ts:647
+/// `ctx.shouldBreak = … !== true`). ocserve mirrors the default (stop) with a
+/// kill switch: OCSERVE_CONTINUE_ON_DENY=1 keeps the loop going.
+pub fn deny_blocks_turn() -> bool {
+    !matches!(
+        std::env::var("OCSERVE_CONTINUE_ON_DENY")
+            .unwrap_or_default()
+            .as_str(),
+        "1" | "on" | "true"
+    )
+}
+
 /// Normalized input key for a raw tool-call arguments JSON string.
 /// Invalid JSON degrades to the raw string (still a valid equality key).
 pub fn input_key(arguments: &str) -> String {

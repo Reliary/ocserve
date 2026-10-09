@@ -196,4 +196,39 @@ else
   echo "ok (no embedded app pack)"
 fi
 
+echo "== guard: permission oracle vectors present + self-consistent (rule 18) =="
+# Behavioural layer: route-binding (16) and shape (P4) cannot see authorization
+# SEMANTICS. The differential itself (freeze↔ocserve) runs in
+# scripts/permission-check.sh (boots both arms); this static check guarantees
+# the committed vectors + fixture exist and the vectors are well-formed, so the
+# differential can never silently no-op. Planted control: malformed vectors → red.
+if [ -f bench/permission/1.18.31.vectors.json ]; then
+  if out=$(python3 - <<'PY' 2>&1
+import json, sys
+try:
+    d = json.load(open("bench/permission/1.18.31.vectors.json"))
+except Exception as e:
+    sys.exit(f"vectors unreadable: {e}")
+v = d.get("vectors")
+if not isinstance(v, list) or len(v) < 10:
+    sys.exit("vectors missing or too few")
+for row in v:
+    if set(row) != {"agent", "action", "resources", "effect"}:
+        sys.exit(f"malformed vector: {row}")
+    if row["effect"] not in ("allow", "ask", "deny"):
+        sys.exit(f"bad effect: {row}")
+import os
+if not os.path.isfile("bench/permission/config/opencode.json"):
+    sys.exit("fixture config missing")
+print(f"ok ({len(v)} vectors)")
+PY
+); then
+    echo "$out"
+  else
+    echo "$out"; echo "FAIL: permission vectors malformed/missing (rule 18)"; fail=1
+  fi
+else
+  echo "ok (no permission vectors)"
+fi
+
 exit $fail

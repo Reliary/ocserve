@@ -204,12 +204,12 @@ fn persisted_always_grants_roundtrip_and_retag_gates_on_default_title() {
     .unwrap();
 
     // grant: idempotent append, JSON roundtrip
-    ocserve_store::session_grant_always(&writer, &db, "ses_a", "bash:echo hi").unwrap();
-    ocserve_store::session_grant_always(&writer, &db, "ses_a", "bash:echo hi").unwrap();
-    ocserve_store::session_grant_always(&writer, &db, "ses_a", "edit:*").unwrap();
+    ocserve_store::session_grant_always(&writer, &db, "ses_a", "bash", "echo hi *").unwrap();
+    ocserve_store::session_grant_always(&writer, &db, "ses_a", "bash", "echo hi *").unwrap();
+    ocserve_store::session_grant_always(&writer, &db, "ses_a", "edit", "*").unwrap();
     let keys = ocserve_store::session_always_keys(&db, "ses_a").unwrap();
     assert_eq!(keys.len(), 2, "idempotent: {keys:?}");
-    assert!(keys.contains(&"bash:echo hi".to_string()));
+    assert!(keys.iter().any(|k| k.starts_with("bash\t")));
     assert!(
         ocserve_store::session_always_keys(&db, "ses_missing")
             .unwrap()
@@ -550,8 +550,10 @@ async fn round_cap_fails_loud_session_error_stopped_part_metric_and_persisted_gr
     );
     let fresh = ocserve_core::permission::PermissionGate::new();
     fresh.hydrate(&st.db, "ses_cap000000000001").unwrap();
+    // keys are "<permission>\t<pattern>"; the hydrated gate covers the pattern.
+    let (perm, pat) = keys[0].split_once('\t').expect("tab-format key");
     assert!(
-        fresh.check_always("ses_cap000000000001", &keys[0]),
+        fresh.check_always("ses_cap000000000001", perm, pat),
         "hydrated gate must consult the persisted grant"
     );
 

@@ -140,11 +140,12 @@ async fn loop_guard_ask(
         seq,
     )?;
     if reply == "always" {
-        let key = format!("doom_loop:{tool}");
-        ctx.gate.grant_always(session_id, &key);
+        ctx.gate.grant_always(session_id, "doom_loop", tool);
         // K-ALWAYS: persist past restart (memory stays the fast path)
-        if let Err(e) = ocserve_store::session_grant_always(writer, &ctx.db, session_id, &key) {
-            tracing::error!("persist always grant {key}: {e:#}");
+        if let Err(e) =
+            ocserve_store::session_grant_always(writer, &ctx.db, session_id, "doom_loop", tool)
+        {
+            tracing::error!("persist always grant doom_loop:{tool}: {e:#}");
         }
     }
     Ok(reply == "once" || reply == "always")
@@ -1053,7 +1054,6 @@ pub async fn run_prompt_with(
 
                 let mut provider_tool_results = Vec::new();
                 for call in &tool_calls {
-                    let resource = permission_resource(&call.name, &call.arguments);
                     let part_id = prt_id();
                     let mut running = json!({
                         "type": "tool", "id": part_id,
@@ -1133,66 +1133,135 @@ pub async fn run_prompt_with(
                         continue;
                     }
 
-                    // ---- permission gate ----
-                    let key = format!("{}:{}", call.name, resource);
-                    let effect = if ctx.gate.check_always(session_id, &key) {
-                        "allow".to_string()
-                    } else {
-                        ocserve_tools::evaluate(&call.name, &resource, &ctx.rules)
-                    };
-                    let mut allowed = effect == "allow";
-                    // hoisted so the trust observe below (post-branch) can see it
+                    // ---- permission gate (ordered ask sequence) ----
+                    // Upstream tools call ctx.ask() zero-or-more times before
+                    // executing; each ask is evaluated against the agent rules
+                    // plus this session's "always" grants. deny → blocked;
+                    // ask → emit + await reply (once/always/reject); always →
+                    // grant the ask's `always` patterns as wildcard rules.
                     let builtin = ocserve_tools::schemas()
                         .iter()
                         .any(|s| s["function"]["name"] == call.name);
-                    if effect == "ask" {
-                        let perm_id = crate::ids::evt_id(); // 26-char request id
-                        let request = json!({
-                            "id": perm_id,
-                            "sessionID": session_id,
-                            "action": call.name,
-                            "resource": resource,
-                            "patterns": [resource],
-                            "always": [resource],
-                            "metadata": {},
-                            "tool": {"messageID": assistant_id, "callID": call.id},
-                        });
-                        let (rx, _perm_guard) =
-                            ctx.gate.clone().register(&perm_id, request.clone());
-                        emit_durable(
-                            ctx,
-                            writer,
-                            session_id,
-                            "permission.asked",
-                            json!({
-                                "sessionID": session_id,
-                                "id": perm_id,
-                                "permission": call.name,
-                                "patterns": [resource],
-                                "always": [resource],
-                                "metadata": {},
-                                "tool": {"messageID": assistant_id, "callID": call.id},
-                            }),
-                            &mut seq,
-                        )?;
-                        let reply = ctx.gate.wait(&perm_id, rx).await;
-                        emit_durable(
-                            ctx,
-                            writer,
-                            session_id,
-                            "permission.replied",
-                            json!({"sessionID": session_id, "requestID": perm_id}),
-                            &mut seq,
-                        )?;
-                        allowed = reply == "once" || reply == "always";
-                        if reply == "always" {
-                            ctx.gate.grant_always(session_id, &key);
-                            // K-ALWAYS: persist past restart
-                            if let Err(e) = ocserve_store::session_grant_always(
-                                writer, &ctx.db, session_id, &key,
-                            ) {
-                                tracing::error!("persist always grant {key}: {e:#}");
+                    let input_value: serde_json::Value =
+                        serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
+                    let asks = ocserve_tools::permission_asks::asks_for(
+                        &call.name,
+                        &input_value,
+                        std::path::Path::new(&ctx.directory),
+                    );
+                    let mut allowed = true;
+                    let mut denied = false;
+                    for ask in &asks {
+                        // granted-always short-circuits the ask
+                        let effect = if ask
+                            .patterns
+                            .iter()
+                            .all(|p| ctx.gate.check_always(session_id, &ask.permission, p))
+                        {
+                            "allow"
+                        } else {
+                            let mut eff = "allow";
+                            for p in &ask.patterns {
+                                match ocserve_tools::evaluate(&ask.permission, p, &ctx.rules)
+                                    .as_str()
+                                {
+                                    "deny" => {
+                                        eff = "deny";
+                                        break;
+                                    }
+                                    "ask" if eff != "deny" => eff = "ask",
+                                    _ => {}
+                                }
                             }
+                            eff
+                        };
+                        if effect == "deny" {
+                            denied = true;
+                            allowed = false;
+                            break;
+                        }
+                        if effect == "ask" {
+                            let perm_id = crate::ids::evt_id();
+                            let request = json!({
+                                "id": perm_id,
+                                "sessionID": session_id,
+                                "action": ask.permission,
+                                "resource": ask.patterns.first().cloned().unwrap_or_default(),
+                                "patterns": ask.patterns,
+                                "always": ask.always,
+                                "metadata": ask.metadata,
+                                "tool": {"messageID": assistant_id, "callID": call.id},
+                            });
+                            let (rx, _perm_guard) =
+                                ctx.gate.clone().register(&perm_id, request.clone());
+                            emit_durable(
+                                ctx,
+                                writer,
+                                session_id,
+                                "permission.asked",
+                                json!({
+                                    "sessionID": session_id,
+                                    "id": perm_id,
+                                    "permission": ask.permission,
+                                    "patterns": ask.patterns,
+                                    "always": ask.always,
+                                    "metadata": ask.metadata,
+                                    "tool": {"messageID": assistant_id, "callID": call.id},
+                                }),
+                                &mut seq,
+                            )?;
+                            let reply = ctx.gate.wait(&perm_id, rx).await;
+                            emit_durable(
+                                ctx,
+                                writer,
+                                session_id,
+                                "permission.replied",
+                                json!({"sessionID": session_id, "requestID": perm_id}),
+                                &mut seq,
+                            )?;
+                            if reply == "reject" {
+                                allowed = false;
+                                break;
+                            }
+                            if reply == "always" {
+                                for pat in &ask.always {
+                                    ctx.gate.grant_always(session_id, &ask.permission, pat);
+                                    // K-ALWAYS: persist past restart
+                                    if let Err(e) = ocserve_store::session_grant_always(
+                                        writer,
+                                        &ctx.db,
+                                        session_id,
+                                        &ask.permission,
+                                        pat,
+                                    ) {
+                                        tracing::error!(
+                                            "persist always grant {}:{pat}: {e:#}",
+                                            ask.permission
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if denied {
+                        // upstream: a hard deny throws → the turn is blocked
+                        // (processor.ts ctx.blocked = shouldBreak).
+                        if crate::loop_guard::deny_blocks_turn() {
+                            emit_durable(
+                                ctx,
+                                writer,
+                                session_id,
+                                "message.part.updated",
+                                json!({"sessionID": session_id, "part": {
+                                    "type": "tool", "id": prt_id(),
+                                    "sessionID": session_id, "messageID": assistant_id,
+                                    "callID": call.id, "tool": call.name,
+                                    "state": {"status": "error", "input": input_value,
+                                        "error": "Permission denied", "time": {"start": now_ms(), "end": now_ms()}},
+                                }}),
+                                &mut seq,
+                            )?;
+                            anyhow::bail!("tool {} denied by permission rules", call.name);
                         }
                     }
 
@@ -1970,23 +2039,6 @@ async fn question_tool_state(
             "time": {"start": ask_start, "end": now_ms()},
         }),
     ))
-}
-
-/// Permission resource per tool (v1: fs tools → path, bash → command).
-fn permission_resource(tool: &str, arguments: &str) -> String {
-    let Ok(v) = serde_json::from_str::<Value>(arguments) else {
-        return "*".to_string();
-    };
-    match tool {
-        "bash" => v["command"].as_str().unwrap_or("*").to_string(),
-        "read" | "write" | "edit" => v["filePath"].as_str().unwrap_or("*").to_string(),
-        "glob" | "grep" => v["path"]
-            .as_str()
-            .or_else(|| v["pattern"].as_str())
-            .unwrap_or("*")
-            .to_string(),
-        _ => "*".to_string(),
-    }
 }
 
 fn compute_cost(pricing: &Option<(f64, f64, f64)>, u: &Usage) -> f64 {
