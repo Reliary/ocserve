@@ -11,6 +11,8 @@ mutants.out.old/
 
 # stray tool caches (never commit)
 .wrangler/
+__pycache__/
+*.pyc
 
 # session-data backups (never commit)
 .safety/

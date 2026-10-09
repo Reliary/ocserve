@@ -129,3 +129,48 @@ fn unfinished_summary_finish_null_stays_ready() {
         "unfinished summary must not exit the loop"
     );
 }
+
+/// session_wire_with (2026-10-09 TUI crash fix): the `session.updated` event
+/// body must be the FULL session merged with overrides, so it never drops
+/// required keys. A `{time:{updated}}` override must DEEP-merge (keep
+/// `created`), and a mid-prompt `{cost,tokens}` override must not clobber
+/// `title`/`slug`.
+#[test]
+fn session_wire_with_merges_full_session() {
+    let (_dir, db, _w) = fixture("wiremerge");
+
+    // full session with no override
+    let full = ocserve_store::session_wire_with(&db, "ses_wiremerge", serde_json::json!({}))
+        .unwrap()
+        .expect("session exists");
+    for k in ["slug", "projectID", "directory", "title", "version", "time"] {
+        assert!(full.get(k).is_some(), "required key {k} present: {full}");
+    }
+
+    // time override deep-merges (created kept)
+    let with_t = ocserve_store::session_wire_with(
+        &db,
+        "ses_wiremerge",
+        serde_json::json!({"time": {"updated": 99}}),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(with_t["time"]["created"], 1, "created kept: {with_t}");
+    assert_eq!(with_t["time"]["updated"], 99);
+    assert_eq!(with_t["title"], "wiremerge", "title not clobbered");
+
+    // cost override keeps identity keys
+    let with_c =
+        ocserve_store::session_wire_with(&db, "ses_wiremerge", serde_json::json!({"cost": 1.5}))
+            .unwrap()
+            .unwrap();
+    assert_eq!(with_c["cost"], 1.5);
+    assert!(with_c.get("slug").is_some());
+
+    // missing session → None
+    assert!(
+        ocserve_store::session_wire_with(&db, "ses_missing", serde_json::json!({}))
+            .unwrap()
+            .is_none()
+    );
+}

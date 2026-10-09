@@ -1512,6 +1512,41 @@ pub fn insert_session(writer: &Writer, info: &serde_json::Value) -> anyhow::Resu
     Ok(())
 }
 
+/// Full session wire object merged with `overrides` (upstream `patch()`:
+/// `{...current, ...info}`). Used by every `session.updated` emit so the event
+/// ALWAYS carries the full Session (spec: required id/slug/projectID/directory/
+/// title/version/time) — a partial `info` merges into client stores and crashes
+/// renderers that read `title`/`time` (TUI `r.title.length`, 2026-10-09).
+///
+/// `overrides` supplies values not yet persisted (mid-prompt cost/tokens land
+/// on the row only at finalize). `time` is deep-merged (upstream
+/// `{...current.time, ...info.time}`) so a `{updated}` override keeps
+/// `created`. Missing session → `None`.
+pub fn session_wire_with(
+    db: &std::path::Path,
+    session_id: &str,
+    overrides: serde_json::Value,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let Some(mut base) = load_session_wire(db, session_id)? else {
+        return Ok(None);
+    };
+    if let (serde_json::Value::Object(b), serde_json::Value::Object(o)) = (&mut base, overrides) {
+        for (k, v) in o {
+            if k == "time"
+                && let (Some(serde_json::Value::Object(bt)), serde_json::Value::Object(ot)) =
+                    (b.get_mut("time"), &v)
+            {
+                for (tk, tv) in ot {
+                    bt.insert(tk.clone(), tv.clone());
+                }
+                continue;
+            }
+            b.insert(k, v);
+        }
+    }
+    Ok(Some(base))
+}
+
 /// One session in upstream wire shape (list schema — always includes agent/
 /// model/summary keys, null when unset; create-response is a leaner shape).
 pub fn load_session_wire(

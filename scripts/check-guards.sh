@@ -37,6 +37,11 @@
 #      config — the behavioural differential (scripts/permission-check.sh) can
 #      never silently no-op (route-binding/shape guards cannot see authz
 #      semantics; the 2026-10-09 hardcoded-allow v2 bug)
+#  19. the event-payload validator (bench/events/event-validate.py) is
+#      non-vacuous — its selftest plants malformed payloads (partial
+#      session.updated, part.updated missing `time`, bad permission id) and
+#      must flag them. The live-DB scan runs in nightly (historical pre-fix
+#      events would otherwise red the commit gate for an already-fixed bug).
 #   7. exact assertions on process-global counters inside src/ (in-crate unit
 #      tests run in one parallel process and race — the reader_opens flake of
 #      2026-10-05; such tests belong in tests/ where they own the process)
@@ -236,6 +241,21 @@ PY
   fi
 else
   echo "ok (no permission vectors)"
+fi
+
+echo "== guard: event-payload validator is non-vacuous (rule 19) =="
+# Event-surface layer: rule 16 (binding) and P4 (JSON 200 bodies) cannot see
+# the SSE/event stream, where the 2026-10-09 TUI crash lived (partial
+# session.updated → r.title.length TypeError). The validator selftest plants
+# malformed payloads (partial session.updated, part.updated missing `time`,
+# bad permission id) and asserts they are flagged — so the gate is deterministic
+# and can never pass vacuously. The live-DB scan (historical + new events) runs
+# in nightly, not here: pre-fix events live in the log and would red the commit
+# gate for a bug that is already fixed at the source.
+if python3 bench/events/event-validate-selftest.py >/dev/null 2>&1; then
+  echo "ok (validator selftest: malformed payloads flagged)"
+else
+  echo "FAIL: event-validate selftest (validator is vacuous/broken)"; fail=1
 fi
 
 exit $fail

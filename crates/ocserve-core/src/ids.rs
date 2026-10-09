@@ -39,6 +39,15 @@ pub fn que_id() -> String {
     format!("que_{}", encode(ms, &nonce[..8]))
 }
 
+/// Permission request id (v1 PermissionID: `per_` +26 chars). Events must carry
+/// the `per_` id — the spec pattern `^per` and clients key on it (2026-10-09:
+/// ocserve emitted `evt_` ids, failing the event-shape guard).
+pub fn per_id() -> String {
+    let ms = now_ms();
+    let nonce: Vec<u8> = std::iter::repeat_with(rand_byte).take(8).collect();
+    format!("per_{}", encode(ms, &nonce[..8]))
+}
+
 /// Upstream `Identifier.ascending()` tail: 13 hex chars = ms*4096+counter
 /// encoded big-endian in 6 bytes; +12 random base62. Used for pty_ ids
 /// (schema/src/identifier.ts, procced live 2026-10-08).

@@ -69,6 +69,20 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Project an assistant message's `tokens` into the Session `tokens` shape
+/// (Session.tokens has no `total`; additionalProperties:false).
+pub(crate) fn session_tokens(t: Value) -> Value {
+    json!({
+        "input": t.get("input").cloned().unwrap_or(json!(0)),
+        "output": t.get("output").cloned().unwrap_or(json!(0)),
+        "reasoning": t.get("reasoning").cloned().unwrap_or(json!(0)),
+        "cache": {
+            "read": t.pointer("/cache/read").cloned().unwrap_or(json!(0)),
+            "write": t.pointer("/cache/write").cloned().unwrap_or(json!(0)),
+        },
+    })
+}
+
 /// Emit a durable event: persist to ring, publish plain frame + sync twin.
 /// `seq` is a session-local counter seeded once (avoids re-opening readers).
 pub(crate) fn emit_durable(
@@ -79,6 +93,9 @@ pub(crate) fn emit_durable(
     properties: Value,
     seq: &mut i64,
 ) -> Result<()> {
+    // normalize ONCE so the persisted payload and every published frame agree
+    // (the event-log validator reads the persisted copy).
+    let properties = crate::event::normalize_props(event_type, properties);
     ocserve_store::append_event(writer, Some(session_id), event_type, &properties)?;
     ocserve_metrics::labeled_counter(
         "ocserve_events_emitted_total",
@@ -99,6 +116,39 @@ pub(crate) fn emit_durable(
     Ok(())
 }
 
+/// Emit `session.updated` with the FULL session merged with `overrides`
+/// (upstream `patch()`: `{...current, ...info}`). The event MUST carry a
+/// complete Session — a partial `info` merges into client stores and crashes
+/// renderers that read `title` (TUI `r.title.length`, 2026-10-09). `overrides`
+/// carries mid-prompt values not yet persisted (cost/tokens land at finalize).
+pub(crate) fn emit_session_updated(
+    ctx: &PromptContext,
+    writer: &ocserve_store::Writer,
+    session_id: &str,
+    overrides: Value,
+    seq: &mut i64,
+) -> Result<()> {
+    let info = match ocserve_store::session_wire_with(&ctx.db, session_id, overrides) {
+        Ok(Some(full)) => full,
+        // Session row missing (deleted mid-turn): emit the partial rather than
+        // nothing — a `session.deleted` should be the authoritative signal, and
+        // a shape guard would flag a missing title if this path is ever hit.
+        Ok(None) => json!({"id": session_id}),
+        Err(e) => {
+            tracing::warn!("session_wire_with({session_id}): {e:#}");
+            json!({"id": session_id})
+        }
+    };
+    emit_durable(
+        ctx,
+        writer,
+        session_id,
+        "session.updated",
+        json!({"sessionID": session_id, "info": info}),
+        seq,
+    )
+}
+
 /// Loop-guard permission rendezvous (D1/P1b): same durable event shape as
 /// the normal permission ask but `action="doom_loop"` (upstream's permission
 /// name, processor.ts:373) with additive metadata.class. Returns true when
@@ -115,7 +165,7 @@ async fn loop_guard_ask(
     call_id: &str,
     seq: &mut i64,
 ) -> Result<bool> {
-    let perm_id = crate::ids::evt_id();
+    let perm_id = crate::ids::per_id();
     // exact shape the live normal ask emits (permission/patterns/always/
     // metadata/tool) — oc-remote's parser consumes this shape proven M2b;
     // upstream's permission name for the doom case is `doom_loop`
@@ -136,7 +186,8 @@ async fn loop_guard_ask(
         writer,
         session_id,
         "permission.replied",
-        json!({"sessionID": session_id, "requestID": perm_id}),
+        // spec: {sessionID, requestID, reply} — reply is required
+        json!({"sessionID": session_id, "requestID": perm_id, "reply": reply}),
         seq,
     )?;
     if reply == "always" {
@@ -556,18 +607,13 @@ pub async fn run_prompt_with(
         .context("persist user message")?;
     }
 
-    emit_durable(
+    emit_session_updated(
         ctx,
         writer,
         session_id,
-        "session.updated",
         json!({
-            "sessionID": session_id,
-            "info": {
-                "id": session_id,
-                "model": {"id": model, "providerID": ctx.provider_id, "variant": "default"},
-                "agent": agent,
-            },
+            "model": {"id": model, "providerID": ctx.provider_id, "variant": "default"},
+            "agent": agent,
         }),
         &mut seq,
     )?;
@@ -1181,12 +1227,11 @@ pub async fn run_prompt_with(
                             break;
                         }
                         if effect == "ask" {
-                            let perm_id = crate::ids::evt_id();
+                            let perm_id = crate::ids::per_id();
                             let request = json!({
                                 "id": perm_id,
                                 "sessionID": session_id,
-                                "action": ask.permission,
-                                "resource": ask.patterns.first().cloned().unwrap_or_default(),
+                                "permission": ask.permission,
                                 "patterns": ask.patterns,
                                 "always": ask.always,
                                 "metadata": ask.metadata,
@@ -1199,15 +1244,7 @@ pub async fn run_prompt_with(
                                 writer,
                                 session_id,
                                 "permission.asked",
-                                json!({
-                                    "sessionID": session_id,
-                                    "id": perm_id,
-                                    "permission": ask.permission,
-                                    "patterns": ask.patterns,
-                                    "always": ask.always,
-                                    "metadata": ask.metadata,
-                                    "tool": {"messageID": assistant_id, "callID": call.id},
-                                }),
+                                request.clone(),
                                 &mut seq,
                             )?;
                             let reply = ctx.gate.wait(&perm_id, rx).await;
@@ -1216,7 +1253,7 @@ pub async fn run_prompt_with(
                                 writer,
                                 session_id,
                                 "permission.replied",
-                                json!({"sessionID": session_id, "requestID": perm_id}),
+                                json!({"sessionID": session_id, "requestID": perm_id, "reply": reply}),
                                 &mut seq,
                             )?;
                             if reply == "reject" {
@@ -1594,15 +1631,11 @@ pub async fn run_prompt_with(
                     json!({"sessionID": session_id, "info": step_info}),
                     &mut seq,
                 )?;
-                emit_durable(
+                emit_session_updated(
                     ctx,
                     writer,
                     session_id,
-                    "session.updated",
-                    json!({
-                        "sessionID": session_id,
-                        "info": {"id": session_id, "cost": total_cost, "time": {"updated": t_done}},
-                    }),
+                    json!({"cost": total_cost, "time": {"updated": t_done}}),
                     &mut seq,
                 )?;
 
@@ -1714,19 +1747,16 @@ pub async fn run_prompt_with(
                 json!({"sessionID": session_id, "info": assistant_info}),
                 &mut seq,
             )?;
-            emit_durable(
+            emit_session_updated(
                 ctx,
                 writer,
                 session_id,
-                "session.updated",
                 json!({
-                    "sessionID": session_id,
-                    "info": {
-                        "id": session_id,
-                        "cost": total_cost,
-                        "tokens": assistant_info["tokens"],
-                        "time": {"updated": t_done},
-                    },
+                    "cost": total_cost,
+                    // Session.tokens has NO `total` (additionalProperties:false);
+                    // the assistant message's tokens do. Project the session shape.
+                    "tokens": session_tokens(assistant_info["tokens"].clone()),
+                    "time": {"updated": t_done},
                 }),
                 &mut seq,
             )?;
@@ -1891,10 +1921,16 @@ fn auto_retag(ctx: &PromptContext, writer: &ocserve_store::Writer, sid: &str) {
     };
     match ocserve_store::retag_default_title(writer, sid, &title) {
         Ok(true) => {
+            // full session (not the old partial {id,title}) — clients merge
+            // the event into their store; a partial would drop required keys.
+            let info = ocserve_store::session_wire_with(&ctx.db, sid, json!({"title": title}))
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| json!({"id": sid, "title": title}));
             ctx.bus.publish(frame(
                 &ctx.directory,
                 "session.updated",
-                json!({"sessionID": sid, "info": {"id": sid, "title": title}}),
+                json!({"sessionID": sid, "info": info}),
             ));
         }
         Ok(false) => {} // named by the user already — never overwrite
@@ -1905,8 +1941,8 @@ fn auto_retag(ctx: &PromptContext, writer: &ocserve_store::Writer, sid: &str) {
 /// K-AUTONOMY surfacing for EVERY async/sync run failure (the "just
 /// stopped, no error" class): durable `[turn stopped]` part on the last
 /// assistant message (+ finalize when it was incomplete), durable
-/// session.error (oc-remote toast — shape matches the proven
-/// emit_session_error_event: name + message + data.message), live idle trio
+/// session.error (oc-remote toast — shape matches the spec
+/// EventSessionError: `{name, data:{message}}`), live idle trio
 /// so status consumers settle (may repeat the post-loop emits on
 /// break-path deaths — idempotent events).
 async fn surface_run_failure(
@@ -1937,8 +1973,7 @@ async fn surface_run_failure(
         "session.error",
         json!({
             "sessionID": sid,
-            "error": {"name": "UnknownError", "message": short,
-                      "data": {"message": short}}
+            "error": {"name": "UnknownError", "data": {"message": short}}
         }),
         &mut eseq,
     ) {

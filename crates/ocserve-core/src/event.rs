@@ -263,9 +263,33 @@ pub fn frame(directory: &str, event_type: &str, properties: Value) -> Value {
         "payload": {
             "id": crate::ids::evt_id(),
             "type": event_type,
-            "properties": properties
+            "properties": normalize_props(event_type, properties)
         }
     })
+}
+
+/// Normalize event `properties` to satisfy the frozen contract's required
+/// fields for the event type — a single choke point so no emitter can ship a
+/// spec-violating payload (the 2026-10-09 TUI crash class: `part.updated`
+/// omitted the required `time`). Idempotent: existing values win.
+///
+/// Only fields the spec marks required but that ocserve does not otherwise
+/// carry are injected here; everything else is the emitter's responsibility
+/// (and is checked by `bench/events/event-validate.py`, guard rule 19).
+pub fn normalize_props(event_type: &str, mut props: Value) -> Value {
+    let base = event_type.strip_suffix(".1").unwrap_or(event_type);
+    // v1 `message.part.updated` requires {sessionID, part, time}.
+    if base == "message.part.updated"
+        && props.get("time").is_none()
+        && let Value::Object(m) = &mut props
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        m.insert("time".into(), json!(now));
+    }
+    props
 }
 
 /// Encode a sync-twin frame (EventReducer consumption): the payload is a
@@ -306,6 +330,30 @@ mod tests {
         assert_eq!(f["payload"]["type"], "session.idle");
         assert_eq!(f["payload"]["properties"]["sessionID"], "ses_1");
         assert!(f["payload"]["id"].as_str().unwrap().starts_with("evt_"));
+    }
+
+    /// normalize_props injects the required `time` on message.part.updated
+    /// (spec Event.message.part.updated requires {sessionID, part, time});
+    /// ocserve omitted it → the 2026-10-09 TUI crash class. Idempotent.
+    #[test]
+    fn normalize_injects_part_time() {
+        let p = normalize_props(
+            "message.part.updated",
+            json!({"sessionID": "ses_1", "part": {"id": "prt_1"}}),
+        );
+        assert!(p["time"].is_number(), "time injected: {p}");
+        // idempotent: an existing time wins
+        let p2 = normalize_props(
+            "message.part.updated",
+            json!({"sessionID": "ses_1", "part": {}, "time": 7}),
+        );
+        assert_eq!(p2["time"], 7);
+        // sync twin suffix resolves to the same base type
+        let p3 = normalize_props("message.part.updated.1", json!({"part": {}}));
+        assert!(p3["time"].is_number());
+        // other types untouched
+        let p4 = normalize_props("session.idle", json!({"sessionID": "ses_1"}));
+        assert!(p4.get("time").is_none());
     }
 
     #[test]

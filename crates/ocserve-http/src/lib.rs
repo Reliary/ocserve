@@ -2349,18 +2349,20 @@ async fn provider_auth_methods(State(st): State<Arc<AppState>>) -> Json<Value> {
 /// client state) + payload reload. Divergence: no instance registry
 /// (TESTING §1.6).
 async fn global_dispose(State(st): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
-    ocserve_store::append_event(&st.writer, None, "server.instance.disposed", &json!({})).map_err(
+    // spec Event.server.instance.disposed.properties: {directory} (required).
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let props = json!({"directory": dir});
+    ocserve_store::append_event(&st.writer, None, "server.instance.disposed", &props).map_err(
         |e| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             name: "InternalError",
             message: format!("{e:#}"),
         },
     )?;
-    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
     st.bus.publish(ocserve_core::event::frame(
         &dir,
         "server.instance.disposed",
-        json!({}),
+        props,
     ));
     if let Err(e) = watch::reconcile(&st).await {
         tracing::warn!("payload reload failed: {e:#}");
@@ -2425,10 +2427,13 @@ async fn post_revert(
         message: format!("{e:#}"),
     })?;
     let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    // full session merged with the revert marker (upstream patch semantics) —
+    // a partial {id,revert} merges into client stores and drops title.
+    let info = session_wire_or_partial_http(&st, &id, json!({"revert": marker})).await;
     st.bus.publish(ocserve_core::event::frame(
         &dir,
         "session.updated",
-        json!({"sessionID": id, "info": {"id": id, "revert": marker}}),
+        json!({"sessionID": id, "info": info}),
     ));
     let sid = id.clone();
     run_blocking(&st.db, move |db| ocserve_store::load_session_wire(db, &sid))
@@ -2465,10 +2470,11 @@ async fn post_unrevert(
         message: format!("{e:#}"),
     })?;
     let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let info = session_wire_or_partial_http(&st, &id, json!({"revert": Value::Null})).await;
     st.bus.publish(ocserve_core::event::frame(
         &dir,
         "session.updated",
-        json!({"sessionID": id, "info": {"id": id, "revert": Value::Null}}),
+        json!({"sessionID": id, "info": info}),
     ));
     let sid = id.clone();
     run_blocking(&st.db, move |db| ocserve_store::load_session_wire(db, &sid))
@@ -3230,13 +3236,13 @@ async fn patch_session(
     })?
     .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))?;
     if dirty {
-        // partial session.updated (prompt's own partial shape) so other
-        // clients re-sort/re-render without a refetch
+        // FULL session (already loaded above) so the event carries every
+        // required key — a partial {id,title,model,agent} merges into client
+        // stores and drops `time`/`version` (TUI/SDK store corruption).
         st.bus.publish(ocserve_core::event::frame(
             st.paths["directory"].as_str().unwrap_or("/"),
             "session.updated",
-            json!({"sessionID": id, "info": {"id": id, "title": info["title"],
-                                              "model": info["model"], "agent": info["agent"]}}),
+            json!({"sessionID": id, "info": info}),
         ));
     }
     Ok(Json(info))
@@ -4197,12 +4203,26 @@ fn insert_message_http(
 
 /// Durable event from HTTP handlers (no PromptContext): persist + plain +
 /// sync twin (seq from next_event_seq — single-flight per handler call).
+/// Full session wire object merged with `overrides`, for a `session.updated`
+/// event body. Falls back to `{id}` on a DB error so the caller never panics;
+/// the event-shape guard (rule 19) flags any missing required key.
+async fn session_wire_or_partial_http(st: &Arc<AppState>, sid: &str, overrides: Value) -> Value {
+    let sid_owned = sid.to_string();
+    run_blocking(&st.db, move |db| {
+        ocserve_store::session_wire_with(db, &sid_owned, overrides)
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| json!({"id": sid}))
+}
 fn emit_durable_http(
     st: &Arc<AppState>,
     sid: &str,
     event_type: &str,
     props: Value,
 ) -> Result<(), ApiError> {
+    let props = ocserve_core::event::normalize_props(event_type, props);
     ocserve_store::append_event(&st.writer, Some(sid), event_type, &props).map_err(|e| {
         ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,

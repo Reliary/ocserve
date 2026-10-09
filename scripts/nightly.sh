@@ -149,6 +149,14 @@ step "models.dev live fetch" \
 #     oracle vectors. Behavioural layer the route/shape guards cannot see.
 step "permission differential (freeze vs ocserve)" ./scripts/permission-check.sh
 
+# 6c. event-payload scan (guard rule 19's live half): validates the live event
+#     log against the frozen Event contract. Post-fix events must be clean;
+#     historical pre-fix rows are counted but not fatal (already fixed at the
+#     source). Read-only.
+step "event payloads vs frozen contract" \
+  python3 bench/events/event-validate.py \
+  "${OCSERVE_DATA_DIR:-$HOME/.local/share/ocserve}/ocserve.db" --minutes 60
+
 # 7. mutants (opt-in): survivor report is triaged like a defect (TESTING §9)
 if [ "$WITH_MUTANTS" = "1" ]; then
   if command -v cargo-mutants >/dev/null 2>&1; then
