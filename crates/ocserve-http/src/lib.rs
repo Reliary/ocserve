@@ -138,6 +138,12 @@ pub enum HttpError {
     Query {
         message: String,
     },
+    /// Effect payload-decode failure envelope (freeze probes: missing body key
+    /// → {"name":"BadRequest","data":{"message":"Missing key\n  at [...]",
+    /// "kind":"Payload"}}).
+    Payload {
+        message: String,
+    },
     /// Effect TaggedErrorClass envelope with schema fields at top level
     /// (errors.ts:143 McpServerNotFoundError → {"_tag":..., name, message}).
     TaggedData {
@@ -187,6 +193,19 @@ impl IntoResponse for HttpError {
                 let body = serde_json::json!({
                     "name": "BadRequest",
                     "data": {"message": message, "kind": "Query"}
+                })
+                .to_string();
+                (
+                    StatusCode::BAD_REQUEST,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+                    .into_response()
+            }
+            HttpError::Payload { message } => {
+                let body = serde_json::json!({
+                    "name": "BadRequest",
+                    "data": {"message": message, "kind": "Payload"}
                 })
                 .to_string();
                 (
@@ -887,6 +906,55 @@ async fn get_mcp(State(st): State<Arc<AppState>>) -> Json<Value> {
         .cloned()
         .unwrap_or_else(|| std::sync::Arc::new(ocserve_mcp::McpHub::default()));
     Json(hub.statuses())
+}
+
+/// POST /mcp (v1 `mcp.add`) — dynamically register an MCP server, then return
+/// the full status map (freeze probed 2026-10-09: `{name:{status,error?}}`).
+/// Missing `name`/`config` → 400 `{"name":"BadRequest","data":{message,kind}}`.
+/// The server is added via the same hub path the config hot-reload uses
+/// (upsert_cfg + connect), so a subsequently-listed server is live.
+async fn post_mcp(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| mcp_payload_err("name"))?;
+    let config = body
+        .get("config")
+        .filter(|c| c.is_object())
+        .ok_or_else(|| mcp_payload_err("config"))?;
+    let hub = st.mcp.get().cloned().ok_or_else(|| {
+        HttpError::Api(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            name: "McpUnavailable",
+            message: "MCP hub not initialized".into(),
+        })
+    })?;
+    // Build a single-entry `mcp` map and reuse the exact config parser so the
+    // POST shape and the config-file shape can never diverge.
+    let mut one = serde_json::Map::new();
+    one.insert(name.to_string(), config.clone());
+    let cfg = ocserve_mcp::parse_config(&Value::Object(one))
+        .into_iter()
+        .next()
+        .ok_or_else(|| mcp_payload_err("config"))?;
+    hub.upsert_cfg(cfg);
+    // connect failure is recorded in the status map (freeze returns the map
+    // with a `failed` entry, HTTP 200) — never a 500 for an unreachable server.
+    if let Err(e) = hub.connect(name).await {
+        tracing::info!("mcp add: connect {name} failed (recorded): {e:#}");
+    }
+    Ok(Json(hub.statuses()))
+}
+
+/// Freeze `McpPaths.status` payload error: `Missing key at ["<field>"]`.
+fn mcp_payload_err(field: &str) -> HttpError {
+    HttpError::Payload {
+        message: format!("Missing key\n  at [\"{field}\"]"),
+    }
 }
 
 /// GET /experimental/session?search=&roots=&limit= — session title search
@@ -4493,7 +4561,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/tui/control/response",
             axum::routing::post(tui::control_response),
         )
-        .route("/mcp", get(get_mcp))
+        .route("/mcp", get(get_mcp).post(post_mcp))
         .route("/permission", get(get_permissions))
         .route(
             "/permission/{id}/reply",

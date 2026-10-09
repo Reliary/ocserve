@@ -310,3 +310,54 @@ async fn experimental_tool_routes() {
     let err: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(err["name"], "BadRequest");
 }
+
+/// POST /mcp (v1 `mcp.add`) — freeze-probed 2026-10-09: missing name/config →
+/// 400 BadRequest payload envelope; an unreachable remote → 200 with the full
+/// status map and a `failed` entry for the new server.
+#[tokio::test]
+async fn mcp_add_missing_fields_payload_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path(), Payloads::default());
+    let hub = std::sync::Arc::new(ocserve_mcp::McpHub::default());
+    st.mcp.set(hub).ok();
+    let app = ocserve_http::router(st.clone());
+
+    let (s, b) = call(&app, "POST", "/mcp", Some(serde_json::json!({}))).await;
+    assert_eq!(s, 400, "{}", String::from_utf8_lossy(&b));
+    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(v["name"], "BadRequest");
+    assert_eq!(v["data"]["message"], "Missing key\n  at [\"name\"]");
+    assert_eq!(v["data"]["kind"], "Payload");
+
+    let (s, b) = call(&app, "POST", "/mcp", Some(serde_json::json!({"name": "x"}))).await;
+    assert_eq!(s, 400);
+    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(v["data"]["message"], "Missing key\n  at [\"config\"]");
+}
+
+#[tokio::test]
+async fn mcp_add_remote_registers_and_reports_status_map() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state(dir.path(), Payloads::default());
+    let hub = std::sync::Arc::new(ocserve_mcp::McpHub::default());
+    st.mcp.set(hub).ok();
+    let app = ocserve_http::router(st.clone());
+
+    let (s, b) = call(
+        &app,
+        "POST",
+        "/mcp",
+        Some(serde_json::json!({
+            "name": "probe-remote",
+            "config": {"type": "remote", "url": "http://127.0.0.1:9/mcp"}
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{}", String::from_utf8_lossy(&b));
+    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(v["probe-remote"]["status"], "failed");
+    // visible on GET /mcp too
+    let (_, b) = call(&app, "GET", "/mcp", None).await;
+    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(v["probe-remote"]["status"], "failed");
+}

@@ -79,6 +79,33 @@ def method_ok(route_methods, method):
     return method in route_methods
 
 
+# A citation is legitimate only when the EXACT route token appears as a whole
+# token — i.e. the character after `METHOD /path` must not be a continuation of
+# the path (a path-segment char: alphanumeric, `_`, `-`, `/`, `{`, `.`, `~`,
+# `%`). This blocks `POST /mcp` matching the interior of `POST /mcp/{name}/...`
+# while still allowing a citation followed by prose, punctuation, backticks,
+# whitespace, `|`, `,`, `)`, etc. A trailing `/` explicitly continues the path.
+PATH_CONTINUATION = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-/{.~%")
+
+
+def is_cited(key, plan):
+    """True iff `key` (e.g. `POST /mcp`) appears in `plan` as a whole route
+    token, not as a prefix of a longer route."""
+    start = 0
+    while True:
+        i = plan.find(key, start)
+        if i < 0:
+            return False
+        j = i + len(key)
+        # token boundary: end of text, or a non-path-continuation char.
+        # The method token also needs a boundary before it (avoid matching the
+        # middle of e.g. `XPOST /mcp`); the method is preceded by a space or
+        # backtick in practice.
+        if j >= len(plan) or plan[j] not in PATH_CONTINUATION:
+            return True
+        start = i + 1
+
+
 def main():
     spec_file, router_file, plan_file = sys.argv[1], sys.argv[2], sys.argv[3]
     write = "--write" in sys.argv
@@ -99,12 +126,13 @@ def main():
             key = f"{method.upper()} {path}"
             if bound:
                 impl.append(key)
-            elif key in plan:
-                # Exact `METHOD /path` citation required. The loose substring
-                # fallback (`path in plan`) vacuously cited e.g. `POST
-                # /api/session` just because `/api/session` appears in a PLAN
-                # route listing — tightened 2026-10-09 (guard must not pass
-                # on an incidental mention).
+            elif is_cited(key, plan):
+                # A citation must be the EXACT `METHOD /path` as a whole route
+                # token — not a substring of a longer route. The earlier
+                # `key in plan` substring test vacuously cited `POST /mcp`
+                # because it is a prefix of the cited `POST /mcp/{name}/connect`
+                # (2026-10-09; the same vacuous-pass class the guard exists to
+                # prevent). See is_cited().
                 cited.append(key)
             else:
                 gaps.append(key)
