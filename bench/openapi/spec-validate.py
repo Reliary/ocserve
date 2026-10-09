@@ -35,6 +35,11 @@ ALLOW = {
     # registry (215 providers, 1.18.31-era); ocserve serves the models.json
     # catalog copy, so per-model variant/family/cost keypaths differ.
     "/config/providers": "D-PAIR-2 provider registry provenance",
+    # D3 (DIFFERENTIATION.md): ocserve adds an additive `trust` object
+    # (+`dropped_tools`) to each MCP status for the MCP trust layer. Freeze's
+    # MCPStatus is additionalProperties:false, so the additive field trips the
+    # validator — a deliberate, documented divergence, not a drift.
+    "/mcp": "D3 additive MCP trust field",
 }
 
 

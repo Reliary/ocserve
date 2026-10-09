@@ -273,7 +273,16 @@ fn side_kind(kind: &str) -> &str {
 
 /// Transform a config-defined model block (different shape: {limit,name,...}).
 fn transform_config_model(pid: &str, mid: &str, m: &Value) -> Value {
-    let limit = m.get("limit").cloned().unwrap_or(json!({}));
+    // Freeze always emits `limit.context`+`limit.output` (provider.ts:1609
+    // defaults both to 0); the v1 spec marks them required. Carrying the raw
+    // config block verbatim left `{}` for models with no limit → spec
+    // violation (caught by P4 on the live config, 2026-10-09).
+    let src = m.get("limit");
+    let limit = json!({
+        "context": src.and_then(|l| l.get("context")).cloned().unwrap_or(json!(0)),
+        "input": src.and_then(|l| l.get("input")).cloned(),
+        "output": src.and_then(|l| l.get("output")).cloned().unwrap_or(json!(0)),
+    });
     json!({
         "id": mid,
         "providerID": pid,
@@ -925,11 +934,23 @@ fn merge_agent(item: &mut Value, value: &Value) {
     let extra_perm = v.get("permission").cloned();
     let obj = item.as_object_mut().expect("agent object");
     for (k, val) in v {
-        if k == "disable" || k == "permission" {
+        // `disable`/`permission` handled specially. `tools` is consumed by the
+        // prompt layer and is NOT an Agent response field (upstream agent.ts
+        // copies a fixed set; `tools` is absent). `model` is a
+        // "provider/model" string in config but an object in the response
+        // (upstream `Provider.parseModel`).
+        if k == "disable" || k == "permission" || k == "tools" {
             continue;
         }
         if k == "top_p" {
             obj.insert("topP".into(), val.clone());
+        } else if k == "model" {
+            if let Some(s) = val.as_str()
+                && let Some((pid, mid)) = s.split_once('/')
+            {
+                obj.insert("model".into(), json!({"providerID": pid, "modelID": mid}));
+            }
+            // a non-string model (already an object) is left untouched
         } else if k == "options" {
             let opts = obj
                 .entry("options")
@@ -1189,6 +1210,55 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P4 (2026-10-09): config agents carry `model` as a "provider/model"
+    /// string and a `tools` map. Upstream agent.ts parses model via
+    /// Provider.parseModel and never copies `tools` into the response — the
+    /// live /agent was emitting a string `model` + a `tools` key, both of
+    /// which violate the Agent schema (additionalProperties:false).
+    #[test]
+    fn config_agent_model_parsed_and_tools_dropped() {
+        let cfg = serde_json::json!({
+            "agent": {
+                "analyze": {
+                    "mode": "primary",
+                    "model": "bailian-coding-plan/qwen3.5-plus",
+                    "tools": {"bash": false, "edit": false},
+                    "permission": {"bash": "deny"}
+                }
+            }
+        });
+        let (agents, _decl) = build_agents(&cfg);
+        let a = agents
+            .iter()
+            .find(|a| a["name"] == "analyze")
+            .expect("config agent present");
+        assert_eq!(
+            a["model"],
+            serde_json::json!({"providerID": "bailian-coding-plan", "modelID": "qwen3.5-plus"}),
+            "model string parsed to {{providerID, modelID}}"
+        );
+        assert!(
+            a.get("tools").is_none(),
+            "tools must not appear in the Agent response"
+        );
+    }
+
+    /// P4 (2026-10-09): a config model with no `limit` block must still emit
+    /// `limit.context`+`limit.output` (freeze defaults both to 0;
+    /// provider.ts:1609). The raw block left `{}` → spec violation.
+    #[test]
+    fn config_model_limit_defaults_to_zero() {
+        let m = serde_json::json!({"name": "Free Model"});
+        let out = transform_config_model("p", "free-model", &m);
+        assert_eq!(out["limit"]["context"], 0);
+        assert_eq!(out["limit"]["output"], 0);
+        // a full limit passes through
+        let m2 = serde_json::json!({"limit": {"context": 1000, "output": 500}});
+        let out2 = transform_config_model("p", "m2", &m2);
+        assert_eq!(out2["limit"]["context"], 1000);
+        assert_eq!(out2["limit"]["output"], 500);
+    }
 
     #[test]
     fn layer_auth_overlay_wins_and_legacy_survives() {
