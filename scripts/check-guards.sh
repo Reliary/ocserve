@@ -30,6 +30,13 @@
 #      an exact-URL PLAN §17 citation — unbound routes fall through to the
 #      HTML proxy and crash JSON-expecting clients (the 2026-10-08 web-UI
 #      settings crash: /pty/shells → HTML → e.shells.reduce TypeError)
+#  16. every operation in the frozen OpenAPI contract is bound or exact-cited
+#      (spec-driven, whole-token citation match)
+#  17. the embedded pinned web UI calls only routes in the frozen spec
+#  18. permission oracle vectors exist, are well-formed, and carry the fixture
+#      config — the behavioural differential (scripts/permission-check.sh) can
+#      never silently no-op (route-binding/shape guards cannot see authz
+#      semantics; the 2026-10-09 hardcoded-allow v2 bug)
 #   7. exact assertions on process-global counters inside src/ (in-crate unit
 #      tests run in one parallel process and race — the reader_opens flake of
 #      2026-10-05; such tests belong in tests/ where they own the process)
