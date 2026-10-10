@@ -275,4 +275,30 @@ else
   echo "FAIL: handler request keys violate the frozen contract (rule 20)"; fail=1
 fi
 
+echo "== guard: no empty partID in live event emitters (rule 21) =="
+# Streaming-identity class: the 2026-10-11 "web UI shows nothing until reload"
+# bug emitted `message.part.delta` with `partID:""` — the client keys deltas by
+# a real `^prt` part id and drops them otherwise (STREAM-DELTA.md). The typed
+# boundary can't see bus-only events, and rule 19 only scans the PERSISTED log
+# (deltas are `emit_live`, never stored). This static rule bans the literal
+# empty partID assignment anywhere in the runtime crates; the behavioral
+# half is tests/stream_delta.rs (real stub-provider turn + a planted pre-fix
+# negative control). Planted-violation self-check first so the grep can never
+# be vacuous.
+plant_dir="crates/ocserve-core/src"
+plant_file="$plant_dir/__rule21_plant.rs"
+printf '%s\n' 'fn _plant() { let _ = json!({"partID": "", "field": "text"}); }' > "$plant_file"
+if grep -RnE '"partID"\s*:\s*""' "$plant_dir" >/dev/null 2>&1; then
+  echo "ok (planted empty partID detected)"
+else
+  echo "FAIL: empty-partID planted violation not detected (rule 21 vacuous)"; fail=1
+fi
+rm -f "$plant_file"
+if grep -RnE '"partID"\s*:\s*""' crates/*/src >/dev/null 2>&1; then
+  grep -RnE '"partID"\s*:\s*""' crates/*/src
+  echo "FAIL: runtime emitter assigns an empty partID (rule 21)"; fail=1
+else
+  echo "ok (no empty partID in runtime emitters)"
+fi
+
 exit $fail

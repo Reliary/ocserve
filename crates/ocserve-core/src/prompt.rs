@@ -254,6 +254,64 @@ pub(crate) fn emit_live(ctx: &PromptContext, event_type: &str, properties: Value
         .publish(frame(&ctx.directory, event_type, properties));
 }
 
+/// Build the assistant message skeleton emitted at the START of a provider turn
+/// (upstream prompt.ts:1186-1201 `sessions.updateMessage(msg)` before the
+/// processor runs). Required keys are all present; `time.completed` is
+/// deliberately absent so clients render the message as streaming
+/// (`streaming = !time.completed`, app bundle). The same `MessageID` is reused
+/// when the message is persisted at turn end so stream and persisted copy
+/// reconcile to ONE message. The same skeleton feeds the client via
+/// `message.updated`.
+pub(crate) fn assistant_message_start(
+    ctx: &PromptContext,
+    session_id: &str,
+    parent_id: &str,
+    assistant_id: &str,
+    agent: &str,
+    model: &str,
+    created: i64,
+) -> Value {
+    json!({
+        "id": assistant_id,
+        "sessionID": session_id,
+        "role": "assistant",
+        "parentID": parent_id,
+        "mode": "primary",
+        "agent": agent,
+        "path": {"cwd": ctx.directory, "root": "/"},
+        "cost": 0,
+        "tokens": {"input": 0, "output": 0, "reasoning": 0,
+                   "cache": {"read": 0, "write": 0}},
+        "modelID": model,
+        "providerID": ctx.provider_id,
+        "time": {"created": created},
+    })
+}
+
+/// Emit a start part (empty text) before deltas, so the client's delta reducer
+/// finds the part it accumulates into. Upstream emits `updatePart` at
+/// `text-start`/`reasoning-start` (processor.ts:280-291,500-511) before any
+/// `updatePartDelta`. Without this, `message.part.delta` is silently dropped
+/// (the 2026-10-11 "web UI doesn't update until reload" bug).
+pub(crate) fn emit_part_start(
+    ctx: &PromptContext,
+    session_id: &str,
+    assistant_id: &str,
+    part_id: &str,
+    part_type: &str,
+    started: i64,
+) {
+    emit_live(
+        ctx,
+        "message.part.updated",
+        json!({"sessionID": session_id, "part": {
+            "type": part_type, "id": part_id, "text": "",
+            "sessionID": session_id, "messageID": assistant_id,
+            "time": {"start": started},
+        }}),
+    );
+}
+
 /// Reconstruct provider messages from stored history (text + tool parts).
 /// History byte budget (K-AUTONOMY scale hole, MEMORY §7.3): the live prompt
 /// build was UNBOUNDED by session size — giant sessions × concurrent prompts
@@ -919,6 +977,43 @@ pub async fn run_prompt_with(
             let mut usage: Option<Usage> = None;
             let mut assembler = ToolCallAssembler::default();
 
+            // ---- assistant message + streaming part identity (upstream
+            // prompt.ts:1186-1201 + processor.ts:280/500): the MessageID and the
+            // text/reasoning PartIDs are minted BEFORE the provider turn and the
+            // assistant skeleton is published so clients (web UI, TUI, oc-remote)
+            // render the message live. The SAME ids are reused at persist time.
+            // The live deltas below are `message.part.delta` — the app's reducer
+            // keys them by `partID` (spec `^prt`) and drops them if the part does
+            // not yet exist (the "updates only after reload" bug). The skeleton is
+            // emitted LAZILY on the first content event so a turn that fails with
+            // no output never leaves a ghost streaming message.
+            let assistant_id = msg_id();
+            let turn_msg_id = user_msg_id.clone();
+            let turn_started = now_ms();
+            let text_part_id = prt_id();
+            let mut assistant_announced = false;
+            let mut live_reasoning_id: Option<String> = None;
+            // announce assistant skeleton + publish a start part for `part_type`
+            // exactly once per part (upstream processor.ts:280-291/500-511 order).
+            macro_rules! announce_part {
+                ($part_id:expr, $part_type:expr) => {{
+                    if !assistant_announced {
+                        emit_live(
+                            ctx,
+                            "message.updated",
+                            json!({"sessionID": session_id, "info": assistant_message_start(
+                                ctx, session_id, &turn_msg_id, &assistant_id, &agent, &model,
+                                turn_started,
+                            )}),
+                        );
+                        assistant_announced = true;
+                    }
+                    emit_part_start(
+                        ctx, session_id, &assistant_id, $part_id, $part_type, turn_started,
+                    );
+                }};
+            }
+
             // Watchdog covers BOTH hang points: response headers (.send inside
             // chat_stream) and the read loop below — a silent socket at either
             // stage must fail, never hang busy (A3).
@@ -991,23 +1086,34 @@ pub async fn run_prompt_with(
                     StreamEvent::TextDelta(t) => {
                         if llm_ttft.is_none() {
                             llm_ttft = Some(started.elapsed());
+                            // publish the text part before its first delta
+                            announce_part!(&text_part_id, "text");
                         }
                         emit_live(
                             ctx,
                             "message.part.delta",
                             json!({
-                                "sessionID": session_id, "messageID": user_msg_id, "partID": "",
-                                "field": "text", "delta": t,
+                                "sessionID": session_id, "messageID": assistant_id,
+                                "partID": text_part_id, "field": "text", "delta": t,
                             }),
                         );
                         text.push_str(&t);
                     }
                     StreamEvent::ReasoningDelta(r) => {
+                        // upstream mints one reasoning part per reasoning-start
+                        // (processor.ts:280); ocserve streams a single reasoning
+                        // block per turn, so one stable id published on first delta.
+                        if live_reasoning_id.is_none() {
+                            let rid = prt_id();
+                            announce_part!(&rid, "reasoning");
+                            live_reasoning_id = Some(rid);
+                        }
                         emit_live(
                             ctx,
                             "message.part.delta",
                             json!({
-                                "sessionID": session_id, "messageID": user_msg_id, "partID": "",
+                                "sessionID": session_id, "messageID": assistant_id,
+                                "partID": live_reasoning_id.clone().unwrap_or_default(),
                                 "field": "reasoning", "delta": r,
                             }),
                         );
@@ -1073,7 +1179,9 @@ pub async fn run_prompt_with(
                 ));
                 break 'outer;
             }
-            let assistant_id = msg_id();
+            // assistant_id / text_part_id / live_reasoning_id are minted once
+            // before the provider turn (see the pre-alloc block above) and reused
+            // here so the streamed part and the persisted part share ONE id.
 
             // ---- tool-call turn ----
             if finish_reason == "tool_calls" && !tool_calls.is_empty() {
@@ -1085,14 +1193,11 @@ pub async fn run_prompt_with(
                     parts.push(json!({
                         "type": "reasoning", "text": reasoning,
                         "time": {"start": t_done - elapsed_ms, "end": t_done},
-                        "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
+                        "id": live_reasoning_id.clone().unwrap_or_else(prt_id),
+                        "sessionID": session_id, "messageID": assistant_id,
                     }));
                 }
                 if !text.is_empty() {
-                    let text_part_id = prt_id();
-                    // v1 parity: experimental.text.complete fires at text-end
-                    // BEFORE the part persists (processor.ts:531); mutation
-                    // flows into persistence AND the provider continuation below.
                     text = hook_mutate(
                         ctx.plugins.as_ref(),
                         "experimental.text.complete",
@@ -1683,11 +1788,16 @@ pub async fn run_prompt_with(
                 parts.push(json!({
                     "type": "reasoning", "text": reasoning,
                     "time": {"start": t_done - elapsed_ms, "end": t_done},
-                    "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
+                    // reuse the reasoning id the live deltas streamed to (if any)
+                    "id": live_reasoning_id.clone().unwrap_or_else(prt_id),
+                    "sessionID": session_id, "messageID": assistant_id,
                 }));
             }
             if !text.is_empty() {
-                let text_part_id = prt_id();
+                // reuse the id the live text deltas streamed to so the client
+                // reconciles the streamed part with the persisted one (upstream
+                // updates the SAME currentText part at text-end, processor.ts:544)
+                let text_part_id = text_part_id.clone();
                 text = hook_mutate(
                     ctx.plugins.as_ref(),
                     "experimental.text.complete",
