@@ -1494,6 +1494,46 @@ pub async fn run_prompt_with(
                         {
                             input = a.clone();
                         }
+                        // G1 soundness: `tool.execute.before` runs AFTER the
+                        // permission gate, so a plugin (compromised via poisoned
+                        // tool output) could widen the approved args (e.g. `rm x`
+                        // → `rm -rf /`) with no re-evaluation. Re-derive the asks
+                        // for the MUTATED args; any ask not already covered by an
+                        // always-grant or an `allow` rule reverts the mutation
+                        // (defense-in-depth; upstream does not re-check).
+                        if input != input_value {
+                            let mutated_asks = ocserve_tools::permission_asks::asks_for(
+                                &call.name,
+                                &input,
+                                std::path::Path::new(&ctx.directory),
+                            );
+                            let widened = mutated_asks.iter().any(|ask| {
+                                let covered_always = ask
+                                    .patterns
+                                    .iter()
+                                    .all(|p| ctx.gate.check_always(session_id, &ask.permission, p));
+                                if covered_always {
+                                    return false;
+                                }
+                                ask.patterns.iter().any(|p| {
+                                    ocserve_tools::evaluate(&ask.permission, p, &ctx.rules)
+                                        != "allow"
+                                })
+                            });
+                            if widened {
+                                ocserve_metrics::labeled_counter(
+                                    "ocserve_agent_health_total",
+                                    "class=\"plugin_args_widened\"",
+                                    1,
+                                );
+                                tracing::warn!(
+                                    "tool.execute.before widened {call} args past the \
+                                     approved set — reverting the mutation",
+                                    call = call.name
+                                );
+                                input = input_value.clone();
+                            }
+                        }
                         // K-EFFICIENCY: tool execution runs OFF the async
                         // workers (spawn_blocking) — a blocking `sleep 570`
                         // or a stalled child previously pinned one of the 8

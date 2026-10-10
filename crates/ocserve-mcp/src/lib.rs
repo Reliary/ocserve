@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 
 /// Upstream catalog.ts sanitize: non [a-zA-Z0-9_-] → `_`.
 pub fn sanitize(value: &str) -> String {
@@ -253,17 +253,25 @@ impl McpClient {
                 let fut = async {
                     stdin.write_all(line.as_bytes()).await?;
                     stdin.flush().await?;
+                    // Bounded read across the whole wait: `read_line` into a
+                    // fresh String grows to the full line BEFORE any length
+                    // check, so a hostile server emitting a giant line (no `\n`)
+                    // would OOM (panic=abort). `take(cap+1)` caps the TOTAL bytes
+                    // read here (skipped notifications included).
+                    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt};
+                    let mut limited =
+                        AsyncReadExt::take(&mut *reader, MAX_LINE_BYTES as u64 + 1);
                     // read until the response with our id (skip notifications)
                     loop {
                         let mut buf = String::new();
-                        let n = reader.read_line(&mut buf).await?;
+                        let n = limited.read_line(&mut buf).await?;
                         if n == 0 {
                             return Err(anyhow!("mcp stdout closed waiting for {method}"));
                         }
                         if buf.len() > MAX_LINE_BYTES {
                             return Err(anyhow!("mcp line exceeds {MAX_LINE_BYTES} cap"));
                         }
-                        let v: Value = serde_json::from_str(&buf)
+                        let v: Value = serde_json::from_str(buf.trim())
                             .with_context(|| format!("mcp line parse for {method}"))?;
                         if v.get("id").and_then(|i| i.as_i64()) == Some(id) {
                             if let Some(err) = v.get("error") {
@@ -299,10 +307,10 @@ impl McpClient {
                 let status = resp.status();
                 if !status.is_success() {
                     let body = resp.text().await.unwrap_or_default();
-                    return Err(anyhow!(
-                        "mcp http {status}: {}",
-                        &body[..body.len().min(200)]
-                    ));
+                    // slice by chars, not bytes — byte-slicing at 200 panics when
+                    // it lands mid-UTF-8 (release = panic abort → outage).
+                    let head: String = body.chars().take(200).collect();
+                    return Err(anyhow!("mcp http {status}: {head}"));
                 }
                 let ct = resp
                     .headers()
@@ -471,6 +479,13 @@ pub struct McpHub {
     statuses: parking_lot::Mutex<HashMap<String, (String, Option<String>)>>,
     /// lazy tool-schema cache (populated on first prompt; listChanged=false)
     tools_cache: parking_lot::Mutex<Option<Vec<Value>>>,
+    /// advertised namespaced tool name → (server, RAW tool name). `sanitize`
+    /// is lossy (`a.b` and `a_b` both → `a_b`), so the dispatched name must
+    /// come from the map recorded at list time, never re-derived by stripping
+    /// a sanitized prefix (upstream dispatches the raw `mcpTool.name` captured
+    /// in the tool closure — catalog.ts:59). Without this, a server declaring
+    /// `a.b` receives `a_b` (confused-deputy / wrong-tool execution).
+    dispatch: parking_lot::Mutex<HashMap<String, (String, String)>>,
     /// ALL configs retained (incl. disabled): connect reads enabled ones,
     /// and statuses() enumerates configured-but-disabled like freeze does
     /// (mcp/index.ts:599-604: absent from s.status => {status:"disabled"}).
@@ -524,6 +539,7 @@ impl McpHub {
                     .lock()
                     .insert(name.to_string(), ("disconnected".into(), None));
                 *self.tools_cache.lock() = None; // schemas refetch on next prompt
+                self.dispatch.lock().clear();
                 Ok(())
             }
             None => anyhow::bail!("MCP server not found: {name}"),
@@ -568,6 +584,7 @@ impl McpHub {
                         .insert(name.to_string(), ("connected".into(), None));
                     self.clients.lock().insert(name.to_string(), client);
                     *self.tools_cache.lock() = None;
+                    self.dispatch.lock().clear();
                     Ok(())
                 }
                 Err(e) => {
@@ -642,8 +659,18 @@ impl McpHub {
     /// touching the process-global env — OCSERVE_MCP_TRUST is env-first like
     /// OCSERVE_SIFT/OCSERVE_LOOP_GUARD, config surface after it proves out).
     pub fn guard_output_with(tool: &str, output: String, enforce: bool) -> String {
-        let bounded = output.get(..65536).unwrap_or(&output);
-        let hits = trust::scan_text(bounded);
+        // Observe (default) may scan a bounded head — it only feeds a metric.
+        // Enforce MUST scan the full output: a 64 KiB pad followed by the
+        // payload previously evaded the head-only window and reached the
+        // prompt. `get(..n)` returns None on a non-char-boundary (safe), so
+        // the whole output is scanned there; the scan is bounded by the MCP
+        // response cap (MAX_LINE_BYTES).
+        let hits = if enforce {
+            trust::scan_text(&output)
+        } else {
+            let bounded = output.get(..65536).unwrap_or(&output);
+            trust::scan_text(bounded)
+        };
         if hits.is_empty() {
             return output;
         }
@@ -771,10 +798,32 @@ impl McpHub {
                             );
                             continue;
                         }
+                        // record the exact dispatch mapping (advertised → raw)
+                        // BEFORE advertising: a lossy-sanitize collision keeps
+                        // the first (stable across list order) and drops this one.
+                        let advertised = tool_name(&name, tname);
+                        {
+                            let mut d = self.dispatch.lock();
+                            if let Some((prev_server, prev_tool)) = d.get(&advertised)
+                                && (prev_server != &name || prev_tool != tname)
+                            {
+                                tracing::warn!(
+                                    server = %name,
+                                    tool = %tname,
+                                    prev_server = %prev_server,
+                                    prev_tool = %prev_tool,
+                                    advertised = %advertised,
+                                    "mcp tool name collision — keeping first"
+                                );
+                                dropped += 1;
+                                continue;
+                            }
+                            d.insert(advertised.clone(), (name.clone(), tname.to_string()));
+                        }
                         out.push(json!({
                             "type": "function",
                             "function": {
-                                "name": tool_name(&name, tname),
+                                "name": advertised,
                                 "description": desc,
                                 "parameters": params,
                             }
@@ -815,7 +864,11 @@ impl McpHub {
                                     new = %pin,
                                     "mcp tool surface drifted from persisted pin (TOFU)"
                                 );
-                                pins_lk.map.insert(name.clone(), pin.clone());
+                                // M5: do NOT overwrite the pin on drift — a
+                                // rug-pull that re-pins itself would report
+                                // clean on the next list. Keep the original
+                                // first-seen surface until an operator removes
+                                // the entry (accept the new surface).
                             }
                             Some(_) => {}
                             None => {
@@ -865,24 +918,19 @@ impl McpHub {
         out
     }
 
-    /// Call a namespaced MCP tool: `server_tool` → (server, tool).
-    /// Returns Ok(None) if the name is not an MCP tool (caller tries builtins).
+    /// Call a namespaced MCP tool. The advertised name resolves through the
+    /// list-time dispatch map to (server, RAW tool name) — never by re-deriving
+    /// the raw name from the sanitized advertisement. Returns Ok(None) if the
+    /// name is not an MCP tool (caller tries builtins).
     pub async fn call(&self, namespaced: &str, args: Value) -> Option<Result<String>> {
-        let candidates: Vec<String> = self.clients.lock().keys().cloned().collect();
-        for server in candidates {
-            let prefix = format!("{}_", sanitize(&server));
-            let Some(rest) = namespaced.strip_prefix(&prefix) else {
-                continue;
-            };
-            let mut client = self.take(&server)?;
-            let result = client
-                .call_tool(rest, args)
-                .await
-                .with_context(|| format!("mcp {server}/{rest}"));
-            self.put(client);
-            return Some(result);
-        }
-        None
+        let (server, raw_tool) = self.dispatch.lock().get(namespaced)?.clone();
+        let mut client = self.take(&server)?;
+        let result = client
+            .call_tool(&raw_tool, args)
+            .await
+            .with_context(|| format!("mcp {server}/{raw_tool}"));
+        self.put(client);
+        Some(result)
     }
 }
 

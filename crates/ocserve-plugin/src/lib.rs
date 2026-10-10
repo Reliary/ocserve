@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::oneshot;
 
@@ -290,12 +290,31 @@ impl Sidecar {
         let pending = Arc::new(parking_lot::Mutex::new(HashMap::<i64, Pending>::new()));
         let pending_task = Arc::clone(&pending);
         tokio::spawn(async move {
+            // Bounded line reads: a plugin that prints a giant line (no newline)
+            // would otherwise grow `line` unbounded (host.mjs stdout is reserved
+            // for RPC, but a runaway plugin can still emit garbage). Cap at the
+            // RPC line budget; a longer line is discarded.
+            const MAX_HOST_LINE: usize = 8 * 1024 * 1024;
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
             loop {
                 line.clear();
-                match reader.read_line(&mut line).await {
+                use tokio::io::AsyncBufReadExt as _;
+                let n = {
+                    let mut limited = tokio::io::AsyncReadExt::take(
+                        &mut reader,
+                        MAX_HOST_LINE as u64 + 1,
+                    );
+                    limited.read_line(&mut line).await
+                };
+                match n {
                     Ok(0) | Err(_) => break,
+                    // oversized: the rest of the line is unreadable framing —
+                    // stop; in-flight RPCs fail on timeout (never hang the pump).
+                    Ok(_) if line.len() > MAX_HOST_LINE => {
+                        tracing::warn!("plugin host: oversized line — reader stopped");
+                        break;
+                    }
                     Ok(_) => {}
                 }
                 let trimmed = line.trim();
@@ -402,7 +421,19 @@ impl Sidecar {
         }
         let args = self.args.clone();
         let loads = std::mem::take(&mut self.loads);
-        let mut fresh = Sidecar::spawn(&args.host_path, &args.server_url, &args.directory).await?;
+        // Spawn failure must NOT lose `loads`: `self` is only replaced on
+        // success, so restore the taken entries and surface the error. Without
+        // this the plugin set is silently empty after a failed respawn — hooks
+        // never replay and `in_flight()` stays zero (statuses stale).
+        let mut fresh = match Sidecar::spawn(&args.host_path, &args.server_url, &args.directory).await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                self.loads = loads;
+                tracing::error!("plugin sidecar respawn failed: {e:#} — plugin set preserved");
+                return Err(e);
+            }
+        };
         // D1-PLAN: replay must normalize too (warm no-op; rebuilds if outputs
         // were wiped mid-run — A1 stores raw, rebuilds here AND at next boot).
         fresh.normalize_root = self.normalize_root.clone();
@@ -435,8 +466,17 @@ impl Sidecar {
         let msg = json!({"id": id, "method": method, "params": params});
         let mut line = msg.to_string();
         line.push('\n');
-        self.stdin.write_all(line.as_bytes()).await?;
-        self.stdin.flush().await?;
+        // A write failure must remove the pending entry or `in_flight()` (the L1
+        // recycle idle gate) never returns to zero and the sidecar can never be
+        // recycled. Clean up before propagating.
+        if let Err(e) = self.stdin.write_all(line.as_bytes()).await {
+            self.pending.lock().remove(&id);
+            return Err(e).context("plugin host stdin write");
+        }
+        if let Err(e) = self.stdin.flush().await {
+            self.pending.lock().remove(&id);
+            return Err(e).context("plugin host stdin flush");
+        }
         match tokio::time::timeout(RPC_TIMEOUT, rx).await {
             Ok(Ok(res)) => res.map_err(|e| anyhow!("plugin host {method}: {e}")),
             Ok(Err(_)) => Err(anyhow!("plugin host dropped response for {method}")),
