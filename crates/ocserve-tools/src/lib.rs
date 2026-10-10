@@ -218,11 +218,15 @@ fn drain_limited<R: std::io::Read + Send + 'static>(reader: Option<R>, quota: us
 fn truncate(mut output: String) -> (String, bool) {
     let mut truncated = false;
     if output.len() > MAX_BYTES {
-        output.truncate(MAX_BYTES);
-        // avoid splitting a UTF-8 char
-        while !output.is_char_boundary(output.len()) {
-            output.pop();
+        // `String::truncate` PANICS when the index is not a UTF-8 char
+        // boundary (the old "repair loop" after it was dead code — the panic
+        // fires inside truncate). Find the floor char boundary <= MAX_BYTES
+        // first, then truncate. release = panic=abort, so this was an outage.
+        let mut cut = MAX_BYTES;
+        while cut > 0 && !output.is_char_boundary(cut) {
+            cut -= 1;
         }
+        output.truncate(cut);
         truncated = true;
     }
     let lines = output.split('\n').count();
@@ -373,7 +377,10 @@ fn read(input: &Value, cwd: &Path) -> Result<ToolResult> {
         ""
     } else {
         let end = match limit {
-            Some(l) => (offset + l).min(lines.len()),
+            // saturating: offset/limit come from the model as u64; a large
+            // offset near usize::MAX would overflow `offset + l` (debug panic /
+            // release wrap-to-huge then `.min(len)` — harmless but UB-adjacent).
+            Some(l) => offset.saturating_add(l).min(lines.len()),
             None => lines.len(),
         };
         &lines[offset..end].join("\n")
@@ -693,6 +700,23 @@ mod tests {
         let (out2, t2) = truncate(many);
         assert!(t2);
         assert!(out2.split('\n').count() <= MAX_LINES + 1);
+    }
+
+    /// 2026-10-11 bug hunt: the old `truncate` called `String::truncate(MAX_BYTES)`
+    /// directly, which PANICS when MAX_BYTES is not a UTF-8 char boundary (the
+    /// "repair loop" after it was dead code). A file of ASCII + a multibyte char
+    /// straddling the cutoff aborted the process (panic=abort). Must now floor to
+    /// a boundary and never panic.
+    #[test]
+    fn truncate_never_panics_on_multibyte_boundary() {
+        // MAX_BYTES ASCII bytes then a 3-byte char whose boundary straddles the cap
+        let mut s = "a".repeat(MAX_BYTES - 1);
+        s.push('€'); // 3 bytes: bytes MAX_BYTES-1, MAX_BYTES, MAX_BYTES+1
+        s.push_str(&"b".repeat(100));
+        let (out, t) = truncate(s);
+        assert!(t);
+        assert!(out.len() <= MAX_BYTES);
+        assert!(out.is_char_boundary(out.len()));
     }
 
     #[test]

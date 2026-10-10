@@ -1048,12 +1048,19 @@ async fn file_find_question_routes() {
     let v = body_json(resp).await;
     let arr = v.as_array().unwrap();
     assert!(!arr.is_empty(), "grep found our file");
+    // freeze SearchMatch shape: {path:{text}, lines:{text}, line_number,
+    // absolute_offset, submatches:[{match:{text},start,end}]} (ripgrep.ts:56-72)
     assert!(
-        arr.iter()
-            .any(|m| m["path"].as_str().unwrap_or("").ends_with("hello.txt")),
+        arr.iter().any(|m| m["path"]["text"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("hello.txt")),
         "our file in matches: {arr:?}"
     );
-    assert!(arr[0]["lineNumber"].as_i64().is_some());
+    assert!(arr[0]["line_number"].as_i64().is_some());
+    assert!(arr[0]["lines"]["text"].as_str().is_some());
+    assert!(arr[0]["submatches"].as_array().is_some());
+    assert!(arr[0]["submatches"][0]["match"]["text"].as_str().is_some());
 
     // question polls → [], reply/reject → 404 (nothing pending, honest)
     let resp = app

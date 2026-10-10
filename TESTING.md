@@ -158,6 +158,7 @@ reviews for session lifecycle; API contract review per handler), rustdoc example
 | State transition testing | session lifecycle (idle→prompted→streaming→tool→compacting→aborted→idle; plus crash→claim→resume) — transitions from PLAN §11 v2 adoption | SIGKILL during tool call → restart → claim resumes exactly once |
 | Use case testing | the 9 oc-remote flows + TUI attach flows (system level) | permission reply mid-stream from Android |
 | Error guessing (from the ledgers) | every prior finding: WAL pinning, missing blob, torn blob/DB write, oversize frame, hook deadline, OAuth expiry | connection checkout crossing `.await` → CI lint test fails |
+| Known limitations (bounded, not bugs) | `bash_patterns::split_commands` approximates the shell (quote-aware only): heredocs, `$( )`, backticks, `&>`, and `2>&1` can split a sub-command, producing a slightly-off external-directory/arity permission ask (never a wrong tool execution — the tool still runs the whole command). freeze parses with tree-sitter. Recorded as D-BASH-SPLIT; revisit only if a real permission miss is observed | heuristic ask may over/under-approximate; execution unaffected |
 | Pairwise (pairwise) | config combinations (auth × metrics × plugins × cache) | combinatorial smoke, kept small by risk ranking |
 | White-box: branch + MC/DC-style | blob/DB crash protocol decision logic, retry classification (overflow/rate/incomplete), SSE overflow policy | exhaustive branch on the commit ordering |
 
