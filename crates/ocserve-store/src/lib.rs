@@ -583,6 +583,15 @@ pub struct Preflight {
     /// session title (K-TITLE efficiency: retag gate rides this read —
     /// named sessions pay ZERO extra queries per prompt).
     pub title: String,
+    /// Session-lifetime usage (the same columns the assistant messages
+    /// accumulate into). Seeded once per prompt so `session.updated` events
+    /// can carry the truthful row values without re-reading mid-turn.
+    pub cost: f64,
+    pub tokens_input: i64,
+    pub tokens_output: i64,
+    pub tokens_reasoning: i64,
+    pub tokens_cache_read: i64,
+    pub tokens_cache_write: i64,
 }
 
 pub fn compaction_preflight(db: &std::path::Path, session_id: &str) -> anyhow::Result<Preflight> {
@@ -592,11 +601,30 @@ pub fn compaction_preflight(db: &std::path::Path, session_id: &str) -> anyhow::R
         [session_id],
         |r| r.get(0),
     )?;
-    let title: String = conn
+    let (title, cost, tin, tout, treason, tcread, tcwrite): (
+        String,
+        f64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = conn
         .query_row(
-            "SELECT title FROM session WHERE id = ?1",
+            "SELECT title, cost, tokens_input, tokens_output, tokens_reasoning, \
+             tokens_cache_read, tokens_cache_write FROM session WHERE id = ?1",
             [session_id],
-            |r| r.get(0),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
         )
         .unwrap_or_default();
     let rows = compaction_rows(&conn, session_id)?;
@@ -609,6 +637,12 @@ pub fn compaction_preflight(db: &std::path::Path, session_id: &str) -> anyhow::R
                 overflow: pending.overflow,
             },
             title,
+            cost,
+            tokens_input: tin,
+            tokens_output: tout,
+            tokens_reasoning: treason,
+            tokens_cache_read: tcread,
+            tokens_cache_write: tcwrite,
         });
     }
     if !rows.is_empty() {
@@ -625,6 +659,12 @@ pub fn compaction_preflight(db: &std::path::Path, session_id: &str) -> anyhow::R
                 seq,
                 state: PreflightState::SummaryExit { info, parts },
                 title,
+                cost,
+                tokens_input: tin,
+                tokens_output: tout,
+                tokens_reasoning: treason,
+                tokens_cache_read: tcread,
+                tokens_cache_write: tcwrite,
             });
         }
     }
@@ -632,6 +672,12 @@ pub fn compaction_preflight(db: &std::path::Path, session_id: &str) -> anyhow::R
         seq,
         state: PreflightState::Ready,
         title,
+        cost,
+        tokens_input: tin,
+        tokens_output: tout,
+        tokens_reasoning: treason,
+        tokens_cache_read: tcread,
+        tokens_cache_write: tcwrite,
     })
 }
 
@@ -2039,31 +2085,64 @@ pub fn update_part(
 /// Single-line SQL (a `\` line-continuation once produced a literal backslash
 /// → syntax error → was swallowed by `let _ =` — AGENTS §2.5 forbids the
 /// swallow; this fn propagates and is covered by a row-affecting test).
+/// Session-usage accumulation (upstream `applyUsage`,
+/// core/session/projector.ts:89-108): EVERY `step-finish` part ADDS its usage
+/// to the session row, and a part removal SUBTRACTS it. ocserve accumulates at
+/// persist time instead of a projection pass — same arithmetic, one writer
+/// batch. `tokens` is an assistant-message `tokens` object (input/output/
+/// reasoning/cache.read/cache.write); `total` is ignored (session shape has no
+/// total).
+pub fn accumulate_session_usage(
+    writer: &Writer,
+    session_id: &str,
+    tokens: &serde_json::Value,
+    cost: f64,
+) -> anyhow::Result<()> {
+    let get = |p: &str| tokens.pointer(p).and_then(|v| v.as_i64()).unwrap_or(0);
+    writer.write(vec![WriteOp::Sql {
+        sql: "UPDATE session SET cost = cost + ?2, \
+              tokens_input = tokens_input + ?3, \
+              tokens_output = tokens_output + ?4, \
+              tokens_reasoning = tokens_reasoning + ?5, \
+              tokens_cache_read = tokens_cache_read + ?6, \
+              tokens_cache_write = tokens_cache_write + ?7 \
+              WHERE id = ?1"
+            .into(),
+        params: vec![
+            session_id.into(),
+            cost.into(),
+            get("/input").into(),
+            get("/output").into(),
+            get("/reasoning").into(),
+            get("/cache/read").into(),
+            get("/cache/write").into(),
+        ],
+    }])?;
+    Ok(())
+}
+
 pub struct PromptStats<'a> {
     pub agent: &'a str,
     pub model_json: &'a str,
-    pub cost: f64,
-    pub tokens_input: u64,
-    pub tokens_output: u64,
-    pub tokens_cache_read: u64,
     pub time_updated: i64,
 }
 
+/// Finalize writes ONLY agent/model/time_updated. Cost and tokens are NOT
+/// written here: the session row accumulates lifetime usage per step-finish
+/// (upstream applyUsage), so overwriting with any turn-scoped total would
+/// clobber other turns' contribution (the 869%-meter bug: the row carried only
+/// the last turn's step sum, and the final MESSAGE carried the whole-turn sum).
 pub fn finalize_session_prompt(
     writer: &Writer,
     session_id: &str,
     stats: &PromptStats<'_>,
 ) -> anyhow::Result<usize> {
     writer.write(vec![WriteOp::Sql {
-        sql: "UPDATE session SET agent = ?2, model = ?3, cost = ?4, tokens_input = ?5, tokens_output = ?6, tokens_cache_read = ?7, time_updated = ?8 WHERE id = ?1".into(),
+        sql: "UPDATE session SET agent = ?2, model = ?3, time_updated = ?4 WHERE id = ?1".into(),
         params: vec![
             session_id.into(),
             stats.agent.into(),
             stats.model_json.into(),
-            stats.cost.into(),
-            (stats.tokens_input as i64).into(),
-            (stats.tokens_output as i64).into(),
-            (stats.tokens_cache_read as i64).into(),
             stats.time_updated.into(),
         ],
     }])
@@ -2707,27 +2786,45 @@ mod finalize_tests {
             params: vec![],
         }])
         .unwrap();
+        // usage first: session rows accumulate lifetime usage via
+        // accumulate_session_usage (upstream applyUsage), NOT finalize.
+        accumulate_session_usage(
+            &w,
+            "ses_f",
+            &serde_json::json!({
+                "total": 9999, "input": 11, "output": 22, "reasoning": 0,
+                "cache": {"write": 0, "read": 33}
+            }),
+            0.5,
+        )
+        .unwrap();
         finalize_session_prompt(
             &w,
             "ses_f",
             &PromptStats {
                 agent: "build",
                 model_json: "{\"id\":\"m\",\"providerID\":\"p\",\"variant\":\"default\"}",
-                cost: 0.5,
-                tokens_input: 11,
-                tokens_output: 22,
-                tokens_cache_read: 33,
                 time_updated: 1234,
             },
         )
         .expect("finalize must not fail (negative control: was silently swallowed)");
         drop(w); // join writer → flushed
         let conn = crate::pragma::open_reader(&db).unwrap();
-        let (agent, model, tin, tcache): (String, String, i64, i64) = conn
+        let (agent, model, tin, tcache, tout, cost): (String, String, i64, i64, i64, f64) = conn
             .query_row(
-                "SELECT agent, model, tokens_input, tokens_cache_read FROM session WHERE id = 'ses_f'",
+                "SELECT agent, model, tokens_input, tokens_cache_read, tokens_output, cost \
+                 FROM session WHERE id = 'ses_f'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(agent, "build");
@@ -2735,8 +2832,68 @@ mod finalize_tests {
             model.contains("\"providerID\":\"p\""),
             "model json: {model}"
         );
+        // the accumulate op wrote the usage; finalize must NOT clobber it
         assert_eq!(tin, 11);
+        assert_eq!(tout, 22);
         assert_eq!(tcache, 33);
+        assert!((cost - 0.5).abs() < 1e-12, "cost accumulated once: {cost}");
+    }
+
+    /// Negative control (AGENTS §1): finalize must NOT overwrite usage once the
+    /// accumulate path owns those columns. Pre-fix finalize carried cost/tokens
+    /// params and clobbered the row — the planted check would then see 77/88
+    /// instead of the accumulated values.
+    #[test]
+    fn finalize_does_not_overwrite_accumulated_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::writer::db_path(dir.path());
+        let w = Writer::spawn(db.clone()).unwrap();
+        w.write(vec![WriteOp::Sql {
+            sql: "INSERT INTO session (id, project_id, directory, path, slug, title, version, time_created, time_updated) VALUES ('ses_g', 'global', '/w', 's', 's', 't', '1', 1, 1)".into(),
+            params: vec![],
+        }])
+        .unwrap();
+        accumulate_session_usage(
+            &w,
+            "ses_g",
+            &serde_json::json!({
+                "total": 0, "input": 10, "output": 0, "reasoning": 0,
+                "cache": {"write": 0, "read": 0}
+            }),
+            0.1,
+        )
+        .unwrap();
+        accumulate_session_usage(
+            &w,
+            "ses_g",
+            &serde_json::json!({
+                "total": 0, "input": 20, "output": 0, "reasoning": 0,
+                "cache": {"write": 0, "read": 0}
+            }),
+            0.2,
+        )
+        .unwrap();
+        finalize_session_prompt(
+            &w,
+            "ses_g",
+            &PromptStats {
+                agent: "build",
+                model_json: "{\"id\":\"m\",\"providerID\":\"p\"}",
+                time_updated: 1,
+            },
+        )
+        .unwrap();
+        drop(w);
+        let conn = crate::pragma::open_reader(&db).unwrap();
+        let (tin, cost): (i64, f64) = conn
+            .query_row(
+                "SELECT tokens_input, cost FROM session WHERE id = 'ses_g'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tin, 30, "two steps accumulate; finalize must not reset");
+        assert!((cost - 0.3).abs() < 1e-9, "cost adds per step: {cost}");
     }
 }
 

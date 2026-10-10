@@ -57,6 +57,10 @@ pub struct Usage {
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub cached_tokens: u64,
+    /// Provider-reported reasoning tokens (OpenAI-compatible
+    /// `completion_tokens_details.reasoning_tokens`). Upstream Session.getUsage
+    /// splits these out of `output` so the context meter counts them once.
+    pub reasoning_tokens: u64,
 }
 
 /// Provider stream events (parsed from OpenAI-compatible SSE `data:` lines).
@@ -216,6 +220,11 @@ fn parse_usage(u: &Value) -> Usage {
         total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
         cached_tokens: u
             .pointer("/prompt_tokens_details/cached_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        reasoning_tokens: u
+            .pointer("/completion_tokens_details/reasoning_tokens")
+            .or_else(|| u.get("reasoning_tokens"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
     }

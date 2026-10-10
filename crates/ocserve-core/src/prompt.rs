@@ -69,17 +69,19 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Project an assistant message's `tokens` into the Session `tokens` shape
-/// (Session.tokens has no `total`; additionalProperties:false).
-pub(crate) fn session_tokens(t: Value) -> Value {
+/// Project a single provider step's `Usage` into the assistant message
+/// `tokens` shape (upstream `Session.getUsage`, session.ts:368-377):
+/// `input` EXCLUDES cache reads/writes (billed separately); `output` excludes
+/// reasoning; `total` is the provider's raw `total_tokens`. This is the ONLY
+/// shape persisted on assistant messages and step-finish parts — a whole-turn
+/// sum here inflated the last message and the web UI's context meter.
+pub(crate) fn message_tokens(u: &Usage) -> Value {
     json!({
-        "input": t.get("input").cloned().unwrap_or(json!(0)),
-        "output": t.get("output").cloned().unwrap_or(json!(0)),
-        "reasoning": t.get("reasoning").cloned().unwrap_or(json!(0)),
-        "cache": {
-            "read": t.pointer("/cache/read").cloned().unwrap_or(json!(0)),
-            "write": t.pointer("/cache/write").cloned().unwrap_or(json!(0)),
-        },
+        "total": u.total_tokens,
+        "input": u.prompt_tokens.saturating_sub(u.cached_tokens),
+        "output": u.completion_tokens.saturating_sub(u.reasoning_tokens),
+        "reasoning": u.reasoning_tokens,
+        "cache": {"write": 0, "read": u.cached_tokens},
     })
 }
 
@@ -577,6 +579,19 @@ pub async fn run_prompt_with(
     let mut pre = ocserve_store::compaction_preflight(&ctx.db, session_id)?;
     let mut seq = pre.seq;
     let mut pre_dirty = false;
+    // Session-lifetime usage accumulator, seeded ONCE from the preflight row.
+    // Mirrors upstream applyUsage (core/session/projector.ts:89-108): every
+    // step-finish ADDS its usage to the session row; the running copy here lets
+    // mid-turn/final `session.updated` events carry the truthful aggregate
+    // without a mid-turn DB read. Seeded once (not re-seeded on the compaction
+    // re-preflight) so a round never double-counts or loses a round's steps.
+    let mut session_cost = pre.cost;
+    let mut session_usage = json!({
+        "input": pre.tokens_input,
+        "output": pre.tokens_output,
+        "reasoning": pre.tokens_reasoning,
+        "cache": {"read": pre.tokens_cache_read, "write": pre.tokens_cache_write},
+    });
 
     let model = req
         .model
@@ -721,7 +736,6 @@ pub async fn run_prompt_with(
     // ── M6 outer compaction loop (upstream runLoop, prompt.ts:1083+) ──
     // Rounds re-filter history, run the pending engine step, then rebuild
     // messages; D1 cap counts engine rounds (COMPACTION §6).
-    let mut total_usage = Usage::default();
     let mut total_cost = 0.0f64;
     let mut auto_doom = crate::compaction::AutoCompactionDoom::default();
     // fatal-death reason (D1/cost); None = generic at the final_out check
@@ -1160,10 +1174,6 @@ pub async fn run_prompt_with(
             let t_done = now_ms();
             let finish_reason = finish.unwrap_or_else(|| "stop".into());
             let u = usage.clone().unwrap_or_default();
-            total_usage.prompt_tokens += u.prompt_tokens;
-            total_usage.completion_tokens += u.completion_tokens;
-            total_usage.total_tokens += u.total_tokens;
-            total_usage.cached_tokens += u.cached_tokens;
             if u.cached_tokens > 0 {
                 ocserve_metrics::labeled_counter(
                     "ocserve_llm_cache_tokens_total",
@@ -1173,6 +1183,41 @@ pub async fn run_prompt_with(
             }
             let step_cost = compute_cost(&ctx.endpoint.pricing, &u);
             total_cost += step_cost;
+            // Session-lifetime accumulation (upstream applyUsage): every
+            // step-finish part adds its usage to the session row. Keep the
+            // in-memory copy in step with the queued DB op (writer.write is
+            // ack-synchronous, so op + copy are always consistent).
+            let step_tokens = message_tokens(&u);
+            ocserve_store::accumulate_session_usage(writer, session_id, &step_tokens, step_cost)?;
+            {
+                let bump = |agg: &mut Value, key: &str, v: i64| {
+                    agg[key] = (agg[key].as_i64().unwrap_or(0) + v).into();
+                };
+                bump(
+                    &mut session_usage,
+                    "input",
+                    step_tokens["input"].as_i64().unwrap_or(0),
+                );
+                bump(
+                    &mut session_usage,
+                    "output",
+                    step_tokens["output"].as_i64().unwrap_or(0),
+                );
+                bump(
+                    &mut session_usage,
+                    "reasoning",
+                    step_tokens["reasoning"].as_i64().unwrap_or(0),
+                );
+                let read =
+                    session_usage["cache"]["read"].as_i64().unwrap_or(0)
+                        + step_tokens["cache"]["read"].as_i64().unwrap_or(0);
+                let write =
+                    session_usage["cache"]["write"].as_i64().unwrap_or(0)
+                        + step_tokens["cache"]["write"].as_i64().unwrap_or(0);
+                session_usage["cache"]["read"] = read.into();
+                session_usage["cache"]["write"] = write.into();
+                session_cost += step_cost;
+            }
             if cost_ceiling > 0.0 && total_cost >= cost_ceiling {
                 death = Some(format!(
                     "prompt reached the cost ceiling ${cost_ceiling:.4} (OCSERVE_PROMPT_MAX_COST_USD)"
@@ -1756,15 +1801,7 @@ pub async fn run_prompt_with(
                     "agent": agent,
                     "path": {"cwd": ctx.directory, "root": "/"},
                     "cost": step_cost,
-                    "tokens": {
-                        // upstream getUsage (session.ts:361-377): input EXCLUDES
-                        // cache reads/writes (they are separate bill lines); the
-                        // raw provider prompt_tokens includes them. Mismatching
-                        // this double-counts cache in `total`-derived overflow.
-                        "total": u.total_tokens, "input": u.prompt_tokens.saturating_sub(u.cached_tokens),
-                        "output": u.completion_tokens, "reasoning": 0,
-                        "cache": {"write": 0, "read": u.cached_tokens},
-                    },
+                    "tokens": step_tokens,
                     "modelID": model,
                     "providerID": ctx.provider_id,
                     "time": {"created": t_done - elapsed_ms, "completed": t_done},
@@ -1801,7 +1838,11 @@ pub async fn run_prompt_with(
                     ctx,
                     writer,
                     session_id,
-                    json!({"cost": total_cost, "time": {"updated": t_done}}),
+                    json!({
+                        "cost": session_cost,
+                        "tokens": session_usage.clone(),
+                        "time": {"updated": t_done},
+                    }),
                     &mut seq,
                 )?;
 
@@ -1873,12 +1914,16 @@ pub async fn run_prompt_with(
                 "mode": "primary",
                 "agent": agent,
                 "path": {"cwd": ctx.directory, "root": "/"},
-                "cost": total_cost,
-                "tokens": {
-                    "total": total_usage.total_tokens, "input": total_usage.prompt_tokens.saturating_sub(total_usage.cached_tokens),
-                    "output": total_usage.completion_tokens, "reasoning": 0,
-                    "cache": {"write": 0, "read": total_usage.cached_tokens},
-                },
+                // Per-step cost (probed against freeze: every assistant message
+                // carries THAT step's cost, not the turn sum — the web UI's
+                // context meter and any other per-message reader keys off it).
+                "cost": step_cost,
+                // Per-step tokens (upstream processor.ts:459 REPLACES the
+                // message tokens each step-finish). The old whole-turn sum here
+                // is what produced the >100% context meter: the sum of N steps'
+                // prompts (input+cache read each call) far exceeds one call's
+                // context window.
+                "tokens": step_tokens,
                 "modelID": model,
                 "providerID": ctx.provider_id,
                 "time": {"created": t_done - elapsed_ms, "completed": t_done},
@@ -1888,7 +1933,7 @@ pub async fn run_prompt_with(
             });
             parts.push(json!({
                 "reason": finish_reason, "type": "step-finish",
-                "tokens": assistant_info["tokens"], "cost": total_cost,
+                "tokens": assistant_info["tokens"], "cost": step_cost,
                 "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
             }));
             insert_message(
@@ -1923,18 +1968,28 @@ pub async fn run_prompt_with(
                 writer,
                 session_id,
                 json!({
-                    "cost": total_cost,
-                    // Session.tokens has NO `total` (additionalProperties:false);
-                    // the assistant message's tokens do. Project the session shape.
-                    "tokens": session_tokens(assistant_info["tokens"].clone()),
+                    "cost": session_cost,
+                    // Session-lifetime aggregate (upstream applyUsage), NOT the
+                    // assistant message's step tokens. Session.tokens has no
+                    // `total` (additionalProperties:false) — `session_usage` is
+                    // already in that shape.
+                    "tokens": session_usage.clone(),
                     "time": {"updated": t_done},
                 }),
                 &mut seq,
             )?;
-            // ── M6 post-turn trigger (upstream prompt.ts:1160-1167): the just-
-            // finished assistant's tokens vs usable → pending anchor; at the D1
-            // cap emit the honest error and stop compacting (answer is kept).
-            let a_total = assistant_info["tokens"]["total"].as_i64().unwrap_or(0);
+            // ── M6 post-turn trigger (upstream prompt.ts:1160-1167 + overflow.ts
+            // isOverflow): the count is the STEP's tokens — `total` when the
+            // provider reports it, else the component sum (upstream's sum omits
+            // reasoning). The old whole-turn sum fired compaction ~Nx early.
+            let a_total = if u.total_tokens > 0 {
+                u.total_tokens as i64
+            } else {
+                step_tokens["input"].as_i64().unwrap_or(0)
+                    + step_tokens["output"].as_i64().unwrap_or(0)
+                    + step_tokens["cache"]["read"].as_i64().unwrap_or(0)
+                    + step_tokens["cache"]["write"].as_i64().unwrap_or(0)
+            };
             let usable_t = crate::compact::usable(
                 &ctx.compaction,
                 ctx.model_limit["input"].as_i64().unwrap_or(0),
@@ -1991,12 +2046,6 @@ pub async fn run_prompt_with(
                 "variant": "default"
             })
             .to_string(),
-            cost: total_cost,
-            tokens_input: total_usage
-                .prompt_tokens
-                .saturating_sub(total_usage.cached_tokens),
-            tokens_output: total_usage.completion_tokens,
-            tokens_cache_read: total_usage.cached_tokens,
             time_updated: t_end,
         },
     )
@@ -2331,6 +2380,7 @@ mod autonomy_tests {
             completion_tokens: 1_000,
             total_tokens: 11_000,
             cached_tokens: 8_000,
+            reasoning_tokens: 0,
         };
         // in=1, out=2, cache_read=0.1 USD/MTok
         let c = compute_cost(&Some((1.0, 2.0, 0.1)), &u);
