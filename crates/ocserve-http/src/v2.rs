@@ -520,7 +520,14 @@ pub async fn fs_list(
 ) -> Result<Json<Value>, ApiError> {
     let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/")).to_path_buf();
     let rel = q.get("path").cloned().unwrap_or_default();
-    let dir = base.join(rel.trim_start_matches('/'));
+    // Containment (the 2026-10-11 traversal fix): resolve + canonicalize and
+    // reject a path that escapes the project root. `git rev-parse`-style
+    // lexical `..` never listed /etc on freeze (it 500s); ocserve listed it.
+    let dir = resolve_within(&base, &rel).map_err(|_| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        name: "BadRequest",
+        message: "path escapes the project directory".into(),
+    })?;
     let entries = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Value>> {
         let mut out = Vec::new();
         let rd = std::fs::read_dir(&dir)?;
@@ -552,6 +559,57 @@ pub async fn fs_list(
     Ok(Json(
         json!({"location": api_location(&st), "data": entries}),
     ))
+}
+
+/// Resolve `rel` under `base` and refuse to escape it. Canonicalizes the base
+/// (the project root exists) and the joined target; a target that does not
+/// canonicalize (missing) is still allowed only if its lexical form stays
+/// inside `base` (so `fs/list?path=missing` reports "No such file" rather than
+/// silently passing). `..` that resolves outside `base` is rejected.
+fn resolve_within(base: &std::path::Path, rel: &str) -> std::io::Result<std::path::PathBuf> {
+    let base_canon = base.canonicalize()?;
+    let joined = base_canon.join(rel.trim_start_matches('/'));
+    match joined.canonicalize() {
+        Ok(real) => {
+            if real.starts_with(&base_canon) {
+                Ok(real)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "path escapes the project directory",
+                ))
+            }
+        }
+        // not found: fall back to a lexical containment check on the joined path
+        Err(_) => {
+            let lex = lexically_normalize(&joined);
+            if lex.starts_with(&base_canon) {
+                Ok(joined)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "path escapes the project directory",
+                ))
+            }
+        }
+    }
+}
+
+/// Lexically resolve `.`/`..` without touching the filesystem (used only for
+/// the not-found branch; a normalized join stays comparable to a canonical base).
+fn lexically_normalize(p: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// GET /api/fs/read/*path — raw bytes of one file (Uint8Array on the wire).
@@ -1161,21 +1219,22 @@ fn payload_err(key: &str) -> HttpError {
 }
 
 /// POST /api/session/{sessionID}/permission/{requestID}/reply — reply to ask.
+/// Body decode precedes the 404 (same Payload envelope as v1); the old
+/// `unwrap_or("reject")` silently rejected a real ask on a malformed body.
 pub async fn permission_reply(
     State(st): State<Arc<AppState>>,
     Path((_sid, rid)): Path<(String, String)>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
-    let reply = body
-        .get("reply")
-        .and_then(|v| v.as_str())
-        .unwrap_or("reject");
+) -> Result<Json<Value>, crate::HttpError> {
+    let reply = crate::validate_permission_reply(&body)?;
     if st.gate.reply(&rid, reply) {
         Ok(Json(json!({"data": {}})))
     } else {
-        Err(ApiError::not_found(format!(
-            "Permission request not found: {rid}"
-        )))
+        Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "PermissionNotFoundError",
+            fields: json!({"requestID": rid, "message": format!("Permission request not found: {rid}")}),
+        })
     }
 }
 

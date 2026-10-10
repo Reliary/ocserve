@@ -127,11 +127,13 @@ async fn sse_headers_match_freeze() {
     }
 }
 
-/// ALIAS: GET /event must be byte-identical to /global/event (upstream one
-/// handler public.ts:155; §17 row `GET /event`). ids are volatile per
-/// connection, so frames compare after id normalization; headers compare raw.
+/// `/event` is the bare `Event` (`{id,type,properties}`), NOT an alias of
+/// `/global/event` (`{payload}`). Live-probed 2026-10-11: freeze `/event`
+/// emits `{"id":…,"type":"server.connected","properties":{}}`; the earlier
+/// "byte-identical alias" claim (public.ts:155) was wrong and shipped a
+/// divergent envelope. Headers still match across the group.
 #[tokio::test]
-async fn event_alias_is_byte_identical_to_global_event() {
+async fn event_serves_bare_event_not_global_alias() {
     let (s1, h1, b1) = collect_first(
         Request::builder()
             .uri("/event")
@@ -139,7 +141,7 @@ async fn event_alias_is_byte_identical_to_global_event() {
             .unwrap(),
     )
     .await;
-    let (s2, h2, b2) = collect_first(
+    let (s2, _h2, b2) = collect_first(
         Request::builder()
             .uri("/global/event")
             .body(Body::empty())
@@ -148,17 +150,22 @@ async fn event_alias_is_byte_identical_to_global_event() {
     .await;
     assert_eq!(s1, StatusCode::OK);
     assert_eq!(s1, s2, "status diverged");
-    assert_eq!(h1, h2, "header sets diverged");
-    // each side asserted INDEPENDENTLY against the freeze literal (a
-    // cross-connection frame comparison raced once under concurrent cargo
-    // load — a flake source; per-side literal asserts are deterministic)
-    let want = r#"data: {"payload":{"id":"evt_<ID>","type":"server.connected","properties":{}}}"#;
-    for (label, body) in [("event", &b1), ("global-event", &b2)] {
-        let text = String::from_utf8_lossy(body);
-        let first = text.split("\n\n").next().expect("at least one frame");
-        assert_eq!(normalize_ids(first), want, "/{label} first frame drifted");
-        assert!(!text.contains("\nid:"), "/{label}: id: lines forbidden");
-    }
+    assert_eq!(h1, _h2, "header sets diverged");
+    let bare = String::from_utf8_lossy(&b1);
+    let first = bare.split("\n\n").next().expect("at least one frame");
+    assert_eq!(
+        normalize_ids(first),
+        r#"data: {"id":"evt_<ID>","type":"server.connected","properties":{}}"#,
+        "/event first frame drifted (bare Event)"
+    );
+    assert!(!bare.contains("\nid:"), "/event: id: lines forbidden");
+    // global still wraps
+    let global = String::from_utf8_lossy(&b2);
+    let gfirst = global.split("\n\n").next().unwrap();
+    assert!(
+        gfirst.contains(r#""payload""#),
+        "/global/event must wrap payload: {gfirst}"
+    );
 }
 
 /// GOLDEN: first SSE frame bytes match upstream modulo the volatile event id.

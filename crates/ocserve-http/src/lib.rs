@@ -1011,22 +1011,56 @@ async fn get_experimental_sessions(
 }
 
 /// POST /permission/{id}/reply — {reply: once|always|reject} (oc-remote contract).
+/// Body decode precedes the 404 (freeze probe: `{}` → 400 Payload "Missing key
+/// at [reply]"; `{"reply":"maybe"}`/`{"reply":123}` → 400 Payload "Expected
+/// once | always | reject"). The old `unwrap_or("reject")` silently coerced a
+/// malformed body into a REJECT of a real pending ask and returned 404 for
+/// unknown ids instead of the decode 400.
 async fn post_permission_reply(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
-    let reply = body
-        .get("reply")
-        .and_then(|v| v.as_str())
-        .unwrap_or("reject")
-        .to_string();
-    if !st.gate.reply(&id, &reply) {
-        return Err(ApiError::not_found(format!(
-            "Permission request not found: {id}"
-        )));
+) -> Result<Json<Value>, HttpError> {
+    let reply = validate_permission_reply(&body)?;
+    if !st.gate.reply(&id, reply) {
+        return Err(HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "PermissionNotFoundError",
+            fields: json!({"requestID": id, "message": format!("Permission request not found: {id}")}),
+        });
     }
     Ok(Json(json!({})))
+}
+
+/// Validate a permission reply enum with the freeze Payload-decode error
+/// messages (order matters: missing key first, then the union value).
+pub(crate) fn validate_permission_reply(body: &Value) -> Result<&'static str, HttpError> {
+    validate_permission_reply_key(body, "reply")
+}
+
+/// Same, for the deprecated `{response: …}` body key.
+pub(crate) fn validate_permission_reply_key(
+    body: &Value,
+    key: &str,
+) -> Result<&'static str, HttpError> {
+    let Some(v) = body.get(key) else {
+        return Err(HttpError::Payload {
+            message: format!("Missing key\n  at [\"{key}\"]"),
+        });
+    };
+    match v.as_str() {
+        Some("once") => Ok("once"),
+        Some("always") => Ok("always"),
+        Some("reject") => Ok("reject"),
+        // freeze renders the offending value with JSON syntax (strings quoted,
+        // numbers bare): `Expected "once" | "always" | "reject", got 123`.
+        _ => Err(HttpError::Payload {
+            message: format!(
+                "Expected \"once\" | \"always\" | \"reject\", got {}\n  at [\"{key}\"]",
+                v
+            ),
+        }),
+    }
 }
 
 /// GET /permission — pending permission requests.
@@ -2779,12 +2813,8 @@ async fn post_session_permission_respond(
     axum::extract::Path((_id, pid)): axum::extract::Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<axum::response::Response, HttpError> {
-    let reply = body
-        .get("response")
-        .and_then(|v| v.as_str())
-        .unwrap_or("reject")
-        .to_string();
-    if !st.gate.reply(&pid, &reply) {
+    let reply = validate_permission_reply_key(&body, "response")?;
+    if !st.gate.reply(&pid, reply) {
         return Err(HttpError::TaggedData {
             status: StatusCode::NOT_FOUND,
             tag: "PermissionNotFoundError",
@@ -3742,23 +3772,36 @@ async fn find_text(
     State(st): State<Arc<AppState>>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
-    let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/"));
     let pattern = q.get("pattern").map(String::as_str).unwrap_or("");
     if pattern.is_empty() {
         return Ok(Json(json!([])));
     }
-    let out = std::process::Command::new("grep")
-        .args([
-            "-rnE",
-            "--binary-files=without-match",
-            "-m",
-            "50",
-            "--",
-            pattern,
-        ])
-        .arg(base)
-        .env("LC_ALL", "C")
-        .output();
+    let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/")).to_path_buf();
+    let pattern = pattern.to_string();
+    // A full `grep -rnE` over the worktree is a blocking process spawn + scan;
+    // it ran INLINE on a tokio worker (the pre-F1 convoy class, same as the
+    // walk_files fix). Run it on the blocking pool.
+    let base2 = base.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("grep")
+            .args([
+                "-rnE",
+                "--binary-files=without-match",
+                "-m",
+                "50",
+                "--",
+                &pattern,
+            ])
+            .arg(&base2)
+            .env("LC_ALL", "C")
+            .output()
+    })
+    .await
+    .map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("grep worker: {e}"),
+    })?;
     let out = match out {
         Ok(o) => o,
         Err(e) => {
@@ -3790,7 +3833,7 @@ async fn find_text(
         };
         let ln: i64 = ln.parse().unwrap_or(0);
         let rel = std::path::Path::new(p1)
-            .strip_prefix(base)
+            .strip_prefix(&base)
             .map(|r| r.to_string_lossy().to_string())
             .unwrap_or_else(|_| p1.to_string());
         matches.push(json!({
@@ -4401,10 +4444,81 @@ fn evt_id(kind: &str) -> String {
 /// - then 10s JSON heartbeats
 /// - frames wrapped: {"directory":..,"project":..,"payload":..} (except server.connected)
 pub(crate) async fn global_event(State(st): State<Arc<AppState>>) -> Response {
-    let connected = Event::default().data(
-        json!({"payload":{"id":evt_id("connected"),"type":"server.connected","properties":{}}})
-            .to_string(),
-    );
+    event_stream(st, EventFormat::Global).await
+}
+
+/// GET /event — v1 bare `Event` stream (`{id,type,properties}`, no wrapper).
+/// The old wiring served the /global/event `{payload}` envelope here — a real
+/// wire divergence (freeze /event: keys id/type/properties, no payload).
+async fn bare_event(State(st): State<Arc<AppState>>) -> Response {
+    event_stream(st, EventFormat::Bare).await
+}
+
+/// GET /api/event — v2 `V2Event` stream (`{id,type,data}`, properties folded
+/// into `data`; `data` is the frozen V2 field name).
+async fn v2_event(State(st): State<Arc<AppState>>) -> Response {
+    event_stream(st, EventFormat::V2).await
+}
+
+#[derive(Clone, Copy)]
+enum EventFormat {
+    /// `{directory,project,payload:{id,type,properties}}`
+    Global,
+    /// `{id,type,properties}`
+    Bare,
+    /// `{id,type,data}`
+    V2,
+}
+
+/// Rewrite one stored global-event frame into the requested wire format.
+/// Returns None for frames the format does not carry (the sync twin is a
+/// /global/event-only concern; /event and /api/event drop it — freeze emits
+/// neither there).
+fn encode_event_frame(stored: &str, fmt: EventFormat) -> Option<String> {
+    if matches!(fmt, EventFormat::Global) {
+        return Some(stored.to_string());
+    }
+    let v: Value = serde_json::from_str(stored).ok()?;
+    let payload = v.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) == Some("sync") {
+        return None;
+    }
+    let id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let ty = payload.get("type").cloned().unwrap_or(Value::Null);
+    let props = payload.get("properties").cloned().unwrap_or(json!({}));
+    Some(match fmt {
+        EventFormat::Bare => json!({"id": id, "type": ty, "properties": props}).to_string(),
+        EventFormat::V2 => json!({"id": id, "type": ty, "data": props}).to_string(),
+        EventFormat::Global => unreachable!(),
+    })
+}
+
+/// Build a synthetic `server.connected` / `server.heartbeat` frame in the given
+/// format (freeze emits these with the format's own envelope: /global/event is
+/// `{payload:{...}}` with NO directory/project on the connected frame, /event is
+/// bare, /api/event is `{id,type,data}`).
+fn synthetic_frame(fmt: EventFormat, event_type: &str) -> String {
+    let id = evt_id(if event_type == "server.connected" {
+        "connected"
+    } else {
+        "heartbeat"
+    });
+    match fmt {
+        EventFormat::Global => json!({"payload": {
+            "id": id, "type": event_type, "properties": {}}})
+        .to_string(),
+        EventFormat::Bare => json!({
+            "id": id, "type": event_type, "properties": {}})
+        .to_string(),
+        EventFormat::V2 => json!({
+            "id": id, "type": event_type, "data": {}})
+        .to_string(),
+    }
+}
+
+/// Shared SSE body for /event, /global/event, /api/event.
+async fn event_stream(st: Arc<AppState>, fmt: EventFormat) -> Response {
+    let connected = Event::default().data(synthetic_frame(fmt, "server.connected"));
     let rx = st.bus.subscribe();
     ocserve_metrics::gauge(
         "ocserve_sse_clients",
@@ -4431,14 +4545,23 @@ pub(crate) async fn global_event(State(st): State<Arc<AppState>>) -> Response {
                 tokio::time::Instant::now() + Duration::from_secs(10),
                 bus_keepalive,
                 sse_guard,
+                fmt,
             ),
-            |(mut rx, mut next_hb, bus, guard)| async move {
-                {
+            |(mut rx, mut next_hb, bus, guard, fmt)| async move {
+                loop {
                     let dur = next_hb.saturating_duration_since(tokio::time::Instant::now());
                     match tokio::time::timeout(dur.max(Duration::from_millis(1)), rx.recv()).await {
                         Ok(Ok(frame)) => {
                             ocserve_metrics::counter("ocserve_sse_events_total", 1);
-                            Some((Ok(Event::default().data(&frame)), (rx, next_hb, bus, guard)))
+                            // frames this format does not carry (the sync twin on
+                            // /event and /api/event) are skipped, not emitted as
+                            // empty frames (freeze has no such frame).
+                            if let Some(out) = encode_event_frame(&frame, fmt) {
+                                return Some((
+                                    Ok(Event::default().data(&out)),
+                                    (rx, next_hb, bus, guard, fmt),
+                                ));
+                            }
                         }
                         Ok(Err(_lagged_or_closed)) => {
                             ocserve_metrics::labeled_counter(
@@ -4446,16 +4569,13 @@ pub(crate) async fn global_event(State(st): State<Arc<AppState>>) -> Response {
                                 "reason=\"lagged_or_closed\"",
                                 1,
                             );
-                            None
+                            return None;
                         }
                         Err(_elapsed) => {
-                            let hb = Event::default().data(
-                                json!({"payload":{"id":evt_id("heartbeat"),
-                                    "type":"server.heartbeat","properties":{}}})
-                                .to_string(),
-                            );
+                            let hb =
+                                Event::default().data(synthetic_frame(fmt, "server.heartbeat"));
                             next_hb += Duration::from_secs(10);
-                            Some((Ok(hb), (rx, next_hb, bus, guard)))
+                            return Some((Ok(hb), (rx, next_hb, bus, guard, fmt)));
                         }
                     }
                 }
@@ -4581,11 +4701,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(get_messages).post(post_message),
         )
         .route("/global/event", get(global_event))
-        // upstream serves /event, /global/event and /api/event from ONE handler
-        // (public.ts:155) — same handler here; oc-remote uses /global/event, TUI/SDK
-        // probes hit /event (was a tolerated 404; now freeze-faithful)
-        .route("/event", get(global_event))
-        .route("/api/event", get(global_event))
+        // Distinct frozen shapes (live-probed 2026-10-11): /global/event wraps
+        // `{directory,project,payload:{...}}`; /event is bare `{id,type,properties}`;
+        // /api/event is v2 `{id,type,data}`. Serving one shape from all three was
+        // a real wire divergence.
+        .route("/event", get(bare_event))
+        .route("/api/event", get(v2_event))
         .route("/metrics", get(metrics))
         // TUI-attach probes (captured live; PLAN §2 hit-set expansion).
         // The /api/* routes are registered in the v2 block below.

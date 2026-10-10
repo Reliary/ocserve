@@ -1717,7 +1717,11 @@ pub async fn run_prompt_with(
                     "path": {"cwd": ctx.directory, "root": "/"},
                     "cost": step_cost,
                     "tokens": {
-                        "total": u.total_tokens, "input": u.prompt_tokens,
+                        // upstream getUsage (session.ts:361-377): input EXCLUDES
+                        // cache reads/writes (they are separate bill lines); the
+                        // raw provider prompt_tokens includes them. Mismatching
+                        // this double-counts cache in `total`-derived overflow.
+                        "total": u.total_tokens, "input": u.prompt_tokens.saturating_sub(u.cached_tokens),
                         "output": u.completion_tokens, "reasoning": 0,
                         "cache": {"write": 0, "read": u.cached_tokens},
                     },
@@ -1831,7 +1835,7 @@ pub async fn run_prompt_with(
                 "path": {"cwd": ctx.directory, "root": "/"},
                 "cost": total_cost,
                 "tokens": {
-                    "total": total_usage.total_tokens, "input": total_usage.prompt_tokens,
+                    "total": total_usage.total_tokens, "input": total_usage.prompt_tokens.saturating_sub(total_usage.cached_tokens),
                     "output": total_usage.completion_tokens, "reasoning": 0,
                     "cache": {"write": 0, "read": total_usage.cached_tokens},
                 },
@@ -1948,7 +1952,9 @@ pub async fn run_prompt_with(
             })
             .to_string(),
             cost: total_cost,
-            tokens_input: total_usage.prompt_tokens,
+            tokens_input: total_usage
+                .prompt_tokens
+                .saturating_sub(total_usage.cached_tokens),
             tokens_output: total_usage.completion_tokens,
             tokens_cache_read: total_usage.cached_tokens,
             time_updated: t_end,
@@ -2207,9 +2213,12 @@ fn compute_cost(pricing: &Option<(f64, f64, f64)>, u: &Usage) -> f64 {
     let Some((pin, pout, pcache)) = pricing else {
         return 0.0;
     };
-    (u.prompt_tokens as f64 * pin
-        + u.completion_tokens as f64 * pout
-        + u.cached_tokens as f64 * pcache)
+    // upstream getUsage: `input` EXCLUDES cache reads, which are billed
+    // separately at cache_read. The provider's prompt_tokens includes cached,
+    // so subtract it before applying the input rate (or cache is charged twice:
+    // once at input rate, once at cache rate).
+    let non_cached = u.prompt_tokens.saturating_sub(u.cached_tokens);
+    (non_cached as f64 * pin + u.completion_tokens as f64 * pout + u.cached_tokens as f64 * pcache)
         / 1_000_000.0
 }
 
@@ -2270,6 +2279,26 @@ mod sift_wiring_tests {
 #[cfg(test)]
 mod autonomy_tests {
     use super::*;
+
+    /// 2026-10-11 bug hunt: cache tokens must not be billed at the input rate.
+    /// The provider's `prompt_tokens` includes the cached portion; upstream
+    /// (session.ts:361-377) bills `input = prompt − cache` at input and cache at
+    /// cache_read. Charging prompt_tokens × input AND cached × cache double-bills.
+    #[test]
+    fn compute_cost_excludes_cache_from_input_rate() {
+        let u = Usage {
+            prompt_tokens: 10_000,
+            completion_tokens: 1_000,
+            total_tokens: 11_000,
+            cached_tokens: 8_000,
+        };
+        // in=1, out=2, cache_read=0.1 USD/MTok
+        let c = compute_cost(&Some((1.0, 2.0, 0.1)), &u);
+        // expect: (2000×1 + 1000×2 + 8000×0.1)/1e6 = 4800/1e6
+        assert!((c - 0.0048).abs() < 1e-12, "got {c}");
+        // the naive (buggy) charge would have been 10_000×1 + 1000×2 + 8000×0.1
+        // = 12_800 → 0.0128, i.e. 2.67× the honest cost.
+    }
 
     #[test]
     fn auto_title_collapses_whitespace_and_caps_at_48() {

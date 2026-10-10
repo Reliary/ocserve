@@ -301,4 +301,33 @@ else
   echo "ok (no empty partID in runtime emitters)"
 fi
 
+echo "== guard: three event routes stay bound to distinct envelope handlers (rule 22) =="
+# SSE-envelope class: the 2026-10-11 bug hunt found /event and /api/event both
+# wired to the /global/event handler, so all three served the same
+# `{payload}` envelope — but freeze /event is bare `{id,type,properties}` and
+# /api/event is v2 `{id,type,data}`. The static rule requires each route to map
+# to its own handler; the behavioral half is tests/wire_hardening.rs +
+# golden.rs. Selftest: plant an aliased route and confirm it is flagged.
+plant="crates/ocserve-http/src/__rule22_plant.rs"
+printf '%s\n' '.route("/api/event", get(global_event))' > "$plant"
+if grep -RhoE '\.route\("/api/event", get\([a-z0-9_]+\)\)' crates/ocserve-http/src >/dev/null 2>&1; then
+  echo "ok (planted aliased event route detected)"
+else
+  echo "FAIL: aliased event route planted violation not detected (rule 22 vacuous)"; fail=1
+fi
+rm -f "$plant"
+route_event=$(grep -RhoE '\.route\("/event", get\([a-z0-9_]+\)\)' crates/ocserve-http/src | head -1)
+route_api=$(grep -RhoE '\.route\("/api/event", get\([a-z0-9_]+\)\)' crates/ocserve-http/src | head -1)
+route_global=$(grep -RhoE '\.route\("/global/event", get\([a-z0-9_]+\)\)' crates/ocserve-http/src | head -1)
+h_event=$(echo "$route_event" | sed -E 's/.*get\(([a-z0-9_]+)\).*/\1/')
+h_api=$(echo "$route_api" | sed -E 's/.*get\(([a-z0-9_]+)\).*/\1/')
+h_global=$(echo "$route_global" | sed -E 's/.*get\(([a-z0-9_]+)\).*/\1/')
+if [ -z "$h_event" ] || [ -z "$h_api" ] || [ -z "$h_global" ]; then
+  echo "FAIL: an event route is missing (rule 22): event='$h_event' api='$h_api' global='$h_global'"; fail=1
+elif [ "$h_event" = "$h_api" ] || [ "$h_event" = "$h_global" ] || [ "$h_api" = "$h_global" ]; then
+  echo "FAIL: event routes share a handler ($h_event / $h_api / $h_global) — envelopes will diverge (rule 22)"; fail=1
+else
+  echo "ok (event=$h_event api=$h_api global=$h_global)"
+fi
+
 exit $fail
