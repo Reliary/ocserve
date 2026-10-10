@@ -1788,6 +1788,7 @@ pub async fn create_session(
     State(st): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let info = crate::create_session_record(&st, &body)?;
+    let resolved = crate::resolve_create_dir_path(&st, &body, None).await;
+    let info = crate::create_session_record(&st, &body, resolved)?;
     Ok(Json(json!({"data": info})))
 }

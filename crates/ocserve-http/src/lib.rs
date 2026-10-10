@@ -1413,13 +1413,24 @@ async fn get_path(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     Json(st.paths.clone())
 }
 
-/// GET /project — global project + current worktree project (keys: id/worktree/time/sandboxes).
+/// GET /project — the global project + one project per distinct session
+/// directory (newest first). freeze derives its project list from the worktree
+/// registry; ocserve derives it from stored session rows (documented
+/// derivation divergence, same wire shape). This is what lets the web UI group
+/// sessions under the directories they actually belong to — with only
+/// `global`+`current`, sessions under other directories were dropped from the
+/// sidebar ("Nothing here yet").
 async fn get_projects(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
+    let mut dirs = ocserve_store::distinct_session_directories(&st.db).unwrap_or_default();
+    // ensure the server worktree is always present even on an empty/fresh DB
     let worktree = st.paths["worktree"].as_str().unwrap_or("/").to_string();
+    if !dirs.iter().any(|d| d == &worktree) {
+        dirs.insert(0, worktree);
+    }
     let project = |id: &str, wt: &str| {
         json!({
             "id": id,
@@ -1428,10 +1439,11 @@ async fn get_projects(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             "sandboxes": [],
         })
     };
-    Json(json!([
-        project("global", "/"),
-        project("current", &worktree),
-    ]))
+    let mut out = vec![project("global", "/")];
+    for d in dirs {
+        out.push(project(&d, &d));
+    }
+    Json(Value::Array(out))
 }
 
 /// GET /project/current — same shape, single object.
@@ -1602,17 +1614,106 @@ pub fn start_plugin_event_pump(st: &Arc<AppState>) {
 /// id, path, projectID, slug, time, title, tokens, version).
 async fn post_session(
     State(st): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
     Json(body): Json<Value>,
 ) -> Result<impl IntoResponse, ApiError> {
-    Ok(Json(create_session_record(&st, &body)?))
+    let resolved =
+        resolve_create_dir_path(&st, &body, q.get("directory").map(String::as_str)).await;
+    Ok(Json(create_session_record(&st, &body, resolved)?))
+}
+
+/// Async directory resolution: the git toplevel lookup spawns a subprocess, so
+/// it runs on the blocking pool (never pins an async worker — the M3 class).
+async fn resolve_create_dir_path(
+    st: &Arc<AppState>,
+    body: &Value,
+    query_dir: Option<&str>,
+) -> (String, String) {
+    let requested = resolve_create_dir(st, body, query_dir);
+    let st = st.clone();
+    tokio::task::spawn_blocking(move || freeze_dir_path(&requested))
+        .await
+        .unwrap_or_else(|_| {
+            let d = resolve_create_dir(&st, body, query_dir);
+            (d.clone(), d.trim_start_matches('/').to_string())
+        })
+}
+
+/// Resolve the create-time directory (freeze semantics): `directory` query
+/// param (v1) wins, else `body.location.directory` (v2 create shape), else the
+/// server worktree. Before this, ocserve ignored the requested directory and
+/// stamped every session with the server cwd — the "session thinks it's in the
+/// ocserve repo" + constant `external_directory` prompt class.
+fn resolve_create_dir(st: &Arc<AppState>, body: &Value, query_dir: Option<&str>) -> String {
+    query_dir
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or_else(|| {
+            body.pointer("/location/directory")
+                .and_then(|d| d.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| st.paths["worktree"].as_str().unwrap_or("/").to_string())
+}
+
+/// freeze directory semantics (probed): if `dir` is inside a git repo, the
+/// project `directory` is the repo toplevel and `path` is `dir` relative to it
+/// (empty when equal, no leading slash); if it is NOT in a repo, `directory` is
+/// `dir` itself and `path` is `dir` with the leading slash stripped (the cwd
+/// relative to the global "/" project root).
+/// Probed: a repo checkout → (toplevel, ""); a subdir of a repo →
+/// (toplevel, "sub/dir"); a non-repo dir `/tmp/xyz` → ("/tmp/xyz", "tmp/xyz").
+fn freeze_dir_path(dir: &str) -> (String, String) {
+    let dir = dir.trim_end_matches('/');
+    match git_toplevel(dir) {
+        Some(root) => {
+            let path = dir
+                .strip_prefix(&root)
+                .unwrap_or("")
+                .trim_start_matches('/')
+                .to_string();
+            (root, path)
+        }
+        None => {
+            let directory = if dir.is_empty() {
+                "/".to_string()
+            } else {
+                dir.to_string()
+            };
+            let path = dir.trim_start_matches('/').to_string();
+            (directory, path)
+        }
+    }
+}
+
+/// `git rev-parse --show-toplevel` for `dir` (no shell). None when the dir is
+/// absent, not a repo, or git is unavailable.
+fn git_toplevel(dir: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!root.is_empty()).then_some(root)
 }
 
 /// Shared session creation — `POST /session` (v1) and `POST /api/session`
-/// (v2) both land here. Returns (id, info); the caller shapes the envelope.
-pub(crate) fn create_session_record(st: &Arc<AppState>, body: &Value) -> Result<Value, ApiError> {
+/// (v2) both land here. `worktree`/`rel_path` are the freeze-resolved project
+/// root + cwd-relative path (see `freeze_dir_path`). Returns the created
+/// Session.Info.
+pub(crate) fn create_session_record(
+    st: &Arc<AppState>,
+    body: &Value,
+    (worktree, rel_path): (String, String),
+) -> Result<Value, ApiError> {
     let id = ocserve_core::ids::ses_id();
     let now = now_ms();
-    let worktree = st.paths["worktree"].as_str().unwrap_or("/").to_string();
     let title = body
         .get("title")
         .and_then(|t| t.as_str())
@@ -1635,7 +1736,7 @@ pub(crate) fn create_session_record(st: &Arc<AppState>, body: &Value) -> Result<
         "id": id,
         "projectID": "global",
         "directory": worktree,
-        "path": worktree.trim_start_matches('/'),
+        "path": rel_path,
         "slug": slug_for(&id),
         "title": title,
         "version": FREEZE_VERSION,
@@ -1656,7 +1757,7 @@ pub(crate) fn create_session_record(st: &Arc<AppState>, body: &Value) -> Result<
         message: format!("{e:#}"),
     })?;
     st.bus.publish(ocserve_core::event::frame(
-        st.paths["directory"].as_str().unwrap_or("/"),
+        &worktree,
         "session.created",
         json!({"sessionID": id, "info": info}),
     ));
@@ -2891,7 +2992,14 @@ pub(crate) fn build_prompt_context(
         db: st.db.clone(),
         blobs: st.blobs.clone(),
         bus: st.bus.clone(),
-        directory: st.paths["directory"].as_str().unwrap_or("/").to_string(),
+        // The session's OWN project directory (requested at create time), not
+        // the server cwd — scopes tool ops + external_directory checks + event
+        // routing to the client's project (the "session thinks it's in the
+        // ocserve repo" + constant permission-prompt class).
+        directory: ocserve_store::session_directory(&st.db, session_id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| st.paths["directory"].as_str().unwrap_or("/").to_string()),
         agent: agent.clone(),
         system,
         endpoint: ocserve_core::prompt::LlmEndpoint {

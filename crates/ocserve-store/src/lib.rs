@@ -1490,6 +1490,40 @@ pub fn session_exists(db: &std::path::Path, session_id: &str) -> anyhow::Result<
     Ok(n > 0)
 }
 
+/// The session's stored `directory` (the project root the client requested at
+/// create time). Used to scope the prompt tool operations + the directory shown
+/// on events to the session's own project rather than the server cwd — the
+/// "session thinks it's in the ocserve repo" + constant external_directory
+/// prompts class. `None` when the session is missing or has no directory.
+pub fn session_directory(db: &std::path::Path, session_id: &str) -> anyhow::Result<Option<String>> {
+    let conn = pragma::open_reader(db)?;
+    let d: Option<String> = conn
+        .query_row(
+            "SELECT directory FROM session WHERE id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    Ok(d.filter(|s| !s.is_empty()))
+}
+
+/// All non-global, non-empty project `directory` values across sessions,
+/// newest first. Feeds `GET /project` so the web UI can group sessions under
+/// the directories they actually belong to (freeze derives its project list
+/// from the sessions + worktree registry; ocserve derives it from stored
+/// session rows — a documented derivation divergence, not a wire divergence).
+pub fn distinct_session_directories(db: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    let conn = pragma::open_reader(db)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT directory, MAX(time_updated) AS t FROM session
+         WHERE directory IS NOT NULL AND directory != ''
+         GROUP BY directory ORDER BY t DESC LIMIT 200",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 /// Insert a new session row (wire metadata shape) + publish-ready info.
 pub fn insert_session(writer: &Writer, info: &serde_json::Value) -> anyhow::Result<()> {
     let id = info["id"].as_str().unwrap_or_default().to_string();
