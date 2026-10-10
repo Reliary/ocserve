@@ -185,3 +185,71 @@ async fn event_streams_use_their_frozen_envelopes() {
         "/api/event must NOT wrap payload: {v2}"
     );
 }
+
+// ---- 4. session-scoped reads 404 on unknown sessions ------------------------
+
+#[tokio::test]
+async fn session_scoped_reads_404_unknown_session() {
+    let app = app();
+    let bogus = "ses_001a125ffffe00000000000000";
+    // freeze 404s todo/children (ocserve returned []); diff is 200 [] on freeze
+    for p in [
+        format!("/session/{bogus}/todo"),
+        format!("/session/{bogus}/children"),
+    ] {
+        assert_eq!(get_status(&app, &p).await, StatusCode::NOT_FOUND, "{p}");
+    }
+    // v2 session reads use the tagged SessionNotFoundError envelope (not v1)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/session/{bogus}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let b: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(b["_tag"], "SessionNotFoundError");
+    assert_eq!(b["sessionID"], bogus);
+}
+
+// ---- 5. question routes: prefix decode + tagged not-found -------------------
+
+#[tokio::test]
+async fn question_routes_prefix_and_tagged_not_found() {
+    let app = app();
+    // bad prefix → 400 Params envelope (freeze decode precedes the 404)
+    let (st, b) = post(&app, "/question/nope/reject", serde_json::json!({})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(b["data"]["kind"], "Params");
+    assert_eq!(
+        b["data"]["message"],
+        "Expected a string starting with \"que\", got \"nope\"\n  at [\"requestID\"]"
+    );
+    // valid prefix, unknown id → tagged QuestionNotFoundError
+    let (st2, b2) = post(
+        &app,
+        "/question/que_bogus12345678901234567/reject",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(st2, StatusCode::NOT_FOUND);
+    assert_eq!(b2["_tag"], "QuestionNotFoundError");
+    // reply variant
+    let (st3, b3) = post(
+        &app,
+        "/question/nope/reply",
+        serde_json::json!({"answers":[["x"]]}),
+    )
+    .await;
+    assert_eq!(st3, StatusCode::BAD_REQUEST);
+    assert_eq!(b3["data"]["kind"], "Params");
+}

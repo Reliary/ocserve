@@ -20,6 +20,10 @@ pub const ZSTD_LEVEL: i32 = 3;
 /// Single-allocation cap for any payload window (MEMORY.md §6).
 pub const MAX_ALLOC: usize = 8 * 1024 * 1024;
 
+/// Per-process staging-dir counter so concurrent writers with an identical
+/// clock tick never collide on the staging path (added to the pid+nanos key).
+static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 // ---- PERF-10X B1: process-global assembled-blob cache ----
 //
 // Trigger (Phase-I probe): deep-page reads pull 13 blobbed parts per page
@@ -160,11 +164,16 @@ impl BlobStore {
         // sha of content — so we stage chunks in a temp object dir keyed by random,
         // then rename to final dir after full hash known.
         let staging = self.root.join("chunks").join(".staging").join(hex_digest(
-            &std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-                .to_le_bytes(),
+            format!(
+                "{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+                STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            )
+            .as_bytes(),
         ));
         fs::create_dir_all(&staging)?;
         let mut written: Vec<(usize, PathBuf, usize)> = Vec::new();

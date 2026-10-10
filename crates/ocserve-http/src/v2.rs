@@ -677,17 +677,9 @@ fn internal(e: anyhow::Error) -> ApiError {
     }
 }
 
-fn not_found(id: &str) -> ApiError {
-    ApiError {
-        status: StatusCode::NOT_FOUND,
-        name: "NotFoundError",
-        message: format!("Session not found: {id}"),
-    }
-}
-
 /// v2 tagged SessionNotFoundError (`{_tag, sessionID, message}`) — freeze
-/// returns this for `/api/session/{id}/...` writes on an unknown session;
-/// ocserve previously 204'd (set_session_field ignored rows affected).
+/// returns this for `/api/session/{id}/...` on an unknown session; ocserve
+/// previously 204'd (blind UPDATE) or used the v1 `{name,data}` envelope.
 fn session_not_found(id: &str) -> crate::HttpError {
     crate::HttpError::TaggedData {
         status: StatusCode::NOT_FOUND,
@@ -793,14 +785,16 @@ pub async fn active_sessions() -> impl IntoResponse {
 pub async fn get_session(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, crate::HttpError> {
     let sid = id.clone();
     let s = run_blocking(&st.db, move |db| ocserve_store::load_session_wire(db, &sid))
         .await
-        .map_err(internal)?;
+        .map_err(|e| crate::HttpError::Api(internal(e)))?;
     match s {
         Some(s) => Ok(Json(json!({"data": session_v2(&s)}))),
-        None => Err(not_found(&id)),
+        // freeze v2 uses the tagged SessionNotFoundError (probe), not the v1
+        // {name,data} envelope.
+        None => Err(session_not_found(&id)),
     }
 }
 
@@ -809,7 +803,7 @@ pub async fn list_messages(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(q): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, crate::HttpError> {
     let limit: usize = q
         .get("limit")
         .and_then(|l| l.parse().ok())
@@ -819,17 +813,17 @@ pub async fn list_messages(
         let sid = id.clone();
         run_blocking(&st.db, move |db| ocserve_store::load_session_wire(db, &sid))
             .await
-            .map_err(internal)?
+            .map_err(|e| crate::HttpError::Api(internal(e)))?
     };
     if s.is_none() {
-        return Err(not_found(&id));
+        return Err(session_not_found(&id));
     }
     let sid = id.clone();
     let msgs = run_blocking(&st.db, move |db| {
         ocserve_store::page_messages(db, &sid, limit as u64, None)
     })
     .await
-    .map_err(internal)?;
+    .map_err(|e| crate::HttpError::Api(internal(e)))?;
     let data: Vec<Value> = msgs
         .0
         .into_iter()
@@ -916,7 +910,7 @@ pub async fn get_message(
 pub async fn session_context(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, crate::HttpError> {
     list_messages(State(st), Path(id), Query(std::collections::HashMap::new())).await
 }
 
@@ -1261,14 +1255,17 @@ pub async fn question_reply(
     State(st): State<Arc<AppState>>,
     Path((_sid, rid)): Path<(String, String)>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, crate::HttpError> {
+    crate::validate_request_prefix(&rid, "que")?;
     let raw = body
         .get("answers")
         .and_then(|a| a.as_array())
-        .ok_or_else(|| ApiError {
-            status: StatusCode::BAD_REQUEST,
-            name: "BadRequest",
-            message: "body must be {answers: [[String]]}".into(),
+        .ok_or_else(|| {
+            crate::HttpError::Api(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                name: "BadRequest",
+                message: "body must be {answers: [[String]]}".into(),
+            })
         })?;
     let mut answers: Vec<Vec<String>> = Vec::with_capacity(raw.len());
     for a in raw {
@@ -1285,7 +1282,7 @@ pub async fn question_reply(
     if st.question_gate.reply(&rid, answers) {
         Ok(Json(json!({"data": {}})))
     } else {
-        Err(ApiError::not_found(format!("Question not found: {rid}")))
+        Err(crate::question_not_found(&rid))
     }
 }
 
@@ -1293,11 +1290,12 @@ pub async fn question_reply(
 pub async fn question_reject(
     State(st): State<Arc<AppState>>,
     Path((_sid, rid)): Path<(String, String)>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, crate::HttpError> {
+    crate::validate_request_prefix(&rid, "que")?;
     if st.question_gate.reject(&rid) {
         Ok(Json(json!({"data": {}})))
     } else {
-        Err(ApiError::not_found(format!("Question not found: {rid}")))
+        Err(crate::question_not_found(&rid))
     }
 }
 

@@ -1074,6 +1074,7 @@ async fn file_find_question_routes() {
         .await
         .unwrap();
     assert_eq!(body_json(resp).await, serde_json::json!([]));
+    // bad prefix decodes first → 400 Params (freeze); ocserve previously 404'd
     let resp = app
         .clone()
         .oneshot(
@@ -1086,14 +1087,14 @@ async fn file_find_question_routes() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "unknown request id");
-    // reject with NO body (oc-remote posts empty) → 404 for unknown id
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "bad prefix -> 400");
+    // valid prefix, unknown id → 404 tagged
     let resp = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/question/q1/reject")
+                .uri("/question/que_unknown1234567890123456/reject")
                 .body(Body::empty())
                 .unwrap(),
         )

@@ -145,6 +145,12 @@ pub enum HttpError {
     Payload {
         message: String,
     },
+    /// Effect path-param decode failure envelope (freeze: bad `que_`/`per_`
+    /// prefix → {"name":"BadRequest","data":{"message":"Expected a string
+    /// starting with \"que\", got \"x\"\n  at [\"requestID\"]","kind":"Params"}}).
+    Params {
+        message: String,
+    },
     /// Effect TaggedErrorClass envelope with schema fields at top level
     /// (errors.ts:143 McpServerNotFoundError → {"_tag":..., name, message}).
     TaggedData {
@@ -207,6 +213,19 @@ impl IntoResponse for HttpError {
                 let body = serde_json::json!({
                     "name": "BadRequest",
                     "data": {"message": message, "kind": "Payload"}
+                })
+                .to_string();
+                (
+                    StatusCode::BAD_REQUEST,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+                    .into_response()
+            }
+            HttpError::Params { message } => {
+                let body = serde_json::json!({
+                    "name": "BadRequest",
+                    "data": {"message": message, "kind": "Params"}
                 })
                 .to_string();
                 (
@@ -3262,6 +3281,18 @@ async fn get_children(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    let exists_id = id.clone();
+    if !run_blocking(&st.db, move |db| {
+        ocserve_store::session_exists(db, &exists_id)
+    })
+    .await
+    .map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })? {
+        return Err(ApiError::not_found(format!("Session not found: {id}")));
+    }
     run_blocking(&st.db, move |db| ocserve_store::load_children(db, &id))
         .await
         .map(|v| Json(Value::Array(v)))
@@ -3276,6 +3307,19 @@ async fn get_todos(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    // freeze 404s an unknown session (probe); ocserve returned `[]`.
+    let exists_id = id.clone();
+    if !run_blocking(&st.db, move |db| {
+        ocserve_store::session_exists(db, &exists_id)
+    })
+    .await
+    .map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })? {
+        return Err(ApiError::not_found(format!("Session not found: {id}")));
+    }
     run_blocking(&st.db, move |db| ocserve_store::load_todos(db, &id))
         .await
         .map(|v| Json(Value::Array(v)))
@@ -3935,26 +3979,54 @@ async fn get_questions(State(st): State<Arc<AppState>>) -> Json<Value> {
     Json(Value::Array(st.question_gate.list()))
 }
 
+/// Validate a `que_`/`per_`-prefixed request id (freeze decode precedes the
+/// 404/200: bad prefix → 400 Params).
+pub(crate) fn validate_request_prefix(id: &str, prefix: &str) -> Result<(), HttpError> {
+    if id.starts_with(prefix) {
+        Ok(())
+    } else {
+        Err(HttpError::Params {
+            message: format!(
+                "Expected a string starting with \"{prefix}\", got \"{id}\"\n  at [\"requestID\"]"
+            ),
+        })
+    }
+}
+
+/// Tagged QuestionNotFoundError (freeze v2 + v1 question routes).
+pub(crate) fn question_not_found(id: &str) -> HttpError {
+    HttpError::TaggedData {
+        status: StatusCode::NOT_FOUND,
+        tag: "QuestionNotFoundError",
+        fields: json!({"requestID": id, "message": format!("Question request not found: {id}")}),
+    }
+}
+
 /// POST /question/{id}/reply — {answers: [[labels]]} (v1 Reply payload) → true.
 async fn post_question_reply(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, HttpError> {
+    validate_request_prefix(&id, "que")?;
     let raw = body
         .get("answers")
         .and_then(|a| a.as_array())
-        .ok_or_else(|| ApiError {
-            status: StatusCode::BAD_REQUEST,
-            name: "BadRequest",
-            message: "body must be {answers: [[String]]}".into(),
+        .ok_or_else(|| {
+            HttpError::Api(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                name: "BadRequest",
+                message: "body must be {answers: [[String]]}".into(),
+            })
         })?;
     let mut answers: Vec<Vec<String>> = Vec::with_capacity(raw.len());
     for a in raw {
-        let row = a.as_array().ok_or_else(|| ApiError {
-            status: StatusCode::BAD_REQUEST,
-            name: "BadRequest",
-            message: "each answer must be an array of labels".into(),
+        let row = a.as_array().ok_or_else(|| {
+            HttpError::Api(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                name: "BadRequest",
+                message: "each answer must be an array of labels".into(),
+            })
         })?;
         answers.push(
             row.iter()
@@ -3965,7 +4037,7 @@ async fn post_question_reply(
     if st.question_gate.reply(&id, answers) {
         Ok(Json(json!(true)))
     } else {
-        Err(ApiError::not_found(format!("Question not found: {id}")))
+        Err(question_not_found(&id))
     }
 }
 
@@ -3973,11 +4045,12 @@ async fn post_question_reply(
 async fn post_question_reject(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, HttpError> {
+    validate_request_prefix(&id, "que")?;
     if st.question_gate.reject(&id) {
         Ok(Json(json!(true)))
     } else {
-        Err(ApiError::not_found(format!("Question not found: {id}")))
+        Err(question_not_found(&id))
     }
 }
 
