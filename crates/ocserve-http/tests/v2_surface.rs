@@ -335,3 +335,42 @@ async fn permission_create_evaluates_ruleset() {
             .starts_with("per")
     );
 }
+
+/// 2026-10-11 bug hunt: v2 write routes must 404 an unknown session with the
+/// tagged SessionNotFoundError (freeze), not 204 — `set_session_field` ran the
+/// UPDATE blind. And v2 list cursors must carry BOTH keys (previous/next, null
+/// when absent) like freeze; ocserve emitted `{}`.
+#[tokio::test]
+async fn v2_unknown_session_write_404s_and_cursors_are_shaped() {
+    let app = app();
+    let bogus = "ses_00000000000000000000000000";
+    let r = req(
+        &app,
+        "POST",
+        &format!("/api/session/{bogus}/agent"),
+        Some(serde_json::json!({"agent": "build"})),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    let j = json(r).await;
+    assert_eq!(j["_tag"], "SessionNotFoundError");
+    assert_eq!(j["sessionID"], bogus);
+
+    let r = req(
+        &app,
+        "POST",
+        &format!("/api/session/{bogus}/model"),
+        Some(serde_json::json!({"model":{"id":"x","providerID":"y"}})),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+
+    // list cursor shape: both keys present (nulls when no pagination)
+    let r = req(&app, "GET", "/api/session?limit=2&order=desc", None).await;
+    let j = json(r).await;
+    assert!(
+        j["cursor"].get("previous").is_some(),
+        "cursor.previous key: {j}"
+    );
+    assert!(j["cursor"].get("next").is_some(), "cursor.next key: {j}");
+}

@@ -685,6 +685,17 @@ fn not_found(id: &str) -> ApiError {
     }
 }
 
+/// v2 tagged SessionNotFoundError (`{_tag, sessionID, message}`) — freeze
+/// returns this for `/api/session/{id}/...` writes on an unknown session;
+/// ocserve previously 204'd (set_session_field ignored rows affected).
+fn session_not_found(id: &str) -> crate::HttpError {
+    crate::HttpError::TaggedData {
+        status: StatusCode::NOT_FOUND,
+        tag: "SessionNotFoundError",
+        fields: json!({"sessionID": id, "message": format!("Session not found: {id}")}),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // session core
 // ---------------------------------------------------------------------------
@@ -764,16 +775,12 @@ pub async fn list_sessions(
         .take(limit)
         .map(|s| session_v2(&s))
         .collect();
-    let prev = if total > 0 && more {
-        window.last().and_then(|s| s.get("id")).cloned()
-    } else {
-        None
-    };
-    let mut cursor = json!({});
-    if let Some(p) = prev {
-        cursor["previous"] = p;
-    }
-    Ok(Json(json!({"data": window, "cursor": cursor})))
+    // freeze always emits both cursor keys (opaque base64url cursors); ocserve
+    // does not paginate v2 session list, so both are null (shape-faithful).
+    let _ = more;
+    Ok(Json(
+        json!({"data": window, "cursor": {"previous": Value::Null, "next": Value::Null}}),
+    ))
 }
 
 /// GET /api/session/active — `{data:{}}` (no per-request foreground drains
@@ -828,7 +835,8 @@ pub async fn list_messages(
         .into_iter()
         .filter_map(|(mid, info)| project_message_v2(&mid, &info))
         .collect();
-    let mut cursor = json!({});
+    // freeze always emits BOTH cursor keys (previous/next), null when absent.
+    let mut cursor = json!({"previous": Value::Null, "next": Value::Null});
     if let Some(next) = msgs.2 {
         cursor["next"] = json!(next);
     }
@@ -977,7 +985,7 @@ pub async fn switch_agent(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<Value>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<StatusCode, crate::HttpError> {
     let agent = body.get("agent").and_then(|v| v.as_str()).unwrap_or("");
     set_session_field(&st, &id, "agent", json!(agent))?;
     Ok(StatusCode::NO_CONTENT)
@@ -988,7 +996,7 @@ pub async fn switch_model(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<Value>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<StatusCode, crate::HttpError> {
     set_session_field(
         &st,
         &id,
@@ -998,18 +1006,28 @@ pub async fn switch_model(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn set_session_field(st: &AppState, id: &str, field: &str, val: Value) -> Result<(), ApiError> {
+fn set_session_field(
+    st: &AppState,
+    id: &str,
+    field: &str,
+    val: Value,
+) -> Result<(), crate::HttpError> {
     let col = match field {
         "agent" => "agent",
         "model" => "model",
         _ => {
-            return Err(ApiError {
+            return Err(crate::HttpError::Api(ApiError {
                 status: StatusCode::BAD_REQUEST,
                 name: "BadRequest",
                 message: format!("unknown field {field}"),
-            });
+            }));
         }
     };
+    // freeze 404s an unknown session (SessionNotFoundError); the old code ran
+    // the UPDATE blind and 204'd regardless of rows affected.
+    if !ocserve_store::session_exists(&st.db, id).map_err(|e| crate::HttpError::Api(internal(e)))? {
+        return Err(session_not_found(id));
+    }
     let text = if field == "model" && val.is_object() {
         val.to_string()
     } else if let Some(s) = val.as_str() {
@@ -1022,7 +1040,7 @@ fn set_session_field(st: &AppState, id: &str, field: &str, val: Value) -> Result
             sql: format!("UPDATE session SET {col} = ?2 WHERE id = ?1"),
             params: vec![id.into(), text.into()],
         }])
-        .map_err(internal)?;
+        .map_err(|e| crate::HttpError::Api(internal(e)))?;
     Ok(())
 }
 
