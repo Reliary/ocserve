@@ -473,13 +473,17 @@ impl AppState {
     /// Build from pre-assembled route payloads with a temp-backed store
     /// (tests / simple construction — real pieces, no placeholders).
     pub fn with_payloads(auth: Option<(String, String)>, p: Payloads) -> Arc<Self> {
+        // pid + nanos + counter: parallel tests calling this on the same clock
+        // tick must not share a temp data dir (writer/db contention → flaky).
+        static NEW_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "ocserve-http-{}-{}",
+            "ocserve-http-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            NEW_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
         std::fs::create_dir_all(&dir).expect("temp data dir");
         let db = ocserve_store::writer::db_path(&dir);
@@ -3580,7 +3584,21 @@ fn scope_path(base: &std::path::Path, raw: &str) -> Result<std::path::PathBuf, A
         }
     };
     let canon_base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
-    let canon = std::fs::canonicalize(&joined).unwrap_or(joined.clone());
+    // Lexical containment FIRST: normalize `..` without touching the FS so an
+    // escape is rejected deterministically even when the target is missing
+    // (the previous code fell back to the raw `..`-laden path when canonicalize
+    // failed, and a lexically-`starts_with` check on that path passed for a
+    // traversal like `base/../../../etc`). Both the normalized join AND the
+    // canonicalized real path must stay inside the base.
+    let norm = lexically_normalize(&joined);
+    if !norm.starts_with(&canon_base) && !norm.starts_with(base) {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            name: "BadRequest",
+            message: format!("path escapes the session directory: {raw}"),
+        });
+    }
+    let canon = std::fs::canonicalize(&joined).unwrap_or(norm);
     if !canon.starts_with(&canon_base) {
         return Err(ApiError {
             status: StatusCode::BAD_REQUEST,
@@ -3589,6 +3607,22 @@ fn scope_path(base: &std::path::Path, raw: &str) -> Result<std::path::PathBuf, A
         });
     }
     Ok(canon)
+}
+
+/// Lexically resolve `.`/`..` (no filesystem access).
+fn lexically_normalize(p: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// GET /file?path= — directory listing (FileNode list, oc-remote file browser).
@@ -3657,19 +3691,20 @@ async fn list_directory(
 async fn read_file_content(
     State(st): State<Arc<AppState>>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, HttpError> {
     let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/"));
-    let raw = q.get("path").map(String::as_str).ok_or_else(|| ApiError {
-        status: StatusCode::BAD_REQUEST,
-        name: "BadRequest",
-        message: "missing path".into(),
+    let raw = q.get("path").map(String::as_str).ok_or_else(|| HttpError::Query {
+        message: "Missing key\n  at [\"path\"]".into(),
     })?;
-    let path = scope_path(base, raw)?;
-    let bytes = std::fs::read(&path).map_err(|e| ApiError {
-        status: StatusCode::BAD_REQUEST,
-        name: "BadRequest",
-        message: format!("read {}: {e}", path.display()),
-    })?;
+    let path = scope_path(base, raw).map_err(HttpError::Api)?;
+    // freeze returns an empty text body for a missing file (probed), not an
+    // error — the web UI probes optional paths.
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => {
+            return Ok(Json(json!({"type": "text", "content": ""})));
+        }
+    };
     // bound: MEMORY §6 parse cap — truncate at 1MB, then floor to a UTF-8 char
     // boundary so a multibyte char straddling the cutoff does not make a text
     // file mislabel as "binary".
@@ -3699,12 +3734,15 @@ async fn read_file_content(
 async fn find_files(
     State(st): State<Arc<AppState>>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, HttpError> {
     let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/")).to_path_buf();
+    // `query` is REQUIRED (freeze Query decode: missing → 400, kind Query);
+    // an empty value is accepted (→ no matches).
     let query = q
         .get("query")
-        .map(String::as_str)
-        .unwrap_or("")
+        .ok_or_else(|| HttpError::Query {
+            message: "Missing key\n  at [\"query\"]".into(),
+        })?
         .to_lowercase();
     if query.is_empty() {
         return Ok(Json(json!([])));
@@ -3727,16 +3765,16 @@ async fn find_files(
         walk_files(&base, &query, &want_type, limit, glob_mode)
     })
     .await
-    .map_err(|e| ApiError {
+    .map_err(|e| HttpError::Api(ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         name: "InternalServerError",
         message: format!("find_files worker: {e}"),
-    })?
-    .map_err(|e| ApiError {
+    }))?
+    .map_err(|e| HttpError::Api(ApiError {
         status: StatusCode::BAD_REQUEST,
         name: "BadRequest",
         message: format!("find_files: {e:#}"),
-    })?;
+    }))?;
     Ok(Json(Value::Array(
         out.into_iter().map(Value::String).collect(),
     )))
@@ -3825,8 +3863,12 @@ pub(crate) fn walk_files(
 async fn find_text(
     State(st): State<Arc<AppState>>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, ApiError> {
-    let pattern = q.get("pattern").map(String::as_str).unwrap_or("");
+) -> Result<Json<Value>, HttpError> {
+    // `pattern` is REQUIRED (freeze Query decode: missing → 400, kind Query);
+    // empty value accepted (→ no matches).
+    let pattern = q.get("pattern").ok_or_else(|| HttpError::Query {
+        message: "Missing key\n  at [\"pattern\"]".into(),
+    })?;
     if pattern.is_empty() {
         return Ok(Json(json!([])));
     }
@@ -3872,27 +3914,27 @@ async fn find_text(
         Ok::<_, std::io::Error>((a, b))
     })
     .await
-    .map_err(|e| ApiError {
+    .map_err(|e| HttpError::Api(ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         name: "InternalError",
         message: format!("find worker: {e}"),
-    })?;
+    }))?;
     let (a_out, b_out) = match out {
         Ok(o) => o,
         Err(e) => {
-            return Err(ApiError {
+            return Err(HttpError::Api(ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 name: "InternalError",
                 message: format!("grep spawn: {e}"),
-            });
+            }));
         }
     };
     if a_out.status.code().unwrap_or(0) > 1 {
-        return Err(ApiError {
+        return Err(HttpError::Api(ApiError {
             status: StatusCode::BAD_REQUEST,
             name: "BadRequest",
             message: "invalid pattern".into(),
-        });
+        }));
     }
     // match-level: (path, line) -> [(byteoffset, text)]
     let mut subs: std::collections::HashMap<(String, i64), Vec<(usize, String)>> =

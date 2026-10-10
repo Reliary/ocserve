@@ -438,16 +438,14 @@ pub async fn get_integration(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let items = all_integrations(&st);
+    // freeze returns `{location, data:null}` for an unknown id (probed), not a
+    // 404 — the web UI reads `data` and treats null as "not configured".
     match items
         .into_iter()
         .find(|i| i.get("id").and_then(|v| v.as_str()) == Some(&id))
     {
         Some(i) => Ok(Json(json!({"location": api_location(&st), "data": i}))),
-        None => Err(ApiError {
-            status: StatusCode::NOT_FOUND,
-            name: "NotFoundError",
-            message: format!("Integration not found: {id}"),
-        }),
+        None => Ok(Json(json!({"location": api_location(&st), "data": null}))),
     }
 }
 
@@ -464,12 +462,17 @@ pub async fn list_references(State(st): State<Arc<AppState>>) -> impl IntoRespon
 pub async fn fs_find(
     State(st): State<Arc<AppState>>,
     Query(q): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, crate::HttpError> {
     let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/")).to_path_buf();
+    // `query` is REQUIRED (freeze: missing → 400 `_tag:InvalidRequestError`
+    // kind Query); empty accepted.
     let query = q
         .get("query")
-        .map(String::as_str)
-        .unwrap_or("")
+        .ok_or_else(|| crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"query\"]", "kind": "Query"}),
+        })?
         .to_lowercase();
     if query.is_empty() {
         return Ok(Json(json!({"location": api_location(&st), "data": []})));
@@ -486,15 +489,19 @@ pub async fn fs_find(
         crate::walk_files(&walk_base, &query, &want_type, limit, glob_mode)
     })
     .await
-    .map_err(|e| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        name: "InternalServerError",
-        message: format!("fs_find worker: {e}"),
+    .map_err(|e| {
+        crate::HttpError::Api(ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalServerError",
+            message: format!("fs_find worker: {e}"),
+        })
     })?
-    .map_err(|e| ApiError {
-        status: StatusCode::BAD_REQUEST,
-        name: "BadRequest",
-        message: format!("fs_find: {e:#}"),
+    .map_err(|e| {
+        crate::HttpError::Api(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            name: "BadRequest",
+            message: format!("fs_find: {e:#}"),
+        })
     })?;
     let data: Vec<Value> = out
         .into_iter()

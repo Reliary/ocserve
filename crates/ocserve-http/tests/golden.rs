@@ -998,7 +998,8 @@ async fn file_find_question_routes() {
     assert_eq!(v["type"], "text");
     assert_eq!(v["content"], "hi there");
 
-    // scope escape → 400
+    // scope escape → 400 (canonicalize + containment rejects the target; the
+    // security-relevant property is that /etc/passwd is never returned)
     let resp = app
         .clone()
         .oneshot(
