@@ -261,7 +261,10 @@ fn attachment_write(st: &Arc<AppState>, id: &str, data: &str) {
     st.pty.write_session(id, data);
 }
 
-/// Largest char boundary ≤ `want` (may be 0 when a single char exceeds).
+/// Largest char boundary ≤ `want`. When a single char is wider than `want`
+/// (only possible for want < 4), returns 0 rather than a non-boundary index —
+/// the previous `want.min(len)` fallback returned an index that is NOT a char
+/// boundary and would panic any caller slicing at it.
 fn floor_char_boundary(s: &str, want: usize) -> usize {
     if want >= s.len() {
         return s.len();
@@ -270,5 +273,5 @@ fn floor_char_boundary(s: &str, want: usize) -> usize {
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    if end == 0 { want.min(s.len()) } else { end }
+    end
 }

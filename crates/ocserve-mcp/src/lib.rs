@@ -39,6 +39,9 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// tools/list pagination bound (catalog.ts MAX_LIST_PAGES).
 pub const MAX_LIST_PAGES: usize = 1_000;
+/// Total tool-metadata budget for one server's tools/list walk (M2: a hostile
+/// server otherwise accumulates pages up to 8 MiB each with no outer bound).
+pub const MAX_TOOLS_BYTES: usize = 64 * 1024 * 1024;
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -380,6 +383,7 @@ impl McpClient {
     /// tools/list with cursor pagination (bounded).
     pub async fn list_tools(&mut self) -> Result<Vec<Value>> {
         let mut out = Vec::new();
+        let mut total_bytes: usize = 0;
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_LIST_PAGES {
             let params = match &cursor {
@@ -388,7 +392,19 @@ impl McpClient {
             };
             let result = self.request("tools/list", params).await?;
             if let Some(tools) = result.get("tools").and_then(|t| t.as_array()) {
+                for t in tools {
+                    total_bytes = total_bytes.saturating_add(t.to_string().len());
+                }
                 out.extend(tools.iter().cloned());
+            }
+            // M2: a hostile server can stream an unbounded tool surface one page
+            // at a time (each page up to the 8 MiB line cap) — accumulated in
+            // `out`, then cloned into the schema cache at boot, with no outer
+            // timeout on the boot path. Cap the TOTAL surface size.
+            if total_bytes > MAX_TOOLS_BYTES {
+                return Err(anyhow!(
+                    "mcp tools/list exceeded {MAX_TOOLS_BYTES} bytes of tool metadata"
+                ));
             }
             let next = result
                 .get("nextCursor")
