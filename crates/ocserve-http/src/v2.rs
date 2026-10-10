@@ -735,19 +735,53 @@ fn session_v2(s: &Value) -> Value {
 pub async fn list_sessions(
     State(st): State<Arc<AppState>>,
     Query(q): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, ApiError> {
-    let limit: usize = q
-        .get("limit")
-        .and_then(|l| l.parse().ok())
-        .unwrap_or(100)
-        .clamp(1, 200);
+) -> Result<Json<Value>, crate::HttpError> {
+    // Query decode precedes the handler (freeze): invalid limit/order/cursor
+    // → 400 with the v2 tagged envelope
+    // `{"_tag":"InvalidRequestError","message":…,"kind":"Query"}`.
+    let q_err = |message: String| crate::HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidRequestError",
+        fields: json!({"message": message, "kind": "Query"}),
+    };
+    let limit: usize = match q.get("limit") {
+        None => 100,
+        Some(raw) => {
+            let n: f64 = raw
+                .parse()
+                .map_err(|_| q_err("Expected an integer, got NaN\n  at [\"limit\"]".into()))?;
+            if !n.is_finite() || n < 0.0 || n.fract() != 0.0 {
+                return Err(q_err(format!(
+                    "Expected an integer, got {raw}\n  at [\"limit\"]"
+                )));
+            }
+            (n as usize).clamp(1, 200)
+        }
+    };
+    if let Some(order) = q.get("order")
+        && order != "asc"
+        && order != "desc"
+    {
+        return Err(q_err(format!(
+            "Expected \"asc\" | \"desc\", got \"{order}\"\n  at [\"order\"]"
+        )));
+    }
+    if let Some(cur) = q.get("cursor")
+        && ocserve_store::decode_cursor(cur).is_err()
+    {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidCursorError",
+            fields: json!({"message": "Invalid cursor"}),
+        });
+    }
     let roots = q.get("roots").map(|v| v == "true").unwrap_or(false);
     let search = q.get("search").cloned().unwrap_or_default().to_lowercase();
     let sid = q.get("sessionID").cloned();
     let db = st.db.clone();
     let mut sessions = run_blocking(&db, ocserve_store::load_sessions_wire)
         .await
-        .map_err(internal)?;
+        .map_err(|e| crate::HttpError::Api(internal(e)))?;
     if roots {
         sessions.retain(|s| s.get("parentID").map(|p| p.is_null()).unwrap_or(true));
     }

@@ -253,3 +253,54 @@ async fn question_routes_prefix_and_tagged_not_found() {
     assert_eq!(st3, StatusCode::BAD_REQUEST);
     assert_eq!(b3["data"]["kind"], "Params");
 }
+
+// ---- 6. v2 list query decode (limit/order/cursor) ---------------------------
+
+#[tokio::test]
+async fn v2_session_list_rejects_bad_query() {
+    let app = app();
+    for (uri, want_msg) in [
+        (
+            "/api/session?limit=abc",
+            "Expected an integer, got NaN\n  at [\"limit\"]",
+        ),
+        (
+            "/api/session?order=up",
+            "Expected \"asc\" | \"desc\", got \"up\"\n  at [\"order\"]",
+        ),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        let b: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(b["_tag"], "InvalidRequestError", "{uri}: {b}");
+        assert_eq!(b["kind"], "Query");
+        assert_eq!(b["message"], want_msg);
+    }
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/session?cursor=zzz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let b: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(b["_tag"], "InvalidCursorError");
+}
