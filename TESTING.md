@@ -65,6 +65,13 @@ traceable test, every test has a traceable requirement.
    registry to tear down (event + reload only); `disconnected` is a ocserve-side status
    value (v1 corpus captured connected/failed only).
 
+   **Named divergence (D-FS-CONTAIN):** `GET /api/fs/list?path=../../etc` — freeze has
+   NO containment check and returns 500 (its `fs.list` throws on the escape); ocserve
+   canonicalizes + contains and returns a clean 400 `BadRequest`. Same outcome class
+   (request refused) but ocserve is strictly safer and its status/body are deterministic;
+   the divergence is intentional (SECURITY fix, 2026-10-11) and covered by
+   `tests/wire_hardening.rs`.
+
    **Named divergences (K-CONFIG):** ocserve serves ONE config (global==user file;
    `PATCH /config` and `PATCH /global/config` share a handler/target). Live-swap covers
    derived route payloads AND the LLM registry (endpoints/keys/limits/default model —
