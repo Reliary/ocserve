@@ -124,7 +124,7 @@ async fn run_prompt(app: axum::Router, st: &Arc<AppState>) {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "messageId": "msg_ov0000000000000000000001",
+                        "messageID": "msg_ov0000000000000000000001",
                         "parts": [{"type": "text", "text": "trigger overflow"}],
                         "model": {"providerID": "fake", "modelID": "m"},
                         "agent": "build",

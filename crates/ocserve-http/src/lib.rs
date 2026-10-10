@@ -958,6 +958,25 @@ fn mcp_payload_err(field: &str) -> HttpError {
     }
 }
 
+/// Boundary wire-decode for v1 routes: freeze renders decode failures as
+/// `{"name":"BadRequest","data":{"message":…,"kind":"Payload"}}` [400]
+/// (field-probes.md). Decode runs FIRST — before session-existence checks
+/// (probe: `{}` on a nonexistent session → 400, not 404).
+pub(crate) fn decode_v1<T>(r: Result<T, ocserve_core::wire::WireError>) -> Result<T, HttpError> {
+    r.map_err(|e| HttpError::Payload { message: e.message })
+}
+
+/// Boundary wire-decode for v2 `/api/*` routes: freeze renders
+/// `{"_tag":"InvalidRequestError","message":…,"kind":"Payload"}` [400]
+/// (field-probes.md — differs from v1 on BOTH tag and nesting).
+pub(crate) fn decode_v2<T>(r: Result<T, ocserve_core::wire::WireError>) -> Result<T, HttpError> {
+    r.map_err(|e| HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidRequestError",
+        fields: json!({"message": e.message, "kind": "Payload"}),
+    })
+}
+
 /// GET /experimental/session?search=&roots=&limit= — session title search
 /// (oc-remote searchSessions: "not a content search"); rows = list wire shape
 /// + embedded project {id, worktree} (observed contract, manifest keys mode).
@@ -2083,11 +2102,14 @@ async fn post_summarize(
         .and_then(|(info, _)| info["agent"].as_str())
         .unwrap_or("build")
         .to_string();
-    let prompt_payload = json!({
-        "model": {"providerID": provider, "modelID": model_id},
-        "agent": agent,
-        "parts": [],
-    });
+    let prompt_payload = ocserve_core::wire::PromptRequest {
+        model: Some(ocserve_core::wire::ModelRef {
+            provider_id: provider.to_string(),
+            model_id: model_id.to_string(),
+        }),
+        agent: Some(agent.clone()),
+        ..Default::default()
+    };
     let ctx = build_prompt_context(&st, &prompt_payload, &sid)?;
     let writer = st.writer.clone();
     ocserve_core::compaction::persist_anchor(&ctx, &writer, &sid, &agent, false, false)
@@ -2134,11 +2156,14 @@ pub(crate) async fn run_compact(
     sid: &str,
 ) -> anyhow::Result<()> {
     let agent = ctx.agent.clone();
-    let prompt_payload = json!({
-        "model": {"providerID": ctx.provider_id, "modelID": ctx.model_id},
-        "agent": agent,
-        "parts": [],
-    });
+    let prompt_payload = ocserve_core::wire::PromptRequest {
+        model: Some(ocserve_core::wire::ModelRef {
+            provider_id: ctx.provider_id.clone(),
+            model_id: ctx.model_id.clone(),
+        }),
+        agent: Some(agent.clone()),
+        ..Default::default()
+    };
     ocserve_core::compaction::persist_anchor(ctx, writer, sid, &agent, false, false).await?;
     ocserve_core::prompt::run_prompt_with(
         ctx,
@@ -2504,7 +2529,7 @@ async fn post_init(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(payload): Json<Value>,
-) -> Result<axum::response::Response, ApiError> {
+) -> Result<axum::response::Response, HttpError> {
     let provider = payload.get("providerID").and_then(|v| v.as_str());
     let model = payload.get("modelID").and_then(|v| v.as_str());
     let (Some(provider), Some(model)) = (provider, model) else {
@@ -2535,7 +2560,7 @@ async fn post_init(
         name: "InternalError",
         message: format!("{e:#}"),
     })? {
-        return Err(ApiError::not_found(format!("Session not found: {id}")));
+        return Err(ApiError::not_found(format!("Session not found: {id}")).into());
     }
     // Reuse the /command path: command=init, arguments="", model from payload.
     let cmd_payload = json!({
@@ -2751,14 +2776,13 @@ async fn search_messages(
 /// returns {info, parts}; captured in testdata/m2/prompt_response.json).
 /// v1 currentModel(sessionID): payload.model → session's stored model
 /// (updated at prompt time) → configured default.
-fn resolve_model(st: &Arc<AppState>, payload: &Value, session_id: &str) -> (String, String) {
-    if let (Some(p), Some(m)) = (
-        payload
-            .pointer("/model/providerID")
-            .and_then(|v| v.as_str()),
-        payload.pointer("/model/modelID").and_then(|v| v.as_str()),
-    ) {
-        return (p.to_string(), m.to_string());
+fn resolve_model(
+    st: &Arc<AppState>,
+    model: Option<&ocserve_core::wire::ModelRef>,
+    session_id: &str,
+) -> (String, String) {
+    if let Some(m) = model {
+        return (m.provider_id.clone(), m.model_id.clone());
     }
     if let Ok(conn) = ocserve_store::pragma::open_reader(&st.db) {
         let stored: Option<String> = conn
@@ -2809,12 +2833,12 @@ pub(crate) fn agent_rules(st: &Arc<AppState>, agent: &str) -> Vec<ocserve_tools:
 /// Shared by POST /message (sync) and POST /prompt_async (backgrounded).
 pub(crate) fn build_prompt_context(
     st: &Arc<AppState>,
-    payload: &Value,
+    req: &ocserve_core::wire::PromptRequest,
     session_id: &str,
 ) -> Result<ocserve_core::prompt::PromptContext, ApiError> {
-    let agent = payload
-        .get("agent")
-        .and_then(|a| a.as_str())
+    let agent = req
+        .agent
+        .as_deref()
         .filter(|a| !a.is_empty())
         .map(String::from)
         .unwrap_or_else(|| st.llm.read().default_agent.clone());
@@ -2825,7 +2849,7 @@ pub(crate) fn build_prompt_context(
         .get(&agent)
         .cloned()
         .unwrap_or_else(|| crate::BUILD_SYSTEM_BLURB.to_string());
-    let (pid, mid) = resolve_model(st, payload, session_id);
+    let (pid, mid) = resolve_model(st, req.model.as_ref(), session_id);
     let (base_url, api_key) =
         st.llm
             .read()
@@ -3019,12 +3043,15 @@ async fn post_message(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(payload): Json<Value>,
-) -> Result<impl IntoResponse, ApiError> {
-    let ctx = build_prompt_context(&st, &payload, &id)?;
+) -> Result<impl IntoResponse, HttpError> {
+    // wire decode FIRST (freeze: HttpApi payload decode precedes handler —
+    // probe: `{}` on a nonexistent session → 400, valid body → 404).
+    let req = decode_v1(ocserve_core::wire::PromptRequest::decode(&payload))?;
+    let ctx = build_prompt_context(&st, &req, &id)?;
     let _release = lock_session(&st, &id).await?;
     let _guard = _release.arc().lock().await;
     let writer = st.writer.clone();
-    let result = ocserve_core::prompt::run_prompt(&ctx, &writer, &id, &payload)
+    let result = ocserve_core::prompt::run_prompt(&ctx, &writer, &id, &req)
         .await
         .map_err(prompt_err)?;
     drop(_guard);
@@ -3041,7 +3068,10 @@ async fn post_prompt_async(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(payload): Json<Value>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<StatusCode, HttpError> {
+    // decode FIRST (probe: `prompt_async {}` → 400 Missing key, never 204;
+    // HttpApi payload decode precedes both 204 and the session check).
+    let req = decode_v1(ocserve_core::wire::PromptRequest::decode(&payload))?;
     let exists_id = id.clone();
     if !run_blocking(&st.db, move |db| {
         ocserve_store::session_exists(db, &exists_id)
@@ -3052,9 +3082,9 @@ async fn post_prompt_async(
         name: "InternalError",
         message: format!("{e:#}"),
     })? {
-        return Err(ApiError::not_found(format!("Session not found: {id}")));
+        return Err(ApiError::not_found(format!("Session not found: {id}")).into());
     }
-    let ctx = build_prompt_context(&st, &payload, &id)?;
+    let ctx = build_prompt_context(&st, &req, &id)?;
     // release MOVES INTO the task: the handler returns 204 immediately, so a
     // handler-scoped guard would drop (and evict the lock entry) while the
     // prompt is still running (antagonism A2 — ownership, not just RAII).
@@ -3069,7 +3099,7 @@ async fn post_prompt_async(
     let handle = tokio::spawn(async move {
         let _release = release;
         let guard = _release.arc().lock().await;
-        match ocserve_core::prompt::run_prompt(&ctx, &writer, &sid, &payload).await {
+        match ocserve_core::prompt::run_prompt(&ctx, &writer, &sid, &req).await {
             Ok(_) => {}
             Err(e) => tracing::error!("prompt_async failed session={sid}: {e:#}"),
         }
@@ -3881,7 +3911,10 @@ async fn post_command(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(payload): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, HttpError> {
+    // decode FIRST (HttpApi payload decode precedes handler — property order
+    // messageID → agent → model → arguments → command, probe-pinned).
+    let cmd = decode_v1(ocserve_core::wire::CommandRequest::decode(&payload))?;
     let exists_id = id.clone();
     if !run_blocking(&st.db, move |db| {
         ocserve_store::session_exists(db, &exists_id)
@@ -3892,16 +3925,10 @@ async fn post_command(
         name: "InternalError",
         message: format!("{e:#}"),
     })? {
-        return Err(ApiError::not_found(format!("Session not found: {id}")));
+        return Err(ApiError::not_found(format!("Session not found: {id}")).into());
     }
-    let name = payload
-        .get("command")
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
-    let arguments = payload
-        .get("arguments")
-        .and_then(|a| a.as_str())
-        .unwrap_or("");
+    let name = cmd.command.as_str();
+    let arguments = cmd.arguments.as_str();
     // scoped: parking_lot guards are !Send — never held across run_prompt's
     // .await (Handler would stop accepting the future)
     let (template, available_owned): (Option<String>, Vec<String>) = {
@@ -3934,21 +3961,11 @@ async fn post_command(
             status: StatusCode::BAD_REQUEST,
             name: "BadRequest",
             message: msg,
-        });
+        }
+        .into());
     };
     let expanded = expand_command(template, arguments);
-    let mut cmd_payload = json!({
-        "parts": [{"type": "text", "text": expanded}],
-    });
-    if let Some(a) = payload.get("agent").and_then(|a| a.as_str()) {
-        cmd_payload["agent"] = json!(a);
-    }
-    if let Some(m) = payload.get("model") {
-        cmd_payload["model"] = m.clone();
-    }
-    if let Some(mid) = payload.get("messageID").and_then(|m| m.as_str()) {
-        cmd_payload["messageId"] = json!(mid);
-    }
+    let mut cmd_parts = json!([{ "type": "text", "text": expanded }]);
     // v1 parity: command.execute.before (prompt.ts:1461) — input
     // {command, sessionID, arguments}, output {parts} mutated before the
     // prompt runs. Fail-open (no sidecar/hook error → parts unchanged).
@@ -3960,24 +3977,42 @@ async fn post_command(
             "sessionID": id,
             "arguments": arguments,
         }),
-        json!({"parts": cmd_payload["parts"].clone()}),
+        json!({"parts": cmd_parts.clone()}),
     )
     .await;
     if let Some(p) = parts_out.get("parts").and_then(|p| p.as_array()) {
-        cmd_payload["parts"] = Value::Array(p.clone());
+        cmd_parts = Value::Array(p.clone());
     }
 
-    let ctx = build_prompt_context(&st, &cmd_payload, &id)?;
+    // Command wire `model` is a STRING (`providerID/modelID`) — parsed with
+    // upstream `Provider.parseModel` semantics. The previous Value-path read
+    // `/model/providerID` off the string and silently fell back to the
+    // session/default model.
+    let req = ocserve_core::wire::PromptRequest {
+        message_id: cmd.message_id.clone(),
+        model: cmd
+            .model
+            .as_deref()
+            .map(ocserve_core::wire::parse_model_str),
+        agent: cmd.agent.clone(),
+        no_reply: false,
+        tools: None,
+        format: None,
+        system: None,
+        variant: cmd.variant.clone(),
+        parts: cmd_parts.as_array().cloned().unwrap_or_default(),
+    };
+    let ctx = build_prompt_context(&st, &req, &id)?;
     let _release = lock_session(&st, &id).await?;
     let Ok(_guard) = _release.arc().try_lock() else {
-        return Err(session_busy(&id));
+        return Err(session_busy(&id).into());
     };
     let writer = st.writer.clone();
     let (info, parts) = ocserve_core::prompt::run_prompt_with(
         &ctx,
         &writer,
         &id,
-        &cmd_payload,
+        &req,
         ocserve_core::prompt::RunOpts {
             // K-TITLE: a command must never name the session after itself
             auto_title: false,
@@ -3998,7 +4033,10 @@ async fn post_shell(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(payload): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, HttpError> {
+    // decode FIRST: probe `{}` → `Missing key at ["agent"]` (freeze's
+    // custom "command required" messages never existed upstream).
+    let sh = decode_v1(ocserve_core::wire::ShellRequest::decode(&payload))?;
     let exists_id = id.clone();
     if !run_blocking(&st.db, move |db| {
         ocserve_store::session_exists(db, &exists_id)
@@ -4009,29 +4047,15 @@ async fn post_shell(
         name: "InternalError",
         message: format!("{e:#}"),
     })? {
-        return Err(ApiError::not_found(format!("Session not found: {id}")));
+        return Err(ApiError::not_found(format!("Session not found: {id}")).into());
     }
-    let command = payload
-        .get("command")
-        .and_then(|c| c.as_str())
-        .ok_or_else(|| ApiError {
-            status: StatusCode::BAD_REQUEST,
-            name: "BadRequest",
-            message: "command required".into(),
-        })?;
-    let agent = payload
-        .get("agent")
-        .and_then(|a| a.as_str())
-        .ok_or_else(|| ApiError {
-            status: StatusCode::BAD_REQUEST,
-            name: "BadRequest",
-            message: "agent required".into(),
-        })?;
-    let (pid, mid) = resolve_model(&st, &payload, &id);
+    let command = sh.command.as_str();
+    let agent = sh.agent.as_str();
+    let (pid, mid) = resolve_model(&st, sh.model.as_ref(), &id);
 
     let _release = lock_session(&st, &id).await?;
     let Ok(_guard) = _release.arc().try_lock() else {
-        return Err(session_busy(&id));
+        return Err(session_busy(&id).into());
     };
     let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
 
@@ -4046,7 +4070,12 @@ async fn post_shell(
     st.bus.publish(status_frame("busy"));
 
     let started = now_ms_local();
-    let user_msg_id = ocserve_core::ids::msg_id();
+    // client-supplied id honored like every other prompt-family route
+    // (probe-unverified for shell specifically — field-probes.md).
+    let user_msg_id = sh
+        .message_id
+        .clone()
+        .unwrap_or_else(ocserve_core::ids::msg_id);
     let user_part = json!({
         "type": "text", "id": ocserve_core::ids::prt_id(),
         "sessionID": id, "messageID": user_msg_id,

@@ -369,7 +369,7 @@ async fn first_turn_titles_a_default_session_and_never_renames_a_named_one() {
     .unwrap();
 
     let prompt = json!({
-        "messageId": "msg_kt0000000000000000000001",
+        "messageID": "msg_kt0000000000000000000001",
         "parts": [{"type": "text", "text": "  fix the\n  overnight   watcher please"}],
         "model": {"providerID": "fake", "modelID": "m"},
         "agent": "build",
@@ -406,7 +406,7 @@ async fn first_turn_titles_a_default_session_and_never_renames_a_named_one() {
         &app,
         "/session/ses_named000001/message",
         json!({
-            "messageId": "msg_kt0000000000000000000002",
+            "messageID": "msg_kt0000000000000000000002",
             "parts": [{"type": "text", "text": "steal this name"}],
             "model": {"providerID": "fake", "modelID": "m"},
             "agent": "build",
@@ -436,7 +436,7 @@ async fn round_cap_fails_loud_session_error_stopped_part_metric_and_persisted_gr
         &app,
         "/session/ses_cap000000000001/prompt_async",
         json!({
-            "messageId": "msg_kc0000000000000000000001",
+            "messageID": "msg_kc0000000000000000000001",
             "parts": [{"type": "text", "text": "keep going"}],
             "model": {"providerID": "fake", "modelID": "m"},
             "agent": "build",

@@ -196,7 +196,7 @@ async fn run_prompt(app: axum::Router, st: &Arc<AppState>, tag: &str, text: &str
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "messageId": format!("msg_{tag}000000000000000000001"),
+                        "messageID": format!("msg_{tag}000000000000000000001"),
                         "parts": [{"type": "text", "text": text}],
                         "model": {"providerID": "fake", "modelID": "m"},
                         "agent": "build",

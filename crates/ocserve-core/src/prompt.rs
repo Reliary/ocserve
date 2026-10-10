@@ -471,9 +471,9 @@ pub async fn run_prompt(
     ctx: &PromptContext,
     writer: &ocserve_store::Writer,
     session_id: &str,
-    payload: &Value,
+    req: &crate::wire::PromptRequest,
 ) -> Result<(Value, Vec<Value>)> {
-    let res = run_prompt_with(ctx, writer, session_id, payload, RunOpts::default()).await;
+    let res = run_prompt_with(ctx, writer, session_id, req, RunOpts::default()).await;
     match res {
         Ok(out) => Ok(out),
         Err(e) => {
@@ -490,7 +490,7 @@ pub async fn run_prompt_with(
     ctx: &PromptContext,
     writer: &ocserve_store::Writer,
     session_id: &str,
-    payload: &Value,
+    req: &crate::wire::PromptRequest,
     opts: RunOpts,
 ) -> Result<(Value, Vec<Value>)> {
     if !ocserve_store::session_exists(&ctx.db, session_id)? {
@@ -520,31 +520,25 @@ pub async fn run_prompt_with(
     let mut seq = pre.seq;
     let mut pre_dirty = false;
 
-    let model = payload
-        .pointer("/model/modelID")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&ctx.model_id)
-        .to_string();
-    let agent = payload
-        .get("agent")
-        .and_then(|v| v.as_str())
+    let model = req
+        .model
+        .as_ref()
+        .map(|m| m.model_id.clone())
+        .unwrap_or_else(|| ctx.model_id.clone());
+    let agent = req
+        .agent
+        .clone()
         .filter(|a| !a.is_empty())
-        .unwrap_or(&ctx.agent)
-        .to_string();
+        .unwrap_or_else(|| ctx.agent.clone());
 
     // ---- persist user message (text parts; file parts land with M3) ----
-    let user_msg_id = match payload.get("messageId").and_then(|v| v.as_str()) {
-        Some(id) if id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => {
-            id.to_string()
-        }
-        _ => msg_id(),
-    };
+    // Boundary decode (wire.rs) validated `messageID` against `^msg` — the
+    // upstream rule (isStartsWith only; probe: bare "msg" and 5000-char ids
+    // pass, no length/charset cap). Internal constructors pass None →
+    // generate (upstream `input.messageID ?? MessageID.ascending()`).
+    let user_msg_id = req.message_id.clone().unwrap_or_else(msg_id);
     let mut user_parts = Vec::new();
-    for p in payload["parts"]
-        .as_array()
-        .map(|a| a.as_slice())
-        .unwrap_or(&[])
-    {
+    for p in &req.parts {
         if p["type"] == "text" {
             let text = p["text"].as_str().unwrap_or("").to_string();
             user_parts.push(json!({
@@ -566,6 +560,18 @@ pub async fn run_prompt_with(
         "agent": agent,
         "model": {"providerID": ctx.provider_id, "modelID": model},
     });
+    // upstream UserV1 info carries the request-scoped fields when present
+    // (prompt.ts:661 tools, :668 system, :669 format — undefined drops the
+    // key in JSON.stringify, so absent ≠ null and we insert only when Some).
+    if let Some(t) = &req.tools {
+        user_info["tools"] = Value::Object(t.clone());
+    }
+    if let Some(s) = &req.system {
+        user_info["system"] = Value::String(s.clone());
+    }
+    if let Some(f) = &req.format {
+        user_info["format"] = f.clone();
+    }
     // v1 parity: chat.message (prompt.ts:1000) fires BEFORE persistence so
     // plugins (magic-context) can mutate {message, parts} into history.
     // Fidelity note: only the REAL prompt flow fires it — upstream's
@@ -582,7 +588,7 @@ pub async fn run_prompt_with(
                 "agent": agent,
                 "model": model,
                 "messageID": user_msg_id,
-                "variant": payload.get("variant").cloned().unwrap_or(Value::Null),
+                "variant": req.variant.clone().map(Value::String).unwrap_or(Value::Null),
             }),
             json!({"message": user_info, "parts": user_parts}),
         )
@@ -636,6 +642,17 @@ pub async fn run_prompt_with(
                 &mut seq,
             )?;
         }
+    }
+    // v1 `noReply` (prompt.ts:1069): the user message persists and the loop
+    // never starts — return the user message itself (probe 2026-10-09:
+    // [200] {info: role:user, parts} with a dead endpoint = no model call).
+    // NAMED DIVERGENCE: upstream rewrites session permission rules from
+    // `input.tools` immediately before this return (prompt.ts:1059-1067);
+    // ocserve's session.permission column stores always-grant keys, not
+    // PermissionV1.Rule objects — tools are decoded and persisted into
+    // user_info, but the ruleset side-effect is not ported (field-probes.md).
+    if req.no_reply {
+        return Ok((user_info, user_parts));
     }
     emit_live(
         ctx,

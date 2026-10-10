@@ -157,6 +157,13 @@ step "event payloads vs frozen contract" \
   python3 bench/events/event-validate.py \
   "${OCSERVE_DATA_DIR:-$HOME/.local/share/ocserve}/ocserve.db" --minutes 60
 
+# 6d. field-contract differential (K-FIELDCONTRACT, guard rule 20's live
+#     half): boots freeze + ocserve under one fixture and byte-compares the
+#     decode corpus (field-probes.md) + identity-echo assertions. The class
+#     route/shape guards cannot see: request-KEY handling.
+step "field-contract differential (freeze vs ocserve)" \
+  ./scripts/field-contract-check.sh
+
 # 7. mutants (opt-in): survivor report is triaged like a defect (TESTING §9)
 if [ "$WITH_MUTANTS" = "1" ]; then
   if command -v cargo-mutants >/dev/null 2>&1; then

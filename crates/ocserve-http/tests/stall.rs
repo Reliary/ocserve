@@ -63,7 +63,7 @@ async fn silent_provider_fails_within_stall_budget_and_releases_state() {
                 .uri("/session/ses_stall/prompt_async")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"messageId":"msg_stall000000000000000000001",
+                    r#"{"messageID":"msg_stall000000000000000000001",
                         "parts":[{"type":"text","text":"hang"}],
                         "model":{"providerID":"fake","modelID":"m"},"agent":"build"}"#,
                 ))

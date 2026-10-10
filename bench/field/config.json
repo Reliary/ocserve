@@ -1,0 +1,10 @@
+{
+  "model": "fake/m",
+  "provider": {
+    "fake": {
+      "npm": "@ai-sdk/fake",
+      "options": { "baseURL": "http://127.0.0.1:9/v1", "apiKey": "x" }
+    }
+  },
+  "command": { "noop": { "template": "run $1" } }
+}

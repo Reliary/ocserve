@@ -547,13 +547,40 @@ async fn prompt_async_returns_204_persists_user_message_and_404s_unknown() {
         r#"{"name":"NotFoundError","data":{"message":"Session not found: ses_nope"}}"#
     );
 
-    // 2. valid → 204, empty body, client messageId honored, background persists
+    // 2. decode rejects an INVALID messageID with freeze's v1 Payload bytes
+    // (field-probes.md: `Expected a string starting with "msg"`).
     let req = Request::builder()
         .method("POST")
         .uri("/session/ses_async/prompt_async")
         .header("content-type", "application/json")
         .body(Body::from(
-            r#"{"messageId":"msg_client_0001","parts":[{"type":"text","text":"ping"}],
+            r#"{"messageID":"notamsg","parts":[{"type":"text","text":"x"}]}"#,
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "bad messageID decodes to 400"
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["name"], "BadRequest");
+    assert_eq!(v["data"]["kind"], "Payload");
+    assert_eq!(
+        v["data"]["message"],
+        "Expected a string starting with \"msg\", got \"notamsg\"\n  at [\"messageID\"]"
+    );
+
+    // 3. valid → 204, empty body, client `messageID` (exact wire key — the
+    // 2026-10-09 double-prompt bug was reading `messageId` and silently
+    // generating a new id), background persists the CLIENT id.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/session/ses_async/prompt_async")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"messageID":"msg_client_0001","parts":[{"type":"text","text":"ping"}],
                 "model":{"providerID":"fake","modelID":"m"},"agent":"build"}"#,
         ))
         .unwrap();
@@ -562,7 +589,28 @@ async fn prompt_async_returns_204_persists_user_message_and_404s_unknown() {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     assert!(bytes.is_empty(), "NoContent body must be empty");
 
-    // background task persists the user message (then fails at the dead
+    // 4. negative pin: a lowercase `messageId` key is an UNKNOWN key (freeze
+    // drops it — onExcessProperty ignore) → server generates its own id; the
+    // supplied value must NOT appear as a stored message id.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/session/ses_async/prompt_async")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"messageId":"msg_lc_ignored0000000000000001",
+                "parts":[{"type":"text","text":"lc"}]}"#,
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "lowercase body still 204s (decode passes)"
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(bytes.is_empty());
+
+    // background tasks persist the user messages (then fail at the dead
     // endpoint — logged, never panics: panic=abort would kill the test)
     let mut saw_user = false;
     for _ in 0..30 {
@@ -574,14 +622,21 @@ async fn prompt_async_returns_204_persists_user_message_and_404s_unknown() {
         let resp = app.clone().oneshot(req).await.unwrap();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        if let Some(arr) = v.as_array()
-            && arr.iter().any(|m| m["info"]["id"] == "msg_client_0001")
-        {
-            saw_user = true;
-            break;
+        if let Some(arr) = v.as_array() {
+            let ids: Vec<&str> = arr
+                .iter()
+                .filter_map(|m| m["info"]["id"].as_str())
+                .collect();
+            if ids.contains(&"msg_client_0001") {
+                saw_user = true;
+            }
+            assert!(
+                !ids.contains(&"msg_lc_ignored0000000000000001"),
+                "lowercase messageId must be ignored (server-generated id instead)"
+            );
         }
     }
-    assert!(saw_user, "background prompt persisted the user message");
+    assert!(saw_user, "background prompt persisted the client messageID");
 }
 
 // ---- oc-remote contract family, Batch 1 (TESTING §4) ----

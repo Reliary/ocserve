@@ -19,7 +19,7 @@
 //! normalizes the v2 body and calls the same `ocserve_core::prompt::run_prompt`
 //! executor the v1 routes use (single owner of the state machine).
 
-use crate::{ApiError, AppState, api_location, run_blocking};
+use crate::{ApiError, AppState, HttpError, api_location, run_blocking};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -1011,21 +1011,22 @@ pub async fn prompt(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
-    // session existence is checked by run_prompt; build context first.
-    let mut payload = json!({
-        "parts": normalize_v2_prompt_parts(&body),
-    });
-    if let Some(mid) = body.get("id").and_then(|v| v.as_str()) {
-        payload["messageId"] = json!(mid);
-    }
-    let ctx = crate::build_prompt_context(&st, &payload, &id)?;
+) -> Result<Json<Value>, HttpError> {
+    // boundary decode FIRST with the v2 envelope (`_tag:InvalidRequestError`,
+    // field-probes.md) — session/endpoint checks follow.
+    let input = crate::decode_v2(ocserve_core::wire::V2PromptInput::decode(&body))?;
+    let req = ocserve_core::wire::PromptRequest {
+        message_id: input.id.clone(), // already validated `^msg_`
+        parts: normalize_v2_prompt_parts(&input),
+        ..Default::default()
+    };
+    let ctx = crate::build_prompt_context(&st, &req, &id)?;
     let release = crate::lock_session(&st, &id).await?;
     let Ok(_guard) = release.arc().try_lock() else {
-        return Err(crate::session_busy(&id));
+        return Err(crate::session_busy(&id).into());
     };
     let writer = st.writer.clone();
-    let (info, _parts) = ocserve_core::prompt::run_prompt(&ctx, &writer, &id, &payload)
+    let (info, _parts) = ocserve_core::prompt::run_prompt(&ctx, &writer, &id, &req)
         .await
         .map_err(crate::prompt_err)?;
     drop(_guard);
@@ -1036,28 +1037,26 @@ pub async fn prompt(
             "sessionID": id,
             "admittedSeq": 0,
             "prompt": body.get("prompt").cloned().unwrap_or(json!({"text": ""})),
-            "delivery": body.get("delivery").cloned().unwrap_or(json!("queue")),
+            // absent/null delivery defaults to "steer" (probe: fresh session,
+            // no delivery field → "delivery":"steer"; NOT "queue").
+            "delivery": Value::String(input.delivery.unwrap_or_else(|| "steer".into())),
             "timeCreated": info.pointer("/time/created").cloned().unwrap_or(json!(0)),
         }
     })))
 }
 
-/// v2 `PromptInput` → v1 parts array (text + file + agent attachments).
-fn normalize_v2_prompt_parts(body: &Value) -> Vec<Value> {
+/// v2 `PromptInput` → v1 parts array (text + file + agent attachments),
+/// built from the decoded struct (wire names live in wire.rs).
+fn normalize_v2_prompt_parts(input: &ocserve_core::wire::V2PromptInput) -> Vec<Value> {
     let mut parts = Vec::new();
-    let p = body.get("prompt").cloned().unwrap_or(json!({}));
-    if let Some(text) = p.get("text").and_then(|v| v.as_str()) {
-        parts.push(json!({"type": "text", "text": text}));
+    // text is required by decode — always present (empty string included,
+    // matching the old `if let Some(text)` behavior for `text:""`).
+    parts.push(json!({"type": "text", "text": input.prompt_text}));
+    for f in &input.prompt_files {
+        parts.push(json!({"type": "file", "file": f}));
     }
-    if let Some(files) = p.get("files").and_then(|v| v.as_array()) {
-        for f in files {
-            parts.push(json!({"type": "file", "file": f}));
-        }
-    }
-    if let Some(agents) = p.get("agents").and_then(|v| v.as_array()) {
-        for a in agents {
-            parts.push(json!({"type": "agent", "agent": a}));
-        }
+    for a in &input.prompt_agents {
+        parts.push(json!({"type": "agent", "agent": a}));
     }
     parts
 }
@@ -1080,7 +1079,7 @@ pub async fn compact(
 ) -> Result<StatusCode, ApiError> {
     // Freeze: ServiceUnavailable when no model is available; ocserve maps to
     // the same when the session has no resolvable model. Otherwise summarize.
-    let payload = json!({});
+    let payload = ocserve_core::wire::PromptRequest::default();
     let ctx = match crate::build_prompt_context(&st, &payload, &id) {
         Ok(c) => c,
         Err(e) => {
@@ -1117,7 +1116,7 @@ pub async fn revert_stage(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, HttpError> {
     let mid = body.get("messageID").and_then(|v| v.as_str()).unwrap_or("");
     if mid.is_empty() {
         return Err(payload_err("messageID"));
@@ -1149,11 +1148,15 @@ pub async fn revert_commit(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn payload_err(key: &str) -> ApiError {
-    ApiError {
+/// v2 `/api/*` payload error — probe-pinned envelope (field-probes.md):
+/// `{"_tag":"InvalidRequestError","message":"Missing key\n  at [\"<key>\"]",
+/// "kind":"Payload"}` [400]. NOTE: differs from v1 routes (name/data nesting)
+/// — this is the v2 HttpApi tagged-error shape.
+fn payload_err(key: &str) -> HttpError {
+    HttpError::TaggedData {
         status: StatusCode::BAD_REQUEST,
-        name: "BadRequest",
-        message: format!("Missing key\n  at [\"{key}\"]"),
+        tag: "InvalidRequestError",
+        fields: json!({"message": format!("Missing key\n  at [\"{key}\"]"), "kind": "Payload"}),
     }
 }
 
@@ -1508,7 +1511,7 @@ pub async fn permission_create(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, HttpError> {
     let action = body.get("action").and_then(|v| v.as_str());
     let resources = body.get("resources").and_then(|v| v.as_array());
     let (Some(action), Some(resources)) = (action, resources) else {
@@ -1519,11 +1522,15 @@ pub async fn permission_create(
         };
         return Err(payload_err(key));
     };
-    if body.get("save").is_some_and(|v| !v.is_array()) {
-        return Err(ApiError {
+    if let Some(sv) = body.get("save").filter(|v| !v.is_null() && !v.is_array()) {
+        // probe-pinned bytes (save:false → freeze v2 envelope); null = absent
+        return Err(HttpError::TaggedData {
             status: StatusCode::BAD_REQUEST,
-            name: "InvalidRequestError",
-            message: "Expected array, got false\n  at [\"save\"]".into(),
+            tag: "InvalidRequestError",
+            fields: json!({
+                "message": format!("Expected array, got {sv}\n  at [\"save\"]"),
+                "kind": "Payload",
+            }),
         });
     }
     // The v2 create IS the permission oracle: it returns the evaluated effect

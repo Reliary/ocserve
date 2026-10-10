@@ -258,4 +258,21 @@ else
   echo "FAIL: event-validate selftest (validator is vacuous/broken)"; fail=1
 fi
 
+echo "== guard: handler request keys are contract-valid (rule 20) =="
+# Field-contract layer: the 2026-10-09 double-prompt bug was a request-key
+# divergence (`messageId` read vs `messageID` wire — FIELD-CONTRACT.md).
+# The prompt family is typed (wire.rs, compile-checked against the spec by
+# wire_keys_match_frozen_spec); this scan extends the net to every remaining
+# axum Json(...) handler: request keys must exist in the frozen contract.
+# Selftest plants a poisoned handler read — if that is not flagged the
+# scanner is vacuous and the gate fails.
+if out=$(python3 bench/openapi/check-request-keys.py --selftest 2>&1) \
+  && scan=$(python3 bench/openapi/check-request-keys.py \
+      bench/openapi/1.18.31.json crates/ocserve-http/src 2>&1); then
+  echo "ok (selftest + scan: $(echo "$scan" | tail -1))"
+else
+  echo "$out"; echo "$scan"
+  echo "FAIL: handler request keys violate the frozen contract (rule 20)"; fail=1
+fi
+
 exit $fail

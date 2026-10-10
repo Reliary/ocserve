@@ -147,7 +147,7 @@ async fn third_identical_call_asks_doom_loop_then_completes_on_approve() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "messageId": "msg_lg0000000000000000000001",
+                        "messageID": "msg_lg0000000000000000000001",
                         "parts": [{"type": "text", "text": "repeat yourself"}],
                         "model": {"providerID": "fake", "modelID": "m"},
                         "agent": "build",

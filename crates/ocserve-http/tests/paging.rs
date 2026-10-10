@@ -448,7 +448,7 @@ async fn abort_releases_prompt_locks_and_tasks() {
         .uri("/session/ses_hang/prompt_async")
         .header("content-type", "application/json")
         .body(Body::from(
-            r#"{"messageId":"msg_hang0000000000000000000001",
+            r#"{"messageID":"msg_hang0000000000000000000001",
                 "parts":[{"type":"text","text":"hang"}],
                 "model":{"providerID":"fake","modelID":"m"},"agent":"build"}"#,
         ))
