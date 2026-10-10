@@ -1127,20 +1127,23 @@ async fn vcs_diff(
     )
 }
 
-/// GET /vcs/diff/raw → raw patch text (empty string when clean).
+/// GET /vcs/diff/raw → raw patch text (empty string when clean), bounded by the
+/// same 10 MB cap the tracked diff uses (was unbounded — a large dirty tree
+/// allocated the whole patch on a request).
 async fn vcs_diff_raw(State(st): State<Arc<AppState>>) -> Response {
     let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
-    let text = run_blocking(&st.db, move |_db| {
-        Ok::<_, anyhow::Error>(vcs::diff_raw(&dir))
+    let (text, truncated) = run_blocking(&st.db, move |_db| {
+        Ok::<_, anyhow::Error>(vcs::diff_raw_bounded(&dir))
     })
     .await
-    .unwrap_or_default();
+    .unwrap_or_else(|_| (String::new(), false));
     Response::builder()
         .header(
             axum::http::header::CONTENT_TYPE,
             "text/plain; charset=utf-8",
         )
         .header(axum::http::header::VARY, "Accept-Encoding")
+        .header("x-ocserve-truncated", if truncated { "1" } else { "0" })
         .body(axum::body::Body::from(text))
         .expect("static response")
 }
@@ -3623,10 +3626,16 @@ async fn read_file_content(
         name: "BadRequest",
         message: format!("read {}: {e}", path.display()),
     })?;
-    // bound: MEMORY §6 parse cap — truncate at 1MB
+    // bound: MEMORY §6 parse cap — truncate at 1MB, then floor to a UTF-8 char
+    // boundary so a multibyte char straddling the cutoff does not make a text
+    // file mislabel as "binary".
     let truncated = bytes.len() > 1024 * 1024;
     let bytes = if truncated {
-        &bytes[..1024 * 1024]
+        let mut cut = 1024 * 1024;
+        while cut > 0 && (bytes[cut] & 0xC0) == 0x80 {
+            cut -= 1;
+        }
+        &bytes[..cut]
     } else {
         &bytes[..]
     };

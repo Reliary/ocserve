@@ -280,6 +280,23 @@ pub fn diff_raw(dir: &str) -> String {
         .join("\n")
 }
 
+/// `/vcs/diff/raw` variant: same patch text but bounded by
+/// `MAX_TOTAL_PATCH_BYTES` (the tracked `diff()` caps its aggregate; the raw
+/// route concatenated the tracked patch AND one `--no-index` per untracked file
+/// with no cap — an unbounded request-reachable allocation on a large dirty
+/// tree). Truncation is at a char boundary; the caller marks it truncated.
+pub fn diff_raw_bounded(dir: &str) -> (String, bool) {
+    let full = diff_raw(dir);
+    if full.len() <= MAX_TOTAL_PATCH_BYTES {
+        return (full, false);
+    }
+    let mut cut = MAX_TOTAL_PATCH_BYTES;
+    while cut > 0 && !full.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    (full[..cut].to_string(), true)
+}
+
 /// `mode`: git | branch. `context`: unified context lines (default full).
 pub fn diff(dir: &str, mode: &str, context: Option<u32>) -> Value {
     if !is_git(dir) {
