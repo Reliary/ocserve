@@ -561,6 +561,10 @@ impl Runtime {
             console: self.console,
             capabilities: self.capabilities,
             compaction,
+            // the once-parsed catalog moves with the payload set (v2 metadata
+            // routes read it; re-parsing per request was 100 ms CPU + ~25 MB
+            // retention — see Payloads::catalog).
+            catalog: std::sync::Arc::new(self.catalog),
         }
     }
 

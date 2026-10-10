@@ -50,8 +50,7 @@ pub async fn location(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 /// `options.apiKey` in config, or is a custom provider absent from the models
 /// catalog (hence with no integration record). This reproduces the observed
 /// freeze set `{opencode, entrim, nube}` from this box's config.
-fn available_provider_ids(st: &AppState, catalog: &Value) -> Vec<String> {
-    let payloads = st.payloads.read();
+fn available_provider_ids(payloads: &crate::Payloads) -> Vec<String> {
     let connected: Vec<String> = payloads
         .provider
         .get("connected")
@@ -63,7 +62,7 @@ fn available_provider_ids(st: &AppState, catalog: &Value) -> Vec<String> {
         })
         .unwrap_or_default();
     let cfg_providers = payloads.config.get("provider").and_then(|v| v.as_object());
-    let cat_obj = catalog.as_object();
+    let cat_obj = payloads.catalog.as_object();
     connected
         .into_iter()
         .filter(|pid| {
@@ -205,18 +204,34 @@ fn parse_release_ms(date: &str) -> Option<i64> {
 }
 
 /// GET /api/provider — `{location, data:[ProviderV2Info]}` for available providers.
-pub async fn list_providers(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let avail = {
-        let catalog = read_catalog_value();
-        available_provider_ids(&st, &catalog)
-    };
-    let payloads = st.payloads.read();
-    let all = payloads
+pub async fn list_providers(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let ae = headers
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    let inm = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    crate::wire_json_h(&st, "api_provider", ae, inm).unwrap_or_else(|| {
+        let payloads = st.payloads.read();
+        Json(providers_body(&payloads, &api_location(&st))).into_response()
+    })
+}
+
+/// Pure projections of the v2 metadata group over the payloads — the ONE
+/// source of truth for both the request path and `rebuild_wire` (the wire
+/// bytes are these values serialized with serde_json). Byte-parity pinned by
+/// `tests/v2_body_parity.rs`.
+pub(crate) fn providers_body(p: &crate::Payloads, location: &Value) -> Value {
+    let avail = available_provider_ids(p);
+    let all = p
         .provider
         .get("all")
         .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
     let data: Vec<Value> = all
         .iter()
         .filter(|p| {
@@ -226,7 +241,73 @@ pub async fn list_providers(State(st): State<Arc<AppState>>) -> impl IntoRespons
         })
         .map(project_provider_v2)
         .collect();
-    Json(json!({"location": api_location(&st), "data": data}))
+    json!({"location": location, "data": data})
+}
+
+/// Pure model-list projection (the `/api/model` body).
+pub(crate) fn models_body(p: &crate::Payloads, location: &Value) -> Value {
+    let avail = available_provider_ids(p);
+    let all = p
+        .provider
+        .get("all")
+        .and_then(|v| v.as_array())
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    let mut data: Vec<Value> = Vec::new();
+    for p in all {
+        let pid = p.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if !avail.iter().any(|a| a == pid) {
+            continue;
+        }
+        if let Some(models) = p.get("models").and_then(|m| m.as_object()) {
+            for m in models.values() {
+                if m.get("status").and_then(|s| s.as_str()) == Some("deprecated") {
+                    continue;
+                }
+                data.push(project_model_v2(m));
+            }
+        }
+    }
+    data.sort_by(|a, b| {
+        let ra = a
+            .pointer("/time/released")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let rb = b
+            .pointer("/time/released")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        rb.cmp(&ra)
+    });
+    json!({"location": location, "data": data})
+}
+
+/// Pure integration-list projection (the `/api/integration` body).
+pub(crate) fn integrations_body(p: &crate::Payloads, location: &Value) -> Value {
+    let catalog = p.catalog.as_object();
+    let mut out: Vec<Value> = Vec::new();
+    if let Some(map) = catalog {
+        for (id, entry) in map {
+            let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+            let env = entry
+                .get("env")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            out.push(integration_entry(id, name, &env));
+        }
+    }
+    // catalog-less custom providers (e.g. entrim/nube here) are integrations too
+    if let Some(cps) = p.config.get("provider").and_then(|v| v.as_object()) {
+        for (id, v) in cps {
+            if catalog.map(|c| c.contains_key(id)).unwrap_or(false) {
+                continue;
+            }
+            let name = v.get("name").and_then(|x| x.as_str()).unwrap_or(id);
+            out.push(integration_entry(id, name, &[]));
+        }
+    }
+    json!({"location": location, "data": out})
 }
 
 fn project_provider_v2(v1: &Value) -> Value {
@@ -285,8 +366,8 @@ pub async fn get_provider(
         .provider
         .get("all")
         .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
     match all
         .iter()
         .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(&provider_id))
@@ -304,56 +385,20 @@ pub async fn get_provider(
 
 /// GET /api/model — `{location, data:[ModelV2Info]}`, available providers only,
 /// non-deprecated models, sorted by release descending (upstream order).
-pub async fn list_models(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let avail = {
-        let catalog = read_catalog_value();
-        available_provider_ids(&st, &catalog)
-    };
-    let payloads = st.payloads.read();
-    let all = payloads
-        .provider
-        .get("all")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut data: Vec<Value> = Vec::new();
-    for p in &all {
-        let pid = p.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        if !avail.iter().any(|a| a == pid) {
-            continue;
-        }
-        if let Some(models) = p.get("models").and_then(|m| m.as_object()) {
-            for m in models.values() {
-                if m.get("status").and_then(|s| s.as_str()) == Some("deprecated") {
-                    continue;
-                }
-                data.push(project_model_v2(m));
-            }
-        }
-    }
-    data.sort_by(|a, b| {
-        let ra = a
-            .pointer("/time/released")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let rb = b
-            .pointer("/time/released")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        rb.cmp(&ra)
-    });
-    Json(json!({"location": api_location(&st), "data": data}))
-}
-
-/// The models catalog (models.json) as a Value, best-effort (empty on miss).
-fn read_catalog_value() -> Value {
-    // Reuse the same discovery rule as the CLI runtime: cache models.json.
-    let home = std::env::var("HOME").unwrap_or_default();
-    let path = std::path::Path::new(&home).join(".cache/opencode/models.json");
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(json!({}))
+pub async fn list_models(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let ae = headers
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    let inm = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    crate::wire_json_h(&st, "api_model", ae, inm).unwrap_or_else(|| {
+        let payloads = st.payloads.read();
+        Json(models_body(&payloads, &api_location(&st))).into_response()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -390,46 +435,21 @@ fn integration_entry(id: &str, name: &str, env: &[Value]) -> Value {
     json!({"id": id, "name": name, "methods": methods, "connections": []})
 }
 
-/// Build the integration list from the models catalog (+ the catalog-less
-/// custom providers seen in config). The catalog is the source of the 226
-/// entries freeze serves; `connections` is always empty on this box (no
-/// OAuth/key integrations connected through the v2 store).
-fn all_integrations(st: &AppState) -> Vec<Value> {
-    let catalog = read_catalog_value();
-    let mut out: Vec<Value> = Vec::new();
-    if let Some(map) = catalog.as_object() {
-        for (id, entry) in map {
-            let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or(id);
-            let env = entry
-                .get("env")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            out.push(integration_entry(id, name, &env));
-        }
-    }
-    // catalog-less custom providers (e.g. entrim/nube here) are integrations too
-    let payloads = st.payloads.read();
-    if let Some(cps) = payloads.config.get("provider").and_then(|v| v.as_object()) {
-        for (id, v) in cps {
-            if catalog
-                .as_object()
-                .map(|c| c.contains_key(id))
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            let name = v.get("name").and_then(|x| x.as_str()).unwrap_or(id);
-            out.push(integration_entry(id, name, &[]));
-        }
-    }
-    out
-}
-
 /// GET /api/integration — `{location, data:[IntegrationInfo]}`.
-pub async fn list_integrations(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let data = all_integrations(&st);
-    Json(json!({"location": api_location(&st), "data": data}))
+pub async fn list_integrations(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let ae = headers
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    let inm = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    crate::wire_json_h(&st, "api_integration", ae, inm).unwrap_or_else(|| {
+        let payloads = st.payloads.read();
+        Json(integrations_body(&payloads, &api_location(&st))).into_response()
+    })
 }
 
 /// GET /api/integration/{integrationID} — single integration.
@@ -437,12 +457,17 @@ pub async fn get_integration(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let items = all_integrations(&st);
+    let payloads = st.payloads.read();
+    let items = integrations_body(&payloads, &api_location(&st));
     // freeze returns `{location, data:null}` for an unknown id (probed), not a
     // 404 — the web UI reads `data` and treats null as "not configured".
-    match items
-        .into_iter()
-        .find(|i| i.get("id").and_then(|v| v.as_str()) == Some(&id))
+    match items["data"]
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .find(|i| i.get("id").and_then(|v| v.as_str()) == Some(&id))
+        })
+        .cloned()
     {
         Some(i) => Ok(Json(json!({"location": api_location(&st), "data": i}))),
         None => Ok(Json(json!({"location": api_location(&st), "data": null}))),

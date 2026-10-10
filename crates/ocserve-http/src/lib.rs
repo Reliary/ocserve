@@ -71,6 +71,11 @@ pub struct Payloads {
     pub capabilities: serde_json::Value,
     /// shared-config `compaction` section (M6 trigger/knobs).
     pub compaction: serde_json::Value,
+    /// Parsed models catalog (`models.json`, ~5.4 MB), swapped with the other
+    /// payloads on reload. Shared so v2 metadata routes never re-read +
+    /// re-parse the file per request — the pre-fix `read_catalog_value` did
+    /// exactly that (100 ms CPU + ~25 MB retention per call; conc-6 → 8 s).
+    pub catalog: std::sync::Arc<serde_json::Value>,
 }
 
 /// PERF-10X F1: run a blocking store call on the runtime's blocking pool.
@@ -358,8 +363,13 @@ pub struct WireEntry {
 }
 
 /// Serialize the hot payload fields once (reload-time). off => empty map
-/// (handlers fall back to the Value path).
-pub(crate) fn rebuild_wire(p: &Payloads, off: bool) -> HashMap<&'static str, WireEntry> {
+/// (handlers fall back to the Value path). `location` is the v2 envelope's
+/// location object (built from `paths`, which is static per process).
+pub(crate) fn rebuild_wire(
+    p: &Payloads,
+    off: bool,
+    location: &Value,
+) -> HashMap<&'static str, WireEntry> {
     let mut m = HashMap::new();
     if off {
         return m;
@@ -405,6 +415,20 @@ pub(crate) fn rebuild_wire(p: &Payloads, off: bool) -> HashMap<&'static str, Wir
     one(&mut m, "provider", &p.provider);
     one(&mut m, "console", &p.console);
     one(&mut m, "capabilities", &p.capabilities);
+    // v2 metadata group: projection is pure over Payloads (the pre-fix
+    // handlers re-read + re-parsed the 5.4 MB catalog and deep-cloned the
+    // provider tree on EVERY request).
+    one(&mut m, "api_model", &crate::v2::models_body(p, location));
+    one(
+        &mut m,
+        "api_provider",
+        &crate::v2::providers_body(p, location),
+    );
+    one(
+        &mut m,
+        "api_integration",
+        &crate::v2::integrations_body(p, location),
+    );
     m
 }
 
@@ -513,7 +537,12 @@ impl AppState {
         let wire_off = std::env::var("OCSERVE_WIRE_CACHE")
             .map(|v| v == "0")
             .unwrap_or(false);
-        let wire_map = rebuild_wire(&p, wire_off);
+        // v2 envelope location (static per process — same value every request).
+        let location = json!({
+            "directory": worktree,
+            "project": {"id": "global", "directory": "/"},
+        });
+        let wire_map = rebuild_wire(&p, wire_off, &location);
         let bus = ocserve_core::EventBus::new();
         let pty = {
             let mgr = ocserve_pty::PtyManager::new(worktree.clone());
@@ -4799,6 +4828,18 @@ async fn event_stream(st: Arc<AppState>, fmt: EventFormat) -> Response {
 /// Basic auth middleware (N6/PLAN §3: auth mode is a freeze artifact — live
 /// instance is passwordless, so default is off; `basic` mode 401s everything
 /// without matching credentials, including SSE and /metrics).
+/// Per-request INFO logging (route hit-set capture) — opt-in via
+/// OCSERVE_REQ_LOG=1 (read once at first request). Default off: at the
+/// measured 10k+ rps a log line per request is pure journald amplification.
+fn req_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("OCSERVE_REQ_LOG")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 async fn auth_gate(
     State(st): State<Arc<AppState>>,
     req: axum::extract::Request,
@@ -4821,9 +4862,13 @@ async fn auth_gate(
             t0.elapsed().as_micros() as u64,
         );
     };
-    // Hit-set capture (M1 §PLAN C4): every request path logged for the
-    // differential route inventory.
-    tracing::info!("req {} {}", req.method(), req.uri().path());
+    // Hit-set capture (M1 §PLAN C4): route-inventory probes set
+    // OCSERVE_REQ_LOG=1. Default OFF — one INFO line per request is pure
+    // journald write amplification at the measured 10k+ rps (and the live
+    // journal showed 1400 /api/health lines in hours of idle traffic).
+    if req_log() {
+        tracing::info!("req {} {}", req.method(), req.uri().path());
+    }
     if let Some((user, pass)) = &st.auth {
         let authorized = req
             .headers()
@@ -5512,15 +5557,62 @@ mod f5_wire {
     /// Kill-switch: wire_off => no cache, wire_json falls back (None).
     #[test]
     fn wire_off_disables_cache() {
-        let empty = rebuild_wire(&Payloads::default(), true);
+        let empty = rebuild_wire(
+            &Payloads::default(),
+            true,
+            &json!({"directory": "/", "project": {"id": "global", "directory": "/"}}),
+        );
         assert!(empty.is_empty(), "off => nothing serialized");
         let st = AppState::new();
         st.wire_off
             .store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(wire_json(&st, "config").is_none(), "off => Value path");
-        st.wire_off
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        assert!(wire_json(&st, "config").is_some(), "on => Bytes path");
+    }
+
+    /// v2 metadata wire entries: cached bytes == the pure builder serialized
+    /// (the single-source-of-truth parity — a handler drift from its builder
+    /// would serve stale shapes to browsers with `Accept-Encoding`).
+    #[test]
+    fn v2_metadata_wire_matches_builders() {
+        for (catalog, name) in [
+            (serde_json::json!({"deepseek": {"name": "DeepSeek"}}), "with-catalog"),
+            (serde_json::json!({}), "empty-catalog"),
+        ] {
+            let payloads = Payloads {
+                provider: serde_json::json!({
+                    "connected": ["opencode", "deepseek"],
+                    "all": [
+                        {"id": "opencode", "name": "opencode", "models": {"m": {"id": "m", "providerID": "opencode", "name": "M"}}},
+                        {"id": "deepseek", "name": "DeepSeek", "models": {"d": {"id": "d", "providerID": "deepseek", "name": "D"}}},
+                    ]
+                }),
+                config: serde_json::json!({"provider": {"entrim": {"name": "Entrim"}}}),
+                catalog: std::sync::Arc::new(catalog),
+                ..Default::default()
+            };
+            let location = json!({"directory": "/", "project": {"id": "global", "directory": "/"}});
+            let wire = rebuild_wire(&payloads, false, &location);
+            for (key, want) in [
+                ("api_model", crate::v2::models_body(&payloads, &location)),
+                (
+                    "api_provider",
+                    crate::v2::providers_body(&payloads, &location),
+                ),
+                (
+                    "api_integration",
+                    crate::v2::integrations_body(&payloads, &location),
+                ),
+            ] {
+                let e = wire
+                    .get(key)
+                    .unwrap_or_else(|| panic!("[{name}] missing wire key {key}"));
+                assert_eq!(
+                    &e.identity[..],
+                    &serde_json::to_vec(&want).unwrap()[..],
+                    "[{name}] {key} wire bytes must equal the pure builder"
+                );
+            }
+        }
     }
 }
 

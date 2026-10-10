@@ -32,6 +32,14 @@ export const ENDPOINTS = [
   'session_status',
 ];
 
+// v2 metadata routes (2026-10-11 perf gap: /api/model|provider|integration were
+// 100 ms+ per call — the web UI + TUI boot path — and invisible to this mix).
+// OFF by default so the committed thresholds (pooled p95 from the v1 mix) stay
+// valid; enable per run with LOAD_INCLUDE_V2=1 or by listing them in
+// LOAD_ROUTES. Post-fix they should sit in the same band as /config.
+const V2_ENDPOINTS = ['api_model', 'api_provider', 'api_integration'];
+if (__ENV.LOAD_INCLUDE_V2 === '1') ENDPOINTS.push(...V2_ENDPOINTS);
+
 // Iteration schedule over ONLY the active endpoints. (First E0-era filter
 // returned null from req() for excluded routes while the switch still cycled
 // all 9 cases — r.headers on null crashed any run whose filter excluded
@@ -123,6 +131,15 @@ export function doIteration() {
       // route), freeze returns 200 SPA catch-all HTML — a status-code-only
       // check counted that as a pass on run1 (recorded lesson).
       req('session_status', 'GET', '/session/status');
+      break;
+    case 'api_model':
+      req('api_model', 'GET', '/api/model');
+      break;
+    case 'api_provider':
+      req('api_provider', 'GET', '/api/provider');
+      break;
+    case 'api_integration':
+      req('api_integration', 'GET', '/api/integration');
       break;
     default:
       break;

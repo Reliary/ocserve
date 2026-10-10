@@ -19,6 +19,12 @@ of *both* servers under **identical read load**:
   (`LOAD_RPS`) → achieved-vs-offered = queueing signal
 - Route mix (`mix.js`): session list, message page + `X-Next-Cursor` page,
   config, agent, command, file list, `POST /session/search`, session status
+- v2 metadata routes (`/api/model`, `/api/provider`, `/api/integration`) —
+  **OFF by default** (`LOAD_INCLUDE_V2=1` or naming them in `LOAD_ROUTES`):
+  they are the web-UI/TUI boot path (2026-10-11: 100 ms+ CPU per call before
+  the once-parsed-catalog + wire-cache fix) but were absent from the mix the
+  committed thresholds were derived from, so enabling them by default would
+  silently re-base the pooled p95 gate. Enable for v2-specific rounds.
 - **Zero LLM-provider traffic by design** — no prompts exist in the
   measured window; the deterministic dummy (stub) belongs to L2 only
   (`L2-DESIGN.md`, pre-registered, not built)

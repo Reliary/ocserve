@@ -197,10 +197,16 @@ pub async fn reconcile(st: &Arc<AppState>) -> anyhow::Result<()> {
     };
     // F5: re-serialize the wire cache in the SAME swap window as the values
     // (build first from the borrow, then publish both — a reader never sees
-    // values without their matching bytes).
+    // values without their matching bytes). Location is static per process
+    // (paths never change after boot).
+    let location = json!({
+        "directory": st.paths["directory"].as_str().unwrap_or("/"),
+        "project": {"id": "global", "directory": "/"},
+    });
     let wire_map = crate::rebuild_wire(
         &payloads,
         st.wire_off.load(std::sync::atomic::Ordering::Relaxed),
+        &location,
     );
     *st.payloads.write() = payloads;
     *st.wire.write() = wire_map;
