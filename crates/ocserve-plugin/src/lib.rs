@@ -129,7 +129,34 @@ fn entry_from_package(pkg_json: &Path, base: &Path, _pkg_name: &str) -> Option<P
     rel = rel.or_else(|| v.get("module").and_then(|x| x.as_str()));
     let rel = rel?;
     let entry = base.join(rel);
-    entry.exists().then_some(entry)
+    // G6: the package's own `exports`/`main`/`module` may point outside the
+    // package (e.g. `../../other`). Lexically normalize and require the entry
+    // to stay inside `base`; a plugin entry is loaded only from its package.
+    let lex = lexically_normalize(&entry);
+    if !lex.starts_with(base)
+        && !std::fs::canonicalize(base)
+            .ok()
+            .is_some_and(|cb| lex.starts_with(&cb))
+    {
+        tracing::warn!("plugin entry {rel} escapes its package dir — refused");
+        return None;
+    }
+    lex.exists().then_some(lex)
+}
+
+fn lexically_normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 struct Pending {

@@ -35,6 +35,42 @@ pub fn spawn(
     cwd: &str,
     env: &[(String, String)],
 ) -> Result<Proc, String> {
+    // Reject interior NULs: `cstring` just appends a terminator, so a NUL in
+    // `command` truncates the executed binary while `info.command` shows the
+    // full string, and a NUL in an env value becomes extra env entries at
+    // execve (argv[0]/env would not match what the API reported).
+    let has_nul = command.contains('\0')
+        || cwd.contains('\0')
+        || args.iter().any(|a| a.contains('\0'))
+        || env
+            .iter()
+            .any(|(k, v)| k.contains('\0') || v.contains('\0'));
+    if has_nul {
+        return Err("pty spawn input contains a NUL byte".to_string());
+    }
+
+    // P4: pre-build every C string BEFORE fork. Only async-signal-safe calls
+    // are permitted between fork and execve in a multi-threaded process;
+    // `format!`/`Vec` growth there can deadlock on allocator contention.
+    let cwd_c = cstring(cwd);
+    let env_strings: Vec<Vec<u8>> = env
+        .iter()
+        .map(|(k, v)| cstring(&format!("{k}={v}")))
+        .collect();
+    let mut envv: Vec<*const i8> = env_strings
+        .iter()
+        .map(|s| s.as_ptr() as *const i8)
+        .collect();
+    envv.push(std::ptr::null());
+    let file = cstring(command);
+    let arg_strings: Vec<Vec<u8>> = args.iter().map(|a| cstring(a)).collect();
+    let mut argv: Vec<*const i8> = Vec::with_capacity(args.len() + 2);
+    argv.push(file.as_ptr() as *const i8);
+    for a in &arg_strings {
+        argv.push(a.as_ptr() as *const i8);
+    }
+    argv.push(std::ptr::null());
+
     unsafe {
         let flags = libc::O_RDWR | libc::O_NOCTTY;
         let master = libc::posix_openpt(flags);
@@ -78,27 +114,7 @@ pub fn spawn(
             }
             libc::close(master);
 
-            let c = cstring(cwd);
-            libc::chdir(c.as_ptr() as *const i8);
-
-            let env_strings: Vec<Vec<u8>> = env
-                .iter()
-                .map(|(k, v)| cstring(&format!("{k}={v}")))
-                .collect();
-            let mut envv: Vec<*const i8> = env_strings
-                .iter()
-                .map(|s| s.as_ptr() as *const i8)
-                .collect();
-            envv.push(std::ptr::null());
-
-            let file = cstring(command);
-            let arg_strings: Vec<Vec<u8>> = args.iter().map(|a| cstring(a)).collect();
-            let mut argv: Vec<*const i8> = Vec::with_capacity(args.len() + 2);
-            argv.push(file.as_ptr() as *const i8);
-            for a in &arg_strings {
-                argv.push(a.as_ptr() as *const i8);
-            }
-            argv.push(std::ptr::null());
+            libc::chdir(cwd_c.as_ptr() as *const i8);
 
             // The child's env is passed explicitly (execvpe-style via
             // execve); upstream merges process.env + overrides — the caller
@@ -256,5 +272,31 @@ fn exit_code(status: i32) -> Option<i32> {
         Some((status >> 8) & 0xff)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod nul_tests {
+    use super::spawn;
+
+    #[test]
+    fn nul_bytes_rejected_in_command_args_env_and_cwd() {
+        let ok = spawn("/bin/true", &[], "/", &[]);
+        assert!(ok.is_ok(), "clean spawn works");
+        let e = match spawn("/bin/true", &["a\0b".into()], "/", &[]) {
+            Err(e) => e,
+            Ok(_) => panic!("NUL in args must be rejected"),
+        };
+        assert!(e.contains("NUL"), "{e}");
+        let e = match spawn("/bin/true", &[], "/", &[("K".into(), "v\0X".into())]) {
+            Err(e) => e,
+            Ok(_) => panic!("NUL in env must be rejected"),
+        };
+        assert!(e.contains("NUL"), "{e}");
+        let e = match spawn("/bin/true", &[], "/a\0b", &[]) {
+            Err(e) => e,
+            Ok(_) => panic!("NUL in cwd must be rejected"),
+        };
+        assert!(e.contains("NUL"), "{e}");
     }
 }
