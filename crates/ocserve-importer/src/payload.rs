@@ -106,15 +106,32 @@ pub fn import_payloads(
     dst.execute_batch("COMMIT")?;
 
     // ---- parts (streamed; large → blobs) ----
+    // FTS bulk-load fast path (2026-10-11 perf dive): the per-insert
+    // `part_search_ai` trigger makes a full import O(N·M) — the trigram
+    // index's segment auto-merge cascade collapses the rate from ~6,800
+    // parts/s (bulk) to ~20-27 parts/s as the corpus grows (measured on the
+    // 170k-part/162MB fixture corpus: 25s rebuild vs >2h trigger-driven; the
+    // real 1.6GB live corpus measured 310s for its FTS rebuild in W1). The
+    // trigger is DROPPED for the streaming phase, one `'rebuild'` bulk-builds
+    // the index, then the trigger is recreated — ALL inside ONE transaction,
+    // so an interrupted import rolls back to the schema migrate() left
+    // (no window where future writes silently skip the index).
     let mut seq_part: HashMap<String, i64> = HashMap::new();
+    let t_parts = std::time::Instant::now();
+    // Batched commits (2026-10-11): ONE 178k-row transaction left the pager
+    // holding every dirty page through the FTS build — measured 3.3 GB/s of
+    // page reads and >30 min for the rebuild vs 25 s when the part rows are
+    // committed first (WAL checkpoints between batches, clean pages feed the
+    // bulk build). The trigger drop rides the first batch's transaction.
     dst.execute_batch("BEGIN")?;
+    dst.execute_batch("DROP TRIGGER IF EXISTS part_search_ai")?;
     {
         let mut stmt = src.prepare(&format!(
             "SELECT id, message_id, session_id, time_created, data FROM part \
              WHERE session_id IN ({ph}) ORDER BY session_id, time_created, id"
         ))?;
         let mut rows = stmt.query(rusqlite::params_from_iter(session_ids))?;
-        let mut batch = 0;
+        let mut batch = 0u64;
         while let Some(row) = rows.next()? {
             let id: String = row.get(0)?;
             let mid: String = row.get(1)?;
@@ -151,13 +168,53 @@ pub fn import_payloads(
             ocserve_store::apply_ops(&dst, &ops)?;
             stats.parts += 1;
             batch += 1;
-            if batch >= 500 {
+            if batch >= 5_000 {
                 dst.execute_batch("COMMIT; BEGIN")?;
                 batch = 0;
+            }
+            if stats.parts.is_multiple_of(40_000) {
+                let el = t_parts.elapsed().as_secs_f64();
+                tracing::info!(
+                    "parts progress: {} in {el:.1}s ({:.0}/s)",
+                    stats.parts,
+                    stats.parts as f64 / el
+                );
             }
         }
     }
     dst.execute_batch("COMMIT")?;
+    let t_ins = t_parts.elapsed().as_secs_f64();
+    tracing::info!(
+        "parts insert phase: {} rows in {t_ins:.1}s ({:.0}/s) — starting FTS bulk build",
+        stats.parts,
+        stats.parts as f64 / t_ins.max(0.001)
+    );
+    // Bulk FTS build on a FRESH connection after a WAL checkpoint (2026-10-11,
+    // measured): rebuilding on the import connection while its 1.1 GB WAL is
+    // pending takes >16 min on the .227 fixture corpus (page reads of the
+    // uncheckpointed WAL dominate); the identical rebuild on a fresh
+    // connection after `wal_checkpoint(TRUNCATE)` = 113 s. So: checkpoint,
+    // drop the import connection, reopen with the writer profile, rebuild,
+    // recreate the trigger. Crash windows (killed mid-rebuild) are closed by
+    // the boot self-heal in `backfill_part_search` (docsize < part_search
+    // count + missing trigger both repaired there).
+    drop(dst);
+    {
+        let ck = Connection::open(target_db).context("reopen for checkpoint")?;
+        ck.busy_timeout(std::time::Duration::from_millis(10_000))?;
+        ck.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .context("wal_checkpoint before fts rebuild")?;
+    }
+    let dst = ocserve_store::pragma::open_writer(target_db).context("reopen writer for fts")?;
+    let t_rb = std::time::Instant::now();
+    dst.execute_batch("INSERT INTO part_search_fts(part_search_fts) VALUES('rebuild')")
+        .context("fts bulk rebuild")?;
+    tracing::info!("fts bulk build: {:.1}s", t_rb.elapsed().as_secs_f64());
+    dst.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS part_search_ai AFTER INSERT ON part_search BEGIN
+             INSERT INTO part_search_fts(rowid, text) VALUES (new.rowid, new.text);
+         END",
+    )?;
 
     // ---- events (bounded ring input; time ≈ session updated) ----
     dst.execute_batch("BEGIN")?;

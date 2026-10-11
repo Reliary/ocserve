@@ -2284,6 +2284,53 @@ pub fn backfill_part_search(
     let total: i64 = conn.query_row("SELECT count(*) FROM msg_part", [], |r| r.get(0))?;
     let have: i64 = conn.query_row("SELECT count(*) FROM part_search", [], |r| r.get(0))?;
     if have >= total {
+        // Import crash-window self-heal (2026-10-11): the bulk FTS importer
+        // drops `part_search_ai`, bulk-builds, then recreates it. A kill
+        // between those steps leaves the projection complete but the index
+        // empty and the trigger missing. Detect both and repair (cheap
+        // checks; the rebuild only runs on a real crash).
+        drop(conn);
+        let conn = pragma::open_reader(db)?;
+        let trigger: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='part_search_ai'",
+            [],
+            |r| r.get(0),
+        )?;
+        let fts_docs: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM part_search_fts_docsize",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(-1);
+        drop(conn);
+        // repair only when needed — a healthy DB pays two cheap counts and no
+        // writer-open (the boot path must stay ~0 ms)
+        if trigger == 0 || (fts_docs >= 0 && fts_docs < have) {
+            let wconn = crate::pragma::open_writer(db)?;
+            if trigger == 0 {
+                tracing::warn!(
+                    "part_search FTS trigger missing (interrupted import?) — recreating"
+                );
+                wconn.execute_batch(
+                    "CREATE TRIGGER part_search_ai AFTER INSERT ON part_search BEGIN
+                         INSERT INTO part_search_fts(rowid, text) VALUES (new.rowid, new.text);
+                     END",
+                )?;
+            }
+            if fts_docs >= 0 && fts_docs < have {
+                tracing::warn!(
+                    "part_search FTS index incomplete ({fts_docs}/{have} docs) — bulk rebuild"
+                );
+                let t_rb = std::time::Instant::now();
+                wconn
+                    .execute_batch("INSERT INTO part_search_fts(part_search_fts) VALUES('rebuild')")?;
+                tracing::warn!(
+                    "part_search FTS rebuild took {:.1}s",
+                    t_rb.elapsed().as_secs_f64()
+                );
+            }
+        }
         return Ok((0, 0, t0.elapsed().as_millis() as u64));
     }
     let blobs = crate::blob::BlobStore::new(
