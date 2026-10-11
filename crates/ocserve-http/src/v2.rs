@@ -223,8 +223,8 @@ pub async fn list_providers(
 /// Pure projections of the v2 metadata group over the payloads — the ONE
 /// source of truth for both the request path and `rebuild_wire` (the wire
 /// bytes are these values serialized with serde_json). Byte-parity pinned by
-/// `tests/v2_body_parity.rs`.
-pub(crate) fn providers_body(p: &crate::Payloads, location: &Value) -> Value {
+/// `tests/v2_body_parity.rs` (including a planted-drift negative control).
+pub fn providers_body(p: &crate::Payloads, location: &Value) -> Value {
     let avail = available_provider_ids(p);
     let all = p
         .provider
@@ -245,7 +245,7 @@ pub(crate) fn providers_body(p: &crate::Payloads, location: &Value) -> Value {
 }
 
 /// Pure model-list projection (the `/api/model` body).
-pub(crate) fn models_body(p: &crate::Payloads, location: &Value) -> Value {
+pub fn models_body(p: &crate::Payloads, location: &Value) -> Value {
     let avail = available_provider_ids(p);
     let all = p
         .provider
@@ -283,7 +283,7 @@ pub(crate) fn models_body(p: &crate::Payloads, location: &Value) -> Value {
 }
 
 /// Pure integration-list projection (the `/api/integration` body).
-pub(crate) fn integrations_body(p: &crate::Payloads, location: &Value) -> Value {
+pub fn integrations_body(p: &crate::Payloads, location: &Value) -> Value {
     let catalog = p.catalog.as_object();
     let mut out: Vec<Value> = Vec::new();
     if let Some(map) = catalog {

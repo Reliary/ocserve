@@ -91,6 +91,27 @@ fn import_counts_byte_parity_and_blob_spill() {
         .query_row("SELECT count(*) FROM part_search", [], |r| r.get(0))
         .unwrap();
     assert_eq!(ps_count, 2, "inline + blob parts indexed");
+
+    // Bulk-path contract (2026-10-11): the importer DROPS part_search_ai for
+    // the streaming phase and recreates it after the one bulk rebuild. Two
+    // invariants guard the crash window documented in payload.rs:
+    // (a) the trigger EXISTS again post-import, and
+    // (b) the FTS docsize equals the projection row count (a killed rebuild
+    //     leaves docsize < count; backfill self-heal repairs it at boot).
+    let trigger: i64 = dst
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='part_search_ai'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(trigger, 1, "bulk import must recreate part_search_ai");
+    let fts_docs: i64 = dst
+        .query_row("SELECT count(*) FROM part_search_fts_docsize", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(fts_docs, ps_count, "FTS index complete after bulk rebuild");
     let blob_hits: i64 = dst
         .query_row(
             "SELECT count(*) FROM part_search_fts WHERE part_search_fts MATCH '\"xxxxxxxxxx\"'",

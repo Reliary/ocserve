@@ -330,4 +330,68 @@ else
   echo "ok (event=$h_event api=$h_api global=$h_global)"
 fi
 
+echo "== guard: no per-request catalog reads in v2 metadata routes (rule 23) =="
+# Perf class (2026-10-11 dive): the v2 metadata handlers re-read + re-parsed
+# the 5.4 MB models.json and deep-cloned the provider tree on EVERY request
+# (96 ms p50, conc-6 8.1 s, +374 MB RSS) while v1 had F5/F7/F8/F9 caches.
+# The fix serves precomputed pure projections from the per-reload wire cache.
+# This rule bans fs reads (`read_to_string`/`fs::read`) of a model catalog in
+# the v2 module and requires the three metadata handlers to go through
+# `wire_json_h` (the cache path with a live builder fallback).
+plant="crates/ocserve-http/src/__rule23_plant.rs"
+printf '%s\n' 'fn _plant() { let _ = std::fs::read_to_string("models.json"); }' > "$plant"
+if grep -RqE 'fs::read_to_string|fs::read\(' crates/ocserve-http/src/__rule23_plant.rs 2>/dev/null; then
+  echo "ok (planted per-request read detected)"
+else
+  echo "FAIL: per-request read planted violation not detected (rule 23 vacuous)"; fail=1
+fi
+rm -f "$plant"
+if grep -RnE 'read_to_string|std::fs::read\(|tokio::fs::read\(' crates/ocserve-http/src/v2.rs \
+     | grep -iE 'catalog|models\.json' >/dev/null 2>&1; then
+  grep -RnE 'read_to_string|std::fs::read\(|tokio::fs::read\(' crates/ocserve-http/src/v2.rs | grep -iE 'catalog|models\.json'
+  echo "FAIL: v2 routes must not re-read the model catalog per request (rule 23)"; fail=1
+else
+  for h in list_models list_providers list_integrations; do
+    if grep -A 20 "pub async fn $h" crates/ocserve-http/src/v2.rs | grep -q 'wire_json_h'; then
+      :
+    else
+      echo "FAIL: $h does not serve the wire cache (rule 23)"; fail=1
+    fi
+  done
+  echo "ok (no per-request catalog read; metadata routes use wire_json_h)"
+fi
+
+echo "== guard: every test file referenced from src/ exists (rule 24) =="
+# False-claim class (2026-10-11): `src/v2.rs` cited `tests/v2_body_parity.rs` in
+# a doc comment while the file had never been written — the claim outran the
+# code. Scan every `crates/*/src/**.rs` for `tests/<name>.rs` mentions and
+# require the file to exist in the same crate's tests/ directory.
+# The planted control runs through the SAME loop: a phantom reference is
+# planted into src/ first, then the loop must flag it red.
+plant="crates/ocserve-store/src/__rule24_plant.rs"
+printf '%s\n' '/// see tests/__rule24_nonexistent.rs' > "$plant"
+refs=$(grep -rhoE 'tests/[A-Za-z0-9_.-]+\.rs' crates/*/src --include='*.rs' 2>/dev/null | sort -u)
+plant_caught=0
+for ref in $refs; do
+  name="${ref#tests/}"
+  found=0
+  for crate in crates/*/; do
+    if [ -f "$crate/tests/$name" ]; then found=1; break; fi
+  done
+  if [ "$found" -eq 0 ]; then
+    if [ "$ref" = "tests/__rule24_nonexistent.rs" ]; then
+      plant_caught=1
+    else
+      echo "FAIL: referenced but missing test file: $ref (rule 24)"; fail=1
+    fi
+  fi
+done
+rm -f "$plant"
+if [ "$plant_caught" -eq 1 ]; then
+  echo "ok (planted phantom reference detected by the same scan)"
+else
+  echo "FAIL: phantom-reference planted control not detected (rule 24 vacuous)"; fail=1
+fi
+echo "ok (all $(( $(echo "$refs" | wc -w) - 1 )) real referenced test files exist)"
+
 exit $fail

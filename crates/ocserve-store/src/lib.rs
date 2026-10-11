@@ -3132,6 +3132,121 @@ mod compaction_projection_tests {
             "compaction part adds projection"
         );
     }
+
+    /// Crash-window self-heal (importer bulk-path fix, 2026-10-11): the importer
+    /// DROPS `part_search_ai`, bulk-rebuilds the FTS, then recreates the
+    /// trigger. A kill mid-flight leaves (a) the trigger missing and/or
+    /// (b) `docsize < part_search count`. `backfill_part_search` must repair
+    /// both halves; the pre-state assertions prove the planted state is
+    /// genuinely broken so the repair assertions aren't vacuous.
+    #[test]
+    fn backfill_repairs_interrupted_import_crash_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::writer::db_path(dir.path());
+        let w = Writer::spawn(db.clone()).unwrap();
+        w.write(vec![session_op("ses_heal")]).unwrap();
+        insert_message(
+            &w,
+            None,
+            "ses_heal",
+            &json!({"id":"msg_heal","sessionID":"ses_heal","role":"user","time":{"created":1}}),
+            &[json!({"id":"prt_heal","sessionID":"ses_heal","messageID":"msg_heal",
+                     "type":"text","text":"healing needle"})],
+        )
+        .unwrap();
+        drop(w);
+
+        // Simulate the kill exactly as the bulk path leaves it: index wiped,
+        // trigger gone.
+        {
+            let conn = crate::pragma::open_writer(&db).unwrap();
+            conn.execute_batch(
+                "INSERT INTO part_search_fts(part_search_fts) VALUES('delete-all');
+                 DROP TRIGGER part_search_ai;",
+            )
+            .unwrap();
+        }
+        {
+            let c = crate::pragma::open_reader(&db).unwrap();
+            let docs: i64 = c
+                .query_row("SELECT count(*) FROM part_search_fts_docsize", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let trg: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name='part_search_ai'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let rows: i64 = c
+                .query_row("SELECT count(*) FROM part_search", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                (docs, trg, rows),
+                (0, 0, 1),
+                "planted crash window must actually be broken"
+            );
+        }
+
+        let w = Writer::spawn(db.clone()).unwrap();
+        let r = backfill_part_search(&w, &db).unwrap();
+        assert_eq!((r.0, r.1), (0, 0), "repair path reports no new indexing");
+        {
+            let c = crate::pragma::open_reader(&db).unwrap();
+            let docs: i64 = c
+                .query_row("SELECT count(*) FROM part_search_fts_docsize", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let trg: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name='part_search_ai'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let hits: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM part_search_fts WHERE part_search_fts MATCH '\"needle\"'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(trg, 1, "trigger recreated");
+            assert_eq!(docs, 1, "index rebuilt (docsize == count)");
+            assert_eq!(hits, 1, "repaired index is searchable");
+        }
+
+        // Second half of the window: trigger missing but index INTACT — the
+        // repair must recreate the trigger without needing a rebuild, and a
+        // subsequent store-path insert must be indexed by the new trigger.
+        {
+            let conn = crate::pragma::open_writer(&db).unwrap();
+            conn.execute_batch("DROP TRIGGER part_search_ai;").unwrap();
+        }
+        let r2 = backfill_part_search(&w, &db).unwrap();
+        assert_eq!((r2.0, r2.1), (0, 0));
+        insert_message(
+            &w,
+            None,
+            "ses_heal",
+            &json!({"id":"msg_heal2","sessionID":"ses_heal","role":"user","time":{"created":2}}),
+            &[json!({"id":"prt_heal2","sessionID":"ses_heal","messageID":"msg_heal2",
+                     "type":"text","text":"second needle"})],
+        )
+        .unwrap();
+        let c = crate::pragma::open_reader(&db).unwrap();
+        let hits: i64 = c
+            .query_row(
+                "SELECT count(*) FROM part_search_fts WHERE part_search_fts MATCH '\"needle\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 2, "recreated trigger indexes new writes");
+    }
 }
 
 #[cfg(test)]

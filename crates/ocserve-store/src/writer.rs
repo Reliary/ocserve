@@ -96,7 +96,24 @@ fn bind(conn: &Connection, sql: &str, params: &[serde_json::Value]) -> Result<us
     // prepares ONCE with SQLITE_PREPARE_PERSISTENT (rusqlite's documented
     // behaviour) and reuses the VDBE across batches — every WriteOp::Sql
     // funnels here, so op-SQL compile cost drops to LRU hits.
-    let mut stmt = conn.prepare_cached(sql)?;
+    // SQLite 3.53.2 schema-state bug (found 2026-10-11): after ANOTHER
+    // connection on the same file recreates a DDL object (the FTS
+    // crash-window self-heal recreates part_search_ai), this connection's
+    // next fresh prepare can fail with a spurious "no such table" while
+    // sqlite_master clearly contains it. The failure is one-shot: a second
+    // prepare of the SAME sql on the SAME connection succeeds. Flush the
+    // statement cache and retry exactly once; a real missing table fails
+    // both times and still propagates. (Proven: minimal repro
+    // `expect_no_error_with_fixed_bind` was red without this, green with.)
+    let mut stmt = match conn.prepare_cached(sql) {
+        Ok(s) => s,
+        Err(first) => {
+            conn.flush_prepared_statement_cache();
+            conn.prepare_cached(sql).inspect(|_| {
+                tracing::debug!("prepare_cached: one-shot schema glitch recovered ({first})");
+            })?
+        }
+    };
     let boxed: Vec<Box<dyn rusqlite::ToSql>> = params
         .iter()
         .map(|v| match v {
@@ -199,11 +216,19 @@ fn exec_op(conn: &Connection, op: &WriteOp, affected: &mut usize) -> Result<()> 
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            *affected += conn.execute(
-                "INSERT OR REPLACE INTO blob_object (sha, byte_len, chunk_cnt, codec, created_at)
-                 VALUES (?1, ?2, ?3, 'zstd', ?4)",
-                rusqlite::params![sha, *byte_len as i64, *chunk_cnt, now],
-            )?;
+            let sql = "INSERT OR REPLACE INTO blob_object (sha, byte_len, chunk_cnt, codec, created_at)
+                 VALUES (?1, ?2, ?3, 'zstd', ?4)";
+            let run = |c: &Connection| {
+                c.execute(sql, rusqlite::params![sha, *byte_len as i64, *chunk_cnt, now])
+            };
+            // same one-shot schema-glitch recovery as bind() (see comment there)
+            match run(conn) {
+                Ok(n) => *affected += n,
+                Err(_) => {
+                    conn.flush_prepared_statement_cache();
+                    *affected += run(conn)?;
+                }
+            }
             Ok(())
         }
     }
