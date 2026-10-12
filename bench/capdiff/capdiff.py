@@ -355,8 +355,12 @@ def post(port, path, obj, timeout=60):
     req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data,
                                  headers={"content-type": "application/json"},
                                  method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read() or b"null")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read() or b"null")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")[:600]
+        raise RuntimeError(f"POST {path} -> HTTP {e.code}: {body}") from e
 
 def metrics_snapshot(port):
     """Parse ocserve /metrics (Prometheus text). freeze serves the SPA there
@@ -635,8 +639,12 @@ def main():
             fr, oc = box["freeze"], box["ocserve"]
     except Exception as e:
         print(f"capdiff INFRA: {e}", file=sys.stderr)
-        if args.keep:
-            print(f"artifacts: {tmp}")
+        for arm in ("freeze", "ocserve"):
+            lg = tmp / f"{arm}.log"
+            if lg.exists():
+                tail = lg.read_text(errors="replace")[-1500:]
+                print(f"---- {arm}.log (tail) ----\n{tail}", file=sys.stderr)
+        print(f"artifacts: {tmp}", file=sys.stderr)
         return 2
     finally:
         wf.stop(); wr.stop()
