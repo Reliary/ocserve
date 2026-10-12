@@ -777,6 +777,25 @@ fn doctor(data_dir: std::path::PathBuf) -> Result<()> {
             "not installed (optional overlay; preferred: scripts/install.sh)"
         }
     );
+    // Tailnet exposure overlay (2026-10-12: a reboot left the socat forwarder
+    // dead-and-DISABLED while loopback stayed healthy — tailnet clients got
+    // connection refused and nothing anywhere said so). Informational only:
+    // the forwarder is per-host (bind IP), installer never manages it.
+    let fwd_unit = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".config/systemd/user/ocserve-tailscale-forward.service");
+    if fwd_unit.exists() {
+        let state = std::process::Command::new("systemctl")
+            .args(["--user", "is-active", "ocserve-tailscale-forward"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let enabled = std::process::Command::new("systemctl")
+            .args(["--user", "is-enabled", "ocserve-tailscale-forward"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        println!("  tailnet fwd:    {state} ({enabled}; 100.x:4912 -> 127.0.0.1:4912)");
+    }
     let db = ocserve_store::writer::db_path(&data_dir);
     if db.exists() {
         match ocserve_store::pragma::open_writer(&db) {
