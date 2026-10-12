@@ -282,8 +282,16 @@ other than the async worker (thread identity recorded by a test-only seam).
   All timers `Persistent=true` (missed runs catch up on boot).
 - **Runbook:** `ocserve doctor` = boot checks + storage health + FTS integrity + blob GC dry-run
   + version/contract info; `ocserve import` (legacy snapshot), `ocserve replay --target|--pair`,
-  and the harnesses `scripts/{replay-check,pair-check,load-test}.sh` (`ocserve bench` was
+  and the harnesses `scripts/{replay-check,pair-check,load-test,capdiff-check}.sh` (`ocserve bench` was
   documented here but NEVER existed — clap rejects it; corrected 2026-10-06).
+  - **Provider-boundary review (speed/efficiency):** `scripts/capdiff-check.sh --full` diffs
+    every provider request the two arms send (sequence) + the SSE event-type set + a cost
+    axis (bytes/round-trips; ocserve inflation = red), and prints ocserve `/metrics` deltas
+    (`ocserve_db_opens_total`, `ocserve_prompt_rounds_total`, `ocserve_llm_request_duration_seconds_count`,
+    `ocserve_rss_bytes`). Freeze serves its SPA at `/metrics` (no metrics) → `n/a`, never 0
+    (`D-PARITY-METRICS`). Determinism: run `--full` **and** `--full --reverse` — captures must be
+    byte-identical. Speed *latency* claims live in `bench/parity` + `bench/load`; capdiff's cost
+    axis is a regression guard, not a latency claim. Result artifact: the JSON report on stdout.
 
 ## 6. Patterns adopted from your repos (and anti-patterns rejected)
 

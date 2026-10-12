@@ -433,6 +433,21 @@ fi
 if ! grep -q "tool_map" bench/capdiff/capdiff.py; then
   echo "FAIL: capdiff tool comparison not name-keyed (rule 27)"; fail=1
 fi
+# K-CAPDIFF-EXT: data-driven matrix — every scenario file present, valid,
+# unique, non-empty; nightly must run the full matrix (orphan scenario = red).
+for f in scenarios.json stub_rules.json; do
+  [ -f "bench/capdiff/$f" ] || { echo "FAIL: bench/capdiff/$f missing (rule 27)"; fail=1; }
+done
+if [ -f bench/capdiff/scenarios.json ]; then
+  if python3 bench/capdiff/validate.py; then
+    :
+  else
+    echo "FAIL: scenarios.json invalid (rule 27)"; fail=1
+  fi
+fi
+if ! grep -q "capdiff-check.sh --full" scripts/nightly.sh; then
+  echo "FAIL: nightly does not run the full capdiff matrix (rule 27)"; fail=1
+fi
 # every non-comment allow line must be preceded (within the comment block) by
 # a D- token somewhere in the file's comments
 if [ -f bench/capdiff/allow.txt ]; then

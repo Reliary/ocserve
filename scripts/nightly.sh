@@ -173,7 +173,7 @@ step "field-contract differential (freeze vs ocserve)" \
 #     continue" bug (raw-vs-filtered history) lived here. `--selftest` proves
 #     the comparator is non-vacuous before trusting a green run.
 step "provider-boundary differential (freeze vs ocserve)" \
-  bash -c './scripts/capdiff-check.sh --selftest && ./scripts/capdiff-check.sh --scenario fresh && ./scripts/capdiff-check.sh --scenario multiturn' 
+  bash -c './scripts/capdiff-check.sh --selftest && ./scripts/capdiff-check.sh --full && ./scripts/capdiff-check.sh --full --reverse' 
 
 # 7. mutants (opt-in): survivor report is triaged like a defect (TESTING §9)
 if [ "$WITH_MUTANTS" = "1" ]; then

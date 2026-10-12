@@ -347,6 +347,34 @@ fn history_message_bytes(info: &Value, parts: &[Value]) -> usize {
     n
 }
 
+/// Default max output tokens (v1 request.ts:128 + transform.ts:1468):
+/// `min(model.limit.output, 32000) || 32000`, unless a plugin's chat.params
+/// overrode it. Shared by the prompt loop and the summarize/compaction path
+/// so both send byte-identical params (K-CAPDIFF post-compaction).
+pub(crate) fn default_max_tokens(plugin_override: Option<u64>, limit_output: u64) -> u32 {
+    match plugin_override {
+        Some(v) => v.min(u32::MAX as u64) as u32,
+        None => {
+            let out = if limit_output == 0 { 32_000 } else { limit_output.min(32_000) };
+            out as u32
+        }
+    }
+}
+
+/// Canonicalize a tool-call `arguments` field to compact JSON the way
+/// upstream does: if the stored value is a JSON string, parse it and
+/// re-serialize compactly; if it is already an object, serialize compactly.
+/// Unparseable strings pass through unchanged (never lose the datum).
+fn canonical_tool_args(v: &Value) -> String {
+    match v {
+        Value::String(s) => match serde_json::from_str::<Value>(s) {
+            Ok(parsed) => parsed.to_string(),
+            Err(_) => s.clone(),
+        },
+        other => other.to_string(),
+    }
+}
+
 pub(crate) fn to_provider_messages(history: &[(Value, Vec<Value>)]) -> Vec<ChatMessage> {
     // tail-weighted budget: find the oldest message we can afford to keep
     let mut total: usize = history
@@ -396,7 +424,12 @@ pub(crate) fn to_provider_messages(history: &[(Value, Vec<Value>)]) -> Vec<ChatM
             }
             continue;
         }
-        // assistant with tool calls: declare calls, then emit results
+        // assistant with tool calls: declare calls, then emit results.
+        // v1 parity (K-CAPDIFF tool-turn): upstream canonicalizes the
+        // arguments to COMPACT JSON (parse the model's argument string, then
+        // re-serialize) — ocserve passed the raw model string through, so the
+        // provider request differed by whitespace whenever the model emitted
+        // spaced JSON.
         let calls: Vec<Value> = tool_parts
             .iter()
             .map(|p| {
@@ -405,7 +438,7 @@ pub(crate) fn to_provider_messages(history: &[(Value, Vec<Value>)]) -> Vec<ChatM
                     "type": "function",
                     "function": {
                         "name": p["tool"],
-                        "arguments": p["state"]["input"].to_string(),
+                        "arguments": canonical_tool_args(&p["state"]["input"]),
                     }
                 })
             })
@@ -1071,14 +1104,10 @@ pub async fn run_prompt_with(
                 // absent. Freeze sends the stub model's 8192; ocserve sent
                 // nothing (capdiff found the gap). A plugin's chat.params can
                 // still override via maxOutputTokens.
-                max_tokens: params_out
-                    .get("maxOutputTokens")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v.min(u32::MAX as u64) as u32)
-                    .or_else(|| {
-                        let out = ctx.model_limit["output"].as_u64().unwrap_or(0);
-                        Some((if out == 0 { 32_000 } else { out.min(32_000) }) as u32)
-                    }),
+                max_tokens: Some(default_max_tokens(
+                    params_out.get("maxOutputTokens").and_then(|v| v.as_u64()),
+                    ctx.model_limit["output"].as_u64().unwrap_or(0),
+                )),
                 options: params_out
                     .get("options")
                     .cloned()
@@ -1986,14 +2015,20 @@ pub async fn run_prompt_with(
                     &mut seq,
                 )?;
 
-                // extend provider conversation for the next turn
+                // extend provider conversation for the next turn.
+                // v1 parity (K-CAPDIFF tool-turn): canonicalize the argument
+                // string to compact JSON (upstream parses + re-serializes) —
+                // a spaced model string otherwise differs from freeze.
                 let calls_json: Vec<Value> = tool_calls
                     .iter()
                     .map(|c| {
                         json!({
                             "id": c.id,
                             "type": "function",
-                            "function": {"name": c.name, "arguments": c.arguments},
+                            "function": {
+                                "name": c.name,
+                                "arguments": canonical_tool_args(&Value::String(c.arguments.clone())),
+                            },
                         })
                     })
                     .collect();
@@ -2636,5 +2671,29 @@ mod history_budget_tests {
         let h = vec![entry(0, "y".repeat(PROMPT_HISTORY_MAX_BYTES + 1))];
         let msgs = to_provider_messages(&h);
         assert_eq!(msgs.len(), 1, "keep at least the newest exchange");
+    }
+
+    #[test]
+    fn default_max_tokens_matches_upstream() {
+        // min(limit.output, 32000) || 32000; plugin override wins
+        assert_eq!(default_max_tokens(None, 8192), 8192);
+        assert_eq!(default_max_tokens(None, 1_000_000), 32_000);
+        assert_eq!(default_max_tokens(None, 0), 32_000);
+        assert_eq!(default_max_tokens(Some(123), 8192), 123);
+    }
+
+    #[test]
+    fn canonical_tool_args_compacts_spaced_json() {
+        // K-CAPDIFF tool-turn: freeze canonicalizes tool-call arguments to
+        // compact JSON; ocserve must match (a spaced model string otherwise
+        // diverges from the frozen provider request).
+        let spaced = Value::String("{\"command\": \"echo x\"}".into());
+        assert_eq!(canonical_tool_args(&spaced), "{\"command\":\"echo x\"}");
+        // object form → compact
+        let obj = json!({"a": 1, "b": [2, 3]});
+        assert_eq!(canonical_tool_args(&obj), "{\"a\":1,\"b\":[2,3]}");
+        // unparseable string passes through (never lose the datum)
+        let bad = Value::String("{not json".into());
+        assert_eq!(canonical_tool_args(&bad), "{not json");
     }
 }

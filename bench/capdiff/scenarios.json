@@ -1,0 +1,22 @@
+{
+  "_comment": "capdiff scenario matrix. Each row: a fresh session driven by ordered steps. Extending coverage = add a row (no code). Verified against freeze 1.18.31.",
+  "scenarios": [
+    {"name": "fresh", "steps": [{"type": "prompt", "text": "hello capdiff"}]},
+    {"name": "multiturn", "steps": [
+      {"type": "prompt", "text": "remember the token ALPHA"},
+      {"type": "prompt", "text": "what token did I ask you to remember?"}
+    ]},
+    {"name": "agent-explore", "steps": [
+      {"type": "prompt", "text": "summarize this repository", "agent": "explore"}
+    ]},
+    {"name": "tool-turn", "steps": [
+      {"type": "prompt", "text": "please RUN_THE_PROBE now"}
+    ]},
+    {"name": "post-compaction", "steps": [
+      {"type": "prompt", "text": "first turn: remember the value 41"},
+      {"type": "prompt", "text": "second turn: add one"},
+      {"type": "summarize"},
+      {"type": "prompt", "text": "after summarize: what value are we tracking?"}
+    ]}
+  ]
+}

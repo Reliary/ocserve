@@ -231,10 +231,14 @@ async fn request_hooks(
             .get("topK")
             .and_then(|v| v.as_u64())
             .map(|v| v.min(u32::MAX as u64) as u32),
-        max_tokens: params_out
-            .get("maxOutputTokens")
-            .and_then(|v| v.as_u64())
-            .map(|v| v.min(u32::MAX as u64) as u32),
+        // v1 parity (K-CAPDIFF post-compaction): the summary request also
+        // defaults max output to min(limit.output, 32000) || 32000 when a
+        // plugin did not override it (request.ts:128 + transform.ts:1468).
+        // Shared helper so prompt + summarize cannot drift.
+        max_tokens: Some(crate::prompt::default_max_tokens(
+            params_out.get("maxOutputTokens").and_then(|v| v.as_u64()),
+            ctx.model_limit["output"].as_u64().unwrap_or(0),
+        )),
         options: params_out
             .get("options")
             .cloned()

@@ -1,0 +1,7 @@
+{
+  "_comment": "Deterministic tool_call rules keyed on the LAST user message text. A match makes the sink emit one tool_call; the model round-trips once and the tool result feeds the next provider request. Keep tool calls side-effect free + hermetic (no filesystem, no network) so both arms capture identical bytes (K-EXT-3).",
+  "rules": [
+    {"match": "RUN_THE_PROBE",
+     "tool_call": {"name": "bash", "arguments": {"command": "echo capdiff-tool-ok"}}}
+  ]
+}
