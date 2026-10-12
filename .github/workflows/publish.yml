@@ -1,42 +1,89 @@
 name: publish
 
 # Publishes the crate family to crates.io in dependency order.
-# Requires the CRATES_IO_TOKEN repository secret. Manual trigger only.
+#
+# Trigger: pushing a v* tag publishes; the manual workflow_dispatch defaults to
+# dry-run so a release can be rehearsed without uploading.
+#
+# Requires the CARGO_REGISTRY_TOKEN repository secret.
+#
+# The ordered list must contain EVERY workspace crate, in dependency order.
+# ocserve-pty is a dependency of ocserve-http — omitting it (the 2026-10-12
+# finding) makes publish abort at ocserve-http because its dependency is not on
+# the registry. Keep this list in lockstep with Cargo.toml members.
+
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "dry-run (package + verify, no upload)"
+        description: 'dry-run (package + verify, no upload)'
         type: boolean
         default: true
+
+permissions:
+  contents: read
 
 jobs:
   publish:
     name: crates.io publish (ordered)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable  # ref IS the toolchain name (do not SHA-pin)
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c  # v2
 
-      - name: dry-run packaging (all crates)
+      - name: verify + test
         run: |
-          for c in ocserve-metrics ocserve-store ocserve-tools ocserve-llm ocserve-mcp \
-                   ocserve-plugin ocserve-core ocserve-http ocserve-importer ocserve; do
-            cargo package -p "$c" --no-verify
-          done
+          cargo check --workspace --release
+          cargo test --workspace
 
-      - name: upload
-        if: ${{ inputs.dry_run == false }}
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+      # The ordered list must cover every member in dependency order. This
+      # guard derives both from Cargo.toml, so a new crate cannot be forgotten.
+      - name: publish order guard
+        run: python3 scripts/check-publish-order.py
+
+      - name: crates are packageable
         run: |
           set -euo pipefail
-          # Dependency order (ocserve-metrics first, ocserve last).
-          for c in ocserve-metrics ocserve-store ocserve-tools ocserve-llm ocserve-mcp \
-                   ocserve-plugin ocserve-core ocserve-http ocserve-importer ocserve; do
-            echo "== publishing $c"
-            cargo publish -p "$c" --no-verify
-            # crates.io index propagation before dependents resolve
-            sleep 30
+          for c in ocserve-metrics ocserve-llm ocserve-mcp ocserve-plugin ocserve-store \
+                   ocserve-importer ocserve-tools ocserve-core ocserve-pty ocserve-http ocserve; do
+            cargo package -p "$c" --list --allow-dirty >/dev/null
+          done
+
+      - name: publish (dry-run)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          for c in ocserve-metrics ocserve-llm ocserve-mcp ocserve-plugin ocserve-store \
+                   ocserve-importer ocserve-tools ocserve-core ocserve-pty ocserve-http ocserve; do
+            echo "::group::dry-run $c"
+            cargo publish -p "$c" --dry-run --allow-dirty --no-verify
+            echo "::endgroup::"
+          done
+
+      - name: publish
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -uo pipefail
+          publish() {
+            c="$1"
+            echo "::group::publish $c"
+            if cargo publish -p "$c" --no-verify; then
+              echo "published $c"
+            else
+              # Idempotent re-run: an already-uploaded version is fine.
+              echo "publish of $c failed (may already be published) — continuing"
+            fi
+            echo "::endgroup::"
+            sleep 30   # crates.io index propagation before dependents resolve
+          }
+          for c in ocserve-metrics ocserve-llm ocserve-mcp ocserve-plugin ocserve-store \
+                   ocserve-importer ocserve-tools ocserve-core ocserve-pty ocserve-http ocserve; do
+            publish "$c"
           done

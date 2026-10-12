@@ -1,0 +1,5 @@
+# rustfmt configuration — pins formatting so `cargo fmt --check` in CI is
+# deterministic across rustfmt versions. Kept minimal on purpose: only the
+# edition is pinned (matches the workspace); style stays rustfmt default so the
+# existing tree is already conformant.
+edition = "2024"

@@ -355,7 +355,11 @@ pub(crate) fn default_max_tokens(plugin_override: Option<u64>, limit_output: u64
     match plugin_override {
         Some(v) => v.min(u32::MAX as u64) as u32,
         None => {
-            let out = if limit_output == 0 { 32_000 } else { limit_output.min(32_000) };
+            let out = if limit_output == 0 {
+                32_000
+            } else {
+                limit_output.min(32_000)
+            };
             out as u32
         }
     }
@@ -937,11 +941,10 @@ pub async fn run_prompt_with(
             // tokio worker (the F1 convoy class).
             let db = ctx.db.clone();
             let sid = session_id.to_string();
-            let history = tokio::task::spawn_blocking(move || {
-                ocserve_store::load_messages(&db, &sid, None)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("history load join: {e}"))??;
+            let history =
+                tokio::task::spawn_blocking(move || ocserve_store::load_messages(&db, &sid, None))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("history load join: {e}"))??;
             // v1 parity, the WHOLE-REQUEST view (prompt.ts:1093): upstream
             // builds every model request from filterCompacted(msgs) — once a
             // compaction completes, only [last tail-carrying anchor, summary]
@@ -951,10 +954,8 @@ pub async fn run_prompt_with(
             // turn (the 5 MB tool part from 10-11) at 90-190 s first-token and
             // died at the watchdog — the "still isn't doing anything" report.
             let filtered = crate::compact::filter_compacted(&history);
-            let history: Vec<(Value, Vec<Value>)> = filtered
-                .iter()
-                .map(|&i| history[i].clone())
-                .collect();
+            let history: Vec<(Value, Vec<Value>)> =
+                filtered.iter().map(|&i| history[i].clone()).collect();
             messages.extend(to_provider_messages(&history));
         }
         let mut tools = if opts.tools_enabled {
@@ -1372,12 +1373,10 @@ pub async fn run_prompt_with(
                     "reasoning",
                     step_tokens["reasoning"].as_i64().unwrap_or(0),
                 );
-                let read =
-                    session_usage["cache"]["read"].as_i64().unwrap_or(0)
-                        + step_tokens["cache"]["read"].as_i64().unwrap_or(0);
-                let write =
-                    session_usage["cache"]["write"].as_i64().unwrap_or(0)
-                        + step_tokens["cache"]["write"].as_i64().unwrap_or(0);
+                let read = session_usage["cache"]["read"].as_i64().unwrap_or(0)
+                    + step_tokens["cache"]["read"].as_i64().unwrap_or(0);
+                let write = session_usage["cache"]["write"].as_i64().unwrap_or(0)
+                    + step_tokens["cache"]["write"].as_i64().unwrap_or(0);
                 session_usage["cache"]["read"] = read.into();
                 session_usage["cache"]["write"] = write.into();
                 session_cost += step_cost;

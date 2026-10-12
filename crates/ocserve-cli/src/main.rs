@@ -1,4 +1,5 @@
 //! ocserve CLI: serve, import, doctor, bench.
+#![cfg_attr(not(test), forbid(unsafe_code))]
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

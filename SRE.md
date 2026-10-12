@@ -284,6 +284,24 @@ other than the async worker (thread identity recorded by a test-only seam).
   + version/contract info; `ocserve import` (legacy snapshot), `ocserve replay --target|--pair`,
   and the harnesses `scripts/{replay-check,pair-check,load-test,capdiff-check}.sh` (`ocserve bench` was
   documented here but NEVER existed — clap rejects it; corrected 2026-10-06).
+- **GitHub CI (`.github/workflows/`, family convention — pinned action SHAs with version
+  comments):**
+  - Per-PR: `ci.yml` (fmt, clippy `-D warnings`, workspace tests, `check-guards.sh`,
+    `check-matrix.sh`, `cargo package --list` for every crate, publish-order guard, test-count
+    ratchet floor, binary-size ceiling, aarch64 cross-check, cargo-deny/audit, artifact upload);
+    `replay.yml` (route replay + capdiff full/forward+reverse + live pair differential — the
+    freeze binary is acquired from npm 1.18.31 via `scripts/acquire-freeze.sh`, never committed);
+    `codeql-analysis.yml`; `pr-secret-scan.yml` (gitleaks over the PR range + `.gitleaks.toml`);
+    `dependency-review.yml`.
+  - Scheduled: `hardening.yml` (deny hard gate + unsafe-policy assertion + weekly outdated),
+    `fuzz.yml` (new `fuzz/` crate: `sse_parser`, `splice_parser`, `wire_decode`), `bench.yml`.
+  - Release: `publish.yml` (tag or manual dry-run; ordered crates.io publish, covers every
+    workspace member in dependency order — `scripts/check-publish-order.py`), `release.yml`
+    (linux/macos x86_64+aarch64 + windows, per-target sha256 + combined SHA256SUMS).
+  - `scorecard.yml` + `dependabot.yml`. Heavy Docker benches (`parity`, `load-test`, `soak`)
+    run locally/manually — no hosted runner yet (decided 2026-10-12).
+  - The nightly `scripts/nightly.sh` remains the local superset (it includes the live-DB
+    steps CI cannot run: splice/list parity over the live db, backup drill, soak gate).
   - **Provider-boundary review (speed/efficiency):** `scripts/capdiff-check.sh --full` diffs
     every provider request the two arms send (sequence) + the SSE event-type set + a cost
     axis (bytes/round-trips; ocserve inflation = red), and prints ocserve `/metrics` deltas

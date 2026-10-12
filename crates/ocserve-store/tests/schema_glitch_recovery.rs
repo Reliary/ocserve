@@ -60,7 +60,13 @@ fn writer_recovers_from_foreign_ddl_schema_glitch() {
     }
     let r = w2.write(vec![WriteOp::Sql {
         sql: MSG_INSERT.into(),
-        params: vec!["m1".into(), "ses_g".into(), "user".into(), 1i64.into(), "{}".into()],
+        params: vec![
+            "m1".into(),
+            "ses_g".into(),
+            "user".into(),
+            1i64.into(),
+            "{}".into(),
+        ],
     }]);
     assert!(
         r.is_ok(),

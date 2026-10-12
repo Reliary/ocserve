@@ -1091,12 +1091,10 @@ async fn set_session_field(
     // pool (F1 class).
     let db = st.db.clone();
     let id_check = id.to_string();
-    let exists = tokio::task::spawn_blocking(move || {
-        ocserve_store::session_exists(&db, &id_check)
-    })
-    .await
-    .map_err(|e| crate::HttpError::Api(internal(anyhow::anyhow!("exists join: {e}"))))?
-    .map_err(|e| crate::HttpError::Api(internal(e)))?;
+    let exists = tokio::task::spawn_blocking(move || ocserve_store::session_exists(&db, &id_check))
+        .await
+        .map_err(|e| crate::HttpError::Api(internal(anyhow::anyhow!("exists join: {e}"))))?
+        .map_err(|e| crate::HttpError::Api(internal(e)))?;
     if !exists {
         return Err(session_not_found(id));
     }

@@ -225,10 +225,14 @@ fn exec_op(conn: &Connection, op: &WriteOp, affected: &mut usize) -> Result<()> 
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            let sql = "INSERT OR REPLACE INTO blob_object (sha, byte_len, chunk_cnt, codec, created_at)
+            let sql =
+                "INSERT OR REPLACE INTO blob_object (sha, byte_len, chunk_cnt, codec, created_at)
                  VALUES (?1, ?2, ?3, 'zstd', ?4)";
             let run = |c: &Connection| {
-                c.execute(sql, rusqlite::params![sha, *byte_len as i64, *chunk_cnt, now])
+                c.execute(
+                    sql,
+                    rusqlite::params![sha, *byte_len as i64, *chunk_cnt, now],
+                )
             };
             // same one-shot schema-glitch recovery as bind() (see comment there)
             match run(conn) {

@@ -6,6 +6,7 @@
 //!
 //! Tool naming = upstream catalog.toolName: sanitize(server)_sanitize(tool)
 //! where sanitize = [^a-zA-Z0-9_-] → `_`.
+#![cfg_attr(not(test), forbid(unsafe_code))]
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
@@ -262,8 +263,7 @@ impl McpClient {
                     // would OOM (panic=abort). `take(cap+1)` caps the TOTAL bytes
                     // read here (skipped notifications included).
                     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt};
-                    let mut limited =
-                        AsyncReadExt::take(&mut *reader, MAX_LINE_BYTES as u64 + 1);
+                    let mut limited = AsyncReadExt::take(&mut *reader, MAX_LINE_BYTES as u64 + 1);
                     // read until the response with our id (skip notifications)
                     loop {
                         let mut buf = String::new();

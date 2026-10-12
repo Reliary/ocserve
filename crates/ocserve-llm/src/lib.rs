@@ -4,6 +4,7 @@
 //! Contract sources: real recorded streams in `testdata/m2/llm_stream_*.bin`
 //! (deepseek official API — reasoning deltas, finish=stop|length, usage with
 //! prompt_cache_hit/miss fields).
+#![cfg_attr(not(test), forbid(unsafe_code))]
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -822,7 +823,12 @@ mod tests {
     #[test]
     fn tool_call_assembler_caps_hostile_index() {
         let mut a = ToolCallAssembler::default();
-        a.push(1_000_000, Some("call_x".into()), Some("bash".into()), "{}".into());
+        a.push(
+            1_000_000,
+            Some("call_x".into()),
+            Some("bash".into()),
+            "{}".into(),
+        );
         assert!(
             a.slot_count() <= MAX_TOOL_CALL_SLOTS,
             "hostile index must not allocate slots: {}",
@@ -830,7 +836,12 @@ mod tests {
         );
         {
             let mut a2 = ToolCallAssembler::default();
-            a2.push(1_000_000, Some("call_x".into()), Some("bash".into()), "{}".into());
+            a2.push(
+                1_000_000,
+                Some("call_x".into()),
+                Some("bash".into()),
+                "{}".into(),
+            );
             assert!(a2.finish().is_empty(), "dropped delta yields no tool call");
         }
         // normal indices still work after a hostile one

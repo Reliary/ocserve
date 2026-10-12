@@ -1,5 +1,6 @@
 //! ocserve-importer: streaming read-only import of the N most recent sessions.
 //! Source DB is never opened read-write (PLAN §9 / STORAGE.md §5).
+#![cfg_attr(not(test), forbid(unsafe_code))]
 
 pub mod payload;
 

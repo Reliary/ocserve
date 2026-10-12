@@ -8,6 +8,7 @@
 //! maintenance host. Isolation: sidecar crash/restart cannot take down the
 //! server; protocol = NDJSON on stdio; plugin chatter is forced to stderr by
 //! the host so framing cannot corrupt.
+#![cfg_attr(not(test), forbid(unsafe_code))]
 
 pub mod normalize;
 pub use normalize::{Outcome as NormalizeOutcome, normalize_or_raw_sync};
@@ -328,10 +329,8 @@ impl Sidecar {
                 line.clear();
                 use tokio::io::AsyncBufReadExt as _;
                 let n = {
-                    let mut limited = tokio::io::AsyncReadExt::take(
-                        &mut reader,
-                        MAX_HOST_LINE as u64 + 1,
-                    );
+                    let mut limited =
+                        tokio::io::AsyncReadExt::take(&mut reader, MAX_HOST_LINE as u64 + 1);
                     limited.read_line(&mut line).await
                 };
                 match n {
@@ -452,15 +451,15 @@ impl Sidecar {
         // success, so restore the taken entries and surface the error. Without
         // this the plugin set is silently empty after a failed respawn — hooks
         // never replay and `in_flight()` stays zero (statuses stale).
-        let mut fresh = match Sidecar::spawn(&args.host_path, &args.server_url, &args.directory).await
-        {
-            Ok(f) => f,
-            Err(e) => {
-                self.loads = loads;
-                tracing::error!("plugin sidecar respawn failed: {e:#} — plugin set preserved");
-                return Err(e);
-            }
-        };
+        let mut fresh =
+            match Sidecar::spawn(&args.host_path, &args.server_url, &args.directory).await {
+                Ok(f) => f,
+                Err(e) => {
+                    self.loads = loads;
+                    tracing::error!("plugin sidecar respawn failed: {e:#} — plugin set preserved");
+                    return Err(e);
+                }
+            };
         // D1-PLAN: replay must normalize too (warm no-op; rebuilds if outputs
         // were wiped mid-run — A1 stores raw, rebuilds here AND at next boot).
         fresh.normalize_root = self.normalize_root.clone();

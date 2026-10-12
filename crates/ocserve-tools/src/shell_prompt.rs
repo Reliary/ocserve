@@ -22,20 +22,32 @@ const CHAIN_BASH: &str = "If the commands depend on each other and must run sequ
 /// user's shell basename (upstream `Shell.name(Shell.acceptable(cfg.shell))`);
 /// `tmp` is the model temp dir (upstream `Global.Path.tmp`).
 pub fn bash_description(shell: &str, tmp: &str) -> String {
-    let command_section = render(COMMAND_SECTION, &[
-        ("defaultTimeoutMs", &DEFAULT_TIMEOUT_MS.to_string()),
-        ("limits.maxLines", &MAX_LINES.to_string()),
-        ("limits.maxBytes", &MAX_BYTES.to_string()),
-        ("chain", CHAIN_BASH),
-    ]);
-    render(SHELL_TEMPLATE, &[
-        ("intro", "Executes a given bash command in a persistent shell session with optional timeout, ensuring proper handling and security measures."),
-        ("os", std::env::consts::OS),
-        ("shell", shell),
-        ("workdirSection", "All commands run in the current working directory by default. Use the `workdir` parameter if you need to run a command in a different directory. AVOID using `cd <directory> && <command>` patterns - use `workdir` instead."),
-        ("tmp", tmp),
-        ("commandSection", &command_section),
-    ])
+    let command_section = render(
+        COMMAND_SECTION,
+        &[
+            ("defaultTimeoutMs", &DEFAULT_TIMEOUT_MS.to_string()),
+            ("limits.maxLines", &MAX_LINES.to_string()),
+            ("limits.maxBytes", &MAX_BYTES.to_string()),
+            ("chain", CHAIN_BASH),
+        ],
+    );
+    render(
+        SHELL_TEMPLATE,
+        &[
+            (
+                "intro",
+                "Executes a given bash command in a persistent shell session with optional timeout, ensuring proper handling and security measures.",
+            ),
+            ("os", std::env::consts::OS),
+            ("shell", shell),
+            (
+                "workdirSection",
+                "All commands run in the current working directory by default. Use the `workdir` parameter if you need to run a command in a different directory. AVOID using `cd <directory> && <command>` patterns - use `workdir` instead.",
+            ),
+            ("tmp", tmp),
+            ("commandSection", &command_section),
+        ],
+    )
 }
 
 /// Minimal `${key}` substitution (upstream `renderPrompt`). Unknown keys are
@@ -76,7 +88,10 @@ mod tests {
     fn bash_description_fills_host_values() {
         let d = bash_description("zsh", "/tmp/opencode");
         assert!(d.starts_with("Executes a given bash command in a persistent shell session"));
-        assert!(d.contains(&format!("Be aware: OS: {}, Shell: zsh", std::env::consts::OS)));
+        assert!(d.contains(&format!(
+            "Be aware: OS: {}, Shell: zsh",
+            std::env::consts::OS
+        )));
         assert!(d.contains("Use `/tmp/opencode` for temporary work"));
         assert!(d.contains("commands will time out after 120000ms"));
         assert!(d.contains("exceeds 2000 lines or 51200 bytes"));

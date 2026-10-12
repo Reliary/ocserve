@@ -471,4 +471,23 @@ fi
 cp /tmp/capdiff_bak.$$ bench/capdiff/capdiff.py 2>/dev/null || true
 rm -f /tmp/capdiff_bak.$$
 
+echo "== guard: publish order covers every member in dependency order (rule 28) =="
+# The crates.io publish list must contain every workspace member, in dependency
+# order. Omitting one (ocserve-pty, 2026-10-12) aborts publish at its dependent;
+# mis-ordering uploads a dependent before its dependency. Derive both sides from
+# Cargo.toml + publish.yml and assert. Live self-test proves the check bites.
+if [ ! -f scripts/check-publish-order.py ]; then
+  echo "FAIL: scripts/check-publish-order.py missing (rule 28)"; fail=1
+else
+  if python3 scripts/check-publish-order.py --selftest >/dev/null 2>&1; then
+    if python3 scripts/check-publish-order.py >/dev/null 2>&1; then
+      echo "ok (publish order complete + topological; planted controls detected)"
+    else
+      echo "FAIL: publish order incomplete or mis-ordered (rule 28)"; fail=1
+    fi
+  else
+    echo "FAIL: publish-order planted control not detected (rule 28 vacuous)"; fail=1
+  fi
+fi
+
 exit $fail

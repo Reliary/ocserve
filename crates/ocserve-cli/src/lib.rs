@@ -1,4 +1,5 @@
 //! ocserve library surface: boot self-checks (SRE §1) exposed for tests.
+#![cfg_attr(not(test), forbid(unsafe_code))]
 
 use anyhow::{Context, Result};
 

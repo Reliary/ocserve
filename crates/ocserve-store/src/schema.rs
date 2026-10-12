@@ -1107,7 +1107,10 @@ mod sa_search {
         upsert(&conn, "p1", "m1", "needle one");
         upsert(&conn, "p2", "m2", "needle two");
         let mut stmt = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {}", crate::SEARCH_MATCH_SCOPED))
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                crate::SEARCH_MATCH_SCOPED
+            ))
             .unwrap();
         let plan: String = stmt
             .query_map(

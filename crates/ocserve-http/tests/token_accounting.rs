@@ -237,7 +237,8 @@ fn token_checker_flags_the_pre_fix_turn_sum() {
     });
     let viol = token_violations(&pre_fix, 1800, 30, 1200, &step2, 1800);
     assert!(
-        viol.iter().any(|v| v.contains("whole-turn sum") || v.contains("carrying a turn/session total")),
+        viol.iter()
+            .any(|v| v.contains("whole-turn sum") || v.contains("carrying a turn/session total")),
         "checker failed to flag the pre-fix shape: {viol:?}"
     );
     // healthy shape is clean (non-vacuous both directions)
@@ -304,9 +305,7 @@ async fn per_step_message_tokens_and_accumulated_session_row() {
     // the two assistant step messages, in order
     let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
     let mut stmt = conn
-        .prepare(
-            "SELECT info FROM msg WHERE session_id=?1 AND role='assistant' ORDER BY seq",
-        )
+        .prepare("SELECT info FROM msg WHERE session_id=?1 AND role='assistant' ORDER BY seq")
         .unwrap();
     let msgs: Vec<Value> = stmt
         .query_map([sid], |r| r.get::<_, String>(0))
@@ -341,7 +340,11 @@ async fn per_step_message_tokens_and_accumulated_session_row() {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .unwrap();
-    assert_eq!((si, so, sc, sr), (1800, 25, 1200, 5), "session accumulates both steps");
+    assert_eq!(
+        (si, so, sc, sr),
+        (1800, 25, 1200, 5),
+        "session accumulates both steps"
+    );
 
     // the shared contract checker (its negative control is proven above)
     let viol = token_violations(m2, si, so, sc, m2, 1800);

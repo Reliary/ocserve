@@ -4,6 +4,7 @@
 //! - PRAGMAs only via `pragma::{create_new,open_writer,open_reader}`
 //! - no connection held across `.await` (enforced by the scoped `Writer` API)
 //! - payloads via `blob::BlobStore`, never as SQLite row payloads > metadata
+#![cfg_attr(not(test), forbid(unsafe_code))]
 
 use rusqlite::OptionalExtension;
 
@@ -601,16 +602,8 @@ pub fn compaction_preflight(db: &std::path::Path, session_id: &str) -> anyhow::R
         [session_id],
         |r| r.get(0),
     )?;
-    let (title, cost, tin, tout, treason, tcread, tcwrite): (
-        String,
-        f64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-    ) = conn
-        .query_row(
+    let (title, cost, tin, tout, treason, tcread, tcwrite): (String, f64, i64, i64, i64, i64, i64) =
+        conn.query_row(
             "SELECT title, cost, tokens_input, tokens_output, tokens_reasoning, \
              tokens_cache_read, tokens_cache_write FROM session WHERE id = ?1",
             [session_id],
@@ -2371,7 +2364,8 @@ type PartSrcRow = (String, String, String, Option<String>, Option<String>, i64);
 /// stamp == docsize && trigger present.
 pub fn stamp_parts_indexed(writer: &Writer, count: i64) -> anyhow::Result<()> {
     writer.write(vec![crate::WriteOp::Sql {
-        sql: "INSERT OR REPLACE INTO import_manifest (key, value) VALUES ('parts_indexed', ?1)".into(),
+        sql: "INSERT OR REPLACE INTO import_manifest (key, value) VALUES ('parts_indexed', ?1)"
+            .into(),
         params: vec![count.into()],
     }])?;
     Ok(())
@@ -2404,11 +2398,9 @@ pub fn backfill_part_search(
         |r| r.get(0),
     )?;
     let fts_docs: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM part_search_fts_docsize",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT count(*) FROM part_search_fts_docsize", [], |r| {
+            r.get(0)
+        })
         .unwrap_or(-1);
     if let Some(n) = stamped
         && trigger == 1
@@ -2441,8 +2433,9 @@ pub fn backfill_part_search(
                     "part_search FTS index incomplete ({fts_docs}/{have} docs) — bulk rebuild"
                 );
                 let t_rb = std::time::Instant::now();
-                wconn
-                    .execute_batch("INSERT INTO part_search_fts(part_search_fts) VALUES('rebuild')")?;
+                wconn.execute_batch(
+                    "INSERT INTO part_search_fts(part_search_fts) VALUES('rebuild')",
+                )?;
                 tracing::warn!(
                     "part_search FTS rebuild took {:.1}s",
                     t_rb.elapsed().as_secs_f64()
@@ -3282,8 +3275,10 @@ mod compaction_projection_tests {
             None,
             "ses_heal",
             &json!({"id":"msg_heal","sessionID":"ses_heal","role":"user","time":{"created":1}}),
-            &[json!({"id":"prt_heal","sessionID":"ses_heal","messageID":"msg_heal",
-                     "type":"text","text":"healing needle"})],
+            &[
+                json!({"id":"prt_heal","sessionID":"ses_heal","messageID":"msg_heal",
+                     "type":"text","text":"healing needle"}),
+            ],
         )
         .unwrap();
         drop(w);
@@ -3365,8 +3360,10 @@ mod compaction_projection_tests {
             None,
             "ses_heal",
             &json!({"id":"msg_heal2","sessionID":"ses_heal","role":"user","time":{"created":2}}),
-            &[json!({"id":"prt_heal2","sessionID":"ses_heal","messageID":"msg_heal2",
-                     "type":"text","text":"second needle"})],
+            &[
+                json!({"id":"prt_heal2","sessionID":"ses_heal","messageID":"msg_heal2",
+                     "type":"text","text":"second needle"}),
+            ],
         )
         .unwrap();
         let c = crate::pragma::open_reader(&db).unwrap();

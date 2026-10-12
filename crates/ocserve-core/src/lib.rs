@@ -4,6 +4,7 @@
 //! Wire-invisible internals adopt v2 engineering where the plan says so
 //! (PLAN §11): durable event seq, bounded ring, crash-recoverable claims
 //! land with M3 milestones.
+#![cfg_attr(not(test), forbid(unsafe_code))]
 
 pub mod compact;
 pub mod compaction;

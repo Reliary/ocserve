@@ -13,6 +13,9 @@ members = [
     "crates/ocserve-pty",
     "crates/ocserve-cli",
 ]
+# The cargo-fuzz crate has its own [workspace] (cargo-fuzz requirement) and
+# depends on nightly libfuzzer-sys; keep it out of the normal build graph.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

@@ -50,6 +50,7 @@ type Observed = (Option<SystemTime>, u64);
 /// Called at boot, after every reconcile swap, and on a periodic task
 /// (`OCSERVE_TRIM_SECS`, default 300 s, 0 disables). `OCSERVE_TRIM=0` turns
 /// every call into a no-op (lab A/B knob). No-op on non-glibc targets.
+#[allow(unsafe_code)] // sole production unsafe: glibc malloc_trim (below)
 pub fn trim_heap() -> bool {
     if std::env::var("OCSERVE_TRIM").is_ok_and(|v| v == "0") {
         return false;

@@ -48,7 +48,8 @@ pub fn provider_prompt(model_id: &str, provider_id: &str) -> &'static str {
     if ml.contains("trinity") {
         return include_str!("../assets/prompt/trinity.txt");
     }
-    if ml.contains("kimi") || ["kimi-for-coding", "moonshotai", "moonshotai-cn"].contains(&pl.as_str())
+    if ml.contains("kimi")
+        || ["kimi-for-coding", "moonshotai", "moonshotai-cn"].contains(&pl.as_str())
     {
         return include_str!("../assets/prompt/kimi.txt");
     }
@@ -121,7 +122,10 @@ pub fn skills_block(skills: &[(String, String, String)]) -> Option<String> {
         out.push_str("\n  <skill>");
         out.push_str(&format!("\n    <name>{name}</name>"));
         out.push_str(&format!("\n    <description>{description}</description>"));
-        out.push_str(&format!("\n    <location>{}</location>", escape_html(location)));
+        out.push_str(&format!(
+            "\n    <location>{}</location>",
+            escape_html(location)
+        ));
         out.push_str("\n  </skill>");
     }
     out.push_str("\n</available_skills>");
@@ -170,16 +174,26 @@ mod tests {
     #[test]
     fn model_selects_provider_prompt() {
         assert!(provider_prompt("claude-sonnet-4", "anthropic").contains("OpenCode"));
-        assert_eq!(provider_prompt("claude-sonnet-4", "anthropic"),
-                   include_str!("../assets/prompt/anthropic.txt"));
-        assert_eq!(provider_prompt("stub-1", "stub"),
-                   include_str!("../assets/prompt/default.txt"));
-        assert_eq!(provider_prompt("gpt-4o", "openai"),
-                   include_str!("../assets/prompt/beast.txt"));
-        assert_eq!(provider_prompt("gpt-5", "openai"),
-                   include_str!("../assets/prompt/gpt.txt"));
-        assert_eq!(provider_prompt("gemini-3-pro", "google"),
-                   include_str!("../assets/prompt/gemini.txt"));
+        assert_eq!(
+            provider_prompt("claude-sonnet-4", "anthropic"),
+            include_str!("../assets/prompt/anthropic.txt")
+        );
+        assert_eq!(
+            provider_prompt("stub-1", "stub"),
+            include_str!("../assets/prompt/default.txt")
+        );
+        assert_eq!(
+            provider_prompt("gpt-4o", "openai"),
+            include_str!("../assets/prompt/beast.txt")
+        );
+        assert_eq!(
+            provider_prompt("gpt-5", "openai"),
+            include_str!("../assets/prompt/gpt.txt")
+        );
+        assert_eq!(
+            provider_prompt("gemini-3-pro", "google"),
+            include_str!("../assets/prompt/gemini.txt")
+        );
     }
 
     #[test]
@@ -196,10 +210,18 @@ mod tests {
 
     #[test]
     fn environment_block_matches_capture_shape() {
-        let e = environment_block("stub-1", "stub", "/", "/", false, "linux",
-                                  "Mon Oct 12 2026");
+        let e = environment_block(
+            "stub-1",
+            "stub",
+            "/",
+            "/",
+            false,
+            "linux",
+            "Mon Oct 12 2026",
+        );
         assert!(e.starts_with(
-            "You are powered by the model named stub-1. The exact model ID is stub/stub-1\n"));
+            "You are powered by the model named stub-1. The exact model ID is stub/stub-1\n"
+        ));
         assert!(e.contains("\n<env>\n  Working directory: /\n"));
         assert!(e.contains("  Is directory a git repo: no\n"));
         assert!(e.contains("  Today's date: Mon Oct 12 2026\n</env>"));

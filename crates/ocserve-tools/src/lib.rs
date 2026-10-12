@@ -2,6 +2,7 @@
 //! kept; no v2 renames). Wildcard/evaluate ported from v1 util/wildcard.ts
 //! and core/permission.ts; tool params verified against v1 sources + live
 //! tool-part capture (testdata/m2).
+#![deny(unsafe_code)]
 
 use anyhow::{Context, Result, bail};
 pub mod shell_prompt;
@@ -167,8 +168,16 @@ fn todowrite(input: &Value) -> Result<ToolResult> {
 /// upstream but not yet executed here, so it is excluded until implemented —
 /// see bench/openapi/FIELD-CONTRACT.md).
 pub const IMPLEMENTED: &[&str] = &[
-    "bash", "edit", "glob", "grep", "question", "read", "skill", "todowrite",
-    "webfetch", "write",
+    "bash",
+    "edit",
+    "glob",
+    "grep",
+    "question",
+    "read",
+    "skill",
+    "todowrite",
+    "webfetch",
+    "write",
 ];
 
 /// Frozen provider tool schemas, captured verbatim from the live 1.18.31
@@ -319,6 +328,7 @@ fn resolve(cwd: &Path, p: &str) -> PathBuf {
     }
 }
 
+#[allow(unsafe_code)] // sole production unsafe: libc::killpg on timeout (below)
 fn bash(input: &Value, cwd: &Path) -> Result<ToolResult> {
     let command = input["command"].as_str().context("bash.command")?;
     let timeout_ms = input["timeout"].as_u64().unwrap_or(120_000).min(600_000);

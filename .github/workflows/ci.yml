@@ -1,9 +1,21 @@
 name: ci
 
+# Fast, deterministic gates on every push/PR. No network, no Docker, no
+# vendored freeze — the provider-boundary and route-replay gates live in
+# capdiff.yml / replay.yml so a missing artifact degrades that job, not this
+# one.
+#
+# Action SHAs are pinned (family convention) with the version in a trailing
+# comment; Dependabot updates both together.
+
 on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,11 +25,14 @@ jobs:
     name: gates (fmt, clippy, tests, guards, matrix)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - uses: dtolnay/rust-toolchain@stable  # ref IS the toolchain name (do not SHA-pin)
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c  # v2
 
       - name: format
         run: cargo fmt --check
@@ -34,34 +49,107 @@ jobs:
       - name: traceability matrix
         run: ./scripts/check-matrix.sh
 
-  replay:
-    name: differential wire replay
+      # The test count must not silently drop: a falling count means tests were
+      # deleted or started skipping. Ratchet: recorded floor, raised over time.
+      - name: test count ratchet
+        run: |
+          count=$(cargo test --workspace 2>&1 | grep "^test result:" | \
+            grep -oP '\d+(?= passed)' | \
+            python3 -c "import sys; print(sum(int(l) for l in sys.stdin if l.strip()))")
+          echo "test count: $count"
+          FLOOR=470
+          if [ "$count" -lt "$FLOOR" ]; then
+            echo "FAIL: test count $count below floor $FLOOR — tests removed or skipping"; exit 1
+          fi
+
+      # Every crate must be publishable (package + verify). `cargo package`
+      # builds the tarball that `cargo install` ships, which contains only the
+      # crate directory — an include_str! reaching above it, or a missing
+      # workspace member (the 2026-10-12 ocserve-pty omission), fails here.
+      # Every crate must be packageable. `cargo package --list` validates the
+      # tarball contents WITHOUT resolving the registry, so it catches a crate
+      # whose files are missing / whose package layout is broken (the class we
+      # want) while staying offline and non-circular on a release that adds a
+      # new crate. The registry-resolving `cargo package` runs in publish.yml.
+      - name: crates are packageable
+        run: |
+          set -euo pipefail
+          for c in ocserve-metrics ocserve-llm ocserve-mcp ocserve-plugin ocserve-store \
+                   ocserve-importer ocserve-tools ocserve-core ocserve-pty ocserve-http ocserve; do
+            echo "::group::package --list $c"
+            cargo package -p "$c" --list --allow-dirty >/dev/null
+            echo "::endgroup::"
+          done
+
+      # The publish workflow's ordered list must cover every workspace member,
+      # in dependency order (the ocserve-pty omission / wrong-order class).
+      - name: publish order guard
+        run: python3 scripts/check-publish-order.py && python3 scripts/check-publish-order.py --selftest
+
+      # release build + artifact: the release artifact is the product; build it
+      # on every push so a broken release build is caught by CI (not tag day).
+      - name: build release
+        run: cargo build --release -p ocserve
+
+      - name: upload binary artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.0
+        with:
+          name: ocserve-linux-x86_64
+          path: target/release/ocserve
+          if-no-files-found: error
+
+  size:
+    name: binary size ceiling
     runs-on: ubuntu-latest
     needs: gates
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable  # ref IS the toolchain name (do not SHA-pin)
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c  # v2
+      - name: build + check size
+        run: |
+          cargo build --release -p ocserve
+          SIZE=$(stat -c %s target/release/ocserve)
+          echo "binary size: $SIZE bytes"
+          # Ceiling re-baselined from measurement, never bypassed (SRE §5 / the
+          # provenance rule): 9,279,528 (2026-10-03) -> 30,000,000 (web-UI
+          # embedded bundle, v2 surface). Headroom is intentional: rolldown +
+          # embedded UI are the large static contributors.
+          MAX=30000000
+          if [ "$SIZE" -gt "$MAX" ]; then
+            echo "FAIL: binary $SIZE exceeds ceiling $MAX — re-baseline with provenance";
+            exit 1
+          fi
 
-      - name: build
-        run: cargo build -p ocserve
-
-      - name: replay against the frozen corpus
-        run: ./scripts/replay-check.sh
+  cross:
+    name: cross-compile check (aarch64-linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable  # ref IS the toolchain name (do not SHA-pin)
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c  # v2
+      - name: install arm64 cross-linker
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+      - name: cargo check (aarch64)
+        run: cargo check --workspace --release --target aarch64-unknown-linux-gnu
 
   audit:
     name: audit + deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable  # ref IS the toolchain name (do not SHA-pin)
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c  # v2
       - name: cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902  # v2
         with:
           command: check
-
       - name: cargo-audit
         run: |
           cargo install cargo-audit --locked

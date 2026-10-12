@@ -20,6 +20,7 @@
 //!
 //! Divergences (recorded): Windows PTY unsupported (stub error; upstream
 //! uses conpty); `workspace` query ignored (single-directory server).
+#![deny(unsafe_code)]
 
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -29,6 +30,11 @@ use std::sync::{Arc, Mutex};
 pub mod shells;
 pub mod ticket;
 
+// The Unix PTY shim is the crate's single unsafe surface (libc openpty/fork/
+// ioctl/waitpid). Crate-root `#![deny(unsafe_code)]` stays; this module is the
+// documented, contained opt-in (AGENTS §2.10). Each unsafe block below carries
+// its own Safety comment.
+#[allow(unsafe_code)]
 #[cfg(unix)]
 mod unix;
 #[cfg(not(unix))]

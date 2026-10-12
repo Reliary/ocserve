@@ -336,15 +336,26 @@ fn load_messages_chunk_boundary_and_blob_parts() {
 
     let msgs = load_messages(&db, "ses_65", None).unwrap();
     assert_eq!(msgs.len(), 65, "all messages returned in order");
-    let ids: Vec<&str> = msgs.iter().map(|(i, _)| i["id"].as_str().unwrap()).collect();
+    let ids: Vec<&str> = msgs
+        .iter()
+        .map(|(i, _)| i["id"].as_str().unwrap())
+        .collect();
     assert_eq!(ids[0], "msg_c1");
     assert_eq!(ids[63], "msg_c64");
     assert_eq!(ids[64], "msg_c65");
     assert_eq!(msgs[0].1.len(), 1, "first-message part survives");
     assert_eq!(msgs[0].1[0]["text"], "inline-1");
-    assert_eq!(msgs[63].1.len(), 1, "chunk-boundary message 64 keeps its part");
+    assert_eq!(
+        msgs[63].1.len(),
+        1,
+        "chunk-boundary message 64 keeps its part"
+    );
     assert_eq!(msgs[63].1[0]["text"], "inline-64");
-    assert_eq!(msgs[64].1.len(), 2, "last-chunk message keeps inline + blob parts");
+    assert_eq!(
+        msgs[64].1.len(),
+        2,
+        "last-chunk message keeps inline + blob parts"
+    );
     assert_eq!(msgs[64].1[0]["text"], "inline-65");
     assert_eq!(
         msgs[64].1[1]["text"].as_str().unwrap().len(),

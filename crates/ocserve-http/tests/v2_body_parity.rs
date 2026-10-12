@@ -66,7 +66,11 @@ fn app() -> axum::Router {
     ocserve_http::router(ocserve_http::AppState::with_payloads(None, payloads()))
 }
 
-async fn get(app: &axum::Router, uri: &str, headers: &[(&str, &str)]) -> (StatusCode, Vec<u8>, String) {
+async fn get(
+    app: &axum::Router,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, Vec<u8>, String) {
     let mut b = Request::builder().method("GET").uri(uri);
     for (k, v) in headers {
         b = b.header(*k, *v);
@@ -122,7 +126,10 @@ async fn v2_metadata_wire_bytes_equal_projection_builders() {
         // did not take a divergent route (e.g. an accidental clone with
         // different filtering).
         let p = payloads();
-        let loc = served.get("location").cloned().unwrap_or(serde_json::Value::Null);
+        let loc = served
+            .get("location")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let expected = match key {
             "api_model" => ocserve_http::v2::models_body(&p, &loc),
             _ => ocserve_http::v2::integrations_body(&p, &loc),
@@ -217,7 +224,10 @@ async fn planted_wire_drift_is_detected() {
     let loc = serde_json::json!(null);
     let expected = ocserve_http::v2::models_body(&p, &loc);
     assert!(
-        expected["data"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        expected["data"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
         "fixture must produce models: {expected}"
     );
     // Plant a drift the way a bad future edit would: one field changed in the

@@ -1,4 +1,5 @@
 //! ocserve-http: axum router, auth, byte-golden SSE, upstream error envelope.
+#![deny(unsafe_code)]
 
 use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode};
@@ -1687,8 +1688,9 @@ fn iso8601_z(ms: i64) -> String {
 /// "Today's date" line (system.ts:environment). Days-from-civil, no date crate.
 pub fn js_to_date_string(ms: i64) -> String {
     const WDAY: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const MON: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul",
-                             "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const MON: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     let days = ms.div_euclid(86_400_000);
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -3185,13 +3187,18 @@ pub(crate) fn build_prompt_context(
     // environment block + skills block, "\n"-joined. Before this ocserve sent
     // a ~250-byte blurb where freeze sends ~9.5 KB (capdiff's first find).
     let base = ocserve_core::system_prompt::base_prompt(
-        if system.is_empty() { None } else { Some(&system) },
+        if system.is_empty() {
+            None
+        } else {
+            Some(&system)
+        },
         &mid,
         &pid,
     );
     let worktree = vcs::toplevel(std::path::Path::new(&session_directory))
         .unwrap_or_else(|| session_directory.clone());
-    let is_git = worktree != session_directory || std::path::Path::new(&worktree).join(".git").exists();
+    let is_git =
+        worktree != session_directory || std::path::Path::new(&worktree).join(".git").exists();
     let env_block = ocserve_core::system_prompt::environment_block(
         &mid,
         &pid,
@@ -3207,11 +3214,7 @@ pub(crate) fn build_prompt_context(
         .map(|(n, d, l, _)| (n.clone(), d.clone(), l.clone()))
         .collect();
     let skills_blk = ocserve_core::system_prompt::skills_block(&skill_rows);
-    let system = ocserve_core::system_prompt::compose(
-        &base,
-        &[Some(env_block), skills_blk],
-        None,
-    );
+    let system = ocserve_core::system_prompt::compose(&base, &[Some(env_block), skills_blk], None);
     let ctx = ocserve_core::prompt::PromptContext {
         db: st.db.clone(),
         blobs: st.blobs.clone(),
@@ -3862,9 +3865,12 @@ async fn read_file_content(
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, HttpError> {
     let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/"));
-    let raw = q.get("path").map(String::as_str).ok_or_else(|| HttpError::Query {
-        message: "Missing key\n  at [\"path\"]".into(),
-    })?;
+    let raw = q
+        .get("path")
+        .map(String::as_str)
+        .ok_or_else(|| HttpError::Query {
+            message: "Missing key\n  at [\"path\"]".into(),
+        })?;
     let path = scope_path(base, raw).map_err(HttpError::Api)?;
     // freeze returns an empty text body for a missing file (probed), not an
     // error — the web UI probes optional paths.
@@ -3937,16 +3943,20 @@ async fn find_files(
         walk_files(&base, &query, &want_type, limit, glob_mode)
     })
     .await
-    .map_err(|e| HttpError::Api(ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        name: "InternalServerError",
-        message: format!("find_files worker: {e}"),
-    }))?
-    .map_err(|e| HttpError::Api(ApiError {
-        status: StatusCode::BAD_REQUEST,
-        name: "BadRequest",
-        message: format!("find_files: {e:#}"),
-    }))?;
+    .map_err(|e| {
+        HttpError::Api(ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalServerError",
+            message: format!("find_files worker: {e}"),
+        })
+    })?
+    .map_err(|e| {
+        HttpError::Api(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            name: "BadRequest",
+            message: format!("find_files: {e:#}"),
+        })
+    })?;
     Ok(Json(Value::Array(
         out.into_iter().map(Value::String).collect(),
     )))
@@ -4086,11 +4096,13 @@ async fn find_text(
         Ok::<_, std::io::Error>((a, b))
     })
     .await
-    .map_err(|e| HttpError::Api(ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        name: "InternalError",
-        message: format!("find worker: {e}"),
-    }))?;
+    .map_err(|e| {
+        HttpError::Api(ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("find worker: {e}"),
+        })
+    })?;
     let (a_out, b_out) = match out {
         Ok(o) => o,
         Err(e) => {
@@ -5718,7 +5730,10 @@ mod f5_wire {
     #[test]
     fn v2_metadata_wire_matches_builders() {
         for (catalog, name) in [
-            (serde_json::json!({"deepseek": {"name": "DeepSeek"}}), "with-catalog"),
+            (
+                serde_json::json!({"deepseek": {"name": "DeepSeek"}}),
+                "with-catalog",
+            ),
             (serde_json::json!({}), "empty-catalog"),
         ] {
             let payloads = Payloads {

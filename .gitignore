@@ -16,3 +16,9 @@ __pycache__/
 
 # session-data backups (never commit)
 .safety/
+
+# cargo-fuzz (own workspace): never commit its lockfile, artifacts, or corpus
+fuzz/Cargo.lock
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/target/

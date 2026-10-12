@@ -1,0 +1,42 @@
+[package]
+name = "ocserve-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+
+[dependencies.ocserve-llm]
+path = "../crates/ocserve-llm"
+
+[dependencies.ocserve-store]
+path = "../crates/ocserve-store"
+
+[dependencies.ocserve-core]
+path = "../crates/ocserve-core"
+
+[[bin]]
+name = "sse_parser"
+path = "fuzz_targets/sse_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "splice_parser"
+path = "fuzz_targets/splice_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false

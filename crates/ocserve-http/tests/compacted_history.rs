@@ -144,7 +144,9 @@ fn seed_compacted_history(st: &AppState) {
     seed(
         st,
         json!({"id":"msg_a1","sessionID":"ses_ch","role":"assistant","time":{"created":11,"completed":12}}),
-        vec![json!({"id":"prt_a1","type":"text","text": format!("BIGMARKER{}", "x".repeat(300_000))})],
+        vec![
+            json!({"id":"prt_a1","type":"text","text": format!("BIGMARKER{}", "x".repeat(300_000))}),
+        ],
     );
     seed(
         st,
@@ -159,14 +161,18 @@ fn seed_compacted_history(st: &AppState) {
     seed(
         st,
         json!({"id":"msg_anchor","sessionID":"ses_ch","role":"user","agent":"plan","time":{"created":30}}),
-        vec![json!({"id":"prt_anchor","type":"compaction","auto":false,"overflow":false,
-                    "tail_start_id":"msg_tail"})],
+        vec![
+            json!({"id":"prt_anchor","type":"compaction","auto":false,"overflow":false,
+                    "tail_start_id":"msg_tail"}),
+        ],
     );
     seed(
         st,
         json!({"id":"msg_summary","sessionID":"ses_ch","role":"assistant","summary":true,
                "parentID":"msg_anchor","finish":"stop","time":{"created":31,"completed":32}}),
-        vec![json!({"id":"prt_summary","type":"text","text":"SUM-MARKER-OK: objective and details"})],
+        vec![
+            json!({"id":"prt_summary","type":"text","text":"SUM-MARKER-OK: objective and details"}),
+        ],
     );
 }
 

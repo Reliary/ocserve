@@ -7,6 +7,7 @@
 //! Label cardinality is bounded by construction (AGENTS §2.3): route labels
 //! are normalized (`/session/ses_x/…` → `/session/{id}/…`), event types come
 //! from the frozen contract, hook names from the upstream table.
+#![cfg_attr(not(test), forbid(unsafe_code))]
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -84,9 +85,7 @@ pub fn observe(name: &'static str, label: &str, micros: u64) {
             d.max_us.fetch_max(micros, Ordering::Relaxed);
             return;
         }
-        let d = g
-            .entry((name, label.to_string()))
-            .or_default();
+        let d = g.entry((name, label.to_string())).or_default();
         d.sum_us.fetch_add(micros, Ordering::Relaxed);
         d.count.fetch_add(1, Ordering::Relaxed);
         d.max_us.fetch_max(micros, Ordering::Relaxed);

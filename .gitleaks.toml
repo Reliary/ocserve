@@ -1,0 +1,46 @@
+# gitleaks configuration (PR secret scan — .github/workflows/pr-secret-scan.yml)
+#
+# Scope: catch real credentials added to the tree or history. The repo already
+# enforces a no-personal-data / no-home-path rule in the pre-commit hook and
+# AGENTS §2.9; gitleaks adds credential-shaped detection over the PR diff.
+title = "ocserve gitleaks config"
+
+[[rules]]
+id = "generic-api-key"
+regex = '''(?i)(?:api[_-]?key|apikey|secret|token|password|passwd|credential)\s*[:=]\s*['"]([0-9a-zA-Z_\-]{16,})['"]'''
+
+[[rules]]
+id = "private-key"
+regex = '''-----BEGIN (?:RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----'''
+
+[[rules]]
+id = "authorization-bearer"
+regex = '''(?:Authorization|authorization)['"]?\s*[:=]\s*['"]?Bearer\s+[0-9a-zA-Z\-_.]{20,}'''
+
+[[rules]]
+id = "aws-access-key"
+regex = '''AKIA[0-9A-Z]{16}'''
+
+[[rules]]
+id = "github-token"
+regex = '''gh[pousr]_[0-9A-Za-z]{36,}'''
+
+[[rules]]
+id = "slack-token"
+regex = '''xox[baprs]-[0-9A-Za-z-]{10,}'''
+
+[allowlist]
+description = "Non-secrets: test fixtures, the keyless public sentinel, and recorded corpora (all reviewed, no real credentials)."
+paths = [
+  '''testdata/''',
+  '''bench/capdiff/''',
+  '''bench/parity/config/''',
+  '''bench/load/''',
+]
+regexes = [
+  # opencode's keyless free-tier sentinel — not a credential (FINDINGS: the
+  # literal string "public" is the whole auth value; see zen keyless path).
+  '''Bearer public''',
+  # synthetic ids used throughout fixtures/tests
+  '''(?:ses|msg|prt|per|que|evt|tok)_[0-9A-Za-z]+''',
+]

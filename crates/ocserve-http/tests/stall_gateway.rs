@@ -73,9 +73,8 @@ fn spawn_sse_server(first_data_after: Option<std::time::Duration>) -> std::net::
                 // read request head + body (best-effort; Content-Length aware)
                 let mut buf = vec![0u8; 65536];
                 let _ = stream.read(&mut buf);
-                let _ = stream.write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n",
-                );
+                let _ =
+                    stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n");
                 let _ = stream.write_all(b": keep-alive\n\n");
                 let t0 = std::time::Instant::now();
                 match first_data_after {
@@ -122,8 +121,6 @@ async fn prompt(st: &std::sync::Arc<AppState>) -> StatusCode {
         .unwrap()
         .status()
 }
-
-
 
 async fn wait_idle(st: &std::sync::Arc<AppState>, budget: std::time::Duration) -> bool {
     let t0 = std::time::Instant::now();
