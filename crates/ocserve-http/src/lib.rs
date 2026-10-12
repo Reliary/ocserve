@@ -264,8 +264,6 @@ pub struct AppState {
     /// closure avoids a crate cycle). None in tests → PATCH still writes
     /// the file, swap skipped (logged).
     pub reloader: parking_lot::RwLock<Option<ConfigReloader>>,
-    /// Known sessions (M1: served from store as it comes online).
-    pub sessions: parking_lot::RwLock<HashMap<String, serde_json::Value>>,
     /// Runtime paths for GET /path (env-derived at boot; never stored in repo).
     pub paths: serde_json::Value,
     /// Auth mode: None = off (freeze default), Some(("user","pass")) = basic.
@@ -429,6 +427,10 @@ pub(crate) fn rebuild_wire(
         "api_integration",
         &crate::v2::integrations_body(p, location),
     );
+    // v2 agent/command lists (perf dive 2026-10-11): per-request projection +
+    // serde on every UI refresh; pure over Payloads, so cache like the rest.
+    one(&mut m, "api_agent", &api_agent_body(p, location));
+    one(&mut m, "api_command", &api_command_body(p, location));
     m
 }
 
@@ -562,7 +564,6 @@ impl AppState {
             wire: parking_lot::RwLock::new(wire_map),
             wire_off: std::sync::atomic::AtomicBool::new(wire_off),
             reloader: parking_lot::RwLock::new(None),
-            sessions: parking_lot::RwLock::new(HashMap::new()),
             // upstream /path shape (keys golden: home/state/config/worktree/directory)
             paths: json!({
                 "home": home,
@@ -812,8 +813,28 @@ pub(crate) fn api_location(st: &AppState) -> Value {
 
 /// GET /api/agent — v2-shaped agent list (permission triple renamed to
 /// {action, resource, effect}; natives-first order; no plugin agents).
-async fn get_api_agent(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let payloads = st.payloads.read();
+async fn get_api_agent(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let ae = headers
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    let inm = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    crate::wire_json_h(&st, "api_agent", ae, inm).unwrap_or_else(|| {
+        let payloads = st.payloads.read();
+        Json(api_agent_body(&payloads, &api_location(&st))).into_response()
+    })
+}
+
+/// Pure projection for /api/agent (cache + fallback share this).
+pub(crate) fn api_agent_body(payloads: &Payloads, location: &Value) -> Value {
+    json!({"location": location, "data": api_agent_data(payloads)})
+}
+
+fn api_agent_data(payloads: &Payloads) -> Vec<Value> {
     let data: Vec<Value> = payloads
         .api_agent
         .iter()
@@ -852,7 +873,7 @@ async fn get_api_agent(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             out
         })
         .collect();
-    Json(json!({"location": api_location(&st), "data": data}))
+    data
 }
 
 /// Captured from live /api/agent (build has no prompt; upstream serves this blurb).
@@ -861,8 +882,24 @@ engineering tasks by inspecting the workspace, making targeted changes, and usin
 to the configured permissions.";
 
 /// GET /api/command — {location, data:[{description,name,template}]}.
-async fn get_api_command(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let payloads = st.payloads.read();
+async fn get_api_command(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let ae = headers
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    let inm = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+    crate::wire_json_h(&st, "api_command", ae, inm).unwrap_or_else(|| {
+        let payloads = st.payloads.read();
+        Json(api_command_body(&payloads, &api_location(&st))).into_response()
+    })
+}
+
+/// Pure projection for /api/command (cache + fallback share this).
+pub(crate) fn api_command_body(payloads: &Payloads, location: &Value) -> Value {
     let data: Vec<Value> = payloads
         .command
         .iter()
@@ -874,7 +911,7 @@ async fn get_api_command(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             })
         })
         .collect();
-    Json(json!({"location": api_location(&st), "data": data}))
+    json!({"location": location, "data": data})
 }
 
 /// Empty-shape routes captured live: {}, [].
@@ -1307,7 +1344,7 @@ impl PageMemoState {
             })
     }
     fn put(&mut self, key: String, entry: PageEntry, epoch: u64) {
-        if entry.body.len() > PAGE_MEMO_ENTRY_CAP {
+        if entry.body.len() > PAGE_MEMO_ENTRY_CAP.min(PAGE_MEMO_MAX_BYTES) {
             return;
         }
         if self.epoch != epoch {
@@ -1320,12 +1357,19 @@ impl PageMemoState {
             let (_, old) = self.entries.remove(pos).expect("position found");
             self.bytes -= old.body.len();
         }
+        // RAM audit 2026-10-11: the env budget was unbounded above — a large
+        // OCSERVE_PAGE_MEMO_MB could hold arbitrarily many bytes, and a single
+        // entry larger than the budget was kept alone (len() == 1 skips the
+        // eviction loop, so `bytes > budget` with no victim). Clamp the
+        // override to the const ceiling and refuse entries that alone exceed
+        // it (entry cap above already bounds each, so a refused entry is
+        // simply not memoized — the route still serves from the DB).
         let budget = std::env::var("OCSERVE_PAGE_MEMO_MB")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(64)
-            * 1024
-            * 1024;
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(PAGE_MEMO_MAX_BYTES)
+            .min(PAGE_MEMO_MAX_BYTES);
         self.bytes += entry.body.len();
         self.entries.push_back((key, entry));
         while self.entries.len() > PAGE_MEMO_MAX_ENTRIES
@@ -3513,6 +3557,9 @@ async fn delete_session_route(
     if !found {
         return Err(ApiError::not_found(format!("Session not found: {id}")));
     }
+    // RAM audit 2026-10-11: release per-session gate state (always-grants +
+    // hydrated marker) — it otherwise accumulates for every session ever seen.
+    st.gate.forget_session(&id);
     // P0e: magic-context consumes session.deleted (live publish — the
     // durable rows cascade away with the session).
     st.bus.publish(ocserve_core::event::frame(
@@ -3728,9 +3775,12 @@ async fn read_file_content(
     let path = scope_path(base, raw).map_err(HttpError::Api)?;
     // freeze returns an empty text body for a missing file (probed), not an
     // error — the web UI probes optional paths.
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(_) => {
+    // Perf dive 2026-10-11: the read ran INLINE on a tokio worker (up to 1 MB
+    // blocking fs + copy — the M3 class). Move it to the blocking pool.
+    let read_path = path.clone();
+    let bytes = match tokio::task::spawn_blocking(move || std::fs::read(&read_path)).await {
+        Ok(Ok(b)) => b,
+        _ => {
             return Ok(Json(json!({"type": "text", "content": ""})));
         }
     };

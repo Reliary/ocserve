@@ -266,7 +266,15 @@ pub async fn process(
     anchor_id: &str,
     last_agent: &str,
 ) -> anyhow::Result<bool> {
-    let history = ocserve_store::load_messages(&ctx.db, session_id, None)?;
+    // Perf dive 2026-10-11: same F1 rule as the prompt path — the full
+    // history DOM parse runs on the blocking pool.
+    let history = {
+        let db = ctx.db.clone();
+        let sid = session_id.to_string();
+        tokio::task::spawn_blocking(move || ocserve_store::load_messages(&db, &sid, None))
+            .await
+            .map_err(|e| anyhow::anyhow!("compaction history join: {e}"))??
+    };
     let rows = ocserve_store::compaction_rows_path(&ctx.db, session_id)?;
 
     // input.messages upstream = filterCompacted output (prompt.ts:1150)

@@ -25,9 +25,9 @@ pub struct Registry {
 
 #[derive(Default)]
 struct Dur {
-    sum_us: u64,
-    count: u64,
-    max_us: u64,
+    sum_us: AtomicU64,
+    count: AtomicU64,
+    max_us: AtomicU64,
 }
 
 pub static REG: Registry = Registry {
@@ -70,12 +70,27 @@ pub fn gauge_delta(name: &'static str, delta: i64) {
 }
 
 /// Record a duration observation (µs) for `{name}{label}` + update max.
+/// Perf dive 2026-10-11: once the (name,label) pair exists the hot path
+/// stores into its own atomics without the global mutex or any allocation —
+/// the middleware calls this on EVERY request with a freshly formatted
+/// label, and the pre-fix path took the global lock + allocated a String key
+/// per call. Slow path (first sight of a pair) keeps exact semantics.
 pub fn observe(name: &'static str, label: &str, micros: u64) {
-    let mut g = REG.durations.lock().expect("metrics lock");
-    let d = g.entry((name, label.to_string())).or_default();
-    d.sum_us += micros;
-    d.count += 1;
-    d.max_us = d.max_us.max(micros);
+    {
+        let mut g = REG.durations.lock().expect("metrics lock");
+        if let Some(d) = g.get(&(name, label.to_string())) {
+            d.sum_us.fetch_add(micros, Ordering::Relaxed);
+            d.count.fetch_add(1, Ordering::Relaxed);
+            d.max_us.fetch_max(micros, Ordering::Relaxed);
+            return;
+        }
+        let d = g
+            .entry((name, label.to_string()))
+            .or_default();
+        d.sum_us.fetch_add(micros, Ordering::Relaxed);
+        d.count.fetch_add(1, Ordering::Relaxed);
+        d.max_us.fetch_max(micros, Ordering::Relaxed);
+    }
 }
 
 /// Normalize a request path to a bounded route label.
@@ -144,17 +159,18 @@ pub fn render() -> String {
         for (name, rows) in by_name {
             s.push_str(&format!("# TYPE {name} summary\n"));
             for (label, d) in rows {
-                if d.count == 0 {
+                let count = d.count.load(Ordering::Relaxed);
+                if count == 0 {
                     continue;
                 }
                 s.push_str(&format!(
                     "{name}_sum{{{label}}} {}\n",
-                    d.sum_us as f64 / 1e6
+                    d.sum_us.load(Ordering::Relaxed) as f64 / 1e6
                 ));
-                s.push_str(&format!("{name}_count{{{label}}} {}\n", d.count));
+                s.push_str(&format!("{name}_count{{{label}}} {count}\n"));
                 s.push_str(&format!(
                     "{name}_max{{{label}}} {}\n",
-                    d.max_us as f64 / 1e6
+                    d.max_us.load(Ordering::Relaxed) as f64 / 1e6
                 ));
             }
         }

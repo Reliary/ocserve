@@ -12,11 +12,18 @@ awk -F, '
 NR == 1 { next }
 {
   n++
-  ts = $1 + 0; rss = $2 + 0; health = $10 + 0
+  ts = $1 + 0; rss = $2 + 0; health = $10 + 0; wal = $5 + 0
   if (health != 200 && health != 0) { bad_health++; if (bad_ts == 0) bad_ts = ts }
   if (n == 1) { t0 = ts }
   # anchor: first sample after t0+3600 (gate applies from hour 1)
   if (anchor_t == 0 && ts >= t0 + 3600) { anchor_t = ts; anchor_rss = rss }
+  # WAL gate (perf guard audit 2026-10-11 blind spot h): the WAL gauge is
+  # sampled but was never gated — an un-checkpointing writer (long reader
+  # pinning the snapshot, checkpoint starvation) grows the WAL unboundedly.
+  # Track the max after the same hour-1 anchor; gate on absolute size, not
+  # slope, because the WAL legitimately seestooths between checkpoints.
+  if (anchor_t != 0 && wal > wal_max) { wal_max = wal }
+  if (wal > 0) { wal_seen = 1 }
   last_t = ts; last_rss = rss
 }
 END {
@@ -31,6 +38,12 @@ END {
   printf "samples=%d duration=%.1fh rss_slope=%.3f MiB/h (anchor %.1f MiB -> last %.1f MiB)\n", \
     n, dur/3600, mbh, anchor_rss/1048576, last_rss/1048576
   if (mbh >= 1.0) { print "FAIL: RSS slope >= 1 MiB/h after hour 1"; exit 1 }
+  # WAL ceiling: wal_autocheckpoint is 1000 pages (≈4 MiB) + journal_size_limit
+  # 64 MiB; sustained growth past 256 MiB means checkpointing is starved.
+  if (wal_seen) {
+    printf "wal_max_after_h1=%.1f MiB\n", wal_max/1048576
+    if (wal_max > 268435456) { print "FAIL: WAL exceeded 256 MiB after hour 1 (checkpoint starvation)"; exit 1 }
+  }
   print "PASS"
 }
 ' "$CSV"

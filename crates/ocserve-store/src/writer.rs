@@ -35,6 +35,9 @@ pub struct Writer {
     handle: Option<std::thread::JoinHandle<()>>,
     /// in-flight batches (send +1, ack -1) — writer_queue_depth metric source
     inflight: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    /// DB path this writer owns (event retention's over-cap gate needs a
+    /// reader on the same file).
+    path: PathBuf,
 }
 
 impl Writer {
@@ -53,7 +56,13 @@ impl Writer {
             tx: Some(tx),
             handle: Some(handle),
             inflight: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            path,
         })
+    }
+
+    /// Path of the DB this writer owns.
+    pub fn db_path_ref(&self) -> &std::path::Path {
+        &self.path
     }
 
     /// In-flight batch count (SRE writer_queue_depth gauge source).

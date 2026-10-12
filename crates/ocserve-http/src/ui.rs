@@ -550,14 +550,20 @@ fn embedded_response(path: &str) -> Response {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, ct);
     if ct.starts_with("text/html") {
-        out = out.header(
-            "content-security-policy",
-            csp_for_html(&String::from_utf8_lossy(body)),
-        );
+        // Perf dive 2026-10-11: the pre-fix path did `String::from_utf8_lossy`
+        // (a full copy of index.html) + sha256 on EVERY navigation, and
+        // `body.to_vec()` copied the entry JS (multi-MB) per request. The
+        // pack is 'static and immutable, so Bytes::from_static is a refcount
+        // and the CSP string is computed once (the pack is one pinned build).
+        static CSP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let csp_value = CSP
+            .get_or_init(|| csp_for_html(&String::from_utf8_lossy(body)))
+            .clone();
+        out = out.header("content-security-policy", csp_value);
     } else {
         out = out.header("content-security-policy", csp(""));
     }
-    out.body(Body::from(body.to_vec()))
+    out.body(Body::from(bytes::Bytes::from_static(body)))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 

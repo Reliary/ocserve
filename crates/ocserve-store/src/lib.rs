@@ -856,6 +856,22 @@ pub fn backfill_compaction(
 ) -> anyhow::Result<(u64, u64, u64)> {
     let t0 = std::time::Instant::now();
     let conn = crate::pragma::open_reader(db)?;
+    // Boot-cost gate (perf dive 2026-10-11): the two scans below run on EVERY
+    // boot (msg LIKE + msg_part type scan measured 0.4-10 s on the live DB).
+    // They only matter for legacy/pre-v8 imports; the compaction engine
+    // maintains the projection directly since v8. A manifest stamp written
+    // after the first successful pass turns later boots into one key lookup.
+    let stamped: Option<String> = conn
+        .query_row(
+            "SELECT value FROM import_manifest WHERE key = 'compaction_backfilled_v1'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if stamped.as_deref() == Some("1") {
+        drop(conn);
+        return Ok((0, 0, t0.elapsed().as_millis() as u64));
+    }
     let mut rows: Vec<(String, String, String, String, i64, i64)> = Vec::new();
     {
         let mut stmt = conn.prepare(
@@ -881,13 +897,21 @@ pub fn backfill_compaction(
         }
     }
     let mut n = 0u64;
+    // Batched (perf dive 2026-10-11): the pre-fix loop committed one
+    // transaction per anchor (~5 s class on thousands of anchors).
+    let mut ops: Vec<WriteOp> = Vec::with_capacity(256);
     for (part_id, msg_id, session_id, inline, _, _) in &rows {
         if inline.is_empty() {
             continue; // blobbed anchor (never in practice) — counted below
         }
-        let op = compaction_upsert_ops(part_id, session_id, msg_id, inline);
-        writer.write(vec![op])?;
+        ops.push(compaction_upsert_ops(part_id, session_id, msg_id, inline));
         n += 1;
+        if ops.len() >= 256 {
+            writer.write(std::mem::take(&mut ops))?;
+        }
+    }
+    if !ops.is_empty() {
+        writer.write(ops)?;
     }
     // link summary assistants (info has summary:true + parentID)
     let mut links = 0u64;
@@ -928,6 +952,11 @@ pub fn backfill_compaction(
     if !link_ops.is_empty() {
         writer.write(link_ops)?;
     }
+    // stamp so future boots skip the two scans (see the gate above)
+    let _ = writer.write(vec![WriteOp::Sql {
+        sql: "INSERT OR REPLACE INTO import_manifest (key, value) VALUES ('compaction_backfilled_v1', '1')".into(),
+        params: vec![],
+    }]);
     Ok((n, links, t0.elapsed().as_millis() as u64))
 }
 
@@ -1349,33 +1378,66 @@ pub fn load_messages(
             .ok_or_else(|| anyhow::anyhow!("db parent"))?
             .join("blobs"),
     )?;
-    for (mid, info_txt) in msgs {
-        let info: serde_json::Value = serde_json::from_str(&info_txt)?;
-        let info = merge_columns(info, &mid, session_id, None);
-        let mut pstmt = conn.prepare_cached(
-            "SELECT id, inline, blob_sha, byte_len FROM msg_part WHERE message_id = ?1 ORDER BY seq",
-        )?;
-        let mut parts: Vec<serde_json::Value> = Vec::new();
-        let mut rows = pstmt.query([&mid])?;
-        while let Some(row) = rows.next()? {
-            let part_id: String = row.get(0)?;
-            let inline: Option<String> = row.get(1)?;
-            let sha: Option<String> = row.get(2)?;
-            let byte_len: i64 = row.get(3)?;
-            let txt = match inline {
-                Some(t) => t,
-                None => match (&sha, byte_len) {
-                    (Some(sha), len) => {
-                        String::from_utf8_lossy(&blobs.get(sha, len as u64)?).into_owned()
-                    }
-                    (None, _) => continue, // corrupt row: no payload at all
-                },
-            };
-            if let Ok(v) = serde_json::from_str(&txt) {
-                parts.push(merge_columns(v, &part_id, session_id, Some(&mid)));
+    // Chunked part prefetch (perf dive 2026-10-11): the pre-fix loop ran one
+    // prepared query PER MESSAGE (N+1; 16.6k messages on the deep session).
+    // Same 64-chunk IN-prefetch the streaming `for_each_message_json` path
+    // already uses (F3). Groups keyed by message_id; emission stays in
+    // message order.
+    const PART_CHUNK: usize = 64;
+    let placeholders = vec!["?"; PART_CHUNK].join(",");
+    let mut pstmt = conn.prepare_cached(&format!(
+        "SELECT message_id, id, inline, blob_sha, byte_len FROM msg_part \
+         WHERE message_id IN ({placeholders}) ORDER BY message_id, seq"
+    ))?;
+    let mut padded: Vec<Option<String>> = Vec::with_capacity(PART_CHUNK);
+    /// (part_id, inline, blob_sha, byte_len) as stored.
+    type PartLite = (String, Option<String>, Option<String>, i64);
+    let mut groups: std::collections::HashMap<String, Vec<PartLite>> =
+        std::collections::HashMap::new();
+    let mut msg_iter = msgs.into_iter().peekable();
+    while msg_iter.peek().is_some() {
+        let head: Vec<(String, String)> = (&mut msg_iter).take(PART_CHUNK).collect();
+        groups.clear();
+        padded.clear();
+        for (mid, _) in &head {
+            padded.push(Some(mid.clone()));
+        }
+        while padded.len() < PART_CHUNK {
+            padded.push(None);
+        }
+        {
+            let mut rows = pstmt.query(rusqlite::params_from_iter(padded.iter()))?;
+            while let Some(row) = rows.next()? {
+                groups.entry(row.get::<_, String>(0)?).or_default().push((
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ));
             }
         }
-        out.push((info, parts));
+        for (mid, info_txt) in head {
+            let info: serde_json::Value = serde_json::from_str(&info_txt)?;
+            let info = merge_columns(info, &mid, session_id, None);
+            let mut parts: Vec<serde_json::Value> = Vec::new();
+            if let Some(rows) = groups.get(&mid) {
+                for (part_id, inline, sha, byte_len) in rows {
+                    let txt = match inline {
+                        Some(t) => t.clone(),
+                        None => match (sha, byte_len) {
+                            (Some(sha), len) => {
+                                String::from_utf8_lossy(&blobs.get(sha, *len as u64)?).into_owned()
+                            }
+                            (None, _) => continue, // corrupt row: no payload at all
+                        },
+                    };
+                    if let Ok(v) = serde_json::from_str(&txt) {
+                        parts.push(merge_columns(v, part_id, session_id, Some(&mid)));
+                    }
+                }
+            }
+            out.push((info, parts));
+        }
     }
     Ok(out)
 }
@@ -1406,21 +1468,34 @@ pub fn prune_events(
     max_age_ms: i64,
 ) -> anyhow::Result<usize> {
     let cutoff = now_ms - max_age_ms;
+    // Age prune: idx_event_time seek (v12) — was an unindexed full scan.
     conn.execute(
         "DELETE FROM event WHERE time_created < ?1 AND time_created <> 0",
         [cutoff],
     )?;
     let aged = conn.changes() as usize;
-    let capped = conn.execute(
-        "DELETE FROM event WHERE rowid IN (
-            SELECT rowid FROM (
-                SELECT rowid, ROW_NUMBER() OVER (
-                    PARTITION BY session_id ORDER BY seq DESC
-                ) AS rn FROM event
-            ) WHERE rn > ?1
-        )",
+    // Cap window (perf dive 2026-10-11): the ROW_NUMBER window materializes
+    // every row into a temp b-tree on EVERY tick even though no session is
+    // near the cap. Gate it behind a covering-idx_event_session existence
+    // check (early-exits when a session IS over; index-only scan otherwise).
+    let over: i64 = conn.query_row(
+        "SELECT count(*) FROM (SELECT 1 FROM event GROUP BY session_id HAVING count(*) > ?1 LIMIT 1)",
         [max_per_session],
+        |r| r.get(0),
     )?;
+    let mut capped = 0;
+    if over > 0 {
+        capped = conn.execute(
+            "DELETE FROM event WHERE rowid IN (
+                SELECT rowid FROM (
+                    SELECT rowid, ROW_NUMBER() OVER (
+                        PARTITION BY session_id ORDER BY seq DESC
+                    ) AS rn FROM event
+                ) WHERE rn > ?1
+            )",
+            [max_per_session],
+        )?;
+    }
     Ok(aged + capped)
 }
 
@@ -1501,15 +1576,26 @@ pub fn append_event(
     }])?;
     // Throttled ring enforcement (STORAGE §4): every 1024th durable write
     // enqueues the retention deletes — an in-band bound, not a cron hope.
+    // The cap-window DELETE is gated on an actual over-cap session (perf dive
+    // 2026-10-11): the ROW_NUMBER window previously ran on every tick and
+    // materialized the whole event table into a temp b-tree for nothing.
     static EVENT_PRUNE_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     use std::sync::atomic::Ordering;
     if EVENT_PRUNE_TICK.fetch_add(1, Ordering::Relaxed) % 1024 == 1023 {
-        writer.write(vec![
-            WriteOp::Sql {
-                sql: "DELETE FROM event WHERE time_created < ?1 AND time_created <> 0".into(),
-                params: vec![(now - EVENT_MAX_AGE_MS).into()],
-            },
-            WriteOp::Sql {
+        writer.write(vec![WriteOp::Sql {
+            sql: "DELETE FROM event WHERE time_created < ?1 AND time_created <> 0".into(),
+            params: vec![(now - EVENT_MAX_AGE_MS).into()],
+        }])?;
+        let over: i64 = {
+            let conn = crate::pragma::open_reader(writer.db_path_ref())?;
+            conn.query_row(
+                "SELECT count(*) FROM (SELECT 1 FROM event GROUP BY session_id HAVING count(*) > ?1 LIMIT 1)",
+                [EVENT_MAX_PER_SESSION],
+                |r| r.get(0),
+            )?
+        };
+        if over > 0 {
+            writer.write(vec![WriteOp::Sql {
                 sql: "DELETE FROM event WHERE rowid IN (
                         SELECT rowid FROM (
                             SELECT rowid, ROW_NUMBER() OVER (
@@ -1519,8 +1605,8 @@ pub fn append_event(
                     )"
                 .into(),
                 params: vec![EVENT_MAX_PER_SESSION.into()],
-            },
-        ])?;
+            }])?;
+        }
     }
     Ok(())
 }
@@ -2275,37 +2361,66 @@ type PartSrcRow = (String, String, String, Option<String>, Option<String>, i64);
 /// part_search. Idempotent (`ON CONFLICT` upsert + NOT EXISTS selection) so
 /// an interrupted run resumes; blobbed parts decompress through the blob
 /// store. Returns (indexed, skipped, elapsed_ms).
+/// Stamp the parts-index parity marker (boot-cost gate, perf dive 2026-10-11):
+/// written after any operation that makes `part_search_fts` complete w.r.t.
+/// `part_search` (import finalize, boot backfill, self-heal rebuild). The boot
+/// parity check then skips the two O(N) table counts when
+/// stamp == docsize && trigger present.
+pub fn stamp_parts_indexed(writer: &Writer, count: i64) -> anyhow::Result<()> {
+    writer.write(vec![crate::WriteOp::Sql {
+        sql: "INSERT OR REPLACE INTO import_manifest (key, value) VALUES ('parts_indexed', ?1)".into(),
+        params: vec![count.into()],
+    }])?;
+    Ok(())
+}
+
 pub fn backfill_part_search(
     writer: &Writer,
     db: &std::path::Path,
 ) -> anyhow::Result<(u64, u64, u64)> {
     let t0 = std::time::Instant::now();
     let conn = pragma::open_reader(db)?;
+    // Boot-cost gate (perf dive 2026-10-11): the healthy-path parity check
+    // counted BOTH msg_part and part_search in full — index-only `count(*)`
+    // scans measured 2.7-4.4 s + 1.5-3.2 s cold on the live 177k-part DB on
+    // EVERY boot. A stamped manifest key (written by the import finalize +
+    // after every self-heal repair) converts the healthy path to a
+    // single-row key lookup; the counts only run when the stamp is absent
+    // (pre-stamp databases) or when the stamp fails to match the cheap
+    // docsize check (corruption/crash evidence), so nothing is skipped.
+    let stamped: Option<i64> = conn
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM import_manifest WHERE key = 'parts_indexed'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    let trigger: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='part_search_ai'",
+        [],
+        |r| r.get(0),
+    )?;
+    let fts_docs: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM part_search_fts_docsize",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1);
+    if let Some(n) = stamped
+        && trigger == 1
+        && fts_docs >= 0
+        && fts_docs as i64 == n
+    {
+        drop(conn);
+        return Ok((0, 0, t0.elapsed().as_millis() as u64));
+    }
     let total: i64 = conn.query_row("SELECT count(*) FROM msg_part", [], |r| r.get(0))?;
     let have: i64 = conn.query_row("SELECT count(*) FROM part_search", [], |r| r.get(0))?;
     if have >= total {
-        // Import crash-window self-heal (2026-10-11): the bulk FTS importer
-        // drops `part_search_ai`, bulk-builds, then recreates it. A kill
-        // between those steps leaves the projection complete but the index
-        // empty and the trigger missing. Detect both and repair (cheap
-        // checks; the rebuild only runs on a real crash).
         drop(conn);
-        let conn = pragma::open_reader(db)?;
-        let trigger: i64 = conn.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='part_search_ai'",
-            [],
-            |r| r.get(0),
-        )?;
-        let fts_docs: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM part_search_fts_docsize",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(-1);
-        drop(conn);
-        // repair only when needed — a healthy DB pays two cheap counts and no
-        // writer-open (the boot path must stay ~0 ms)
+        // repair only when needed — a healthy DB pays the stamp lookup above
+        // and lands here only when the stamp is missing or mismatched
         if trigger == 0 || (fts_docs >= 0 && fts_docs < have) {
             let wconn = crate::pragma::open_writer(db)?;
             if trigger == 0 {
@@ -2330,7 +2445,11 @@ pub fn backfill_part_search(
                     t_rb.elapsed().as_secs_f64()
                 );
             }
+            drop(wconn);
         }
+        // healthy (already or just repaired) — stamp so future boots skip
+        // the O(N) counts entirely
+        let _ = stamp_parts_indexed(writer, have);
         return Ok((0, 0, t0.elapsed().as_millis() as u64));
     }
     let blobs = crate::blob::BlobStore::new(
@@ -2391,6 +2510,9 @@ pub fn backfill_part_search(
     }
     if !batch.is_empty() {
         writer.write(batch)?;
+    }
+    if indexed > 0 {
+        let _ = stamp_parts_indexed(writer, have + indexed as i64);
     }
     Ok((indexed, skipped, t0.elapsed().as_millis() as u64))
 }
@@ -2657,9 +2779,16 @@ pub fn memo_stats() -> (u64, u64, u64, u64, u64, usize, u64) {
 // Global match: fts rowid-DESC walk + LIMIT inside the subquery (early
 // termination), payload+msg join only for the <=limit+1 survivors.
 const SEARCH_MATCH_GLOBAL: &str = "SELECT ps.session_id, ps.message_id, ps.part_id, m.role, m.time_created, ps.text FROM part_search ps JOIN msg m ON m.id = ps.message_id WHERE ps.rowid IN (SELECT rowid FROM part_search_fts WHERE part_search_fts MATCH ?1 ORDER BY rowid DESC LIMIT ?2 OFFSET ?3) ORDER BY ps.rowid DESC";
-// Scoped match: session rowid-range walk (idx_part_search_session, reverse
-// scan = rowid DESC for free) + EXISTS probe per candidate row.
-const SEARCH_MATCH_SCOPED: &str = "SELECT ps.session_id, ps.message_id, ps.part_id, m.role, m.time_created, ps.text FROM part_search ps JOIN msg m ON m.id = ps.message_id WHERE ps.session_id = ?2 AND EXISTS (SELECT 1 FROM part_search_fts f WHERE f.rowid = ps.rowid AND part_search_fts MATCH ?1) ORDER BY ps.rowid DESC LIMIT ?3 OFFSET ?4";
+// Scoped match (perf dive 2026-10-11): the pre-fix shape walked the session's
+// rowid range with a per-row FTS EXISTS probe — no early termination, so an
+// absent (or old) needle scanned every row of the session: measured 215,742 ms
+// on the 56k-row session (97.7s warm), reproduced live. The S3 shape drives
+// from the vtab (SCAN f VIRTUAL TABLE early-terminates after LIMIT+1 hits),
+// probes part_search by rowid, filters session_id in the residual, and keeps
+// the same ORDER BY f.rowid DESC contract: measured 5 ms on the same needle,
+// 395 ms worst case on the densest trigram ("the"), page-by-page equal to
+// global-filtered results (proven in the E2 shootout before adoption).
+const SEARCH_MATCH_SCOPED: &str = "SELECT ps.session_id, ps.message_id, ps.part_id, m.role, m.time_created, ps.text FROM part_search_fts f JOIN part_search ps ON ps.rowid = f.rowid JOIN msg m ON m.id = ps.message_id WHERE part_search_fts MATCH ?1 AND ps.session_id = ?2 ORDER BY f.rowid DESC LIMIT ?3 OFFSET ?4";
 // LIKE fallback (<3 chars): rowid-DESC scan with LIMIT — no sort needed.
 const SEARCH_LIKE_GLOBAL: &str = "SELECT ps.session_id, ps.message_id, ps.part_id, m.role, m.time_created, ps.text FROM part_search ps JOIN msg m ON m.id = ps.message_id WHERE ps.text LIKE ?1 ESCAPE '\\' ORDER BY ps.rowid DESC LIMIT ?2 OFFSET ?3";
 const SEARCH_LIKE_SCOPED: &str = "SELECT ps.session_id, ps.message_id, ps.part_id, m.role, m.time_created, ps.text FROM part_search ps JOIN msg m ON m.id = ps.message_id WHERE ps.session_id = ?2 AND ps.text LIKE ?1 ESCAPE '\\' ORDER BY ps.rowid DESC LIMIT ?3 OFFSET ?4";

@@ -361,6 +361,30 @@ else
   echo "ok (no per-request catalog read; metadata routes use wire_json_h)"
 fi
 
+echo "== guard: no SELECT * on hot tables in server paths (rule 25) =="
+# Perf/memory class (2026-10-11 dive): SELECT * materializes every column of
+# wide/hot tables (event payloads, msg info, msg_part inline) even when the
+# caller needs two of them; also freezes the wire shape to the schema.
+# Ban literal `SELECT * FROM <hot>` and `SELECT * FROM (SELECT` shapes in
+# crates/*/src, allowlisting the one EQP-probe use (schema.rs explains a plan,
+# never executes for data). Planted control runs through the same scan.
+plant="crates/ocserve-store/src/__rule25_plant.rs"
+printf '%s\n' 'fn _plant() { let _ = "SELECT * FROM event"; }' > "$plant"
+hot_hits=$(grep -rnE "SELECT \* FROM (event|msg|msg_part|part_search|session)" crates/*/src 2>/dev/null \
+  | grep -v 'EXPLAIN QUERY PLAN' | grep -v '__rule25_plant' || true)
+plant_hit=$(grep -rnE "SELECT \* FROM (event|msg|msg_part|part_search|session)" crates/ocserve-store/src/__rule25_plant.rs 2>/dev/null || true)
+rm -f "$plant"
+if [ -z "$plant_hit" ]; then
+  echo "FAIL: rule 25 planted control not detected"
+  fail=1
+fi
+if [ -n "$hot_hits" ]; then
+  echo "$hot_hits"
+  echo "FAIL: SELECT * on a hot table in server paths (rule 25)"; fail=1
+else
+  echo "ok (no SELECT * on hot tables; planted SELECT* detected)"
+fi
+
 echo "== guard: every test file referenced from src/ exists (rule 24) =="
 # False-claim class (2026-10-11): `src/v2.rs` cited `tests/v2_body_parity.rs` in
 # a doc comment while the file had never been written — the claim outran the

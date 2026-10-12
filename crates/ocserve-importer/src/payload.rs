@@ -215,6 +215,22 @@ pub fn import_payloads(
              INSERT INTO part_search_fts(rowid, text) VALUES (new.rowid, new.text);
          END",
     )?;
+    // Stamp the parity marker (boot-cost gate, perf dive 2026-10-11): the
+    // server's boot check then skips two O(N) counts on every restart; the
+    // stamp is validated against fts docsize + trigger presence, so a crash
+    // between rebuild and stamp keeps the old (or missing) value and the
+    // full check still runs.
+    {
+        let docs: i64 = dst
+            .query_row("SELECT count(*) FROM part_search_fts_docsize", [], |r| {
+                r.get(0)
+            })
+            .context("docsize after fts rebuild")?;
+        dst.execute(
+            "INSERT OR REPLACE INTO import_manifest (key, value) VALUES ('parts_indexed', ?1)",
+            [docs],
+        )?;
+    }
 
     // ---- events (bounded ring input; time ≈ session updated) ----
     dst.execute_batch("BEGIN")?;

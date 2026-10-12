@@ -94,7 +94,19 @@ pub struct ToolCallAssembler {
     slots: Vec<(Option<String>, Option<String>, String)>,
 }
 
+/// Upper bound on simultaneously streamed tool calls (RAM audit 2026-10-11):
+/// `index` is provider-supplied; a hostile/broken stream could previously name
+/// a huge index and allocate that many slots (and the while-loop allocated
+/// gap slots before the push). A real turn never streams more than a handful;
+/// OpenAI-compatible providers cap tools per request anyway.
+pub const MAX_TOOL_CALL_SLOTS: usize = 256;
+
 impl ToolCallAssembler {
+    /// Max slot index observed so far (test/metric surface).
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
     pub fn push(
         &mut self,
         index: usize,
@@ -102,6 +114,11 @@ impl ToolCallAssembler {
         name: Option<String>,
         arguments_delta: String,
     ) {
+        if index >= MAX_TOOL_CALL_SLOTS {
+            // drop the delta rather than allocate; the turn will fail its
+            // tool-call validation loudly if this ever fires on real traffic
+            return;
+        }
         while self.slots.len() <= index {
             self.slots.push((None, None, String::new()));
         }
@@ -798,6 +815,27 @@ mod tests {
         assert_eq!(calls[0].arguments, "{\"command\":\"ls\"}");
         assert_eq!(calls[1].name, "read");
         assert_eq!(calls[1].arguments, "{\"path\":\"x\"}");
+    }
+    /// RAM audit 2026-10-11: the provider-supplied `index` must not allocate
+    /// unbounded slots. Negative control: removing the `MAX_TOOL_CALL_SLOTS`
+    /// early-return makes `slot_count` grow to the hostile index (red).
+    #[test]
+    fn tool_call_assembler_caps_hostile_index() {
+        let mut a = ToolCallAssembler::default();
+        a.push(1_000_000, Some("call_x".into()), Some("bash".into()), "{}".into());
+        assert!(
+            a.slot_count() <= MAX_TOOL_CALL_SLOTS,
+            "hostile index must not allocate slots: {}",
+            a.slot_count()
+        );
+        {
+            let mut a2 = ToolCallAssembler::default();
+            a2.push(1_000_000, Some("call_x".into()), Some("bash".into()), "{}".into());
+            assert!(a2.finish().is_empty(), "dropped delta yields no tool call");
+        }
+        // normal indices still work after a hostile one
+        a.push(0, Some("call_ok".into()), Some("read".into()), "{}".into());
+        assert_eq!(a.finish().len(), 1);
     }
 
     /// parse_sse_data edge cases: keep-alive, empty, malformed.

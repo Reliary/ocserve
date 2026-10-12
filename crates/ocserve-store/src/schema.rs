@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -79,6 +79,7 @@ CREATE TABLE event (
 ) STRICT;
 
 CREATE INDEX idx_event_session ON event(session_id, seq);
+CREATE INDEX idx_event_time ON event(time_created);
 
 -- permission decisions (per project+action+resource, S8)
 CREATE TABLE permission (
@@ -579,6 +580,33 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                     conn.execute_batch("ALTER TABLE session ADD COLUMN revert TEXT;")?;
                 }
             }
+            11 => {
+                // v11->v12: event retention prune index (perf dive 2026-10-11).
+                // The age DELETE ran as an unindexed full scan of `event`
+                // (EQP: SCAN event) INSIDE the writer transaction every 1024th
+                // durable append; the cap-window DELETE additionally built a
+                // temp b-tree over all rows (ROW_NUMBER window). Measured on
+                // the live DB: event = 166k rows / 317 MB. The (time_created)
+                // index makes the age delete a seek; `idx_event_session`
+                // already exists for the cap window. The migration itself is
+                // a one-time index build (fast on any realistic event table —
+                // it is a narrow integer key).
+                // Guard: synthetic/replayed v1 fixtures may not carry the
+                // event table yet (same composability rule as v10->v11) —
+                // index only when the table exists.
+                let has: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='event'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                if has > 0 {
+                    conn.execute_batch(
+                        "CREATE INDEX IF NOT EXISTS idx_event_time ON event(time_created);",
+                    )?;
+                }
+            }
             other => {
                 bail!(
                     "database schema version {other} out of step for {SCHEMA_VERSION}; \
@@ -1060,6 +1088,51 @@ mod sa_search {
         assert!(
             !plan.contains("TEMP B-TREE"),
             "sort must be gone (E1 winner shape); plan: {plan}"
+        );
+    }
+
+    /// EQP control (perf dive 2026-10-11): the scoped search must drive from
+    /// the FTS virtual table (early-terminating walk) — the pre-fix shape
+    /// walked the session index with a per-row EXISTS probe (measured
+    /// 215,742 ms on the 56k-row live session; S3 = 5 ms on the same needle).
+    /// Mutation: revert SEARCH_MATCH_SCOPED to the EXISTS shape → the plan
+    /// loses `part_search_fts` FIRST and this reds.
+    #[test]
+    fn scoped_match_plan_is_an_fts_walk_not_a_session_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.db");
+        let conn = pragma::create_new(&p).unwrap();
+        migrate(&conn).unwrap();
+        seed(&conn);
+        upsert(&conn, "p1", "m1", "needle one");
+        upsert(&conn, "p2", "m2", "needle two");
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", crate::SEARCH_MATCH_SCOPED))
+            .unwrap();
+        let plan: String = stmt
+            .query_map(
+                rusqlite::params!["\"needle\"", "ses_x", 10_i64, 0_i64],
+                |r| r.get::<_, String>(3),
+            )
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            plan.contains("VIRTUAL TABLE"),
+            "scoped plan must drive from the fts vtab: {plan}"
+        );
+        assert!(
+            plan.starts_with("SCAN f VIRTUAL TABLE") || plan.starts_with("SEARCH f"),
+            "the fts walk must be the FIRST plan step (early termination): {plan}"
+        );
+        assert!(
+            !plan.contains("EXISTS"),
+            "per-row EXISTS probe shape must be gone: {plan}"
+        );
+        assert!(
+            !plan.contains("TEMP B-TREE"),
+            "no sort in the scoped shape: {plan}"
         );
     }
 

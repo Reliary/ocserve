@@ -127,7 +127,15 @@ impl EventBus {
     /// exceeds count or byte bounds (lagging receivers get `Lagged` and
     /// disconnect — backpressure → disconnect, not stall, not growth).
     pub fn publish(&self, frame: Value) {
-        let bytes = frame.to_string();
+        self.publish_str(frame.to_string());
+    }
+
+    /// Publish an already-serialized frame (perf dive 2026-10-11): the
+    /// prompt path serializes the same props three times per event (persist,
+    /// plain frame, sync twin) and the two SSE formats re-parse + re-encode
+    /// per subscriber. Keeping the ring items as strings lets every reader
+    /// derive its wire format without a Value round-trip.
+    pub fn publish_str(&self, bytes: String) {
         let len = bytes.len();
         let mut ring = self.inner.ring.lock().expect("event ring poisoned");
         ring.next_seq += 1;

@@ -809,7 +809,17 @@ pub async fn run_prompt_with(
                 opts.prelude.clone().unwrap_or_default(),
             ));
         } else {
-            let history = ocserve_store::load_messages(&ctx.db, session_id, None)?;
+            // Perf dive 2026-10-11: load_messages is a multi-MB DOM parse +
+            // blob reads (historically 93 MB response / 400 MB as Values on
+            // the deep session) — run it on the blocking pool, never on a
+            // tokio worker (the F1 convoy class).
+            let db = ctx.db.clone();
+            let sid = session_id.to_string();
+            let history = tokio::task::spawn_blocking(move || {
+                ocserve_store::load_messages(&db, &sid, None)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("history load join: {e}"))??;
             messages.extend(to_provider_messages(&history));
         }
         let mut tools = if opts.tools_enabled {

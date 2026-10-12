@@ -74,10 +74,40 @@ impl PermissionGate {
     /// request must survive the create handler returning). No waiter exists, so
     /// the receiver is dropped; `reply` keys on the entry's PRESENCE, not on a
     /// successful oneshot send, so this still resolves cleanly.
+    ///
+    /// Bounded (RAM audit 2026-10-11): unlike `register`, no PendingGuard can
+    /// ever clean these up, so a client retry loop minting asks would grow
+    /// `pending`/`requests` without limit. Cap the persistent set — evicting
+    /// the oldest by request timestamp — and count evictions on a metric.
     pub fn register_persistent(&self, id: &str, request: Value) {
+        const PERSISTENT_CAP: usize = 512;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending.lock().insert(id.to_string(), tx);
-        self.requests.lock().insert(id.to_string(), request);
+        {
+            // lock order: pending -> requests (every other site acquires in
+            // this order, and none hold both simultaneously — nesting here
+            // cannot invert).
+            let mut pending = self.pending.lock();
+            let mut requests = self.requests.lock();
+            if requests.len() >= PERSISTENT_CAP {
+                // evict oldest by request time (millis), fall back to key order
+                let oldest = requests
+                    .iter()
+                    .min_by_key(|(_, v)| {
+                        v.get("time")
+                            .and_then(|t| t.get("created").or_else(|| t.as_i64().map(|_| t)))
+                            .and_then(|t| t.as_i64())
+                            .unwrap_or(i64::MAX)
+                    })
+                    .map(|(k, _)| k.clone());
+                if let Some(k) = oldest {
+                    pending.remove(&k);
+                    requests.remove(&k);
+                    ocserve_metrics::counter("ocserve_permission_persistent_evicted_total", 1);
+                }
+            }
+            pending.insert(id.to_string(), tx);
+            requests.insert(id.to_string(), request);
+        }
         drop(rx);
     }
 
@@ -117,6 +147,15 @@ impl PermissionGate {
     /// Gauge support: number of asks awaiting a reply.
     pub fn pending_len(&self) -> usize {
         self.pending.lock().len()
+    }
+
+    /// Drop all per-session state (RAM audit 2026-10-11: `always`/`hydrated`
+    /// grew per session and never shrank — a thousands-of-sessions vector).
+    /// Called on session delete; a re-created session id re-hydrates from the
+    /// DB on its next prompt.
+    pub fn forget_session(&self, session_id: &str) {
+        self.always.lock().remove(session_id);
+        self.hydrated.lock().remove(session_id);
     }
 
     /// Resolve a pending ask from a client reply. Returns true when the id was
@@ -308,5 +347,67 @@ mod guard_tests {
         drop(guard); // no-op after reply
         assert_eq!(gate.pending_len(), 0);
         drop(rx);
+    }
+}
+
+#[cfg(test)]
+mod persistent_cap_tests {
+    use super::*;
+
+    /// RAM audit 2026-10-11: the persistent set (no drop-guard path) must be
+    /// bounded. Negative control: removing the eviction block makes len()
+    /// exceed the cap (red).
+    #[test]
+    fn persistent_registrations_are_capped() {
+        let gate = PermissionGate::new();
+        for i in 0..700 {
+            gate.register_persistent(
+                &format!("per_{i:04}"),
+                serde_json::json!({"time": {"created": i as i64}}),
+            );
+        }
+        assert!(
+            gate.pending_len() <= 512,
+            "persistent pending set must be capped: {}",
+            gate.pending_len()
+        );
+        assert!(
+            gate.requests.lock().len() <= 512,
+            "persistent request snapshots must be capped: {}",
+            gate.requests.lock().len()
+        );
+        // the newest ask survives (oldest evicted, not the newest)
+        assert!(gate.pending.lock().contains_key("per_0699"));
+    }
+}
+
+#[cfg(test)]
+mod forget_session_tests {
+    use super::*;
+
+    /// Session-delete must release per-session gate state (RAM audit
+    /// 2026-10-11). Negative control: removing the `forget_session` body
+    /// leaves `always`/`hydrated` populated → red.
+    #[test]
+    fn forget_session_releases_state() {
+        let gate = PermissionGate::new();
+        {
+            gate.always
+                .lock()
+                .entry("ses_x".into())
+                .or_default()
+                .push(GrantRule {
+                    permission: "bash".into(),
+                    pattern: "git *".into(),
+                });
+            gate.hydrated.lock().insert("ses_x".into());
+        }
+        gate.forget_session("ses_x");
+        assert!(gate.always.lock().get("ses_x").is_none());
+        assert!(!gate.hydrated.lock().contains("ses_x"));
+        // unrelated sessions unaffected
+        gate.hydrated.lock().insert("ses_y".into());
+        gate.forget_session("ses_x");
+        assert!(gate.hydrated.lock().contains("ses_y"));
     }
 }

@@ -282,3 +282,75 @@ fn fresh_schema_has_page_index_v5() {
         .unwrap();
     assert_eq!(ver, ocserve_store::schema::SCHEMA_VERSION);
 }
+
+// ---- perf dive 2026-10-11: load_messages 64-chunk part prefetch ----
+
+/// The chunked part prefetch must be byte-identical to the old per-message
+/// query at BOTH sides of the 64-message chunk boundary (65 messages, parts
+/// on #1, #64, #65), and blob-resolved parts must survive the batching.
+/// Negative control: the pad-line removal was planted and this test went red
+/// (last chunk fails to match 65th-message parts), then restored green.
+#[test]
+fn load_messages_chunk_boundary_and_blob_parts() {
+    use ocserve_store::{BlobStore, Writer, load_messages};
+    let dir = tempfile::tempdir().unwrap();
+    let db = ocserve_store::writer::db_path(dir.path());
+    let w = Writer::spawn(db.clone()).unwrap();
+    w.write(vec![ocserve_store::WriteOp::Sql {
+        sql: "INSERT INTO session (id, project_id, directory, path, slug, title, version, time_created, time_updated) VALUES ('ses_65', 'global', '/w', 's', 's', 't', '1', 1, 1)".into(),
+        params: vec![],
+    }])
+    .unwrap();
+    // 65 messages; parts on the first, the 64th, and the 65th (chunk edges)
+    let mut ops = Vec::new();
+    for i in 1..=65 {
+        ops.push(ocserve_store::WriteOp::Sql {
+            sql: format!(
+                "INSERT INTO msg (id, session_id, role, seq, time_created, info) VALUES ('msg_c{i}', 'ses_65', 'user', {i}, {i}, '{{\"role\":\"user\",\"time\":{{\"created\":{i}}}}}')"
+            ),
+            params: vec![],
+        });
+    }
+    for i in [1usize, 64, 65] {
+        ops.push(ocserve_store::WriteOp::Sql {
+            sql: format!(
+                "INSERT INTO msg_part (id, message_id, session_id, seq, type, byte_len, inline, blob_sha) VALUES ('prt_c{i}', 'msg_c{i}', 'ses_65', 1, 'text', 30, '{{\"type\":\"text\",\"text\":\"inline-{i}\"}}', NULL)"
+            ),
+            params: vec![],
+        });
+    }
+    w.write(ops).unwrap();
+    // one blob-backed part on message 65 (spill path must resolve inside the chunk)
+    let big = format!("{{\"type\":\"text\",\"text\":\"{}\"}}", "b".repeat(9000));
+    let blobs = BlobStore::new(dir.path().join("blobs")).unwrap();
+    let (sha, _, _) = blobs.put(big.as_bytes()).unwrap();
+    w.write(vec![ocserve_store::WriteOp::Sql {
+        sql: format!(
+            "INSERT INTO msg_part (id, message_id, session_id, seq, type, byte_len, inline, blob_sha) VALUES ('prt_blob', 'msg_c65', 'ses_65', 2, 'text', {}, NULL, '{sha}')",
+            big.len()
+        ),
+        params: vec![],
+    }])
+    .unwrap();
+    drop(w);
+
+    let msgs = load_messages(&db, "ses_65", None).unwrap();
+    assert_eq!(msgs.len(), 65, "all messages returned in order");
+    let ids: Vec<&str> = msgs.iter().map(|(i, _)| i["id"].as_str().unwrap()).collect();
+    assert_eq!(ids[0], "msg_c1");
+    assert_eq!(ids[63], "msg_c64");
+    assert_eq!(ids[64], "msg_c65");
+    assert_eq!(msgs[0].1.len(), 1, "first-message part survives");
+    assert_eq!(msgs[0].1[0]["text"], "inline-1");
+    assert_eq!(msgs[63].1.len(), 1, "chunk-boundary message 64 keeps its part");
+    assert_eq!(msgs[63].1[0]["text"], "inline-64");
+    assert_eq!(msgs[64].1.len(), 2, "last-chunk message keeps inline + blob parts");
+    assert_eq!(msgs[64].1[0]["text"], "inline-65");
+    assert_eq!(
+        msgs[64].1[1]["text"].as_str().unwrap().len(),
+        9000,
+        "blob part resolved through the batched prefetch"
+    );
+    // messages without parts must have empty part vecs, not dropped rows
+    assert!(msgs[1].1.is_empty());
+}

@@ -449,8 +449,20 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
                 tick.tick().await;
                 // K-EFFICIENCY: tick cost visibility (the idle-jump suspect
                 // until measured otherwise — 11 msgs total, so likely tiny).
+                // Perf dive 2026-10-11: sync_tick is a synchronous fn doing
+                // many reader opens + prepared statements + blob fsyncs; it
+                // previously ran INLINE in this async task, parking a tokio
+                // worker every 60 s. Run it on the blocking pool.
+                let st_worker = st.clone();
                 let sync_t0 = std::time::Instant::now();
-                let tick_result = ocserve_http::sync::sync_tick(&st);
+                let tick_result = match tokio::task::spawn_blocking(move || {
+                    ocserve_http::sync::sync_tick(&st_worker)
+                })
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => Err(anyhow::anyhow!("sync tick join: {e}")),
+                };
                 ocserve_metrics::observe(
                     "ocserve_sync_tick",
                     if tick_result.is_ok() {

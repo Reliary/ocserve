@@ -1047,7 +1047,7 @@ pub async fn switch_agent(
     Json(body): Json<Value>,
 ) -> Result<StatusCode, crate::HttpError> {
     let agent = body.get("agent").and_then(|v| v.as_str()).unwrap_or("");
-    set_session_field(&st, &id, "agent", json!(agent))?;
+    set_session_field(&st, &id, "agent", json!(agent)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1062,11 +1062,12 @@ pub async fn switch_model(
         &id,
         "model",
         body.get("model").cloned().unwrap_or(json!({})),
-    )?;
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn set_session_field(
+async fn set_session_field(
     st: &AppState,
     id: &str,
     field: &str,
@@ -1085,7 +1086,18 @@ fn set_session_field(
     };
     // freeze 404s an unknown session (SessionNotFoundError); the old code ran
     // the UPDATE blind and 204'd regardless of rows affected.
-    if !ocserve_store::session_exists(&st.db, id).map_err(|e| crate::HttpError::Api(internal(e)))? {
+    // Perf dive 2026-10-11: blocking store calls on this async handler's
+    // worker — move both the existence check and the write to the blocking
+    // pool (F1 class).
+    let db = st.db.clone();
+    let id_check = id.to_string();
+    let exists = tokio::task::spawn_blocking(move || {
+        ocserve_store::session_exists(&db, &id_check)
+    })
+    .await
+    .map_err(|e| crate::HttpError::Api(internal(anyhow::anyhow!("exists join: {e}"))))?
+    .map_err(|e| crate::HttpError::Api(internal(e)))?;
+    if !exists {
         return Err(session_not_found(id));
     }
     let text = if field == "model" && val.is_object() {
@@ -1095,12 +1107,18 @@ fn set_session_field(
     } else {
         val.to_string()
     };
-    st.writer
-        .write(vec![ocserve_store::WriteOp::Sql {
-            sql: format!("UPDATE session SET {col} = ?2 WHERE id = ?1"),
-            params: vec![id.into(), text.into()],
+    let w = st.writer.clone();
+    let id_w = id.to_string();
+    let col_w = col.to_string();
+    tokio::task::spawn_blocking(move || {
+        w.write(vec![ocserve_store::WriteOp::Sql {
+            sql: format!("UPDATE session SET {col_w} = ?2 WHERE id = ?1"),
+            params: vec![id_w.into(), text.into()],
         }])
-        .map_err(|e| crate::HttpError::Api(internal(e)))?;
+    })
+    .await
+    .map_err(|e| crate::HttpError::Api(internal(anyhow::anyhow!("write join: {e}"))))?
+    .map_err(|e| crate::HttpError::Api(internal(e)))?;
     Ok(())
 }
 
@@ -1686,7 +1704,12 @@ pub async fn permission_create(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(String::from)
-        .unwrap_or_else(|| session_agent(&st, &id));
+        .unwrap_or_default();
+    let agent = if agent.is_empty() {
+        session_agent_async(&st, &id).await
+    } else {
+        agent
+    };
     let rules = crate::agent_rules(&st, &agent);
     let mut effect = "allow";
     for r in resources {
@@ -1732,6 +1755,17 @@ fn session_agent(st: &Arc<AppState>, session_id: &str) -> String {
         return raw;
     }
     st.llm.read().default_agent.clone()
+}
+
+/// Perf dive 2026-10-11: `session_agent` opens a reader (blocking) — the
+/// async permission path calls this variant so the lookup runs on the
+/// blocking pool (F1 class).
+async fn session_agent_async(st: &Arc<AppState>, session_id: &str) -> String {
+    let st2 = st.clone();
+    let sid = session_id.to_string();
+    tokio::task::spawn_blocking(move || session_agent(&st2, &sid))
+        .await
+        .unwrap_or_else(|_| st.llm.read().default_agent.clone())
 }
 
 /// DELETE /experimental/worktree — 400 WorktreeRemoveInput required.
