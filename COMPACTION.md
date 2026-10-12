@@ -135,7 +135,9 @@ Both servers read the same config file → **zero new config surface for ocserve
   P0c-proven) → on success: clone replay + summary assistant + optional autocontinue
   message in **one `apply_ops` transaction** (§5 P3) → emit part events per message
   (wire-compatible, no batching) → fork prune-equivalent marks → emit `session.compacted`.
-- **Guards**: prompt lock held for the whole create (no 409 from inside); the 120 s
+- **Guards**: prompt lock held for the whole create (no 409 from inside); the two-phase
+  provider watchdog (first-data TTFB budget 300 s default, stream budget 120 s — see
+  TESTING §1.6 "gateway queues the model"); the 120 s
   stall watchdog applies per model call as today; **consecutive-auto cap = 3** then
   honest `ContextOverflowError` (§6 D2).
 

@@ -434,6 +434,35 @@ pub(crate) fn provider_stall() -> std::time::Duration {
     })
 }
 
+/// First-data budget (2026-10-12 gateway-hang fix): the opencode-go gateway
+/// answers headers immediately, then streams `: keep-alive` comment pings
+/// every 5 s while the free-tier queue holds the model — so a socket-liveness
+/// watchdog NEVER fires, and the pre-fix code applied the 120 s stream-stall
+/// budget to the wait for the FIRST real event. Live probe: a 6.5 MB request
+/// (matching the user's stuck session) got first data at 13-17 s normally but
+/// the queue can hold well past 120 s (one probe sat 67 s+; the user's
+/// turn(s) died at exactly 120 s four times). Same env override, longer
+/// default (300 s); once real data starts the normal stream budget applies.
+pub(crate) fn provider_ttfb() -> std::time::Duration {
+    static S: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        // dedicated override first (tests + ops), then the shared stall
+        // override (so `OCSERVE_PROVIDER_STALL_SECS=1` in the existing stall
+        // test still bounds BOTH phases), then the 300 s default.
+        std::time::Duration::from_secs(
+            std::env::var("OCSERVE_PROVIDER_TTFB_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or_else(|| {
+                    std::env::var("OCSERVE_PROVIDER_STALL_SECS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                })
+                .unwrap_or(300),
+        )
+    })
+}
+
 /// K-EFFICIENCY: per-prompt RSS + reader-open accounting. Emission lives in
 /// Drop so bail paths (cap, provider errors, `?`) report too — tail-only
 /// emission was proven wrong by the cap e2e going red.
@@ -1097,15 +1126,29 @@ pub async fn run_prompt_with(
             // silent would otherwise hang run_prompt forever → lock held →
             // status busy forever → later prompts queue forever. No byte for
             // 120s = error → guards unwind → session self-heals.
+            // 2026-10-12 gateway-hang: keep-alive comments are NOT data, so
+            // the first real event gets the longer TTFB budget (provider_ttfb)
+            // and everything after the normal stream budget — a gateway
+            // queueing the model for minutes no longer kills the turn, while
+            // a genuinely silent socket still trips.
+            let mut first_data_seen = false;
             loop {
-                let ev = match tokio::time::timeout(provider_stall(), stream.next()).await {
+                let budget = if first_data_seen {
+                    provider_stall()
+                } else {
+                    provider_ttfb()
+                };
+                let ev = match tokio::time::timeout(budget, stream.next()).await {
                     Err(_) => anyhow::bail!(
                         "provider stream stalled: no data for {}s (watchdog)",
-                        provider_stall().as_secs()
+                        budget.as_secs()
                     ),
                     Ok(None) => break,
                     Ok(Some(ev)) => ev,
                 };
+                if !first_data_seen {
+                    first_data_seen = true;
+                }
                 match ev.context("provider stream")? {
                     StreamEvent::TextDelta(t) => {
                         if llm_ttft.is_none() {

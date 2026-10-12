@@ -10,7 +10,8 @@ use crate::compact::{
 };
 use crate::ids::{msg_id, prt_id};
 use crate::prompt::{
-    PromptContext, emit_durable, emit_live, hook_mutate, provider_stall, to_provider_messages,
+    PromptContext, emit_durable, emit_live, hook_mutate, provider_stall, provider_ttfb,
+    to_provider_messages,
 };
 use anyhow::Context as _;
 use futures_util::StreamExt as _;
@@ -556,15 +557,27 @@ pub async fn process(
     let mut text = String::new();
     let mut finish: Option<String> = None;
     let mut usage: Option<Usage> = None;
+    // 2026-10-12 two-phase budget (see prompt.rs): the gateway can hold the
+    // model behind keep-alive pings; first real event gets provider_ttfb,
+    // everything after the normal stream budget.
+    let mut first_data_seen = false;
     loop {
-        let ev = match tokio::time::timeout(provider_stall(), stream.next()).await {
+        let budget = if first_data_seen {
+            provider_stall()
+        } else {
+            provider_ttfb()
+        };
+        let ev = match tokio::time::timeout(budget, stream.next()).await {
             Err(_) => anyhow::bail!(
                 "compaction stream stalled: no data for {}s (watchdog)",
-                provider_stall().as_secs()
+                budget.as_secs()
             ),
             Ok(None) => break,
             Ok(Some(ev)) => ev,
         };
+        if !first_data_seen {
+            first_data_seen = true;
+        }
         match ev.context("compaction stream")? {
             StreamEvent::TextDelta(t) => {
                 emit_live(
