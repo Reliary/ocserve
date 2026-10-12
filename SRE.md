@@ -289,10 +289,15 @@ other than the async worker (thread identity recorded by a test-only seam).
   - Per-PR: `ci.yml` (fmt, clippy `-D warnings`, workspace tests, `check-guards.sh`,
     `check-matrix.sh`, `cargo package --list` for every crate, publish-order guard, test-count
     ratchet floor, binary-size ceiling, aarch64 cross-check, cargo-deny/audit, artifact upload);
-    `replay.yml` (route replay + capdiff full/forward+reverse + live pair differential — the
-    freeze binary is acquired from npm 1.18.31 via `scripts/acquire-freeze.sh`, never committed);
+    `replay.yml` (route replay against the committed corpus — offline, no freeze needed);
     `codeql-analysis.yml`; `pr-secret-scan.yml` (gitleaks over the PR range + `.gitleaks.toml`);
     `dependency-review.yml`.
+  - **Freeze differentials are LOCAL, not hosted:** the GitHub-hosted runner cannot drive the
+    vendored opencode 1.18.31 (a message POST returns HTTP 500 there — runner-specific;
+    byte-identical binary is green on the dev box). `capdiff` (provider boundary) and
+    `pair-check` (live server-to-server) therefore run in the local `scripts/nightly.sh`, and
+    `scripts/acquire-freeze.sh` stages the freeze binary (npm `opencode-ai@1.18.31`) for a
+    from-scratch box. Promote to PR CI when a self-hosted runner exists.
   - Scheduled: `hardening.yml` (deny hard gate + unsafe-policy assertion + weekly outdated),
     `fuzz.yml` (new `fuzz/` crate: `sse_parser`, `splice_parser`, `wire_decode`), `bench.yml`.
   - Release: `publish.yml` (tag or manual dry-run; ordered crates.io publish, covers every

@@ -25,14 +25,14 @@ jobs:
         language: ['rust']
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-      - uses: dtolnay/rust-toolchain@stable  # ref IS the toolchain name (do not SHA-pin)
+      - uses: actions-rust-lang/setup-rust-toolchain@46a9d261ee2ace4b93b3bd6e867168ac38627b38  # v1.12.0
       - name: initialize CodeQL
-        uses: github/codeql-action/init@cf12ceefebab2c867b9c35d7f907e059681d37ab  # v3
+        uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e  # v3
         with:
           languages: ${{ matrix.language }}
       - name: build
         run: cargo build --workspace
       - name: perform CodeQL analysis
-        uses: github/codeql-action/analyze@cf12ceefebab2c867b9c35d7f907e059681d37ab  # v3
+        uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e  # v3
         with:
           category: /language:${{ matrix.language }}
