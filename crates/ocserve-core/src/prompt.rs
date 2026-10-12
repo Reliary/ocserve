@@ -371,11 +371,21 @@ pub(crate) fn to_provider_messages(history: &[(Value, Vec<Value>)]) -> Vec<ChatM
     let mut out = Vec::new();
     for (info, parts) in &history[start..] {
         let role = info["role"].as_str().unwrap_or("user");
-        let text: String = parts
+        let mut text: String = parts
             .iter()
             .filter(|p| p["type"] == "text")
             .filter_map(|p| p["text"].as_str())
             .collect();
+        // v1 parity (message-v2.ts:231-235): a user compaction part renders as
+        // the literal question "What did we do so far?" — ocserve emitted an
+        // EMPTY user message for the anchor, so the model got the summary with
+        // no cue what it summarised.
+        if role == "user" && parts.iter().any(|p| p["type"] == "compaction") {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str("What did we do so far?");
+        }
         let tool_parts: Vec<&Value> = parts.iter().filter(|p| p["type"] == "tool").collect();
         if tool_parts.is_empty() {
             if !text.is_empty() || role == "user" {
@@ -822,9 +832,22 @@ pub async fn run_prompt_with(
             // loop breaks when summary.parentID == latest user,
             // prompt.ts:1101-1115) — auto never trips this: replay/
             // autocontinue append AFTER the summary.
+            //
+            // 2026-10-12 "session won't continue": upstream only breaks on the
+            // summary when it is the ANSWER to the newest user message — a
+            // fresh prompt CREATES its user message before the loop, so
+            // `parentID == lastUser.id` is false and the turn proceeds to the
+            // model with filtered history. ocserve's preflight sees the store
+            // BEFORE the new user message persists, so a prompt arriving right
+            // after a summarize was indistinguishable from the summarize
+            // finishing — SummaryExit swallowed the message (no busy, no
+            // hooks, nothing). persist_user discriminates exactly: it is true
+            // for every real prompt and false only for the summarize flow.
             ocserve_store::PreflightState::SummaryExit { info, parts } => {
-                final_out = Some((info, parts));
-                break 'outer;
+                if !opts.persist_user {
+                    final_out = Some((info, parts));
+                    break 'outer;
+                }
             }
             ocserve_store::PreflightState::Ready => {}
         }
@@ -849,6 +872,19 @@ pub async fn run_prompt_with(
             })
             .await
             .map_err(|e| anyhow::anyhow!("history load join: {e}"))??;
+            // v1 parity, the WHOLE-REQUEST view (prompt.ts:1093): upstream
+            // builds every model request from filterCompacted(msgs) — once a
+            // compaction completes, only [last tail-carrying anchor, summary]
+            // + the verbatim tail + everything after reach the model. ocserve
+            // shipped the RAW history here, so a successful summarize relieved
+            // nothing: the 2026-10-12 stuck session kept shipping ~6.5 MB per
+            // turn (the 5 MB tool part from 10-11) at 90-190 s first-token and
+            // died at the watchdog — the "still isn't doing anything" report.
+            let filtered = crate::compact::filter_compacted(&history);
+            let history: Vec<(Value, Vec<Value>)> = filtered
+                .iter()
+                .map(|&i| history[i].clone())
+                .collect();
             messages.extend(to_provider_messages(&history));
         }
         let mut tools = if opts.tools_enabled {
