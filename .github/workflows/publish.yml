@@ -12,9 +12,10 @@ name: publish
 # finding) makes publish abort at ocserve-http because its dependency is not on
 # the registry. Keep this list in lockstep with Cargo.toml members.
 
+# Manual-only until a CARGO_REGISTRY_TOKEN repository secret exists (none yet —
+# publishing is done from the maintainer's local Cargo credentials for v0.2.0).
+# When the secret is added, restore the `push: tags: ['v*']` trigger.
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
     inputs:
       dry_run:
