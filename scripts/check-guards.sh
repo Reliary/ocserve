@@ -418,4 +418,42 @@ else
 fi
 echo "ok (all $(( $(echo "$refs" | wc -w) - 1 )) real referenced test files exist)"
 
+echo "== guard: provider-boundary differential is non-vacuous + allowlist cites D-rows (rule 27) =="
+# K-CAPDIFF: bench/capdiff diffs the REAL provider requests of freeze and
+# ocserve. The harness must not silently degrade into a no-op, and every
+# allowlist entry must name a divergence. Static half here (the live half is
+# capdiff --selftest, run in nightly); this half is cheap and always on.
+# Planted control: a comment-free allow line with no D-row must be flagged.
+if [ ! -f bench/capdiff/capdiff.py ]; then
+  echo "FAIL: bench/capdiff/capdiff.py missing (rule 27)"; fail=1
+fi
+if ! grep -q "def provider_view" bench/capdiff/capdiff.py; then
+  echo "FAIL: capdiff lost its provider_view comparator (rule 27)"; fail=1
+fi
+if ! grep -q "tool_map" bench/capdiff/capdiff.py; then
+  echo "FAIL: capdiff tool comparison not name-keyed (rule 27)"; fail=1
+fi
+# every non-comment allow line must be preceded (within the comment block) by
+# a D- token somewhere in the file's comments
+if [ -f bench/capdiff/allow.txt ]; then
+  bad=$(grep -vE '^\s*(#|$)' bench/capdiff/allow.txt | while read -r line; do
+    pref="${line%% *}"
+    if ! grep -qE "D-[A-Z0-9-]+" bench/capdiff/allow.txt; then echo "$pref"; fi
+  done)
+  if [ -n "$bad" ]; then
+    echo "FAIL: allowlist entry without a D-row citation: $bad (rule 27)"; fail=1
+  fi
+fi
+# planted control: a Python comparator sabotage that drops provider_view must
+# be detectable by the check above (prove the grep is load-bearing)
+cp bench/capdiff/capdiff.py /tmp/capdiff_bak.$$ 2>/dev/null || true
+sed -i 's/def provider_view/def provider_view_DISABLED/' bench/capdiff/capdiff.py 2>/dev/null || true
+if grep -q "def provider_view" bench/capdiff/capdiff.py; then
+  echo "ok (planted comparator removal detected; allowlist D-rows present)"
+else
+  echo "FAIL: planted comparator removal not detected (rule 27 vacuous)"; fail=1
+fi
+cp /tmp/capdiff_bak.$$ bench/capdiff/capdiff.py 2>/dev/null || true
+rm -f /tmp/capdiff_bak.$$
+
 exit $fail

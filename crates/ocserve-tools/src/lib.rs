@@ -4,6 +4,8 @@
 //! tool-part capture (testdata/m2).
 
 use anyhow::{Context, Result, bail};
+pub mod shell_prompt;
+
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -160,17 +162,68 @@ fn todowrite(input: &Value) -> Result<ToolResult> {
     })
 }
 
+/// Tools ocserve executes. Advertised tool list = the intersection of these
+/// names and the frozen provider-tools.json (D-TOOLS-TASK: `task` is advertised
+/// upstream but not yet executed here, so it is excluded until implemented —
+/// see bench/openapi/FIELD-CONTRACT.md).
+pub const IMPLEMENTED: &[&str] = &[
+    "bash", "edit", "glob", "grep", "question", "read", "skill", "todowrite",
+    "webfetch", "write",
+];
+
+/// Frozen provider tool schemas, captured verbatim from the live 1.18.31
+/// provider request (bench/capdiff/frozen/TOOLS.json →
+/// scripts/capture-provider-contract.sh). Never hand-edit: a version bump
+/// re-captures this file. Descriptions/schemas must be byte-identical to what
+/// freeze sends or a model trained on opencode behaves differently
+/// (K-CAPDIFF — capdiff diffs both arms' real provider requests).
+fn frozen_tools() -> Vec<Value> {
+    let raw: Value = serde_json::from_str(include_str!("../assets/provider-tools.json"))
+        .expect("vendored provider-tools.json is valid");
+    raw.as_array().cloned().unwrap_or_default()
+}
+
+/// Provider tool schemas, filtered to IMPLEMENTED (deny filtering happens in
+/// the caller). Order matches the frozen capture.
 pub fn schemas() -> Vec<Value> {
-    vec![
-        json!({"type":"function","function":{"name":"bash","description":"Run a shell command and return its output.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"The command to execute"},"timeout":{"type":"number","description":"Optional timeout in milliseconds"}},"required":["command"]}}}),
-        json!({"type":"function","function":{"name":"read","description":"Read a file from the filesystem.","parameters":{"type":"object","properties":{"filePath":{"type":"string","description":"The absolute path to the file to read"},"offset":{"type":"number"},"limit":{"type":"number"}},"required":["filePath"]}}}),
-        json!({"type":"function","function":{"name":"write","description":"Write content to a file (creates or overwrites).","parameters":{"type":"object","properties":{"filePath":{"type":"string","description":"The absolute path to the file to write"},"content":{"type":"string"}},"required":["filePath","content"]}}}),
-        json!({"type":"function","function":{"name":"edit","description":"Replace exact text in a file.","parameters":{"type":"object","properties":{"filePath":{"type":"string","description":"The absolute path to the file to edit"},"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["filePath","oldText","newText"]}}}),
-        json!({"type":"function","function":{"name":"glob","description":"Find files by glob pattern.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}}}),
-        json!({"type":"function","function":{"name":"grep","description":"Regex search file contents.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"}},"required":["pattern"]}}}),
-        json!({"type":"function","function":{"name":"todowrite","description":"Create and maintain a structured task list for the current coding session. Use it to track progress during multi-step work and keep todo statuses current.","parameters":{"type":"object","properties":{"todos":{"type":"array","description":"The updated todo list","items":{"type":"object","properties":{"content":{"type":"string"},"status":{"type":"string","description":"pending | in_progress | completed"},"priority":{"type":"string"}},"required":["content","status"]}}},"required":["todos"]}}}),
-        json!({"type":"function","function":{"name":"question","description":QUESTION_DESCRIPTION,"parameters":{"type":"object","properties":{"questions":{"type":"array","description":"Questions to ask","items":{"type":"object","properties":{"question":{"type":"string","description":"Complete question"},"header":{"type":"string","description":"Very short label (max 30 chars)"},"options":{"type":"array","description":"Available choices","items":{"type":"object","properties":{"label":{"type":"string","description":"Display text (1-5 words, concise)"},"description":{"type":"string","description":"Explanation of choice"}},"required":["label","description"]}},"multiple":{"type":"boolean","description":"Allow selecting multiple choices"}},"required":["question","header","options"]}}},"required":["questions"]}}}),
-    ]
+    let (shell, tmp) = host_shell_and_tmp();
+    frozen_tools()
+        .into_iter()
+        .filter(|t| {
+            t.pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .map(|n| IMPLEMENTED.contains(&n))
+                .unwrap_or(false)
+        })
+        .map(|mut t| {
+            if t.pointer("/function/name").and_then(|n| n.as_str()) == Some("bash") {
+                // the frozen capture baked THIS host's `${os}/${shell}/${tmp}`;
+                // re-render for the running host (K-CAPDIFF)
+                let desc = shell_prompt::bash_description(&shell, &tmp);
+                t["function"]["description"] = Value::String(desc);
+            }
+            t
+        })
+        .collect()
+}
+
+/// Host shell basename (upstream `Shell.name`) + model temp dir
+/// (upstream `Global.Path.tmp`, which is `<tmp>/opencode`).
+fn host_shell_and_tmp() -> (String, String) {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| {
+            std::path::Path::new(&s)
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "sh".to_string());
+    let tmp = std::env::temp_dir()
+        .join("opencode")
+        .to_string_lossy()
+        .into_owned();
+    (shell, tmp)
 }
 
 /// v1 tool/question.txt — model-facing contract for the question tool
@@ -252,6 +305,7 @@ pub fn execute(name: &str, input: &Value, cwd: &Path) -> Result<ToolResult> {
         "glob" => glob(input, cwd),
         "grep" => grep(input, cwd),
         "todowrite" => todowrite(input),
+        "webfetch" => webfetch(input),
         other => bail!("unknown tool: {other}"),
     }
 }
@@ -416,19 +470,35 @@ fn write(input: &Value, cwd: &Path) -> Result<ToolResult> {
 
 fn edit(input: &Value, cwd: &Path) -> Result<ToolResult> {
     let fp = input["filePath"].as_str().context("edit.filePath")?;
-    let old = input["oldText"].as_str().context("edit.oldText")?;
-    let new = input["newText"].as_str().context("edit.newText")?;
+    // v1 parity (K-CAPDIFF): the model-facing param names are oldString /
+    // newString / replaceAll, NOT oldText / newText. A model trained on
+    // opencode emits the upstream names, so the old schema silently failed
+    // every edit. Accept the upstream names; keep oldText/newText as
+    // tolerated aliases (forward-compat, older ocserve clients).
+    let old = input["oldString"]
+        .as_str()
+        .or_else(|| input["oldText"].as_str())
+        .context("edit.oldString")?;
+    let new = input["newString"]
+        .as_str()
+        .or_else(|| input["newText"].as_str())
+        .context("edit.newString")?;
+    let replace_all = input["replaceAll"].as_bool().unwrap_or(false);
     let path = resolve(cwd, fp);
     let content =
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let hits = content.matches(old).count();
     if hits == 0 {
-        bail!("oldText not found in {fp}");
+        bail!("oldString not found in {fp}");
     }
-    if hits > 1 {
-        bail!("oldText matches {hits} times in {fp}; must be unique");
+    if hits > 1 && !replace_all {
+        bail!("oldString matches {hits} times in {fp}; must be unique (or set replaceAll)");
     }
-    let updated = content.replacen(old, new, 1);
+    let updated = if replace_all {
+        content.replace(old, new)
+    } else {
+        content.replacen(old, new, 1)
+    };
     std::fs::write(&path, &updated).with_context(|| format!("write {}", path.display()))?;
     Ok(ToolResult {
         output: format!("Edited {fp}"),
@@ -508,6 +578,119 @@ fn grep(input: &Value, cwd: &Path) -> Result<ToolResult> {
         error: false,
         metadata: None,
     })
+}
+
+/// webfetch: fetch a URL, return text/markdown/html (v1 tool/webfetch.txt).
+/// Bounded: response capped at MAX_BYTES; timeout default 30s (max 120, per
+/// the wire schema). markdown = a conservative HTML->text strip (upstream
+/// uses turndown; D-WEBFETCH-MD covers conversion differences — the fetch
+/// itself is parity).
+fn webfetch(input: &Value) -> Result<ToolResult> {
+    let url = input["url"].as_str().context("webfetch.url")?;
+    let format = input["format"].as_str().unwrap_or("markdown");
+    let timeout_s = input["timeout"].as_u64().unwrap_or(30).min(120);
+    // v1 webfetch.txt: HTTP URLs are automatically upgraded to HTTPS.
+    let url = match url.strip_prefix("http://") {
+        Some(rest) => format!("https://{rest}"),
+        None => url.to_string(),
+    };
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_s))
+        .user_agent("ocserve/1.0")
+        .build()
+        .context("webfetch client")?;
+    let resp = client.get(&url).send().context("webfetch request")?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("webfetch {url}: HTTP {status}");
+    }
+    let body = resp.text().context("webfetch body")?;
+    let out = match format {
+        "html" => body,
+        "text" | "markdown" => html_to_text(&body),
+        _ => html_to_text(&body),
+    };
+    let (output, truncated) = truncate(out);
+    Ok(ToolResult {
+        output,
+        truncated,
+        exit: None,
+        title: url,
+        error: false,
+        metadata: None,
+    })
+}
+
+/// Conservative HTML->text: drop script/style, strip tags, decode common
+/// entities, collapse blank lines.
+fn html_to_text(html: &str) -> String {
+    let no_script = strip_blocks(html, "script");
+    let no_style = strip_blocks(&no_script, "style");
+    let mut out = String::with_capacity(no_style.len());
+    let mut in_tag = false;
+    for c in no_style.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                out.push(' ');
+            }
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    collapse_lines(&decode_entities(&out))
+}
+
+fn strip_blocks(html: &str, tag: &str) -> String {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    loop {
+        match rest.find(&open) {
+            Some(i) => {
+                out.push_str(&rest[..i]);
+                match rest[i..].find(&close) {
+                    Some(j) => rest = &rest[i + j + close.len()..],
+                    None => break,
+                }
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn decode_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+}
+
+fn collapse_lines(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut blank = 0;
+    for line in s.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            blank += 1;
+            if blank > 1 {
+                continue;
+            }
+        } else {
+            blank = 0;
+        }
+        out.push_str(t);
+        out.push('\n');
+    }
+    out.trim_end().to_string()
 }
 
 /// regex via the `grep` binary (v1 parity: ripgrep semantics without the dep;
@@ -772,28 +955,54 @@ mod tests {
     }
 
     #[test]
-    fn schemas_cover_eight_tools() {
+    fn schemas_are_frozen_and_filtered_to_implemented() {
+        // K-CAPDIFF: the provider tool schemas must be byte-identical to what
+        // freeze sends for the tools ocserve executes. Guard: every emitted
+        // schema equals the vendored frozen entry, and the emitted name set is
+        // exactly IMPLEMENTED ∩ frozen (so a new frozen tool is either
+        // implemented or explicitly excluded, never silently dropped).
         let s = schemas();
-        assert_eq!(s.len(), 8, "six exec + question (gated) + todowrite");
+        let frozen: Vec<Value> =
+            serde_json::from_str(include_str!("../assets/provider-tools.json")).unwrap();
+        let frozen_by: std::collections::BTreeMap<String, &Value> = frozen
+            .iter()
+            .map(|t| (t["function"]["name"].as_str().unwrap().to_string(), t))
+            .collect();
+        let mut emitted: Vec<String> = Vec::new();
         for spec in &s {
-            assert_eq!(spec["type"], "function");
-            assert!(spec["function"]["name"].as_str().is_some());
-            assert!(spec["function"]["parameters"]["type"] == "object");
+            let name = spec["function"]["name"].as_str().unwrap().to_string();
+            let frozen = frozen_by.get(&name).unwrap();
+            // params must be byte-identical to the capture
+            assert_eq!(
+                &spec["function"]["parameters"], &frozen["function"]["parameters"],
+                "{name} params diverged from the frozen capture"
+            );
+            if name == "bash" {
+                // description is HOST-templated upstream — re-rendered for the
+                // running host, so assert the render (not the capture)
+                let (shell, tmp) = host_shell_and_tmp();
+                let want = shell_prompt::bash_description(&shell, &tmp);
+                assert_eq!(spec["function"]["description"], serde_json::json!(want));
+            } else {
+                assert_eq!(
+                    &spec["function"]["description"], &frozen["function"]["description"],
+                    "{name} description diverged from the frozen capture"
+                );
+            }
+            emitted.push(name);
         }
-        assert_eq!(s[6]["function"]["name"], "todowrite");
-        assert_eq!(s[7]["function"]["name"], "question");
-        let q = &s[7];
+        let mut want: Vec<String> = IMPLEMENTED
+            .iter()
+            .filter(|n| frozen_by.contains_key(**n))
+            .map(|n| n.to_string())
+            .collect();
+        want.sort();
+        emitted.sort();
+        assert_eq!(emitted, want);
+        // question: frozen required set + description carry the v1 contract
+        let q = frozen_by.get("question").unwrap();
         let params = &q["function"]["parameters"];
         assert_eq!(params["required"][0], "questions");
-        let item = &params["properties"]["questions"]["items"];
-        for f in ["question", "header", "options"] {
-            assert!(item["properties"].get(f).is_some(), "Prompt requires {f}");
-        }
-        assert_eq!(
-            item["required"],
-            serde_json::json!(["question", "header", "options"]),
-            "v1 Prompt required set (custom is Info-only, not in the tool schema)"
-        );
         assert!(
             q["function"]["description"]
                 .as_str()

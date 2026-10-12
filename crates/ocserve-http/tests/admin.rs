@@ -298,9 +298,15 @@ async fn experimental_tool_routes() {
         .iter()
         .find(|i| i["id"] == "bash")
         .expect("bash in list");
-    assert_eq!(
-        bash["description"],
-        "Run a shell command and return its output."
+    // description is the frozen (host-templated) bash contract, not a short
+    // stub — K-CAPDIFF
+    assert!(
+        bash["description"]
+            .as_str()
+            .unwrap()
+            .starts_with("Executes a given bash command in a persistent shell session"),
+        "bash description must be the frozen contract: {}",
+        bash["description"]
     );
     assert_eq!(bash["parameters"]["type"], "object");
 

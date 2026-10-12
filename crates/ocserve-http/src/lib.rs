@@ -1683,7 +1683,28 @@ fn iso8601_z(ms: i64) -> String {
 }
 
 /// Freeze default session title (session.ts `parentTitlePrefix + ISO`) —
-/// empty titles would render "untitled" in clients (K-TITLE).
+/// JS `Date.prototype.toDateString()` ("Mon Oct 12 2026") — the env block's
+/// "Today's date" line (system.ts:environment). Days-from-civil, no date crate.
+pub fn js_to_date_string(ms: i64) -> String {
+    const WDAY: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MON: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul",
+                             "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let days = ms.div_euclid(86_400_000);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as usize;
+    let y = if m <= 2 { y + 1 } else { y };
+    // 1970-01-01 was a Thursday (weekday 4; JS Sun=0)
+    let wd = (days + 4).rem_euclid(7) as usize;
+    format!("{} {} {:02} {}", WDAY[wd], MON[m - 1], d, y)
+}
+
 fn default_session_title(now_ms: i64) -> String {
     format!("New session - {}", iso8601_z(now_ms))
 }
@@ -1799,6 +1820,12 @@ fn resolve_create_dir(st: &Arc<AppState>, body: &Value, query_dir: Option<&str>)
 /// (toplevel, "sub/dir"); a non-repo dir `/tmp/xyz` → ("/tmp/xyz", "tmp/xyz").
 fn freeze_dir_path(dir: &str) -> (String, String) {
     let dir = dir.trim_end_matches('/');
+    // `/` (or empty) is the global project root: no repo lookup — running
+    // `git -C ""` would silently default to the SERVER cwd and mis-stamp the
+    // session with the ocserve repo (the `?directory=/` env-block bug).
+    if dir.is_empty() {
+        return ("/".to_string(), String::new());
+    }
     match git_toplevel(dir) {
         Some(root) => {
             let path = dir
@@ -1809,13 +1836,8 @@ fn freeze_dir_path(dir: &str) -> (String, String) {
             (root, path)
         }
         None => {
-            let directory = if dir.is_empty() {
-                "/".to_string()
-            } else {
-                dir.to_string()
-            };
             let path = dir.trim_start_matches('/').to_string();
-            (directory, path)
+            (dir.to_string(), path)
         }
     }
 }
@@ -3059,6 +3081,38 @@ pub(crate) fn agent_rules(st: &Arc<AppState>, agent: &str) -> Vec<ocserve_tools:
         .unwrap_or_default()
 }
 
+/// Skills for the system-prompt block (system.ts:skills): the command payloads
+/// with source "skill", as (name, description, location). Built-in skills
+/// carry an empty location; upstream writes "<built-in>" for those.
+fn skill_entries(st: &Arc<AppState>) -> Vec<(String, String, String, String)> {
+    let payloads = st.payloads.read();
+    payloads
+        .command
+        .iter()
+        .filter(|c| c.get("source").and_then(|v| v.as_str()) == Some("skill"))
+        .filter_map(|c| {
+            let name = c.get("name").and_then(|v| v.as_str())?.to_string();
+            let description = c
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let location = c
+                .get("location")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("<built-in>")
+                .to_string();
+            let content = c
+                .get("template")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some((name, description, location, content))
+        })
+        .collect()
+}
+
 /// Resolve agent/model/system/endpoint/rules into a runnable prompt context.
 /// Shared by POST /message (sync) and POST /prompt_async (backgrounded).
 pub(crate) fn build_prompt_context(
@@ -3078,7 +3132,7 @@ pub(crate) fn build_prompt_context(
         .systems
         .get(&agent)
         .cloned()
-        .unwrap_or_else(|| crate::BUILD_SYSTEM_BLURB.to_string());
+        .unwrap_or_default();
     let (pid, mid) = resolve_model(st, req.model.as_ref(), session_id);
     let (base_url, api_key) =
         st.llm
@@ -3116,7 +3170,48 @@ pub(crate) fn build_prompt_context(
         .systems
         .get("compaction")
         .cloned()
-        .unwrap_or_else(|| system.clone());
+        .unwrap_or_else(|| {
+            // summarize runs on the compaction agent; if it has no explicit
+            // prompt, fall back to the model-selected provider prompt (what
+            // upstream would build when agent.prompt is absent).
+            ocserve_core::system_prompt::base_prompt(None, &mid, &pid)
+        });
+    let session_directory = ocserve_store::session_directory(&st.db, session_id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| st.paths["directory"].as_str().unwrap_or("/").to_string());
+    // v1 parity (K-CAPDIFF): compose the provider system message exactly as
+    // upstream — base (agent.prompt else model-selected provider prompt) +
+    // environment block + skills block, "\n"-joined. Before this ocserve sent
+    // a ~250-byte blurb where freeze sends ~9.5 KB (capdiff's first find).
+    let base = ocserve_core::system_prompt::base_prompt(
+        if system.is_empty() { None } else { Some(&system) },
+        &mid,
+        &pid,
+    );
+    let worktree = vcs::toplevel(std::path::Path::new(&session_directory))
+        .unwrap_or_else(|| session_directory.clone());
+    let is_git = worktree != session_directory || std::path::Path::new(&worktree).join(".git").exists();
+    let env_block = ocserve_core::system_prompt::environment_block(
+        &mid,
+        &pid,
+        &session_directory,
+        &worktree,
+        is_git,
+        std::env::consts::OS,
+        &js_to_date_string(now_ms()),
+    );
+    let skills = skill_entries(st);
+    let skill_rows: Vec<(String, String, String)> = skills
+        .iter()
+        .map(|(n, d, l, _)| (n.clone(), d.clone(), l.clone()))
+        .collect();
+    let skills_blk = ocserve_core::system_prompt::skills_block(&skill_rows);
+    let system = ocserve_core::system_prompt::compose(
+        &base,
+        &[Some(env_block), skills_blk],
+        None,
+    );
     let ctx = ocserve_core::prompt::PromptContext {
         db: st.db.clone(),
         blobs: st.blobs.clone(),
@@ -3125,10 +3220,7 @@ pub(crate) fn build_prompt_context(
         // the server cwd — scopes tool ops + external_directory checks + event
         // routing to the client's project (the "session thinks it's in the
         // ocserve repo" + constant permission-prompt class).
-        directory: ocserve_store::session_directory(&st.db, session_id)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| st.paths["directory"].as_str().unwrap_or("/").to_string()),
+        directory: session_directory,
         agent: agent.clone(),
         system,
         endpoint: ocserve_core::prompt::LlmEndpoint {
@@ -3143,6 +3235,7 @@ pub(crate) fn build_prompt_context(
         mcp: st.mcp.get().cloned(),
         plugins: st.plugins.get().cloned(),
         questions: st.question_gate.clone(),
+        skills,
         model_limit,
         max_rounds: st.max_rounds,
         cost_ceiling: st.cost_ceiling,

@@ -116,6 +116,14 @@ fn has_head(dir: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Git worktree toplevel for `dir` (upstream `project.worktree`). None when
+/// `dir` is not inside a git work tree.
+pub fn toplevel(dir: &std::path::Path) -> Option<String> {
+    let d = dir.to_str()?;
+    let (t, c) = run_git(d, &["rev-parse", "--show-toplevel"])?;
+    (c == 0 && !t.trim().is_empty()).then(|| t.trim().to_string())
+}
+
 pub fn info(dir: &str) -> Value {
     let branch = run_git(dir, &["rev-parse", "--abbrev-ref", "HEAD"])
         .filter(|(t, c)| *c == 0 && !t.trim().is_empty())

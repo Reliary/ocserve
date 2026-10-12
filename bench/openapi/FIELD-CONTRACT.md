@@ -117,3 +117,20 @@ byte-identical to freeze, echo assertions green on both arms, 0 divergences.**
   semantics not implemented (declared in the type only).
   **SUPERSEDED: noReply/system/tools/format implemented as above; residual
   named gaps live in field-probes.md §Out of scope.**
+
+## D-TOOLS-TASK — provider advertises `task`, ocserve does not execute it
+
+`bench/capdiff` (K-CAPDIFF) compared the two arms' real provider requests and
+found freeze advertises 11 tools; ocserve executes 10 (missing `task`, a
+subagent launcher). The vendored `default.txt` system prompt tells the model to
+use `Task`, so this is a REAL functional gap, not a cosmetic one:
+
+- Freeze: `task` launches a subagent (separate session, its own model loop) and
+  returns its output to the parent.
+- ocserve: no subagent execution path yet → the tool is NOT advertised, so the
+  model cannot call a tool that would fail.
+
+Allowlisted in `bench/capdiff/allow.txt` as `$.tools.task` (one line, name-keyed
+diff). Implementing `task` needs a subagent executor reusing `run_prompt_with`
+against a child session — tracked, not yet built. The other 10 tools are now
+byte-identical (schemas + descriptions).

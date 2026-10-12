@@ -1,0 +1,3 @@
+source: live freeze 1.18.31 provider request (scripts/capture-provider-contract.sh)
+tools: 11
+rebuild: ./scripts/capture-provider-contract.sh — never hand-edit

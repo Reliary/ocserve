@@ -67,6 +67,14 @@ pub fn asks_for(tool: &str, args: &Value, cwd: &Path) -> Vec<Ask> {
         "glob" => single("glob", str_arg(args, "pattern"), args, cwd),
         "grep" => single("grep", str_arg(args, "pattern"), args, cwd),
         "webfetch" => single_always("webfetch", args),
+        // v1 skill tool: ctx.ask({permission:"skill", patterns:[name],
+        // always:[name]}) — pattern is the skill name, not "*".
+        "skill" => vec![Ask {
+            permission: "skill".to_string(),
+            patterns: vec![str_arg(args, "name")],
+            always: vec![str_arg(args, "name")],
+            metadata: Value::Null,
+        }],
         "websearch" => single_always("websearch", args),
         "todowrite" => single_always("todowrite", args),
         // Unknown/other tools: a wildcard ask (upstream default = ask).

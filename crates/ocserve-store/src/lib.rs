@@ -952,11 +952,14 @@ pub fn backfill_compaction(
     if !link_ops.is_empty() {
         writer.write(link_ops)?;
     }
-    // stamp so future boots skip the two scans (see the gate above)
-    let _ = writer.write(vec![WriteOp::Sql {
+    // stamp so future boots skip the two scans (see the gate above).
+    // PROPAGATE (AGENTS §2.5): a write failure on a healthy writer means
+    // storage is broken — swallowing it left the boot re-scanning forever and
+    // hid a real error (guard rule 1 caught this on 2026-10-12).
+    writer.write(vec![WriteOp::Sql {
         sql: "INSERT OR REPLACE INTO import_manifest (key, value) VALUES ('compaction_backfilled_v1', '1')".into(),
         params: vec![],
-    }]);
+    }])?;
     Ok((n, links, t0.elapsed().as_millis() as u64))
 }
 

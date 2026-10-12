@@ -14,6 +14,7 @@ pub mod permission;
 pub mod prompt;
 pub mod question;
 pub mod sift_boundary;
+pub mod system_prompt;
 pub mod wire;
 pub mod zen;
 

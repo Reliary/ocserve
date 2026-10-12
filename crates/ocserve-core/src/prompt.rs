@@ -48,6 +48,9 @@ pub struct PromptContext {
     pub plugins: Option<Arc<tokio::sync::Mutex<ocserve_plugin::Sidecar>>>,
     /// Question rendezvous (v1 Question service): `question` tool gate.
     pub questions: Arc<crate::question::QuestionGate>,
+    /// Skills for the system-prompt block and the `skill` tool: name,
+    /// description, location, content (K-CAPDIFF).
+    pub skills: Vec<(String, String, String, String)>,
     /// model limit block from the catalog (M6: compaction trigger math).
     pub model_limit: serde_json::Value,
     /// K-AUTONOMY: hard round cap for this run (0 = unlimited). Resolved
@@ -512,6 +515,40 @@ impl Drop for PhaseProbe {
 
 /// Run a builtin tool on the blocking pool (K-EFFICIENCY: never pin an
 /// async worker with sync process I/O).
+/// v1 skill tool output (tool/skill.ts): the `<skill_content>` block. ocserve
+/// ships skills with content inline (built-in + config), so the file-list
+/// sampler is skipped — D-SKILL-FILES names that divergence.
+fn skill_exec(
+    skills: &[(String, String, String, String)],
+    input: &Value,
+) -> Result<ocserve_tools::ToolResult> {
+    let name = input["name"].as_str().context("skill.name")?;
+    let (_, _, location, content) = skills
+        .iter()
+        .find(|(n, _, _, _)| n == name)
+        .ok_or_else(|| anyhow::anyhow!("Skill not found: {name}"))?;
+    let base = std::path::Path::new(location)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| location.clone());
+    let output = format!(
+        "<skill_content name=\"{name}\">\n# Skill: {name}\n\n{}\n\n\
+         Base directory for this skill: {base}\n\
+         Relative paths in this skill (e.g., scripts/, reference/) are relative \
+         to this base directory.\nNote: file list is sampled.\n\n\
+         <skill_files>\n</skill_files>\n</skill_content>",
+        content.trim()
+    );
+    Ok(ocserve_tools::ToolResult {
+        output,
+        truncated: false,
+        exit: None,
+        title: format!("Loaded skill: {name}"),
+        error: false,
+        metadata: None,
+    })
+}
+
 async fn spawn_tool(
     name: &str,
     input: Value,
@@ -1029,10 +1066,19 @@ pub async fn run_prompt_with(
                     .get("topK")
                     .and_then(|v| v.as_u64())
                     .map(|v| v.min(u32::MAX as u64) as u32),
+                // v1 parity (request.ts:128 + transform.ts:1468): the default
+                // max output is min(model.limit.output, 32000) || 32000 — NOT
+                // absent. Freeze sends the stub model's 8192; ocserve sent
+                // nothing (capdiff found the gap). A plugin's chat.params can
+                // still override via maxOutputTokens.
                 max_tokens: params_out
                     .get("maxOutputTokens")
                     .and_then(|v| v.as_u64())
-                    .map(|v| v.min(u32::MAX as u64) as u32),
+                    .map(|v| v.min(u32::MAX as u64) as u32)
+                    .or_else(|| {
+                        let out = ctx.model_limit["output"].as_u64().unwrap_or(0);
+                        Some((if out == 0 { 32_000 } else { out.min(32_000) }) as u32)
+                    }),
                 options: params_out
                     .get("options")
                     .cloned()
@@ -1673,7 +1719,12 @@ pub async fn run_prompt_with(
                         // or a stalled child previously pinned one of the 8
                         // tokio workers and starved EVERY route (the observed
                         // multi-minute "server hung" windows).
-                        let exec = if builtin {
+                        let exec = if call.name == "skill" {
+                            // v1 skill tool (tool/skill.ts): resolve the skill
+                            // by name, emit the <skill_content> block. Missing
+                            // name → error (upstream Effect.die).
+                            skill_exec(&ctx.skills, &input)
+                        } else if builtin {
                             spawn_tool(&call.name, input, &ctx.directory).await
                         } else if let Some(hub) = &ctx.mcp {
                             match hub.call(&call.name, input.clone()).await {

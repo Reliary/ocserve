@@ -164,6 +164,17 @@ step "event payloads vs frozen contract" \
 step "field-contract differential (freeze vs ocserve)" \
   ./scripts/field-contract-check.sh
 
+# 6e. provider-boundary differential (K-CAPDIFF, guard rule 27's live half):
+#     boots freeze + ocserve under one fixture with the provider baseURL
+#     redirected to a capture sink, drives the SAME prompts, and diffs the
+#     REAL server->provider request bodies (messages, system bytes, tool
+#     schemas+descriptions, params) + the SSE event-type set. The boundary
+#     every client-facing gate is blind to — the 2026-10-12 "session won't
+#     continue" bug (raw-vs-filtered history) lived here. `--selftest` proves
+#     the comparator is non-vacuous before trusting a green run.
+step "provider-boundary differential (freeze vs ocserve)" \
+  bash -c './scripts/capdiff-check.sh --selftest && ./scripts/capdiff-check.sh --scenario fresh && ./scripts/capdiff-check.sh --scenario multiturn' 
+
 # 7. mutants (opt-in): survivor report is triaged like a defect (TESTING §9)
 if [ "$WITH_MUTANTS" = "1" ]; then
   if command -v cargo-mutants >/dev/null 2>&1; then
