@@ -57,17 +57,17 @@ pub fn spawn(
         .iter()
         .map(|(k, v)| cstring(&format!("{k}={v}")))
         .collect();
-    let mut envv: Vec<*const i8> = env_strings
+    let mut envv: Vec<*const libc::c_char> = env_strings
         .iter()
-        .map(|s| s.as_ptr() as *const i8)
+        .map(|s| s.as_ptr() as *const libc::c_char)
         .collect();
     envv.push(std::ptr::null());
     let file = cstring(command);
     let arg_strings: Vec<Vec<u8>> = args.iter().map(|a| cstring(a)).collect();
-    let mut argv: Vec<*const i8> = Vec::with_capacity(args.len() + 2);
-    argv.push(file.as_ptr() as *const i8);
+    let mut argv: Vec<*const libc::c_char> = Vec::with_capacity(args.len() + 2);
+    argv.push(file.as_ptr() as *const libc::c_char);
     for a in &arg_strings {
-        argv.push(a.as_ptr() as *const i8);
+        argv.push(a.as_ptr() as *const libc::c_char);
     }
     argv.push(std::ptr::null());
 
@@ -87,7 +87,7 @@ pub fn spawn(
                 std::io::Error::last_os_error()
             ));
         }
-        let mut name = [0i8; 128];
+        let mut name = [0 as libc::c_char; 128];
         if libc::ptsname_r(master, name.as_mut_ptr(), name.len()) != 0 {
             libc::close(master);
             return Err("ptsname_r failed".into());
@@ -114,12 +114,16 @@ pub fn spawn(
             }
             libc::close(master);
 
-            libc::chdir(cwd_c.as_ptr() as *const i8);
+            libc::chdir(cwd_c.as_ptr() as *const libc::c_char);
 
             // The child's env is passed explicitly (execvpe-style via
             // execve); upstream merges process.env + overrides — the caller
             // pre-merges, so use execve with an explicit envp.
-            libc::execve(file.as_ptr() as *const i8, argv.as_ptr(), envv.as_ptr());
+            libc::execve(
+                file.as_ptr() as *const libc::c_char,
+                argv.as_ptr(),
+                envv.as_ptr(),
+            );
             libc::_exit(127);
         }
 
