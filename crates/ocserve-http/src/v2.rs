@@ -679,11 +679,10 @@ pub async fn fs_read(
 // session diff — the proven TUI sidebar crash path
 // ---------------------------------------------------------------------------
 
-/// GET /session/{id}/diff — revert-range file diffs. ocserve stores the revert
-/// marker but has no snapshot engine (D-REVERT-NOSNAP), so the diff is `[]`
-/// unless a marker carries a `files` array (then echoed). Crucially this is
-/// **JSON**, not SPA HTML: the TUI's `SidebarFiles` flatMaps the result and an
-/// HTML string crashes it (2026-10-08).
+/// GET /session/{id}/diff — with `?messageID=`, the message's stored
+/// `summary.diffs` (upstream `SessionSummary.diff`); without it, the session
+/// convenience path returns `[]`. Crucially this is **JSON**, not SPA HTML: the
+/// TUI's `SidebarFiles` flatMaps the result and an HTML string crashes it.
 pub async fn session_diff(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1287,7 +1286,7 @@ pub async fn revert_stage(
         &st,
         &id,
         "session.next.revert.staged",
-        json!({"sessionID": id, "revert": marker.to_value()}),
+        json!({"sessionID": id, "timestamp": now_ms_http(), "revert": marker.to_value()}),
     )
     .map_err(HttpError::Api)?;
     Ok(Json(json!({"data": marker.to_value()})))
@@ -1367,7 +1366,7 @@ pub async fn revert_commit(
             &st,
             &id,
             "session.next.revert.committed",
-            json!({"sessionID": id, "messageID": mid}),
+            json!({"sessionID": id, "messageID": mid, "timestamp": now_ms_http()}),
         )?;
     }
     Ok(StatusCode::NO_CONTENT)
@@ -1377,6 +1376,13 @@ pub async fn revert_commit(
 /// `{"_tag":"InvalidRequestError","message":"Missing key\n  at [\"<key>\"]",
 /// "kind":"Payload"}` [400]. NOTE: differs from v1 routes (name/data nesting)
 /// — this is the v2 HttpApi tagged-error shape.
+fn now_ms_http() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn payload_err(key: &str) -> HttpError {
     HttpError::TaggedData {
         status: StatusCode::BAD_REQUEST,

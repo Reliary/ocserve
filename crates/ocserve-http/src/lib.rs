@@ -5349,9 +5349,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         // v1 control-plane log writer (web UI diagnostics)
         .route("/log", axum::routing::post(post_log))
-        // revert/unrevert (K-REVERT): marker semantics only — the snapshot/
-        // git-restore engine is out of MVP (divergence D-REVERT-NOSNAP,
-        // PLAN §17). Marker shapes mirrored from session/revert.ts.
+        // revert/unrevert (SNAPSHOT.md): real file-restoring revert — the
+        // snapshot engine restores pre-turn files, reverts tool patch parts,
+        // computes the range diff, sets the marker. Busy → 409.
         .route("/session/{id}/revert", axum::routing::post(post_revert))
         .route("/session/{id}/unrevert", axum::routing::post(post_unrevert))
         // /instance/dispose — v1 single-instance dispose (freeze: true)

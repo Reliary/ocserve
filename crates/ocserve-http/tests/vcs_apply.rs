@@ -1,7 +1,7 @@
 //! K-SNAPSHOT / SNAPSHOT §7.3 — `/vcs/apply` mutates the worktree.
 //!
 //! The pre-fix handler returned a success/error *shape* without ever applying
-//! the patch (D-VCS-NOAPPLY). These tests assert the observable side effect:
+//! the patch (pre-SNAPSHOT). These tests assert the observable side effect:
 //! a valid patch changes the file bytes on disk; a conflicting patch changes
 //! nothing; a non-git directory reports `non-git`. The shared checker is
 //! exercised with a planted shape-only response to prove it is non-vacuous.

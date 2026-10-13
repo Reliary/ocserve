@@ -35,9 +35,17 @@ docker compose -f "$HERE/compose.yaml" down >/dev/null 2>&1 || true
 docker run --rm -v "$HERE:/x" alpine:3 sh -c \
   'rm -rf /x/work /x/data /x/freeze-work && mkdir -p /x/work /x/data /x/freeze-work' >/dev/null 2>&1 || true
 
-echo "== freeze vs ocserve differential =="
+echo "== freeze vs ocserve differential (selftest then real) =="
+docker compose -f "$HERE/compose.yaml" run --rm differential --selftest
+i2a=$?
+# down before recreating: the server/freeze bind mounts must be released, or
+# they keep pointing at the deleted inode and read stale state.
+docker compose -f "$HERE/compose.yaml" down >/dev/null 2>&1 || true
+docker run --rm -v "$HERE:/x" alpine:3 sh -c \
+  'rm -rf /x/work /x/data /x/freeze-work && mkdir -p /x/work /x/data /x/freeze-work' >/dev/null 2>&1 || true
 docker compose -f "$HERE/compose.yaml" run --rm differential
-i2=$?
+i2b=$?
+i2=$([ "$i2a" = "0" ] && [ "$i2b" = "0" ] && echo 0 || echo 1)
 
 if [ "${KEEP:-0}" != "1" ]; then
   docker compose -f "$HERE/compose.yaml" down -v >/dev/null 2>&1 || true

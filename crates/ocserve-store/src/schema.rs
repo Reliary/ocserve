@@ -564,8 +564,7 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                 // v10->v11: session revert marker (K-REVERT). The v1 revert
                 // route sets {messageID, partID?, snapshot?, diff?} on the
                 // session info and unrevert clears it; file-level snapshot
-                // restore is the snapshot engine (out of MVP, divergence
-                // D-REVERT-NOSNAP). Column stored as JSON text.
+                // restore is the snapshot engine (SNAPSHOT.md). JSON text.
                 // Guard: idempotent when a test rewinds user_version without
                 // dropping the column (the version gate normally prevents
                 // re-runs; the guard keeps rewind-based arms composable).

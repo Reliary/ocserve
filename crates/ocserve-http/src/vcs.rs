@@ -17,8 +17,8 @@
 //! capped. Total patch bytes capped at 10 MB (freeze `MAX_TOTAL_PATCH_BYTES`).
 //! All git runs off the async workers via `run_blocking` at the call site.
 //!
-//! Divergence D-VCS-NOAPPLY: `/vcs/apply` is not implemented (write path; the
-//! web bundle has zero call sites — PLAN §17).
+//! `/vcs/apply` applies a patch to the worktree via `git apply -` (SNAPSHOT
+//! §5); `vcs::apply` is the shell-out used by the v2 handler.
 
 use serde_json::{Value, json};
 use std::process::Command;

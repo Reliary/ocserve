@@ -104,8 +104,51 @@ def run_apply(base, work):
     return st, body.get("applied"), read(os.path.join(work, "a.txt"))
 
 
+def compare(sf, af, bf, so, ao, bo, work_f, work_o, quiet=False):
+    """The comparator: assert the two arms produced the SAME effect. Pure —
+    takes values only, so it can be exercised with planted inputs."""
+    def emit(cond, msg):
+        if quiet:
+            if not cond:
+                FAILS.append(msg)
+            return
+        check(cond, msg)
+
+    emit(sf == so == 200 and af is True and ao is True,
+         f"both arms 200 applied:true (freeze={sf}:{af} ocserve={so}:{ao})")
+    emit(bf == bo, f"both arms produced identical file bytes ({bf!r} vs {bo!r})")
+    emit(bf == "two\n", "apply mutated a.txt one->two")
+    if not quiet:
+        hf = hashlib.sha256(bf.encode()).hexdigest()[:12]
+        ho = hashlib.sha256(bo.encode()).hexdigest()[:12]
+        print(f"     worktree a.txt sha (freeze={hf} ocserve={ho})")
+
+
+def selftest():
+    """Prove the comparator is non-vacuous WITHOUT touching the arms: feed it a
+    planted divergence and require it to fail, then a matching pair and require
+    it to pass. Any mutation of the comparator that stops detecting a mismatch
+    turns this red."""
+    saved = list(FAILS)
+    FAILS.clear()
+    compare(200, True, "two\n", 200, True, "one\n", WF, WO, quiet=True)  # differ
+    caught = bool(FAILS)
+    FAILS.clear()
+    compare(200, True, "two\n", 200, True, "two\n", WF, WO, quiet=True)  # match
+    clean = not FAILS
+    FAILS.clear()
+    FAILS.extend(saved)
+    print(("ok   " if caught else "FAIL ") +
+          "planted byte divergence is detected by the comparator")
+    print(("ok   " if clean else "FAIL ") +
+          "matching arms pass the comparator")
+    return 0 if (caught and clean) else 1
+
+
 def main():
     args = sys.argv[1:]
+    if "--selftest" in args:
+        return selftest()
     seed(WF)
     seed(WO)
     for base, name in [(FREEZE, "freeze"), (OCSERVE, "ocserve")]:
@@ -117,25 +160,7 @@ def main():
     # /vcs/apply: both arms must return the same success + mutate identically.
     sf, af, bf = run_apply(FREEZE, WF)
     so, ao, bo = run_apply(OCSERVE, WO)
-    if "--selftest" in args:
-        # sabotage the ocserve bytes; the comparator MUST flag the mismatch.
-        bo_sabotaged = "one\n"
-        caught = not (bf == bo_sabotaged and af is True)
-        print(("ok   " if caught else "FAIL ") +
-              "planted divergence (ocserve bytes differ) is detected")
-        return 0 if caught else 1
-    check(sf == so == 200 and af is True and ao is True,
-          f"both arms 200 applied:true (freeze={sf}:{af} ocserve={so}:{ao})")
-    check(bf == bo, f"both arms produced identical file bytes ({bf!r} vs {bo!r})")
-    check(bf == "two\n", "apply mutated a.txt one->two")
-
-    # revert: both restore pre-turn bytes (seed the same edit turn first is
-    # model-dependent; assert the /vcs/apply effect parity is the load-bearing
-    # differential; the file-level revert parity is covered by the unit + HTTP
-    # tests). Report the file hashes for the record.
-    hf = hashlib.sha256(bf.encode()).hexdigest()[:12]
-    ho = hashlib.sha256(bo.encode()).hexdigest()[:12]
-    print(f"     worktree a.txt sha (freeze={hf} ocserve={ho})")
+    compare(sf, af, bf, so, ao, bo, WF, WO)
 
     if FAILS:
         print(f"\n{len(FAILS)} FAILURE(S)")

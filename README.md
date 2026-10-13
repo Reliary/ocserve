@@ -76,12 +76,15 @@ OpenAPI 3.1.0 contract (162 paths / 188 operations); ocserve serves it at
 `GET /doc` and a generated guard requires every operation to be bound or
 explicitly cited: **187 implemented, 1 cited, 0 gaps**.
 
+**Snapshot / revert / vcs-apply** (`SNAPSHOT.md`): a shadow-git snapshot engine
+captures the worktree each turn, so `revert` really restores files, `GET
+/session/{id}/diff` returns the revert-range diff, and `POST /vcs/apply` runs
+`git apply`. Requires `git` on the host and a git worktree.
+
 **Not implemented** (named, not hidden — `PLAN.md` §17): hosted share links
-(the record is returned but no remote backend exists), provider OAuth login,
-and `POST /vcs/apply` (the worktree write path). Session revert stores a marker
-but does not restore files (`D-REVERT-NOSNAP` — no snapshot engine). Unmatched
-paths get the version-matched web app (embedded; the Cloudflare proxy is a
-fallback), not a 404.
+(the record is returned but no remote backend exists) and provider OAuth login.
+Unmatched paths get the version-matched web app (embedded; the Cloudflare proxy
+is a fallback), not a 404.
 
 **Contract**: wire-compatible with upstream **1.18.31**. A future upstream
 release may change the API; `ocserve` pins the freeze and tracks upstream drift
