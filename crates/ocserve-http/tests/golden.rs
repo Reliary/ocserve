@@ -8,6 +8,14 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt; // oneshot
 
+/// Collision-proof fixture discriminator. Nanos alone is NOT enough: parallel
+/// tests in one binary can read the clock in the same tick and collide
+/// ("table session already exists" — the 2026-10-13 CI-only flake).
+fn next_fixture() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn app() -> axum::Router {
     ocserve_http::router(ocserve_http::AppState::new())
 }
@@ -491,10 +499,7 @@ async fn prompt_async_returns_204_persists_user_message_and_404s_unknown() {
     let dir = std::env::temp_dir().join(format!(
         "ocserve-async-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        next_fixture()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let db = ocserve_store::writer::db_path(&dir);
@@ -1435,10 +1440,7 @@ async fn command_expands_and_persists_user_message_before_llm_fails() {
     let dir = std::env::temp_dir().join(format!(
         "ocserve-cmd-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        next_fixture()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let db = ocserve_store::writer::db_path(&dir);

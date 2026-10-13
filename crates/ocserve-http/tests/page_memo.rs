@@ -13,6 +13,14 @@ use ocserve_http::{AppState, LlmRegistry, Payloads, Wires};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tower::ServiceExt;
 
+/// Collision-proof fixture discriminator. Nanos alone is NOT enough: parallel
+/// tests in one binary can read the clock in the same tick and collide
+/// ("table session already exists" — the 2026-10-13 CI-only flake).
+fn next_fixture() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn lock() -> MutexGuard<'static, ()> {
@@ -25,10 +33,7 @@ fn tmp(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "ocserve-pagememo-{}-{}-{name}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        next_fixture()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     dir

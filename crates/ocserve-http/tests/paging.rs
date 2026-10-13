@@ -7,14 +7,19 @@ use http_body_util::BodyExt;
 use ocserve_http::{AppState, LlmRegistry, Payloads, Wires};
 use tower::ServiceExt; // oneshot
 
+/// Collision-proof fixture discriminator. Nanos alone is NOT enough: parallel
+/// tests in one binary can read the clock in the same tick and collide
+/// ("table session already exists" — the 2026-10-13 CI-only flake).
+fn next_fixture() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn state_with(endpoints: [(&str, &str); 1]) -> (std::sync::Arc<AppState>, axum::Router) {
     let dir = std::env::temp_dir().join(format!(
         "ocserve-pg-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        next_fixture()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let db = ocserve_store::writer::db_path(&dir);

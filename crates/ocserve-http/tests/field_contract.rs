@@ -27,14 +27,12 @@ fn app() -> axum::Router {
 /// session check / noReply return, so endpoint-less states 400 first.
 fn app_with_endpoint() -> axum::Router {
     use ocserve_http::{AppState, LlmRegistry, Payloads, Wires};
-    let dir = std::env::temp_dir().join(format!(
-        "ocserve-fc-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    // Collision-proof fixture dir: pid + a process-global atomic (nanos alone
+    // collided when parallel test threads read the clock in the same tick —
+    // CI-only flake 2026-10-13, "table session already exists").
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("ocserve-fc-{}-{}", std::process::id(), n));
     std::fs::create_dir_all(&dir).unwrap();
     let db = ocserve_store::writer::db_path(&dir);
     let writer = std::sync::Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
