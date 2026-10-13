@@ -490,4 +490,25 @@ else
   fi
 fi
 
+echo "== guard: mutating endpoints have an asserted effect (rule 29) =="
+# Class-completion (SNAPSHOT §8): a mutating endpoint that returns a success
+# shape without performing the mutation (the /vcs/apply + revert class). Every
+# mutating op in the frozen spec must be classified in bench/sidefx/effects.tsv
+# as effect-tested (a real side-effect test drives the route) or no-effect (a
+# named reason). Routing (16) and shape (P4) guards are structurally blind to
+# this; only an effect assertion sees it. Planted controls prove non-vacuousness.
+if [ -f bench/sidefx/check-effects.py ]; then
+  if python3 bench/sidefx/check-effects.py --selftest >/dev/null 2>&1; then
+    if out=$(python3 bench/sidefx/check-effects.py 2>&1); then
+      echo "$out"
+    else
+      echo "$out"; echo "FAIL: mutating endpoint lacks an asserted effect (rule 29)"; fail=1
+    fi
+  else
+    echo "FAIL: effects-classification planted control not detected (rule 29 vacuous)"; fail=1
+  fi
+else
+  echo "ok (no effects classifier)"
+fi
+
 exit $fail

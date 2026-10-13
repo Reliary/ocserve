@@ -213,3 +213,64 @@ async fn echo_roundtrip_through_real_pty() {
     let resp = req(&app, "GET", &format!("/pty/{id}"), None).await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// K-SNAPSHOT / SNAPSHOT §8 — the v2 `/api/pty` group has the same observable
+/// effects as the v1 group (create spawns, update mutates, remove deletes).
+/// This is what guard rule 29's `tested:` classification for the v2 pty ops
+/// points at, closing the shape-only class for the v2 surface.
+#[tokio::test]
+async fn v2_pty_group_has_real_effects() {
+    let app = app();
+    // create spawns a real process (observable via GET /api/pty/{id})
+    let resp = req(
+        &app,
+        "POST",
+        "/api/pty",
+        Some(serde_json::json!({"command": "/bin/sh"})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let id = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(id.starts_with("pty_"));
+    let resp = req(&app, "GET", &format!("/api/pty/{id}"), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"]["status"], "running");
+
+    // update mutates the stored title (observable on the next GET)
+    let resp = req(
+        &app,
+        "PUT",
+        &format!("/api/pty/{id}"),
+        Some(serde_json::json!({"title": "V2 Renamed"})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = req(&app, "GET", &format!("/api/pty/{id}"), None).await;
+    assert_eq!(body_json(resp).await["data"]["title"], "V2 Renamed");
+
+    // remove deletes it (observable: GET 404s)
+    let resp = req(&app, "DELETE", &format!("/api/pty/{id}"), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = req(&app, "GET", &format!("/api/pty/{id}"), None).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // connect-token mints a one-shot ticket (observable via the token route)
+    let resp = req(
+        &app,
+        "POST",
+        "/api/pty",
+        Some(serde_json::json!({"command": "/bin/sh"})),
+    )
+    .await;
+    let id2 = body_json(resp).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = req(&app, "POST", &format!("/api/pty/{id2}/connect-token"), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_json(resp).await["data"]["ticket"].is_string());
+    let _ = req(&app, "DELETE", &format!("/api/pty/{id2}"), None).await;
+}

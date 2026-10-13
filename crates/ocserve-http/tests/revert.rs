@@ -376,3 +376,118 @@ async fn revert_without_snapshots_does_not_restore_files() {
         "snapshots disabled ⇒ revert must not touch the worktree"
     );
 }
+
+/// v2 revert group has real effects (SNAPSHOT §6): stage restores files + sets
+/// the marker; clear restores the snapshot + clears; commit deletes the range.
+#[tokio::test]
+async fn v2_revert_stage_clear_commit_have_effects() {
+    let addr = spawn_seq_provider();
+    let sid = "ses_rev000000000000000000004";
+    let (st, wt, _tmp) = setup(addr, sid);
+    let app = ocserve_http::router(st.clone());
+    let user_mid = "msg_rev000000000000000000004";
+    let r = post(
+        &app,
+        &format!("/session/{sid}/prompt_async"),
+        json!({"messageID": user_mid, "parts": [{"type": "text", "text": "edit"}], "model": {"providerID": "fake", "modelID": "m"}, "agent": "build"}),
+    )
+    .await;
+    assert!(matches!(
+        r.status(),
+        StatusCode::NO_CONTENT | StatusCode::OK
+    ));
+    wait_finished(&st).await;
+    assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "two\n");
+
+    // stage → file restored + marker set + {data:{messageID}}
+    let r = post(
+        &app,
+        &format!("/api/session/{sid}/revert/stage"),
+        json!({"messageID": user_mid}),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK, "stage");
+    let v = body_json(r).await;
+    assert_eq!(v["data"]["messageID"], user_mid, "{v}");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+        "one\n",
+        "stage restores files"
+    );
+
+    // clear → snapshot restored (file back to 'two') + marker cleared
+    let r = post(&app, &format!("/api/session/{sid}/revert/clear"), json!({})).await;
+    assert_eq!(r.status(), StatusCode::NO_CONTENT, "clear");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+        "two\n",
+        "clear restores the snapshot"
+    );
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/session/{sid}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        body_json(r).await["revert"].is_null(),
+        "clear drops the marker"
+    );
+
+    // stage again, then commit → the reverted range is deleted + marker cleared
+    let before: i64 = {
+        let conn = rusqlite::Connection::open(&st.db).unwrap();
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM msg WHERE session_id='{sid}'"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    post(
+        &app,
+        &format!("/api/session/{sid}/revert/stage"),
+        json!({"messageID": user_mid}),
+    )
+    .await;
+    let r = post(
+        &app,
+        &format!("/api/session/{sid}/revert/commit"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::NO_CONTENT, "commit");
+    let after: i64 = {
+        let conn = rusqlite::Connection::open(&st.db).unwrap();
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM msg WHERE session_id='{sid}'"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert!(
+        after < before,
+        "commit must delete the reverted range: {before} -> {after}"
+    );
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/session/{sid}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        body_json(r).await["revert"].is_null(),
+        "commit clears the marker"
+    );
+}

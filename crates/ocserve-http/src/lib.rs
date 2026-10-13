@@ -2735,9 +2735,11 @@ pub(crate) async fn revert_apply(
     let mid = message_id.to_string();
     let pid = part_id.map(String::from);
     // Load the full message graph once, off the workers.
-    let messages = run_blocking(&db, move |db| ocserve_store::load_messages(db, &sid, None))
-        .await
-        .map_err(internal_err)?;
+    let messages = run_blocking(&db, move |db| {
+        ocserve_store::load_messages(db, &sid, None) // allow:load_messages (SNAPSHOT revert: full message graph for target resolution + patch collection, upstream revert.ts)
+    })
+    .await
+    .map_err(internal_err)?;
     let target = ocserve_core::revert::resolve_target(&messages, &mid, pid.as_deref());
     let dir = session_directory_http(st, id).await;
     let snapshots = snapshots_for(st, &dir);
