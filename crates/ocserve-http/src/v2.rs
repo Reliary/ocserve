@@ -1915,22 +1915,47 @@ pub async fn list_skills_raw(State(st): State<Arc<AppState>>) -> impl IntoRespon
     Json(data)
 }
 
-/// POST /vcs/apply — apply a patch. ocserve does not mutate the worktree
-/// (write path; D-VCS-NOAPPLY). Freeze-probed error shapes:
-/// missing `patch` → 400 payload; otherwise `VcsApplyError` "not-clean".
-pub async fn vcs_apply(Json(body): Json<Value>) -> impl IntoResponse {
-    if body.get("patch").and_then(|v| v.as_str()).is_none() {
+/// POST /vcs/apply — apply a patch to the session directory's git worktree
+/// (upstream `project/vcs.ts:399`): `git apply` → `{applied:true}`; not a git
+/// worktree → `reason:"non-git"`; patch rejected → `reason:"not-clean"`.
+/// missing `patch` → 400 payload. The route DOES mutate the worktree.
+pub async fn vcs_apply(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let Some(patch) = body.get("patch").and_then(|v| v.as_str()) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"name": "BadRequest", "data": {"message": "Missing key\n  at [\"patch\"]", "kind": "Payload"}})),
         )
             .into_response();
+    };
+    // upstream honors `?directory=` (WorkspaceRoutingQuery); default the
+    // server's worktree.
+    let dir = q
+        .get("directory")
+        .cloned()
+        .unwrap_or_else(|| st.paths["directory"].as_str().unwrap_or("/").to_string());
+    let patch = patch.to_string();
+    let applied = crate::run_blocking(&st.db, move |_db| {
+        Ok::<_, anyhow::Error>(crate::vcs::apply(&dir, &patch))
+    })
+    .await
+    .unwrap_or(None);
+    match applied {
+        Some(true) => (StatusCode::OK, Json(json!({"applied": true}))).into_response(),
+        Some(false) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"name": "VcsApplyError", "data": {"message": "Patch can't be applied", "reason": "not-clean"}})),
+        )
+            .into_response(),
+        None => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"name": "VcsApplyError", "data": {"message": "Patch can't be applied because the project is not git-based", "reason": "non-git"}})),
+        )
+            .into_response(),
     }
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({"name": "VcsApplyError", "data": {"message": "Patch can't be applied", "reason": "not-clean"}})),
-    )
-        .into_response()
 }
 
 /// POST /experimental/workspace — create a workspace. Freeze requires `type`

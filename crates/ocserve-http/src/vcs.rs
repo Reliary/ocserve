@@ -110,6 +110,37 @@ fn kind(code: &str) -> &'static str {
     }
 }
 
+
+/// Maximum patch size accepted by `apply` (SNAPSHOT §5). A larger patch is
+/// refused as `not-clean` (upstream `git.applyPatch` would also fail/misbehave
+/// on an absurd patch; this bounds the write).
+const MAX_APPLY_PATCH_BYTES: usize = 64 * 1024 * 1024;
+
+/// `git apply -` in `dir` with `patch` on stdin (upstream `Git.applyPatch`).
+/// `None` when `dir` is not inside a git work tree; `Some(ok)` otherwise.
+pub fn apply(dir: &str, patch: &str) -> Option<bool> {
+    if patch.len() > MAX_APPLY_PATCH_BYTES {
+        return Some(false);
+    }
+    if !is_git(dir) {
+        return None;
+    }
+    let mut child = Command::new("git")
+        .current_dir(dir)
+        .args(["apply", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    if let Some(mut si) = child.stdin.take() {
+        use std::io::Write;
+        let _ = si.write_all(patch.as_bytes());
+    }
+    let out = child.wait_with_output().ok()?;
+    Some(out.status.success())
+}
+
 fn has_head(dir: &str) -> bool {
     run_git(dir, &["rev-parse", "--verify", "--quiet", "HEAD"])
         .map(|(_, c)| c == 0)
