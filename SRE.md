@@ -4,16 +4,15 @@ Companion to `PLAN.md`. Mindset: every failure is loud and actionable at boot; e
 `PLAN.md §10` is a queryable metric; every knob is declared, typed, and validated; CPU work
 is measured before it is specialized.
 
-## Minimum CPU ISA (PERF-10X C1)
+## Minimum CPU ISA
 
-Release binaries are built with `-Ctarget-cpu=x86-64-v3` / `-march=x86-64-v3`
-(`.cargo/config.toml`) — AVX2, BMI1/2, FMA, MOVBE, AVX. Qualifying hosts:
-Zen2+ (AMD), Ice Lake+ / Tiger Lake+ (Intel), Apple silicon under
-Rosetta 2 (AVX2-capable), and both known deploy targets (Meteor Lake
-workstation, Tiger Lake .227 bench box). `x86_64-v2` (the Rust baseline
-for many distros) is the practical floor; **x86-64-v1 hosts cannot run the
-release binary** — dev builds inherit the same flags via `.cargo/config.toml`;
-`RUSTFLAGS` override or removing the config file restores baseline builds.
+Release binaries are built with the **baseline x86-64 ISA** (no `.cargo/config.toml`).
+An earlier plan (PERF-10X C1) added `-Ctarget-cpu=x86-64-v3` / `-march=x86-64-v3`, but the
+A/B sandwich failed the keep-rule (post-flag throughput tied the pre-flag binary to 0.1%, so
+the flag bought nothing measurable) and the config was **removed** (`PERF-10X.md` C1+C4).
+No per-architecture flags are set today, so the release binary runs on any x86-64 host.
+`RUSTFLAGS`/`CFLAGS` overrides remain available for a local, measured experiment; a change
+is adopted only if it clears the A/B keep-rule (`PERF-10X.md` Phase IV).
 
 ## 1. Fail-fast
 
@@ -136,9 +135,9 @@ fails boot. Visibility: `ocserve_models_refresh_total{result}` + nightly
 ## 4. CPU: measure first, specialize second
 
 **Justified per-arch work:**
-- zstd and sha256 (`sha2` with `cpufeatures`) dispatch to AVX2/SHA-NI at **runtime** — zero
-  code, verify with `ocserve doctor` (blob GC dry-run) before/after (expect nothing if
-  already active).
+- zstd and sha256 (`sha2` with `cpufeatures`) dispatch to AVX2/SHA-NI at **runtime** —
+  zero code, active on any capable host; verify with `ocserve doctor` (blob GC dry-run)
+  before/after (expect nothing if already active).
 - `available_parallelism()` for defaults (not hard-coded 22) with env override — the reliary8
   lesson (WSL2/ARM).
 - `page_size` decided per-machine at DB creation (4096 x86 NVMe; 16384 arm64) — immutable

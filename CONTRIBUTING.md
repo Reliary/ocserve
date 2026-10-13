@@ -36,8 +36,8 @@ Differential gates (need the vendored freeze binary; see `bench/pair/`):
 
 ## Docs are the spec
 
-Five documents are normative and disagreements are fixed as doc commits
-(precedence: `TESTING.md` → `PLAN.md` → domain spec):
+The core documents below are normative and disagreements are fixed as doc
+commits (precedence: `TESTING.md` → `PLAN.md` → domain spec):
 
 | Doc | Holds |
 |---|---|
@@ -46,6 +46,7 @@ Five documents are normative and disagreements are fixed as doc commits
 | `SRE.md` | boot checks, metrics, config knobs, runbook |
 | `MEMORY.md` | memory budget and allocation rules |
 | `TESTING.md` | test levels, anti-theater rules, bug-class table |
+| `SNAPSHOT.md` | file snapshots, revert/unrevert/session-diff, `/vcs/apply` |
 | `TRACEABILITY.md` | requirement → test → status matrix |
 
 ## Code style

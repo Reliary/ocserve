@@ -1,6 +1,9 @@
 # COMPACTION.md — auto-compaction (M6): compatibility contract + design
 
-**Status:** design for review — no engine code written. **Precedence:** TESTING.md gates
+**Status (2026-10-13): SHIPPED** — the M6 engine is built and green (C1–C5 in
+`crates/ocserve-core/src/{compaction,compact}.rs`; §9 stub-overflow battery passes; manual
+`summarize` shares the same path). The body below retains its original design-for-review
+voice as the audit trail; §10 tracks per-item status. **Precedence:** TESTING.md gates
 > PLAN.md > this doc. All upstream claims cite `~/src/opencode-v1` line numbers from the
 2026-10-03 read (freeze 1.18.31). Antagonism ledger: §7.
 

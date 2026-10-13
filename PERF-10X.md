@@ -148,11 +148,11 @@ bounded-memory intent, fix the comment either way.
 
 | ID | Change | Keep rule |
 |---|---|---|
-| C1 | `.cargo/config.toml`: `-Ctarget-cpu=x86-64-v3` + `CFLAGS_…=-march=x86-64-v3` (Rust+sqlite3.c+zstd). **Explicit v3, never `native`** (MTL-built native ≠ TGL-safe; v3 = AVX2/BMI2/FMA, safe both) | A/B measurable; min-ISA documented in SRE (both targets qualify) |
-| C4 | add `-DSQLITE_DEFAULT_MEMSTATUS=0` via CFLAGS env (build.rs does not override → no libsqlite3-sys patch). `SQLITE_OMIT_GET_TABLE` **evaluated and rejected**: rusqlite never exposes `sqlite3_get_table`, but an omitted symbol is a link-time risk for any C dep that might reference it, for negligible size/win | A/B measurable |
+| C1 | `.cargo/config.toml`: `-Ctarget-cpu=x86-64-v3` + `CFLAGS_…=-march=x86-64-v3` (Rust+sqlite3.c+zstd). **Explicit v3, never `native`** (MTL-built native ≠ TGL-safe; v3 = AVX2/BMI2/FMA, safe both) — **RAN, FAILED keep-rule, REVERTED** (`PERF-10X.md` C1+C4 A/B below): post-flag tied the pre-flag binary to 0.1%. Kept in the record as the measured disposition. | A/B measurable |
+| C4 | add `-DSQLITE_DEFAULT_MEMSTATUS=0` via CFLAGS env — **RAN, FAILED keep-rule, REVERTED** with C1 (the two were tested as one sandwich). `SQLITE_OMIT_GET_TABLE` **evaluated and rejected**: rusqlite never exposes `sqlite3_get_table`, but an omitted symbol is a link-time risk for any C dep that might reference it, for negligible size/win | A/B measurable |
 | C5 | `worker_threads` → `max(8, available_parallelism)` | trivial |
 | C6 | `.set_nodelay(true)` on listener (floor probe decides need) | probe — **SKIPPED with evidence**: baseline summary `http_req_blocked` p99 = 0.014 ms, `http_req_sending` p95 = 0.018 ms, `http_req_connecting` p95 = 0 ⇒ loopback floor already sub-millisecond, nothing for nodelay to win |
-| C2 | PGO script (`scripts/pgo-build.sh`): profile-generate → training (replay + pair + local single-route k6 + import smoke) → profile-use. Requires `rustup component add llvm-tools-preview` (matched llvm-profdata; system LLVM-22 one risky) | re-runnable, documented cadence |
+| C2 | PGO (not built — deferred): a PGO build script (profile-generate → training (replay + pair + local single-route k6 + import smoke) → profile-use). Requires `rustup component add llvm-tools-preview` (matched llvm-profdata). Deferred pending a measured need; the C1/C4 A/B showed the compiler axis is not where the wins are. | re-runnable, documented cadence |
 | C7 | size ceiling: PGO +10–30% `.text` likely trips 20,971,520 B → bump only by standing rule (measurement + provenance comment) | standing rule |
 | C3 | BOLT: **deferred** — tooling absent (needs perf + llvm-bolt install approval) | — |
 

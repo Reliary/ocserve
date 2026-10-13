@@ -38,7 +38,7 @@ raw `.dat` kept out of repo (214 MB).
    wiring stays a *retention* option only if the post-fix soak still shows
    step-function RSS retention (morning soak showed +76/+58 MB steps before
    the drain fix — unproven after it).
-2. **Highest-leverage code fixes (phase 1):**
+2. **Highest-impact code fixes (phase 1):**
    - serialize `/message` frames + prompt request bodies into **reused
      buffers** (`to_writer` into a per-thread `Vec<u8>` instead of
      `Value::to_string`) — kills group #2 outright;

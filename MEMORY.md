@@ -1,7 +1,7 @@
 # ocserve — memory management spec ("so lightweight")
 
 Companion to `PLAN.md`. Hard contract: **RSS < 300 MB steady-state (ocserve process only;
-+80 MB if the Node plugin sidecar is active — declared boundary, both measured),
+the plugin sidecar is a separate boundary with a 160 MB systemd hard cap — both measured),
 zero swap growth over 24 h**.
 
 ## 1. Reconciled budget (fixes the fatal cache×pool arithmetic)
@@ -107,7 +107,7 @@ independently —10s+ settle, trigger+event exercised): RSS **flat 144-148 MB at
 64/128/192/256** — the V8 cap never binds baseline RSS (native/WASM dominates), so
 headroom is free. Default raised to **128** (`OCSERVE_PLUGIN_HEAP_MB` overrides), and
 `Sidecar::ensure_alive` now respawns + replays all loads on the next RPC after any
-death (`sidecar_respawns_after_death_and_reloads_plugins`). The160 MB systemd
+death (`sidecar_respawns_after_death_and_reloads_plugins`). The 160 MB systemd
 `MemoryMax` remains the hard boundary. Any future plugin
 addition must re-measure (gate: sidecar ≤160 MB after load, else a plugin is dropped or
 loads lazily).
@@ -194,7 +194,7 @@ tokio::runtime::Builder::new_multi_thread()
 Phase-0 evidence: `bench/profiling/REPORT.md` (bytehound over glibc, debug
 build, 40 s mixed load — **4.48M allocs / 99.5% churn**, top groups =
 per-fetch SQLite pcache in `get_messages` + `serde_json::to_string` frame
-building). Ordered by measured leverage:
+building). Ordered by measured impact:
 
 1. ~~Reused serialization buffers~~ **SHIPPED** — `/message` frames serialize
    into one reused `Vec<u8>` per fetch (+ blob `from_slice`, no lossy copy);

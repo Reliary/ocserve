@@ -1,6 +1,7 @@
 # ocserve — Rust drop-in server for opencode v1
 
-Status: **plan, pre-implementation, adversarially stress-tested twice** (2026-10-01).
+Status (2026-10-13): **shipped and published** (v0.3.1). This document originated as the
+build plan; the milestone record, parity ledger (§17), and standards below are current.
 Every claim is sourced from local trees/service/DB measurements, direct empirical tests, or a
 verified reference (§12). Nothing is aspirational.
 
@@ -192,7 +193,7 @@ recovery. **No savings percentages are claimed until the benchmark harness measu
 6. MCP OAuth: token store on disk (mode 600), refresh-before-expiry with skew, single-flight
    refresh; mock-server test with 6-minute tokens under 20-minute session.
 
-**Adoption posture on major upstream lines (recorded 2026-10-03, deep dive evidence below):**
+**Adoption posture on major upstream lines (recorded 2026-10-03, evidence below):**
 
 - **v1 freeze remains the contract.** `PLAN.md §3` wire/API/plugin surfaces are pinned to
   1.18.31; upstream v1 patch/minor releases (1.18.32–34) are watched via the nightly byte-
@@ -215,8 +216,8 @@ recovery. **No savings percentages are claimed until the benchmark harness measu
   v2-only, ocserve implements upstream's own documented bridge shape: accept the v2
   registration surface (`Plugin.define({id, setup(ctx)})` + `ctx.session.hook(...)` +
   `ctx.tool.hook(...)` + `ctx.event.subscribe()` + `ctx.storage`/`options`) and map each
-  domain hook to our v1-style dispatch (`hook_mutate` sites). Adapter lives in one file
-  (`crates/ocserve-plugin/src/compat_v2.rs` conceptually) so v2 drift is triaged as a mapping
+  domain hook to our v1-style dispatch (`hook_mutate` sites). The adapter lives in one file
+  (a single `compat_v2.rs` module if it ships) so v2 drift is triaged as a mapping
   diff, not scattered edits. Maintenance cost = the shim + one nightly replay column; the
   rest of the pipeline (freeze, matrix, guards) is unchanged.
 - **Explicit non-goals at the v2 boundary** (recorded so they don't creep): mirroring v2's
@@ -481,7 +482,7 @@ the client probes for MiMoCode extensions; vanilla opencode also 404s, so our
 | `/global/config` | GET | **live (K-WEBUI-PERF)** — freeze shape = /config minus instance-scoped keys (`agent`/`command`/`mode`/`username`); served from the wire cache with negotiation + ETag. Probed key diff 2026-10-08 |
 | `/vcs` `/vcs/status` `/vcs/diff` `/vcs/diff/raw` | GET | **live (K-WEBUI-PERF)** — freeze git shapes (info/FileStatus[]/FileDiff[]/raw text); bad `mode` → 400 Query envelope; one batched tracked patch + single status/numstat spawn (never per-file), 10 MB total cap. `/vcs/apply` **out** (write path, zero web-bundle call sites) |
 | `/file/status` `/find/symbol` | GET | **live (shape-only)** — freeze returns snapshot-engine files / LSP symbols; with neither engine the honest shape is `[]`, which the web UI tolerates (it only checks length) |
-| web-UI performance program | — | `bench/webui/WEBUI-PLAN.md` — compression (precomputed br/gzip wire variants + dynamic JSON + lazy asset cache), ETag/304 validators, session-list scaling (`limit`/`roots`/`search`/`start`), route closure. Boot wire 9.10 MB → 1.03 MB (br). Guard rule 15 (method-aware web-bundle binding) |
+| web-UI performance program | — | `bench/webui/WEBUI-PLAN.md` — compression (precomputed br/gzip wire variants + dynamic JSON + lazy asset cache), ETag/304 validators, session-list scaling (`limit`/`roots`/`search`/`start`), route closure. Boot wire 9.10 MB → 1.03 MB (br). Guard rule 17 (embedded-bundle ⊆ frozen spec) |
 | `/session/{id}/share` (POST/DELETE) | POST | **live (shape)** — returns the Session record (freeze shape). No hosted share backend; divergence **D-SHARE-NOBACKEND** (share field never set). Was wrongly "out/404 tolerated" — freeze answers 200 with the record |
 | `/session/{id}/revert` `/session/{id}/unrevert` `/session/{id}/diff?messageID=` | POST/GET | **live (SNAPSHOT.md, K-SNAPSHOT)** — real file-restoring revert: snapshot the worktree, restore pre-turn files, revert the tool `patch` parts, compute + persist per-message `summary.diffs` + session `summary`, emit `session.diff`, set the marker; busy→409. `unrevert` restores the snapshot + clears. The next prompt runs `revert.cleanup` (drop the range + clear the marker). **`D-REVERT-NOSNAP` REMOVED**. v2 `stage/clear/commit` + `session.next.revert.*` events likewise real |
 | `/session/{id}/fork` | POST | **live** (K-FORK) — freeze session.fork ported (session.ts:691). The earlier "out, 404 tolerated" row was STALE: oc-remote defines `forkSession` (OpenCodeApi.kt:551) with 3 UI call sites (ChatScreen.kt:2074/2298/2552 → ChatViewModel.kt:2284) and shows a "fork failed" snackbar on 404 — a dead feature, not a tolerated probe |

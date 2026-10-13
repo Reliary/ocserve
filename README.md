@@ -74,7 +74,7 @@ full TUI/web-UI v2 `/api/*` surface.
 **API coverage is spec-driven and complete.** The frozen server ships its own
 OpenAPI 3.1.0 contract (162 paths / 188 operations); ocserve serves it at
 `GET /doc` and a generated guard requires every operation to be bound or
-explicitly cited: **187 implemented, 1 cited, 0 gaps**.
+explicitly cited: **188 implemented, 0 cited, 0 gaps**.
 
 **Snapshot / revert / vcs-apply** (`SNAPSHOT.md`): a shadow-git snapshot engine
 captures the worktree each turn, so `revert` really restores files, `GET
@@ -120,6 +120,7 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings \
 | `COMPACTION.md` | auto-compaction: upstream algorithm, wire surfaces, design |
 | `DIFFERENTIATION.md` | what is built differently from upstream, and the killed ideas |
 | `PERF-10X.md` | performance program: target, acceptance, evidence, kill-switches |
+| `SNAPSHOT.md` | file snapshots, revert/unrevert/session-diff, `/vcs/apply` |
 | `TRACEABILITY.md` | requirement ↔ test ↔ evidence matrix |
 | `THIRD-PARTY.md` | upstream MIT attribution and the compatibility framing |
 

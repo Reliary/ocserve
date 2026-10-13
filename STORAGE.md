@@ -138,7 +138,7 @@ memos off, interleaved where noisy). Warm µs figures from `prep_A/B` and
 | busy_timeout / wal_autocheckpoint / journal_size_limit | 5000 / 1000 / 64 MB | keep (docs defaults + WAL-reset history) |
 | case_sensitive_like / automatic_index / cache_spill / locking_mode | untouched | case_sensitive_like is deprecated (docs) and LIKE contract tests pin default semantics; the rest are docs-recommended defaults |
 
-**Prepared statements (cutting edge, rusqlite 0.40.2):** `prepare_cached`
+**Prepared statements (rusqlite 0.40.2):** `prepare_cached`
 is the modern path — it prepares with `SQLITE_PREPARE_PERSISTENT` and LRU-
 reuses the VDBE (docs: "returns a cached statement … else prepares with
 SQLITE_PREPARE_PERSISTENT"; cache key `sql.trim()`, default capacity 16 →
@@ -281,7 +281,7 @@ from `reliary8/.../schema.rs:45-52`).
 - No `target-cpu` effects on SQLite; compile flags are the bundled defaults + our needs
   (FTS5, JSON1, STAT4 all default-on in bundled).
 - SIMD: SQLite's built-in; we do not hand-roll. zstd and sha2 dispatch to CPU features
-  internally (cpuid) — verified by `ocserve bench --blob` before/after, no code required.
+  internally (cpuid) — active on any capable host; no code or flag needed.
 
 ## 7. CI gates (storage)
 

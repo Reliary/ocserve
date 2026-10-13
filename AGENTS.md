@@ -17,6 +17,9 @@ tests pass.
 | `DIFFERENTIATION.md` | what we build vs upstream and why: harness thesis, candidates D1–D7 with evidence, graveyard of killed ideas, primitives rolled in (sift placement law), phasing |
 | `PERF-10X.md` | performance program: 10× target + acceptance A–D, evidence base, fixes F1–F8, compiler track C1–C7, phases, kill-switches/ethics (dual cache reporting) |
 | `SNAPSHOT.md` | file snapshots, `revert`/`unrevert`/`session diff`, `/vcs/apply`: upstream mechanism line-cited, divergences, bounds, side-effect test plan, guard rule 29 (mutating-endpoint class closure) |
+| `TRACEABILITY.md` | requirement ↔ test ↔ evidence matrix (every F/N/K row) |
+| `THIRD-PARTY.md` | upstream MIT attribution and the compatibility framing |
+| `SECURITY.md` / `CONTRIBUTING.md` | vulnerability reporting + threat posture; contributor workflow |
 
 Precedence when documents disagree: `TESTING.md` gates always win (nothing ships untested);
 then `PLAN.md`; then the companion spec for that domain (`STORAGE`/`MEMORY`/`SRE`). Any
@@ -138,7 +141,7 @@ main ─────────────●────●──────
    freeze artifacts attached.
 
 **Sequencing from the ground up (fits the milestones):**
-- Day 0: `git init`, this file + the five docs, `chore: initial spec set`, tag `m0-start`.
+- Day 0: `git init`, this file + the core docs, `chore: initial spec set`, tag `m0-start`.
 - M0: harness first, on topic branches; contract/corpus commits isolated; exit = `m0-exit` tag.
 - Then M1→M5 in order: no milestone branch cuts from a non-exit point of its predecessor.
 - Sidecar/native-profile experiments stay on `spike/*` until their gate (PLAN §10.4,

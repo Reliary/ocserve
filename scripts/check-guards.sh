@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Static guardrails (AGENTS §2.3/§2.5) — one command that fails the build on
-# the bug CLASSES we have actually shipped once each:
+# the bug/performance CLASSES we have actually shipped once each. Each rule has
+# a planted negative control inline (a violation is injected and must be
+# flagged) so the grep can never pass vacuously. The rule numbers are stable
+# IDs cited across the docs; some numbers were retired when a stronger,
+# generated check superseded them (noted below), so the sequence has gaps.
+#
 #   1. swallowed storage writes        (the finalize-SQL silent failure)
 #   2. literal backslash inside SQL    (the "\\" continuation syntax error)
 #   3. whole-session Value materialization in HTTP (the OOM class) — the
@@ -11,40 +16,37 @@
 #      set-difference / report writer) — the nightly watch would go silently
 #      wrong (PLAN §6/§8, K-DRIFT)
 #   6. non-ocserve systemd units mutated from repo scripts (drop-ins/restarts —
-#      the 2026-10-05 incident class; only ocserve* units are mutable, see
-#      TESTING §1.6)
+#      the 2026-10-05 incident class; only ocserve* units are mutable, TESTING §1.6)
+#   7. exact assertions on process-global counters inside src/ (parallel in-crate
+#      tests race — the reader_opens flake; such tests belong in tests/)
+#   8. (retired — folded into 7)
 #   9. unit template keeps OOMPolicy=continue (child OOM must not bounce the
 #      service — the 2026-10-06 stop-policy bounce; A3's completion)
 #  10. A3 child wrapper stays byte-identical in ocserve-mcp + ocserve-plugin
-#      (two copies, no shared dep — drift would silently drop oom_score_adj
-#      or the L1 kids move from one spawn path)
+#      (two copies, no shared dep — drift would silently drop oom_score_adj)
 #  11. installer/uninstaller never delete shared opencode state (config, auth,
-#      legacy db, model cache, packages — only ocserve-derived *.normalized.mjs
-#      artifacts are allowed near opencode paths)
-#  12. pair-check allowlist entries must cite a named D-PAIR row (the only
-#      legitimate way a freeze↔ocserve divergence passes the pair gate)
+#      legacy db, model cache, packages — only ocserve-derived *.normalized.mjs)
+#  12. pair-check allowlist entries must cite a named D-PAIR row
 #  13. load-test: a line that INVOKES k6 may never name a LIVE service port
-#      (4912/4901) — k6 targets fixture arms only; health asserts on the
-#      live ports must not sit on k6 lines
-#  14. every URL in the frozen v1 SDK surface is bound in the router or has
-#      an exact-URL PLAN §17 citation — unbound routes fall through to the
-#      HTML proxy and crash JSON-expecting clients (the 2026-10-08 web-UI
-#      settings crash: /pty/shells → HTML → e.shells.reduce TypeError)
+#  14,15. (retired — superseded by rule 16's generated spec-coverage check)
 #  16. every operation in the frozen OpenAPI contract is bound or exact-cited
 #      (spec-driven, whole-token citation match)
 #  17. the embedded pinned web UI calls only routes in the frozen spec
-#  18. permission oracle vectors exist, are well-formed, and carry the fixture
-#      config — the behavioural differential (scripts/permission-check.sh) can
-#      never silently no-op (route-binding/shape guards cannot see authz
-#      semantics; the 2026-10-09 hardcoded-allow v2 bug)
-#  19. the event-payload validator (bench/events/event-validate.py) is
-#      non-vacuous — its selftest plants malformed payloads (partial
-#      session.updated, part.updated missing `time`, bad permission id) and
-#      must flag them. The live-DB scan runs in nightly (historical pre-fix
-#      events would otherwise red the commit gate for an already-fixed bug).
-#   7. exact assertions on process-global counters inside src/ (in-crate unit
-#      tests run in one parallel process and race — the reader_opens flake of
-#      2026-10-05; such tests belong in tests/ where they own the process)
+#  18. permission oracle vectors exist, are well-formed, and carry the fixture config
+#  19. the event-payload validator selftest is non-vacuous
+#  20. every request key read off an axum `Json(...)` binding exists in the contract
+#  21. no runtime emitter assigns an empty `partID` (the streaming-delta class)
+#  22. /event, /api/event, /global/event stay bound to distinct envelope handlers
+#  23. no per-request catalog reads in the v2 metadata routes
+#  24. every `tests/*.rs` cited from `src/` exists
+#  25. no `SELECT *` on hot tables in server paths
+#  26. WAL ceiling in soak-gate.sh
+#  27. provider-boundary differential (capdiff) is non-vacuous + allowlist cites D-rows
+#  28. crates.io publish order covers every member in dependency order
+#  29. every mutating endpoint has an asserted side effect (the shape-only class)
+#  30. no compiled-in asset (`include_str!`/`include_bytes!`) escapes its crate root
+#  31. docs are not stale (dead repo paths, dangling guard-rule refs, removed
+#      divergences still listed as current)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -532,6 +534,26 @@ if [ -f scripts/check-crate-assets.py ]; then
   fi
 else
   echo "FAIL: scripts/check-crate-assets.py missing (rule 30)"; fail=1
+fi
+
+echo "== guard: docs are not stale (rule 31) =="
+# Docs are the spec (AGENTS §1); nothing checked them, so dead references
+# accumulated (the 2026-10-13 audit: three files referenced but gone, a stale
+# divergence, dangling guard-rule numbers). The linter fails on: backticked
+# repo paths that don't exist, `rule N` refs with no real rule, and a removed
+# divergence still listed as current. Planted control: dead path + bogus rule.
+if [ -f scripts/check-docs.py ]; then
+  if python3 scripts/check-docs.py --selftest >/dev/null 2>&1; then
+    if out=$(python3 scripts/check-docs.py 2>&1); then
+      echo "$out"
+    else
+      echo "$out"; echo "FAIL: stale doc reference (rule 31)"; fail=1
+    fi
+  else
+    echo "FAIL: doc-lint planted control not detected (rule 31 vacuous)"; fail=1
+  fi
+else
+  echo "FAIL: scripts/check-docs.py missing (rule 31)"; fail=1
 fi
 
 exit $fail

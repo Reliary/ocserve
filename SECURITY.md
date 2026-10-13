@@ -40,12 +40,10 @@ for a fix.
 ## Current known divergences
 
 The parity ledger (`PLAN.md §17`, `bench/*/allow.txt`) names every intentional
-difference from upstream. Two are security-relevant and documented, not hidden:
+difference from upstream. One is security-relevant and documented, not hidden:
 
 - `D-PTY-1`: the PTY connect-token accepts a request with no `Origin` — safe on
   a loopback bind, a hazard on a non-loopback bind.
-- `D-VCS-NOAPPLY`: `POST /vcs/apply` returns freeze's envelopes but does not
-  mutate the worktree.
 
 ## Security Practices
 
