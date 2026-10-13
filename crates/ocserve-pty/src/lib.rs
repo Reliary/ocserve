@@ -122,6 +122,7 @@ impl Session {
 
     /// Append a chunk from the reader thread: advance cursor, retain ≤2 MiB,
     /// fan out to subscribers (bounded; full channel ⇒ drop subscriber).
+    #[cfg_attr(not(unix), allow(dead_code))] // only the unix reader calls it
     fn push_output(&self, chunk: String) {
         let len = utf16_len(&chunk);
         let mut buf = self.buf.lock().unwrap();

@@ -34,7 +34,10 @@ jobs:
             os: windows-latest
           - target: aarch64-pc-windows-msvc
             os: windows-latest
-    continue-on-error: ${{ matrix.target == 'aarch64-pc-windows-msvc' }}
+    # Linux is the supported target. macOS/Windows builds are best-effort:
+    # the PTY shim is Linux/glibc-specific (ptsname_r), so non-Linux
+    # artifacts are produced only if the tree happens to compile there.
+    continue-on-error: ${{ !startsWith(matrix.target, 'x86_64-unknown-linux-gnu') && !startsWith(matrix.target, 'aarch64-unknown-linux-gnu') }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - uses: actions-rust-lang/setup-rust-toolchain@46a9d261ee2ace4b93b3bd6e867168ac38627b38  # v1.12.0
