@@ -2722,7 +2722,7 @@ pub(crate) fn internal_err(e: anyhow::Error) -> ApiError {
     }
 }
 
-/// Shared revert engine (v1 + v2 stage): resolve target, restore/记录 files,
+/// Shared revert engine (v1 + v2 stage): resolve target, restore files,
 /// compute + persist the range summary, emit `session.diff`, set the marker.
 pub(crate) async fn revert_apply(
     st: &Arc<AppState>,
