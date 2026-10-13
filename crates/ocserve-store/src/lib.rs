@@ -817,6 +817,27 @@ pub fn last_message_conn(
 }
 
 /// Replace a message's info row (summary finalize: finish/error/completed).
+/// Set the session summary counters (upstream `Session.setSummary`).
+pub fn set_session_summary(
+    writer: &Writer,
+    session_id: &str,
+    additions: i64,
+    deletions: i64,
+    files: i64,
+) -> anyhow::Result<usize> {
+    writer.write(vec![WriteOp::Sql {
+        sql: "UPDATE session SET summary_additions = ?2, summary_deletions = ?3, \
+              summary_files = ?4 WHERE id = ?1"
+            .into(),
+        params: vec![
+            session_id.into(),
+            additions.into(),
+            deletions.into(),
+            files.into(),
+        ],
+    }])
+}
+
 pub fn update_message_info(
     writer: &Writer,
     session_id: &str,
@@ -1773,6 +1794,60 @@ pub fn set_session_revert(
             params: vec![session_id.into(), now.into()],
         }]),
     }
+}
+
+/// Lazy revert cleanup (upstream `SessionRevert.cleanup`, called at prompt
+/// start `prompt.ts:459/1056`): a session carrying a `revert` marker drops the
+/// reverted range (messages from the target onward, or the target's parts from
+/// `partID` onward) and clears the marker. No-op without a marker.
+pub fn revert_cleanup(
+    writer: &Writer,
+    db: &std::path::Path,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let Some(sess) = load_session_wire(db, session_id)? else {
+        return Ok(());
+    };
+    let Some(rev) = sess.get("revert") else {
+        return Ok(());
+    };
+    if rev.is_null() {
+        return Ok(());
+    }
+    let mid = rev.get("messageID").and_then(|v| v.as_str()).unwrap_or("");
+    if mid.is_empty() {
+        return Ok(());
+    }
+    let pid = rev.get("partID").and_then(|v| v.as_str());
+    let from = messages_from(db, session_id, mid)?; // inclusive, chronological
+    match pid {
+        Some(pid) => {
+            // keep the target message; delete its parts from `partID` onward,
+            // then every message strictly after the target.
+            let msgs = load_messages(db, session_id, None)?;
+            if let Some((_info, parts)) = msgs.iter().find(|(i, _)| i["id"].as_str() == Some(mid)) {
+                let mut drop = false;
+                for p in parts {
+                    if p["id"].as_str() == Some(pid) {
+                        drop = true;
+                    }
+                    if drop && let Some(pidv) = p["id"].as_str() {
+                        delete_part(writer, db, mid, pidv)?;
+                    }
+                }
+            }
+            for m in from.iter().skip(1) {
+                delete_message(writer, db, session_id, m)?;
+            }
+        }
+        None => {
+            for m in &from {
+                delete_message(writer, db, session_id, m)?;
+            }
+        }
+    }
+    set_session_revert(writer, session_id, None)?;
+    Ok(())
 }
 
 /// Messages from `message_id` onward (revert range computation; v1 slices

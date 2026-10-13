@@ -40,7 +40,11 @@ fn spawn_seq_provider() -> std::net::SocketAddr {
     std::thread::spawn(move || {
         let n = AtomicUsize::new(0);
         for sock in listener.incoming().flatten() {
-            let body = if n.fetch_add(1, Ordering::SeqCst) == 0 { STEP1_SSE } else { STEP2_SSE };
+            let body = if n.fetch_add(1, Ordering::SeqCst) == 0 {
+                STEP1_SSE
+            } else {
+                STEP2_SSE
+            };
             std::thread::spawn(move || {
                 let mut sock = sock;
                 let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
@@ -61,7 +65,9 @@ fn spawn_seq_provider() -> std::net::SocketAddr {
                     .lines()
                     .find_map(|l| {
                         let (k, v) = l.split_once(':')?;
-                        k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok()).flatten()
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
                     })
                     .unwrap_or(0);
                 while got.len() < head_end + clen {
@@ -88,8 +94,17 @@ fn setup(addr: std::net::SocketAddr, sid: &str) -> (Arc<AppState>, std::path::Pa
     let wt = dir.join("worktree");
     std::fs::create_dir_all(&wt).unwrap();
     let g = |args: &[&str]| {
-        let o = std::process::Command::new("git").current_dir(&wt).args(args).output().unwrap();
-        assert!(o.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&o.stderr));
+        let o = std::process::Command::new("git")
+            .current_dir(&wt)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&o.stderr)
+        );
     };
     g(&["init", "-q"]);
     g(&["config", "user.email", "t@t"]);
@@ -102,16 +117,30 @@ fn setup(addr: std::net::SocketAddr, sid: &str) -> (Arc<AppState>, std::path::Pa
     let writer = Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
     let blobs = Arc::new(ocserve_store::BlobStore::new(dir.join("blobs")).unwrap());
     let mut limits = std::collections::HashMap::new();
-    limits.insert(("fake".to_string(), "m".to_string()), json!({"context": 1_000_000}));
+    limits.insert(
+        ("fake".to_string(), "m".to_string()),
+        json!({"context": 1_000_000}),
+    );
     let llm = LlmRegistry {
         limits,
-        endpoints: [("fake".into(), (format!("http://{addr}"), String::new()))].into_iter().collect(),
+        endpoints: [("fake".into(), (format!("http://{addr}"), String::new()))]
+            .into_iter()
+            .collect(),
         pricing: Default::default(),
         default_model: ("fake".into(), "m".into()),
         systems: Default::default(),
         default_agent: "build".into(),
     };
-    let st = AppState::with_wiring(None, Payloads::default(), Wires { db, blobs, writer, llm });
+    let st = AppState::with_wiring(
+        None,
+        Payloads::default(),
+        Wires {
+            db,
+            blobs,
+            writer,
+            llm,
+        },
+    );
     // allow write + bash so no permission prompt blocks (no client to answer)
     let mut p = st.payloads.write();
     p.agent = vec![json!({
@@ -200,7 +229,10 @@ async fn tool_turn_records_a_patch_part_and_start_snapshot() {
         json!({"messageID": "msg_snap000000000000000000001", "parts": [{"type": "text", "text": "make a file"}], "model": {"providerID": "fake", "modelID": "m"}, "agent": "build"}),
     )
     .await;
-    assert!(matches!(resp.status(), StatusCode::NO_CONTENT | StatusCode::OK));
+    assert!(matches!(
+        resp.status(),
+        StatusCode::NO_CONTENT | StatusCode::OK
+    ));
 
     // wait for the turn to finish (final assistant message with finish=stop)
     let mut done = false;
@@ -220,7 +252,10 @@ async fn tool_turn_records_a_patch_part_and_start_snapshot() {
         }
     }
     assert!(done, "turn did not finish");
-    assert!(wt.join("made.txt").exists(), "the write tool must have created the file");
+    assert!(
+        wt.join("made.txt").exists(),
+        "the write tool must have created the file"
+    );
 
     let parts = load_assistant_parts(&st, sid);
     let patch_files: Vec<String> = parts
@@ -240,7 +275,14 @@ async fn tool_turn_records_a_patch_part_and_start_snapshot() {
 
     // PLANTED NEGATIVE CONTROL: with the patch parts removed (the pre-fix
     // shape), the SAME checker must flag — proving it is non-vacuous.
-    let stripped: Vec<Value> = parts.iter().filter(|p| p["type"] != "patch").cloned().collect();
+    let stripped: Vec<Value> = parts
+        .iter()
+        .filter(|p| p["type"] != "patch")
+        .cloned()
+        .collect();
     let control = snapshot_violations(&stripped, &["made.txt".to_string()]);
-    assert!(!control.is_empty(), "checker is vacuous: it must flag a missing patch part");
+    assert!(
+        !control.is_empty(),
+        "checker is vacuous: it must flag a missing patch part"
+    );
 }

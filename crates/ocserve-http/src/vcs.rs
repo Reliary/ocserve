@@ -110,7 +110,6 @@ fn kind(code: &str) -> &'static str {
     }
 }
 
-
 /// Maximum patch size accepted by `apply` (SNAPSHOT §5). A larger patch is
 /// refused as `not-clean` (upstream `git.applyPatch` would also fail/misbehave
 /// on an absurd patch; this bounds the write).

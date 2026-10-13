@@ -94,7 +94,12 @@ impl Snapshots {
         }
         if !existed {
             let init = shadow_args(&gs, &worktree, &["init"]);
-            let _ = run_git(&init, None, None, &[("GIT_DIR", &gs), ("GIT_WORK_TREE", &worktree)]);
+            let _ = run_git(
+                &init,
+                None,
+                None,
+                &[("GIT_DIR", &gs), ("GIT_WORK_TREE", &worktree)],
+            );
             for (k, v) in TUNING {
                 let a = shadow_args(&gs, &worktree, &["config", k, v]);
                 let _ = run_git(&a, None, None, &[]);
@@ -136,7 +141,9 @@ impl Snapshots {
         let mut alternates: Vec<String> = Vec::new();
         if source_objects.exists() {
             alternates.push(source_objects.display().to_string());
-            if let Ok(text) = std::fs::read_to_string(source_objects.join("info").join("alternates")) {
+            if let Ok(text) =
+                std::fs::read_to_string(source_objects.join("info").join("alternates"))
+            {
                 for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
                     if Path::new(line).exists() {
                         alternates.push(line.to_string());
@@ -149,7 +156,10 @@ impl Snapshots {
         }
         let obj_info = gitdir.join("objects").join("info");
         let _ = std::fs::create_dir_all(&obj_info);
-        let _ = std::fs::write(obj_info.join("alternates"), format!("{}\n", alternates.join("\n")));
+        let _ = std::fs::write(
+            obj_info.join("alternates"),
+            format!("{}\n", alternates.join("\n")),
+        );
         let source_index = Path::new(&source).join("index");
         if source_index.exists() {
             let _ = std::fs::copy(&source_index, gitdir.join("index"));
@@ -160,7 +170,11 @@ impl Snapshots {
     /// minus source-repo gitignored files, minus >2 MiB untracked files.
     fn add(&self, worktree: &str, gs: &str) {
         let diff = run_git(
-            &quote(shadow_args(gs, worktree, &["diff-files", "--name-only", "-z", "--", "."])),
+            &quote(shadow_args(
+                gs,
+                worktree,
+                &["diff-files", "--name-only", "-z", "--", "."],
+            )),
             Some(&self.directory),
             None,
             &[],
@@ -169,14 +183,26 @@ impl Snapshots {
             &quote(shadow_args(
                 gs,
                 worktree,
-                &["ls-files", "--full-name", "--others", "--exclude-standard", "-z", "--", "."],
+                &[
+                    "ls-files",
+                    "--full-name",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                    "--",
+                    ".",
+                ],
             )),
             Some(&self.directory),
             None,
             &[],
         );
         if diff.code != 0 || other.code != 0 {
-            tracing::warn!(dc = diff.code, oc = other.code, "snapshot: list files failed");
+            tracing::warn!(
+                dc = diff.code,
+                oc = other.code,
+                "snapshot: list files failed"
+            );
             return;
         }
         let mut all: Vec<String> = Vec::new();
@@ -213,7 +239,13 @@ impl Snapshots {
         }
         let paths: Vec<String> = files
             .iter()
-            .map(|f| if f.starts_with(':') { format!("./{f}") } else { f.clone() })
+            .map(|f| {
+                if f.starts_with(':') {
+                    format!("./{f}")
+                } else {
+                    f.clone()
+                }
+            })
             .collect();
         let stdin = nul_terminated(&paths);
         let args = quote(vec![
@@ -233,7 +265,11 @@ impl Snapshots {
         r.text
             .split('\0')
             .filter(|s| !s.is_empty())
-            .map(|s| s.strip_prefix("./:").map(|x| format!(":{x}")).unwrap_or_else(|| s.to_string()))
+            .map(|s| {
+                s.strip_prefix("./:")
+                    .map(|x| format!(":{x}"))
+                    .unwrap_or_else(|| s.to_string())
+            })
             .collect()
     }
 
@@ -245,7 +281,14 @@ impl Snapshots {
         let args = shadow_args(
             gs,
             worktree,
-            &["rm", "--cached", "-f", "--ignore-unmatch", "--pathspec-from-file=-", "--pathspec-file-nul"],
+            &[
+                "rm",
+                "--cached",
+                "-f",
+                "--ignore-unmatch",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+            ],
         );
         let _ = run_git(&args, Some(worktree), Some(&stdin), &[]);
     }
@@ -258,7 +301,13 @@ impl Snapshots {
         let args = shadow_args(
             gs,
             worktree,
-            &["add", "--all", "--sparse", "--pathspec-from-file=-", "--pathspec-file-nul"],
+            &[
+                "add",
+                "--all",
+                "--sparse",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+            ],
         );
         let r = run_git(&args, Some(worktree), Some(&stdin), &[]);
         if r.code != 0 {
@@ -275,16 +324,36 @@ impl Snapshots {
         let (worktree, gs) = (c.worktree.clone(), c.gitdir.display().to_string());
         self.add(&worktree, &gs);
         let r = run_git(
-            &quote(shadow_args(gs.as_str(), &worktree, &["diff", "--cached", "--no-ext-diff", "--name-only", hash, "--", "."])),
+            &quote(shadow_args(
+                gs.as_str(),
+                &worktree,
+                &[
+                    "diff",
+                    "--cached",
+                    "--no-ext-diff",
+                    "--name-only",
+                    hash,
+                    "--",
+                    ".",
+                ],
+            )),
             Some(&self.directory),
             None,
             &[],
         );
         if r.code != 0 {
             tracing::warn!(code = r.code, "snapshot: patch diff failed");
-            return Patch { hash: hash.to_string(), files: Vec::new() };
+            return Patch {
+                hash: hash.to_string(),
+                files: Vec::new(),
+            };
         }
-        let rel: Vec<String> = r.text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+        let rel: Vec<String> = r
+            .text
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
         let ignored = self.ignore(&worktree, &rel);
         let wt = worktree.trim_end_matches('/');
         let files = rel
@@ -292,7 +361,10 @@ impl Snapshots {
             .filter(|f| !ignored.contains(f))
             .map(|f| format!("{wt}/{f}"))
             .collect();
-        Patch { hash: hash.to_string(), files }
+        Patch {
+            hash: hash.to_string(),
+            files,
+        }
     }
 
     /// `restore(snapshot)` — replace the index with the tree + checkout all
@@ -300,12 +372,22 @@ impl Snapshots {
     pub fn restore(&self, snapshot: &str) {
         let Some(c) = self.context() else { return };
         let (worktree, gs) = (c.worktree.clone(), c.gitdir.display().to_string());
-        let rt = run_git(&core_args(&gs, &worktree, &["read-tree", snapshot]), Some(&worktree), None, &[]);
+        let rt = run_git(
+            &core_args(&gs, &worktree, &["read-tree", snapshot]),
+            Some(&worktree),
+            None,
+            &[],
+        );
         if rt.code != 0 {
             tracing::error!(code = rt.code, stderr = %rt.stderr.trim(), "snapshot: read-tree failed");
             return;
         }
-        let co = run_git(&core_args(&gs, &worktree, &["checkout-index", "-a", "-f"]), Some(&worktree), None, &[]);
+        let co = run_git(
+            &core_args(&gs, &worktree, &["checkout-index", "-a", "-f"]),
+            Some(&worktree),
+            None,
+            &[],
+        );
         if co.code != 0 {
             tracing::error!(code = co.code, stderr = %co.stderr.trim(), "snapshot: checkout-index failed");
         }
@@ -326,11 +408,21 @@ impl Snapshots {
                     .strip_prefix(&worktree)
                     .map(|r| r.display().to_string().replace('\\', "/"))
                     .unwrap_or_else(|_| abs.clone());
-                let co = run_git(&core_args(&gs, &worktree, &["checkout", &p.hash, "--", abs]), Some(&worktree), None, &[]);
+                let co = run_git(
+                    &core_args(&gs, &worktree, &["checkout", &p.hash, "--", abs]),
+                    Some(&worktree),
+                    None,
+                    &[],
+                );
                 if co.code == 0 {
                     continue;
                 }
-                let tree = run_git(&core_args(&gs, &worktree, &["ls-tree", &p.hash, "--", &rel]), Some(&worktree), None, &[]);
+                let tree = run_git(
+                    &core_args(&gs, &worktree, &["ls-tree", &p.hash, "--", &rel]),
+                    Some(&worktree),
+                    None,
+                    &[],
+                );
                 if tree.code == 0 && !tree.text.trim().is_empty() {
                     continue; // existed in the snapshot but checkout failed — keep
                 }
@@ -348,7 +440,11 @@ impl Snapshots {
         let add = shadow_args(&gs, &worktree, &["add", "--all"]);
         let _ = run_git(&add, Some(&self.directory), None, &[]);
         let r = run_git(
-            &quote(shadow_args(gs.as_str(), &worktree, &["diff", "--cached", "--no-ext-diff", hash, "--", "."])),
+            &quote(shadow_args(
+                gs.as_str(),
+                &worktree,
+                &["diff", "--cached", "--no-ext-diff", hash, "--", "."],
+            )),
             Some(&self.directory),
             None,
             &[],
@@ -369,22 +465,49 @@ impl Snapshots {
         let q = |cmd: &[&str]| quote(shadow_args(&gs, &worktree, cmd));
 
         let statuses = run_git(
-            &q(&["diff", "--no-ext-diff", "--name-status", "--no-renames", from, to, "--", "."]),
+            &q(&[
+                "diff",
+                "--no-ext-diff",
+                "--name-status",
+                "--no-renames",
+                from,
+                to,
+                "--",
+                ".",
+            ]),
             Some(&self.directory),
             None,
             &[],
         );
-        let mut status_map: std::collections::HashMap<String, &'static str> = std::collections::HashMap::new();
+        let mut status_map: std::collections::HashMap<String, &'static str> =
+            std::collections::HashMap::new();
         for line in statuses.text.lines() {
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             let mut it = line.splitn(2, '\t');
             if let (Some(code), Some(file)) = (it.next(), it.next()) {
-                let st = if code.starts_with('A') { "added" } else if code.starts_with('D') { "deleted" } else { "modified" };
+                let st = if code.starts_with('A') {
+                    "added"
+                } else if code.starts_with('D') {
+                    "deleted"
+                } else {
+                    "modified"
+                };
                 status_map.insert(file.to_string(), st);
             }
         }
         let numstat = run_git(
-            &q(&["diff", "--no-ext-diff", "--no-renames", "--numstat", from, to, "--", "."]),
+            &q(&[
+                "diff",
+                "--no-ext-diff",
+                "--no-renames",
+                "--numstat",
+                from,
+                to,
+                "--",
+                ".",
+            ]),
             Some(&self.directory),
             None,
             &[],
@@ -404,7 +527,13 @@ impl Snapshots {
                 Some((file, binary, a, d))
             })
             .collect();
-        let ignored = self.ignore(&worktree, &rows.iter().map(|(f, _, _, _)| f.clone()).collect::<Vec<_>>());
+        let ignored = self.ignore(
+            &worktree,
+            &rows
+                .iter()
+                .map(|(f, _, _, _)| f.clone())
+                .collect::<Vec<_>>(),
+        );
         let mut out = Vec::new();
         for (file, binary, additions, deletions) in rows {
             if ignored.contains(&file) {
@@ -414,7 +543,15 @@ impl Snapshots {
                 String::new()
             } else {
                 run_git(
-                    &q(&["diff", "--no-ext-diff", "-U2147483647", from, to, "--", &file]),
+                    &q(&[
+                        "diff",
+                        "--no-ext-diff",
+                        "-U2147483647",
+                        from,
+                        to,
+                        "--",
+                        &file,
+                    ]),
                     Some(&self.directory),
                     None,
                     &[],
@@ -477,8 +614,10 @@ fn shadow_args(gitdir: &str, worktree: &str, cmd: &[&str]) -> Vec<String> {
 
 fn core_args(gitdir: &str, worktree: &str, cmd: &[&str]) -> Vec<String> {
     let mut v = vec![
-        "-c".to_string(), "core.longpaths=true".to_string(),
-        "-c".to_string(), "core.symlinks=true".to_string(),
+        "-c".to_string(),
+        "core.longpaths=true".to_string(),
+        "-c".to_string(),
+        "core.symlinks=true".to_string(),
     ];
     v.extend(shadow_args(gitdir, worktree, cmd));
     v
@@ -486,10 +625,14 @@ fn core_args(gitdir: &str, worktree: &str, cmd: &[&str]) -> Vec<String> {
 
 fn quote(mut args: Vec<String>) -> Vec<String> {
     let mut v: Vec<String> = [
-        "-c", "core.autocrlf=false",
-        "-c", "core.longpaths=true",
-        "-c", "core.symlinks=true",
-        "-c", "core.quotepath=false",
+        "-c",
+        "core.autocrlf=false",
+        "-c",
+        "core.longpaths=true",
+        "-c",
+        "core.symlinks=true",
+        "-c",
+        "core.quotepath=false",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -507,10 +650,20 @@ fn nul_terminated(items: &[String]) -> String {
 }
 
 fn top_literal_nul(files: &[String]) -> String {
-    nul_terminated(&files.iter().map(|f| format!(":(top,literal){f}")).collect::<Vec<_>>())
+    nul_terminated(
+        &files
+            .iter()
+            .map(|f| format!(":(top,literal){f}"))
+            .collect::<Vec<_>>(),
+    )
 }
 
-fn run_git(args: &[String], cwd: Option<&str>, stdin: Option<&str>, env: &[(&str, &str)]) -> GitResult {
+fn run_git(
+    args: &[String],
+    cwd: Option<&str>,
+    stdin: Option<&str>,
+    env: &[(&str, &str)],
+) -> GitResult {
     let mut cmd = Command::new("git");
     cmd.args(args);
     if let Some(d) = cwd {
@@ -526,7 +679,11 @@ fn run_git(args: &[String], cwd: Option<&str>, stdin: Option<&str>, env: &[(&str
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let Ok(mut child) = cmd.spawn() else {
-        return GitResult { text: String::new(), code: -1, stderr: "spawn failed".into() };
+        return GitResult {
+            text: String::new(),
+            code: -1,
+            stderr: "spawn failed".into(),
+        };
     };
     if let Some(s) = stdin
         && let Some(mut si) = child.stdin.take()
@@ -535,7 +692,11 @@ fn run_git(args: &[String], cwd: Option<&str>, stdin: Option<&str>, env: &[(&str
         let _ = si.write_all(s.as_bytes());
     }
     let Ok(out) = child.wait_with_output() else {
-        return GitResult { text: String::new(), code: -1, stderr: "wait failed".into() };
+        return GitResult {
+            text: String::new(),
+            code: -1,
+            stderr: "wait failed".into(),
+        };
     };
     GitResult {
         text: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -582,8 +743,17 @@ mod tests {
             let dir = tmp.path().to_path_buf();
             let data = tempfile::tempdir().unwrap();
             let run = |args: &[&str]| {
-                let out = Command::new("git").current_dir(&dir).args(args).output().unwrap();
-                assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+                let out = Command::new("git")
+                    .current_dir(&dir)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "git {:?}: {}",
+                    args,
+                    String::from_utf8_lossy(&out.stderr)
+                );
             };
             run(&["init", "-q"]);
             run(&["config", "user.email", "t@t"]);
@@ -592,7 +762,11 @@ mod tests {
             std::fs::write(dir.join(".gitignore"), "ignored.txt\n").unwrap();
             run(&["add", "."]);
             run(&["commit", "-qm", "init"]);
-            Self { dir, _tmp: tmp, data }
+            Self {
+                dir,
+                _tmp: tmp,
+                data,
+            }
         }
         fn snap(&self) -> Snapshots {
             Snapshots::new(self.data.path(), self.dir.display().to_string(), true)
@@ -616,7 +790,11 @@ mod tests {
         assert!(p.files[0].ends_with("/a.txt"), "{:?}", p.files);
         // restore returns the file to the captured tree
         s.restore(&base);
-        assert_eq!(r.read("a.txt"), "one\n", "restore must reset tracked content");
+        assert_eq!(
+            r.read("a.txt"),
+            "one\n",
+            "restore must reset tracked content"
+        );
     }
 
     #[test]
@@ -626,10 +804,17 @@ mod tests {
         let base = s.track().unwrap();
         r.write("new.txt", "fresh\n");
         let p = s.patch(&base);
-        assert!(p.files.iter().any(|f| f.ends_with("/new.txt")), "{:?}", p.files);
+        assert!(
+            p.files.iter().any(|f| f.ends_with("/new.txt")),
+            "{:?}",
+            p.files
+        );
         // revert deletes a file that did not exist in the snapshot
         s.revert(&[p]);
-        assert!(!r.dir.join("new.txt").exists(), "revert must delete an added file");
+        assert!(
+            !r.dir.join("new.txt").exists(),
+            "revert must delete an added file"
+        );
     }
 
     #[test]
@@ -650,7 +835,11 @@ mod tests {
         let base = s.track().unwrap();
         r.write("ignored.txt", "secret\n");
         let p = s.patch(&base);
-        assert!(p.files.iter().all(|f| !f.ends_with("ignored.txt")), "ignored must be filtered: {:?}", p.files);
+        assert!(
+            p.files.iter().all(|f| !f.ends_with("ignored.txt")),
+            "ignored must be filtered: {:?}",
+            p.files
+        );
     }
 
     #[test]
@@ -661,7 +850,11 @@ mod tests {
         let big = "x".repeat((LIMIT as usize) + 10);
         r.write("big.bin", &big);
         let p = s.patch(&base);
-        assert!(p.files.iter().all(|f| !f.ends_with("big.bin")), ">2MiB untracked must be excluded: {:?}", p.files);
+        assert!(
+            p.files.iter().all(|f| !f.ends_with("big.bin")),
+            ">2MiB untracked must be excluded: {:?}",
+            p.files
+        );
     }
 
     #[test]
@@ -714,6 +907,10 @@ mod tests {
         std::fs::create_dir_all(r.dir.join("sub")).unwrap();
         r.write("sub/deep.txt", "d\n");
         let p = s.patch(&base);
-        assert!(p.files.iter().any(|f| f.ends_with("/sub/deep.txt")), "{:?}", p.files);
+        assert!(
+            p.files.iter().any(|f| f.ends_with("/sub/deep.txt")),
+            "{:?}",
+            p.files
+        );
     }
 }

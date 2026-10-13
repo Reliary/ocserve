@@ -1263,7 +1263,9 @@ pub async fn wait(State(_): State<Arc<AppState>>, Path(_id): Path<String>) -> im
     )
 }
 
-/// POST /api/session/{sessionID}/revert/stage — `{data:RevertState}`.
+/// POST /api/session/{sessionID}/revert/stage — `{data:RevertState}`. Runs the
+/// real revert engine (restore files, compute the range diff, set the marker)
+/// and emits `session.next.revert.staged` so the web UI resyncs.
 pub async fn revert_stage(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1273,30 +1275,101 @@ pub async fn revert_stage(
     if mid.is_empty() {
         return Err(payload_err("messageID"));
     }
-    let mut marker = json!({"messageID": mid, "diff": "", "files": []});
-    if let Some(p) = body.get("partID")
-        && !p.is_null()
-    {
-        marker["partID"] = p.clone();
-    }
-    ocserve_store::set_session_revert(&st.writer, &id, Some(&marker)).map_err(internal)?;
-    Ok(Json(json!({"data": marker})))
+    let part_id = body
+        .get("partID")
+        .and_then(|v| v.as_str())
+        .filter(|p| !p.is_empty())
+        .map(String::from);
+    let marker = crate::revert_apply(&st, &id, mid, part_id.as_deref())
+        .await
+        .map_err(HttpError::Api)?;
+    crate::emit_durable_http(
+        &st,
+        &id,
+        "session.next.revert.staged",
+        json!({"sessionID": id, "revert": marker.to_value()}),
+    )
+    .map_err(HttpError::Api)?;
+    Ok(Json(json!({"data": marker.to_value()})))
 }
 
-/// POST /api/session/{sessionID}/revert/clear — NoContent (clear marker).
+/// POST /api/session/{sessionID}/revert/clear — restore the snapshot, clear the
+/// marker, emit `session.next.revert.cleared`; NoContent.
 pub async fn revert_clear(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    // restore the marker's snapshot (upstream unrevert)
+    let existing = run_blocking(&st.db, {
+        let sid = id.to_string();
+        move |db| ocserve_store::load_session_wire(db, &sid)
+    })
+    .await
+    .map_err(internal)?
+    .and_then(|s| {
+        s.get("revert")
+            .and_then(|r| r.get("snapshot"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    });
+    let dir = crate::session_directory_http(&st, &id).await;
+    if let Some(snap) = crate::snapshots_for(&st, &dir)
+        && let Some(s) = existing
+    {
+        let _ = run_blocking(&st.db, move |_db| {
+            snap.restore(&s);
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+    }
     ocserve_store::set_session_revert(&st.writer, &id, None).map_err(internal)?;
+    crate::emit_durable_http(
+        &st,
+        &id,
+        "session.next.revert.cleared",
+        json!({"sessionID": id}),
+    )?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /api/session/{sessionID}/revert/commit — NoContent (marker stays).
+/// POST /api/session/{sessionID}/revert/commit — finalize the revert: delete
+/// the reverted range and clear the marker; emit `session.next.revert.committed`.
 pub async fn revert_commit(
-    State(_): State<Arc<AppState>>,
-    Path(_id): Path<String>,
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    let mid = run_blocking(&st.db, {
+        let sid = id.to_string();
+        move |db| ocserve_store::load_session_wire(db, &sid)
+    })
+    .await
+    .map_err(internal)?
+    .and_then(|s| {
+        s.get("revert")
+            .and_then(|r| r.get("messageID"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    });
+    if let Some(mid) = mid {
+        // delete messages from the revert target onward (upstream revert.cleanup)
+        let rows = run_blocking(&st.db, {
+            let sid = id.to_string();
+            let mid = mid.clone();
+            move |db| ocserve_store::messages_from(db, &sid, &mid)
+        })
+        .await
+        .map_err(internal)?;
+        for m in rows {
+            let _ = ocserve_store::delete_message(&st.writer, &st.db, &id, &m);
+        }
+        ocserve_store::set_session_revert(&st.writer, &id, None).map_err(internal)?;
+        crate::emit_durable_http(
+            &st,
+            &id,
+            "session.next.revert.committed",
+            json!({"sessionID": id, "messageID": mid}),
+        )?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

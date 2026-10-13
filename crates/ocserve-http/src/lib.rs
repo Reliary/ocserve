@@ -2654,12 +2654,11 @@ async fn global_dispose(State(st): State<Arc<AppState>>) -> Result<Json<Value>, 
     Ok(Json(json!(true)))
 }
 
-/// POST /session/{id}/revert — v1 reverts to {messageID, partID?}: the
-/// session info carries a `revert` marker; the message list is sliced from
-/// the target (synchronous slice — v1 removes rows lazily via `cleanup`
-/// before the next prompt; ocserve marks only, so history survives until
-/// the next prompt's filter step). Snapshot restore is engine-out
-/// (D-REVERT-NOSNAP): `snapshot`/`diff` fields are not populated.
+/// POST /session/{id}/revert — real file-restoring revert (SNAPSHOT.md §2,
+/// upstream session/revert.ts): snapshot the worktree if needed, restore the
+/// pre-turn files, revert the tool `patch` parts, compute the revert-range
+/// diff, persist per-message `summary.diffs` + session `summary`, emit
+/// `session.diff`, set the marker. Busy → 409 (mapBusy parity).
 async fn post_revert(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -2670,11 +2669,8 @@ async fn post_revert(
         ocserve_store::session_exists(db, &exists_id)
     })
     .await
-    .map_err(|e| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        name: "InternalError",
-        message: format!("{e:#}"),
-    })? {
+    .map_err(internal_err)?
+    {
         return Err(ApiError::not_found(format!("Session not found: {id}")));
     }
     let message_id = payload
@@ -2689,48 +2685,179 @@ async fn post_revert(
             StatusCode::BAD_REQUEST,
             axum::Json(json!({
                 "name": "BadRequest",
-                "data": {
-                    "message": "Missing key\n  at [\"messageID\"]",
-                    "kind": "Payload"
-                }
+                "data": {"message": "Missing key\n  at [\"messageID\"]", "kind": "Payload"}
             })),
         )
             .into_response());
     }
-    let part_id = payload.get("partID").cloned();
-    let mut marker = json!({"messageID": message_id});
-    if let Some(p) = part_id
-        && !p.is_null()
-    {
-        marker["partID"] = p;
-    }
-    ocserve_store::set_session_revert(&st.writer, &id, Some(&marker)).map_err(|e| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        name: "InternalError",
-        message: format!("{e:#}"),
-    })?;
+    let part_id = payload
+        .get("partID")
+        .and_then(|v| v.as_str())
+        .filter(|p| !p.is_empty())
+        .map(String::from);
+
+    // busy → 409 (upstream mapBusy)
+    let release = lock_session(&st, &id).await?;
+    let Ok(_guard) = release.arc().try_lock() else {
+        return Err(session_busy(&id));
+    };
+
+    let marker = revert_apply(&st, &id, &message_id, part_id.as_deref()).await?;
+    let _ = marker;
     let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
-    // full session merged with the revert marker (upstream patch semantics) —
-    // a partial {id,revert} merges into client stores and drops title.
-    let info = session_wire_or_partial_http(&st, &id, json!({"revert": marker})).await;
-    st.bus.publish(ocserve_core::event::frame(
-        &dir,
-        "session.updated",
-        json!({"sessionID": id, "info": info}),
-    ));
+    let _ = dir;
     let sid = id.clone();
     run_blocking(&st.db, move |db| ocserve_store::load_session_wire(db, &sid))
         .await
-        .map_err(|e| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            name: "InternalError",
-            message: format!("{e:#}"),
-        })?
+        .map_err(internal_err)?
         .map(|j| axum::Json(j).into_response())
         .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))
 }
 
-/// POST /session/{id}/unrevert — clears the marker (v1 clearRevert).
+pub(crate) fn internal_err(e: anyhow::Error) -> ApiError {
+    ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    }
+}
+
+/// Shared revert engine (v1 + v2 stage): resolve target, restore/记录 files,
+/// compute + persist the range summary, emit `session.diff`, set the marker.
+pub(crate) async fn revert_apply(
+    st: &Arc<AppState>,
+    id: &str,
+    message_id: &str,
+    part_id: Option<&str>,
+) -> Result<ocserve_core::revert::Marker, ApiError> {
+    let db = st.db.clone();
+    let sid = id.to_string();
+    let mid = message_id.to_string();
+    let pid = part_id.map(String::from);
+    // Load the full message graph once, off the workers.
+    let messages = run_blocking(&db, move |db| ocserve_store::load_messages(db, &sid, None))
+        .await
+        .map_err(internal_err)?;
+    let target = ocserve_core::revert::resolve_target(&messages, &mid, pid.as_deref());
+    let dir = session_directory_http(st, id).await;
+    let snapshots = snapshots_for(st, &dir);
+
+    // marker.snapshot = existing snapshot else capture now (upstream `?? track()`)
+    let existing = run_blocking(&st.db, {
+        let sid = id.to_string();
+        move |db| ocserve_store::load_session_wire(db, &sid)
+    })
+    .await
+    .map_err(internal_err)?
+    .and_then(|s| {
+        s.get("revert")
+            .and_then(|r| r.get("snapshot"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    });
+
+    let mut marker = ocserve_core::revert::Marker {
+        message_id: target
+            .as_ref()
+            .map(|t| t.0.clone())
+            .unwrap_or_else(|| mid.clone()),
+        part_id: target.as_ref().and_then(|t| t.1.clone()),
+        snapshot: existing.clone(),
+        diff: None,
+    };
+    if let Some(snap) = snapshots.clone() {
+        let prev = marker.snapshot.clone();
+        let (snapshot, _patches) = run_blocking(&st.db, {
+            let msgs = messages.clone();
+            let snap = snap.clone();
+            let prev = prev.clone();
+            move |_db| {
+                let snapshot = match &prev {
+                    Some(s) => s.clone(),
+                    None => snap.track().unwrap_or_default(),
+                };
+                if let Some(p) = &prev {
+                    snap.restore(p);
+                }
+                let patches = ocserve_core::revert::collect_patches(&msgs);
+                snap.revert(&patches);
+                Ok::<_, anyhow::Error>((snapshot, patches))
+            }
+        })
+        .await
+        .map_err(internal_err)?;
+        if !snapshot.is_empty() {
+            marker.snapshot = Some(snapshot.clone());
+            let diff = run_blocking(&st.db, {
+                let snap = snap.clone();
+                let s = snapshot.clone();
+                move |_db| Ok::<_, anyhow::Error>(snap.diff(&s))
+            })
+            .await
+            .map_err(internal_err)?;
+            if !diff.is_empty() {
+                marker.diff = Some(diff);
+            }
+        }
+    }
+
+    // revert-range diffs (summary.computeDiff over messages from the target)
+    let range: Vec<(Value, Vec<Value>)> = match &target {
+        Some((tmid, _)) => messages
+            .iter()
+            .skip_while(|(info, _)| info["id"].as_str() != Some(tmid.as_str()))
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    };
+    let (diffs, summary) = match snapshots.clone() {
+        Some(snap) => run_blocking(&st.db, move |_db| {
+            Ok::<_, anyhow::Error>(ocserve_core::revert::compute_range(&snap, &range))
+        })
+        .await
+        .map_err(internal_err)?,
+        None => (
+            Vec::new(),
+            json!({"additions": 0, "deletions": 0, "files": 0}),
+        ),
+    };
+
+    // persist: session summary + per-user-message summary.diffs
+    let adds = summary["additions"].as_i64().unwrap_or(0);
+    let dels = summary["deletions"].as_i64().unwrap_or(0);
+    let files = summary["files"].as_i64().unwrap_or(0);
+    ocserve_store::set_session_summary(&st.writer, id, adds, dels, files).map_err(internal_err)?;
+    if let Some((tmid, _)) = &target
+        && let Some((info, _)) = messages
+            .iter()
+            .find(|(i, _)| i["id"].as_str() == Some(tmid.as_str()))
+    {
+        let mut info = info.clone();
+        info["summary"] = json!({"diffs": diffs});
+        ocserve_store::update_message_info(&st.writer, id, tmid, &info).map_err(internal_err)?;
+    }
+    ocserve_store::set_session_revert(&st.writer, id, Some(&marker.to_value()))
+        .map_err(internal_err)?;
+
+    // events: session.diff (upstream Session.Event.Diff), then session.updated
+    let diff_val = Value::Array(diffs.clone());
+    emit_durable_http(
+        st,
+        id,
+        "session.diff",
+        json!({"sessionID": id, "diff": diff_val}),
+    )?;
+    let info = session_wire_or_partial_http(st, id, json!({"revert": marker.to_value()})).await;
+    emit_durable_http(
+        st,
+        id,
+        "session.updated",
+        json!({"sessionID": id, "info": info}),
+    )?;
+    Ok(marker)
+}
+
+/// POST /session/{id}/unrevert — restore the snapshot + clear the marker.
 async fn post_unrevert(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -2740,35 +2867,63 @@ async fn post_unrevert(
         ocserve_store::session_exists(db, &exists_id)
     })
     .await
-    .map_err(|e| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        name: "InternalError",
-        message: format!("{e:#}"),
-    })? {
+    .map_err(internal_err)?
+    {
         return Err(ApiError::not_found(format!("Session not found: {id}")));
     }
-    ocserve_store::set_session_revert(&st.writer, &id, None).map_err(|e| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        name: "InternalError",
-        message: format!("{e:#}"),
-    })?;
-    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let release = lock_session(&st, &id).await?;
+    let Ok(_guard) = release.arc().try_lock() else {
+        return Err(session_busy(&id));
+    };
+    // restore the marker's snapshot (upstream unrevert)
+    let existing = run_blocking(&st.db, {
+        let sid = id.to_string();
+        move |db| ocserve_store::load_session_wire(db, &sid)
+    })
+    .await
+    .map_err(internal_err)?
+    .and_then(|s| {
+        s.get("revert")
+            .and_then(|r| r.get("snapshot"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    });
+    let dir = session_directory_http(&st, &id).await;
+    if let Some(snap) = snapshots_for(&st, &dir)
+        && let Some(s) = existing
+    {
+        let _ = run_blocking(&st.db, move |_db| {
+            snap.restore(&s);
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+    }
+    ocserve_store::set_session_revert(&st.writer, &id, None).map_err(internal_err)?;
     let info = session_wire_or_partial_http(&st, &id, json!({"revert": Value::Null})).await;
-    st.bus.publish(ocserve_core::event::frame(
-        &dir,
+    emit_durable_http(
+        &st,
+        &id,
         "session.updated",
         json!({"sessionID": id, "info": info}),
-    ));
+    )?;
     let sid = id.clone();
     run_blocking(&st.db, move |db| ocserve_store::load_session_wire(db, &sid))
         .await
-        .map_err(|e| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            name: "InternalError",
-            message: format!("{e:#}"),
-        })?
+        .map_err(internal_err)?
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("Session not found: {id}")))
+}
+
+/// The session's stored working directory (or the server worktree fallback).
+pub(crate) async fn session_directory_http(st: &Arc<AppState>, id: &str) -> String {
+    let sid = id.to_string();
+    run_blocking(&st.db, move |db| {
+        Ok::<_, anyhow::Error>(ocserve_store::session_directory(db, &sid).ok().flatten())
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| st.paths["directory"].as_str().unwrap_or("/").to_string())
 }
 
 /// POST /instance/dispose — freeze returns `true` (marks the instance for
@@ -3215,7 +3370,7 @@ pub(crate) fn build_prompt_context(
         .collect();
     let skills_blk = ocserve_core::system_prompt::skills_block(&skill_rows);
     let system = ocserve_core::system_prompt::compose(&base, &[Some(env_block), skills_blk], None);
-    let snapshots = snapshots_for(&st, &session_directory);
+    let snapshots = snapshots_for(st, &session_directory);
     let ctx = ocserve_core::prompt::PromptContext {
         db: st.db.clone(),
         blobs: st.blobs.clone(),
@@ -3255,10 +3410,7 @@ pub(crate) fn build_prompt_context(
 /// Build the snapshot handle for a session directory. Enabled unless
 /// `snapshot:false` in config (upstream key) or `OCSERVE_SNAPSHOT=0`. `None`
 /// when disabled — the prompt then records no snapshots (upstream no-op parity).
-fn snapshots_for(
-    st: &AppState,
-    directory: &str,
-) -> Option<ocserve_core::snapshot::Snapshots> {
+fn snapshots_for(st: &AppState, directory: &str) -> Option<ocserve_core::snapshot::Snapshots> {
     let cfg_off = st
         .payloads
         .read()
@@ -4810,7 +4962,7 @@ async fn session_wire_or_partial_http(st: &Arc<AppState>, sid: &str, overrides: 
     .flatten()
     .unwrap_or_else(|| json!({"id": sid}))
 }
-fn emit_durable_http(
+pub(crate) fn emit_durable_http(
     st: &Arc<AppState>,
     sid: &str,
     event_type: &str,

@@ -706,6 +706,13 @@ pub async fn run_prompt_with(
     // K-ALWAYS: one DB read pulls this session's persisted always-grants
     // into the gate (memory-first consult afterwards).
     ctx.gate.hydrate(&ctx.db, session_id)?;
+    // SNAPSHOT P5 (upstream prompt.ts:459/1056 `revert.cleanup`): a session
+    // carrying a revert marker drops the reverted range + clears the marker
+    // before this prompt builds its history — so a revert takes effect on the
+    // next turn even though the rows were kept until now.
+    if opts.persist_user {
+        ocserve_store::revert_cleanup(writer, &ctx.db, session_id)?;
+    }
     // K-MODEL-STATE: resolved model+agent land at START (not finalize) —
     // cap/OOM/abort deaths keep the selection sticky for the next
     // payload-less send. Churn-free UPDATE (0 rows when unchanged).
@@ -964,7 +971,11 @@ pub async fn run_prompt_with(
         // SNAPSHOT (upstream processor.ts step-start): capture the worktree
         // before this round's model stream so a `patch` part can record what
         // its tool calls changed. Not captured for transient summarize rounds.
-        let round_base = if opts.skip_history { None } else { snap_track(ctx).await };
+        let round_base = if opts.skip_history {
+            None
+        } else {
+            snap_track(ctx).await
+        };
         let mut messages = vec![ChatMessage::text("system", ctx.system.clone())];
         if opts.skip_history {
             // transient instruction carries the serialized history (summarize)
@@ -1431,7 +1442,11 @@ pub async fn run_prompt_with(
 
             // ---- tool-call turn ----
             if finish_reason == "tool_calls" && !tool_calls.is_empty() {
-                let mut parts = vec![step_start_part(round_base.as_deref(), session_id, &assistant_id)];
+                let mut parts = vec![step_start_part(
+                    round_base.as_deref(),
+                    session_id,
+                    &assistant_id,
+                )];
                 if !reasoning.is_empty() {
                     parts.push(json!({
                         "type": "reasoning", "text": reasoning,
@@ -2085,7 +2100,11 @@ pub async fn run_prompt_with(
             }
 
             // ---- final turn ----
-            let mut parts = vec![step_start_part(round_base.as_deref(), session_id, &assistant_id)];
+            let mut parts = vec![step_start_part(
+                round_base.as_deref(),
+                session_id,
+                &assistant_id,
+            )];
             if !reasoning.is_empty() {
                 parts.push(json!({
                     "type": "reasoning", "text": reasoning,

@@ -14,8 +14,17 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 fn git(dir: &std::path::Path, args: &[&str]) {
-    let o = std::process::Command::new("git").current_dir(dir).args(args).output().unwrap();
-    assert!(o.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&o.stderr));
+    let o = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "git {:?}: {}",
+        args,
+        String::from_utf8_lossy(&o.stderr)
+    );
 }
 
 /// A repo with `a.txt` = "one\n" committed.
@@ -43,7 +52,12 @@ fn app_for(wt: &std::path::Path, tag: &str) -> Arc<AppState> {
     let st = AppState::with_wiring(
         None,
         Payloads::default(),
-        Wires { db, blobs, writer, llm: LlmRegistry::default() },
+        Wires {
+            db,
+            blobs,
+            writer,
+            llm: LlmRegistry::default(),
+        },
     );
     let _ = wt;
     st
@@ -155,6 +169,13 @@ fn pre_fix_shape_cannot_satisfy_the_side_effect_assertion() {
     // assert it does NOT look like success and does NOT imply a mutation.
     let pre_fix_status = StatusCode::BAD_REQUEST;
     let pre_fix_body = json!({"name": "VcsApplyError", "data": {"message": "Patch can't be applied", "reason": "not-clean"}});
-    assert_ne!(pre_fix_status, StatusCode::OK, "pre-fix never returned 200 for a valid patch");
-    assert_ne!(pre_fix_body["applied"], true, "pre-fix body cannot carry applied:true");
+    assert_ne!(
+        pre_fix_status,
+        StatusCode::OK,
+        "pre-fix never returned 200 for a valid patch"
+    );
+    assert_ne!(
+        pre_fix_body["applied"], true,
+        "pre-fix body cannot carry applied:true"
+    );
 }
