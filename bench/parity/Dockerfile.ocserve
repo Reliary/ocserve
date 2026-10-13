@@ -19,8 +19,11 @@ RUN --mount=type=cache,target=/src/target \
     && cp /src/target/release/ocserve /out/ocserve
 
 FROM debian:bookworm-slim
+# git is a RUNTIME dependency (SNAPSHOT.md): the snapshot engine shells to git
+# for track/restore/revert and /vcs/*, and /vcs/apply runs `git apply`. The
+# host deployment relies on the system git; the container needs it installed.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/ocserve /usr/local/bin/ocserve
 RUN ocserve --version || true

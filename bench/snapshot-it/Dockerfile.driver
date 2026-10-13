@@ -1,0 +1,8 @@
+# syntax=docker/dockerfile:1.7
+# Snapshot integration driver: curl + python (no build toolchain needed).
+FROM python:3.12-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY driver.py /driver.py
+ENTRYPOINT ["python", "-u", "/driver.py"]

@@ -1,0 +1,95 @@
+# Snapshot integration harness (SNAPSHOT.md §7.5).
+#
+# `server`  — ocserve built in-container (bookworm glibc), serving the
+#             bind-mounted shared worktree at /work.
+# `driver`  — a curl/python driver that mutates + reverts through the server
+#             and asserts the observable effects on the shared worktree.
+name: snapshot-it
+
+services:
+  stub:
+    build:
+      context: .
+      dockerfile: Dockerfile.stub
+    environment:
+      STUB_PORT: "8080"
+    networks: [snap]
+
+  server:
+    build:
+      context: ../..
+      dockerfile: bench/parity/Dockerfile.ocserve
+      args: {}
+    environment:
+      OCSERVE_LEGACY_SYNC: "0"
+      HOME: /root
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: "*"
+    volumes:
+      - ./config/opencode.json:/root/.config/opencode/opencode.json:ro
+      - ./config/auth.json:/root/.local/share/opencode/auth.json:ro
+      - ./config/model.json:/root/.local/state/opencode/model.json:ro
+      - ./work:/work
+      - ./data:/data
+    working_dir: /work
+    # override the parity entrypoint: serve /work on 4925, data under /data
+    entrypoint: ["ocserve", "serve", "--port", "4925", "--hostname", "0.0.0.0", "--data-dir", "/data"]
+    networks: [snap]
+
+  freeze:
+    build:
+      context: ../parity
+      dockerfile: Dockerfile.upstream
+    environment:
+      HOME: /root
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: "*"
+    volumes:
+      - ./config/opencode.json:/root/.config/opencode/opencode.json:ro
+      - ./config/auth.json:/root/.local/share/opencode/auth.json:ro
+      - ./config/model.json:/root/.local/state/opencode/model.json:ro
+      - ./freeze-work:/freeze
+    # upstream entrypoint serves on 4921; override to bind the shared worktree
+    entrypoint: ["opencode", "serve", "--port", "4926", "--hostname", "0.0.0.0"]
+    working_dir: /freeze
+    networks: [snap]
+
+  driver:
+    build:
+      context: .
+      dockerfile: Dockerfile.driver
+    environment:
+      SERVER: "http://server:4925"
+      WORK: /work
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: "*"
+    volumes:
+      - ./work:/work
+    depends_on:
+      - server
+      - stub
+    networks: [snap]
+
+  differential:
+    build:
+      context: .
+      dockerfile: Dockerfile.differential
+    environment:
+      FREEZE: "http://freeze:4926"
+      OCSERVE: "http://server:4925"
+      WF: /freeze
+      WO: /work
+    volumes:
+      - ./freeze-work:/freeze
+      - ./work:/work
+    depends_on:
+      - freeze
+      - server
+    networks: [snap]
+
+networks:
+  snap:
+    driver: bridge
