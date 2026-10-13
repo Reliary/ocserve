@@ -304,6 +304,7 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     );
     let writer_for_sampler = writer.clone();
     let wal_path_sampler = db_path.with_extension("db-wal");
+    let data_dir_sampler = data_dir.clone();
     // W1 one-time search backfill (idempotent/resumable; ~7.5s measured
     // scale for126k parts; later boots no-op via the parity check)
     match ocserve_store::backfill_part_search(&writer, &db_path) {
@@ -625,6 +626,19 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
                     Err(e) => tracing::error!("maintenance task join: {e}"),
                     Ok(Err(e)) => tracing::error!("storage maintenance: {e:#}"),
                     Ok(Ok(_)) => {}
+                }
+                // SNAPSHOT.md §4: prune shadow-git repos hourly
+                // (`git gc --prune=7.days`), mirroring upstream's interval.
+                if optimize {
+                    let dd = data_dir_sampler.clone();
+                    let pruned = tokio::task::spawn_blocking(move || {
+                        ocserve_core::snapshot::Snapshots::gc_prune_all(&dd)
+                    })
+                    .await
+                    .unwrap_or(0);
+                    if pruned > 0 {
+                        tracing::info!("snapshot: pruned {pruned} shadow repo(s)");
+                    }
                 }
             }
         });

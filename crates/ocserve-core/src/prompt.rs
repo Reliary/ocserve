@@ -70,19 +70,41 @@ pub struct PromptContext {
 }
 
 /// `track()` off the tokio workers (git shells out — the F1 convoy rule).
+/// Times the operation and records `ocserve_snapshot_ops_seconds{op=track}` +
+/// `ocserve_snapshot_capture_total{result}` (SNAPSHOT.md §4; A1 evidence).
 async fn snap_track(ctx: &PromptContext) -> Option<String> {
     let s = ctx.snapshots.clone()?;
-    tokio::task::spawn_blocking(move || s.track())
+    let start = std::time::Instant::now();
+    let out = tokio::task::spawn_blocking(move || s.track())
         .await
         .ok()
-        .flatten()
+        .flatten();
+    ocserve_metrics::observe(
+        "ocserve_snapshot_ops_seconds",
+        "op=\"track\"",
+        start.elapsed().as_micros() as u64,
+    );
+    let result = if out.is_some() { "ok" } else { "none" };
+    ocserve_metrics::labeled_counter(
+        "ocserve_snapshot_capture_total",
+        &format!("result=\"{result}\""),
+        1,
+    );
+    out
 }
 
 /// `patch(hash)` off the tokio workers.
 async fn snap_patch(ctx: &PromptContext, hash: &str) -> Option<crate::snapshot::Patch> {
     let s = ctx.snapshots.clone()?;
     let h = hash.to_string();
-    tokio::task::spawn_blocking(move || s.patch(&h)).await.ok()
+    let start = std::time::Instant::now();
+    let out = tokio::task::spawn_blocking(move || s.patch(&h)).await.ok();
+    ocserve_metrics::observe(
+        "ocserve_snapshot_ops_seconds",
+        "op=\"patch\"",
+        start.elapsed().as_micros() as u64,
+    );
+    out
 }
 
 /// Build a `step-start` part. Upstream sets `snapshot: ctx.snapshot` and

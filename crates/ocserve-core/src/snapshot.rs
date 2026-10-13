@@ -582,6 +582,34 @@ impl Snapshots {
         let a = shadow_args(&gs, &worktree, &["gc", &format!("--prune={PRUNE}")]);
         let _ = run_git(&a, Some(&self.directory), None, &[]);
     }
+
+    /// `gc_prune_all(data_dir)` — `git gc --prune=7.days` over every shadow
+    /// repo under `<data_dir>/snapshot/*` (upstream `Snapshot.cleanup()` runs
+    /// on an interval). Best-effort; returns the number of repos pruned.
+    pub fn gc_prune_all(data_dir: &Path) -> usize {
+        let root = data_dir.join("snapshot");
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return 0;
+        };
+        let mut n = 0;
+        for e in entries.flatten() {
+            let gitdir = e.path();
+            if !gitdir.join("HEAD").exists() {
+                continue;
+            }
+            let gs = gitdir.display().to_string();
+            // gc does not need a work-tree, but passing one is harmless.
+            let a = vec![
+                format!("--git-dir={gs}"),
+                "gc".to_string(),
+                format!("--prune={PRUNE}"),
+            ];
+            if run_git(&a, None, None, &[]).code == 0 {
+                n += 1;
+            }
+        }
+        n
+    }
 }
 
 const TUNING: &[(&str, &str)] = &[
@@ -777,6 +805,19 @@ mod tests {
         fn read(&self, name: &str) -> String {
             std::fs::read_to_string(self.dir.join(name)).unwrap()
         }
+    }
+
+    #[test]
+    fn gc_prune_all_prunes_existing_shadow_repos() {
+        let r = Repo::new();
+        let s = r.snap();
+        let _base = s.track().expect("track"); // materializes the shadow repo
+        // one shadow repo exists under <data>/snapshot/
+        let pruned = Snapshots::gc_prune_all(r.data.path());
+        assert_eq!(pruned, 1, "the one shadow repo is pruned");
+        // a missing snapshot root is a clean no-op, not a panic
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(Snapshots::gc_prune_all(empty.path()), 0);
     }
 
     #[test]
