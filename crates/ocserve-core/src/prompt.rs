@@ -63,6 +63,40 @@ pub struct PromptContext {
     pub compaction: crate::compact::CompactionCfg,
     /// system prompt for compaction requests (hidden `compaction` agent).
     pub compaction_system: String,
+    /// File snapshots (SNAPSHOT.md): `None` when disabled. Captures the
+    /// worktree before a turn, records tool changes as `patch` parts, and
+    /// restores files on revert.
+    pub snapshots: Option<crate::snapshot::Snapshots>,
+}
+
+/// `track()` off the tokio workers (git shells out — the F1 convoy rule).
+async fn snap_track(ctx: &PromptContext) -> Option<String> {
+    let s = ctx.snapshots.clone()?;
+    tokio::task::spawn_blocking(move || s.track())
+        .await
+        .ok()
+        .flatten()
+}
+
+/// `patch(hash)` off the tokio workers.
+async fn snap_patch(ctx: &PromptContext, hash: &str) -> Option<crate::snapshot::Patch> {
+    let s = ctx.snapshots.clone()?;
+    let h = hash.to_string();
+    tokio::task::spawn_blocking(move || s.patch(&h)).await.ok()
+}
+
+/// Build a `step-start` part. Upstream sets `snapshot: ctx.snapshot` and
+/// JSON.stringify DROPS the key when it is undefined — so ocserve must emit
+/// the key only when a snapshot hash exists (non-git ⇒ no key, byte-parity).
+fn step_start_part(snapshot: Option<&str>, session_id: &str, assistant_id: &str) -> Value {
+    let mut p = json!({
+        "type": "step-start", "id": prt_id(),
+        "sessionID": session_id, "messageID": assistant_id,
+    });
+    if let Some(h) = snapshot {
+        p["snapshot"] = Value::String(h.to_string());
+    }
+    p
 }
 
 pub(crate) fn now_ms() -> i64 {
@@ -927,6 +961,10 @@ pub async fn run_prompt_with(
         }
 
         // ---- provider context ----
+        // SNAPSHOT (upstream processor.ts step-start): capture the worktree
+        // before this round's model stream so a `patch` part can record what
+        // its tool calls changed. Not captured for transient summarize rounds.
+        let round_base = if opts.skip_history { None } else { snap_track(ctx).await };
         let mut messages = vec![ChatMessage::text("system", ctx.system.clone())];
         if opts.skip_history {
             // transient instruction carries the serialized history (summarize)
@@ -1393,10 +1431,7 @@ pub async fn run_prompt_with(
 
             // ---- tool-call turn ----
             if finish_reason == "tool_calls" && !tool_calls.is_empty() {
-                let mut parts = vec![json!({
-                    "type": "step-start", "id": prt_id(),
-                    "sessionID": session_id, "messageID": assistant_id,
-                })];
+                let mut parts = vec![step_start_part(round_base.as_deref(), session_id, &assistant_id)];
                 if !reasoning.is_empty() {
                     parts.push(json!({
                         "type": "reasoning", "text": reasoning,
@@ -1982,6 +2017,17 @@ pub async fn run_prompt_with(
                     "tokens": step_info["tokens"], "cost": step_cost,
                     "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
                 }));
+                // SNAPSHOT patch part (upstream processor.ts: `patch(ctx.snapshot)`
+                // after the tool round, then re-capture). Only when files changed.
+                if let Some(base) = &round_base
+                    && let Some(patch) = snap_patch(ctx, base).await
+                    && !patch.files.is_empty()
+                {
+                    parts.push(json!({
+                        "type": "patch", "hash": patch.hash, "files": patch.files,
+                        "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
+                    }));
+                }
                 insert_message(writer, Some(&*ctx.blobs), session_id, &step_info, &parts)
                     .context("persist tool-step message")?;
                 for part in &parts {
@@ -2039,10 +2085,7 @@ pub async fn run_prompt_with(
             }
 
             // ---- final turn ----
-            let mut parts = vec![json!({
-                "type": "step-start", "id": prt_id(),
-                "sessionID": session_id, "messageID": assistant_id,
-            })];
+            let mut parts = vec![step_start_part(round_base.as_deref(), session_id, &assistant_id)];
             if !reasoning.is_empty() {
                 parts.push(json!({
                     "type": "reasoning", "text": reasoning,
@@ -2110,6 +2153,16 @@ pub async fn run_prompt_with(
                 "tokens": assistant_info["tokens"], "cost": step_cost,
                 "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
             }));
+            // SNAPSHOT patch part for the final turn (upstream `cleanup`).
+            if let Some(base) = &round_base
+                && let Some(patch) = snap_patch(ctx, base).await
+                && !patch.files.is_empty()
+            {
+                parts.push(json!({
+                    "type": "patch", "hash": patch.hash, "files": patch.files,
+                    "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
+                }));
+            }
             insert_message(
                 writer,
                 Some(&*ctx.blobs),

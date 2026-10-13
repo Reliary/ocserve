@@ -3215,6 +3215,7 @@ pub(crate) fn build_prompt_context(
         .collect();
     let skills_blk = ocserve_core::system_prompt::skills_block(&skill_rows);
     let system = ocserve_core::system_prompt::compose(&base, &[Some(env_block), skills_blk], None);
+    let snapshots = snapshots_for(&st, &session_directory);
     let ctx = ocserve_core::prompt::PromptContext {
         db: st.db.clone(),
         blobs: st.blobs.clone(),
@@ -3244,8 +3245,39 @@ pub(crate) fn build_prompt_context(
         cost_ceiling: st.cost_ceiling,
         compaction,
         compaction_system,
+        // SNAPSHOT (SNAPSHOT.md): config `snapshot != false` + env kill-switch;
+        // the engine resolves the worktree lazily and no-ops when non-git.
+        snapshots,
     };
     Ok(ctx)
+}
+
+/// Build the snapshot handle for a session directory. Enabled unless
+/// `snapshot:false` in config (upstream key) or `OCSERVE_SNAPSHOT=0`. `None`
+/// when disabled — the prompt then records no snapshots (upstream no-op parity).
+fn snapshots_for(
+    st: &AppState,
+    directory: &str,
+) -> Option<ocserve_core::snapshot::Snapshots> {
+    let cfg_off = st
+        .payloads
+        .read()
+        .config
+        .get("snapshot")
+        .map(|v| v == &serde_json::Value::Bool(false))
+        .unwrap_or(false);
+    let env_off = std::env::var("OCSERVE_SNAPSHOT")
+        .map(|v| v == "0")
+        .unwrap_or(false);
+    if cfg_off || env_off {
+        return None;
+    }
+    let data_dir = st.db.parent().unwrap_or_else(|| std::path::Path::new("."));
+    Some(ocserve_core::snapshot::Snapshots::new(
+        data_dir.to_path_buf(),
+        directory,
+        true,
+    ))
 }
 
 /// Per-session prompt lock (insert-only while active; bounded by in-flight).
