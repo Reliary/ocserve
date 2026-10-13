@@ -59,6 +59,24 @@ def existing_guard_rules() -> set[int]:
     return rules
 
 
+def gitignored_dirs() -> tuple[str, ...]:
+    """Directory prefixes from .gitignore (runtime artifacts that legitimately
+    do not exist in a clean checkout, e.g. bench/drift/)."""
+    out: list[str] = []
+    gi = os.path.join(ROOT, ".gitignore")
+    if os.path.isfile(gi):
+        for line in open(gi, encoding="utf-8", errors="ignore"):
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("!"):
+                continue
+            if line.endswith("/") and "/" in line:
+                out.append(line)
+    return tuple(out)
+
+
+IGNORED = gitignored_dirs()
+
+
 def check_dead_paths() -> list[str]:
     bad: list[str] = []
     for name in DOCS:
@@ -66,7 +84,11 @@ def check_dead_paths() -> list[str]:
         for i, line in enumerate(open(path, encoding="utf-8", errors="ignore"), 1):
             for m in TOKEN.finditer(line):
                 p = m.group(1)
-                if p.startswith(PREFIXES) and not os.path.exists(os.path.join(ROOT, p)):
+                if not p.startswith(PREFIXES):
+                    continue
+                if any(p.startswith(d) for d in IGNORED):
+                    continue  # gitignored runtime artifact (bench/drift/, …)
+                if not os.path.exists(os.path.join(ROOT, p)):
                     bad.append(f"{name}:{i}: dead repo path `{p}`")
     return bad
 
