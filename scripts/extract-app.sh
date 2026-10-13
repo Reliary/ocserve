@@ -11,10 +11,13 @@
 #   1. boot the freeze binary on a throwaway port
 #   2. GET / → parse every src/href (entry JS + CSS + favicons + manifest)
 #   3. transitively GET every asset each references (CSS fonts, worker JS)
-#   4. write bench/webui/app/<tag>/ + a manifest (path → sha256, count)
+#   4. write a scratch tree, then pack it into the owning crate's assets:
+#      crates/ocserve-http/assets/webui/<tag>.pack.zst (+ <tag>.manifest.json)
 #
-# The output is committed and embedded at build time (see ocserve-http/doc.rs
-# precedent). Re-run on any upstream bump:
+# The pack is committed and embedded at build time. It MUST live inside the
+# crate that embeds it — an artifact under `bench/` (outside every crate root)
+# is not in the `.crate` tarball, so `cargo install` fails to compile it (the
+# 0.3.0 defect; guard rule 30). Re-run on any upstream bump:
 #   scripts/extract-app.sh <freeze-binary> <tag>
 #
 # Safety: boots a read-only server on a loopback port with an empty HOME; never
@@ -33,8 +36,9 @@ case "$ver" in
   *) echo "extract-app: binary reports '$ver'; expected tag '$TAG'" >&2; exit 2 ;;
 esac
 
-OUT="bench/webui/app/$TAG"
+ASSET_DIR="crates/ocserve-http/assets/webui"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/ocserve-extract.XXXXXX")"
+OUT="$TMP/app.$TAG"
 cleanup() {
   [ -n "${PID:-}" ] && kill -- -"$PID" 2>/dev/null || true
   pkill -f "opencode serve --port $PORT" 2>/dev/null || true
@@ -106,17 +110,18 @@ PY
 
 # move into place (python wrote to TMP; the tag arg was passed positionally)
 mkdir -p "$(dirname "$OUT")"
-rm -rf "$OUT" "$OUT.tmp"
+rm -rf "$OUT"
 mv "$TMP/out" "$OUT"
 
-# Pack the closure into ONE embeddable artifact. The loose files are
-# gitignored (10 MB of vendored third-party assets); the committed source of
-# truth is the pack + manifest:
-#   bench/webui/app/<tag>.pack.zst      — the embedded blob (include_bytes!)
-#   bench/webui/app/<tag>.manifest.json — path → sha256 → bytes (inspectable)
+# Pack the closure into ONE embeddable artifact inside the owning crate. The
+# loose files are dropped after packing (10 MB of vendored third-party assets
+# must not live in git); the committed source of truth is the pack + manifest:
+#   crates/ocserve-http/assets/webui/<tag>.pack.zst      — embedded (include_bytes!)
+#   crates/ocserve-http/assets/webui/<tag>.manifest.json — path → sha256 → bytes
 # Pack format (before zstd): "OCAP1\n" | u32 count | (u16 pathlen, path,
 # u64 datalen, data)* — trivial to parse, no tar dependency.
-python3 - "$OUT" "$TMP/app.pack" "bench/webui/app/$TAG.manifest.json" <<'PY'
+mkdir -p "$ASSET_DIR"
+python3 - "$OUT" "$TMP/app.pack" "$ASSET_DIR/$TAG.manifest.json" <<'PY'
 import hashlib, json, os, struct, sys
 
 src, pack_path, manifest_path = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -149,15 +154,11 @@ print(f"packed {len(entries)} files: raw {len(blob)} bytes")
 PY
 
 # zstd the raw pack (CLI; -19, deterministic content). This is the embedded blob.
-zstd -19 -q -f "$TMP/app.pack" -o "bench/webui/app/$TAG.pack.zst"
-stat -c 'pack: %s bytes (zstd)' "bench/webui/app/$TAG.pack.zst"
+zstd -19 -q -f "$TMP/app.pack" -o "$ASSET_DIR/$TAG.pack.zst"
+stat -c 'pack: %s bytes (zstd)' "$ASSET_DIR/$TAG.pack.zst"
 
 # Loose extracted files are regenerable from the pack via the manifest; keep
-# the tree small (10 MB of vendored assets must not live in git). The
-# committed source of truth is <tag>.pack.zst + <tag>.manifest.json.
-printf '%s\n' \
-  "# Loose extracted assets are regenerable (scripts/extract-app.sh). The" \
-  "# committed source of truth is <tag>.pack.zst + <tag>.manifest.json." \
-  "1.18.31/" > bench/webui/app/.gitignore
+# the tree small. The committed source of truth is <tag>.pack.zst +
+# <tag>.manifest.json (both inside the owning crate).
 rm -rf "$OUT"
-echo "extract-app: wrote $TAG.pack.zst + $TAG.manifest.json (loose files removed)"
+echo "extract-app: wrote $ASSET_DIR/$TAG.pack.zst + $TAG.manifest.json"

@@ -10,7 +10,7 @@ Delivered: W1 compression (boot wire 9.10 MB → 1.03 MB br), W2 validators
 (ETag/304, immutable assets), W3 lazy byte-bounded asset cache (0 at boot),
 W4 session-list scaling (freeze ListQuery parity), W5 route closure + `/vcs/*`,
 and **P6 embedded version-matched UI** (embedded-first, proxy fallback;
-`bench/webui/app/1.18.31.pack.zst`). Guards: rule 16 (spec coverage) + rule 17
+`crates/ocserve-http/assets/webui/1.18.31.pack.zst`). Guards: rule 16 (spec coverage) + rule 17
 (embedded-UI skew) supersede the old rule 15.
 
 ## Baseline (measured 2026-10-08, this box, ocserve :4912 vs freeze :4901)

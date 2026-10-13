@@ -6,7 +6,7 @@
 //! dropped and the app rendered both its optimistic row and the server row.
 //! This module closes that class: every prompt-family request body decodes
 //! ONCE at the boundary into a typed struct whose serde/wire names are
-//! compile-checked against the frozen spec (`bench/openapi/1.18.31.json`,
+//! compile-checked against the frozen spec (`assets/openapi/1.18.31.json`,
 //! pinned test), with byte-exact Effect decode-error messages captured from
 //! freeze in `bench/openapi/field-probes.md`.
 //!
@@ -1164,11 +1164,11 @@ mod wire_tests {
     }
 
     /// B4: wire key sets are pinned to the frozen spec. Generated from
-    /// `bench/openapi/1.18.31.json` — upstream adds/renames a field → spec
+    /// `assets/openapi/1.18.31.json` — upstream adds/renames a field → spec
     /// refresh → red here → struct updated in lockstep.
     #[test]
     fn wire_keys_match_frozen_spec() {
-        let raw = include_str!("../../../bench/openapi/1.18.31.json");
+        let raw = crate::spec::SPEC_JSON;
         let spec: Value = serde_json::from_str(raw).expect("spec parses");
         let props = |path: &str, method: &str| -> Vec<String> {
             // Direct indexing only: serde_json::pointer tokenizes on `/`, and

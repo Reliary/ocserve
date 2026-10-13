@@ -14,14 +14,18 @@
 #   --from-live  copies the document a running server returns at $URL/doc
 #             (use to re-verify a vendor against the frozen binary).
 #
-# Output is pretty-printed and written to bench/openapi/<tag>.json. The file is
-# a generated artifact — never hand-edit it.
+# Output is pretty-printed and written to the owning crate's assets directory,
+# `crates/ocserve-core/assets/openapi/<tag>.json`. It MUST live inside a crate
+# so it is packaged and published with it — an artifact embedded from outside
+# a crate root (`bench/`) is not in the `.crate` tarball, so `cargo install`
+# fails to compile it (the 0.3.0 defect; guard rule 30). The file is a
+# generated artifact — never hand-edit it.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 TAG="${1:?usage: extract-spec.sh <tag> [--from-live URL]}"
-OUT="bench/openapi/${TAG}.json"
-mkdir -p bench/openapi
+OUT="crates/ocserve-core/assets/openapi/${TAG}.json"
+mkdir -p "$(dirname "$OUT")"
 
 if [ "${2:-}" = "--from-live" ]; then
   URL="${3:?--from-live needs a base URL, e.g. --from-live http://127.0.0.1:4901}"

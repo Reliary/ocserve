@@ -13,12 +13,15 @@
 # Usage: scripts/extract-rules.sh 1.18.31
 #   (reads the local opencode worktree OPENCODE_SRC or a GitHub raw fetch)
 #
-# Output: bench/permission/<tag>.rules.json (generated — never hand-edit).
+# Output: crates/ocserve-tools/assets/permission/<tag>.rules.json (generated —
+# never hand-edit). It lives inside the owning crate so it is packaged and
+# published with it; an artifact embedded from outside a crate root (`bench/`)
+# is not in the `.crate` tarball (the 0.3.0 defect; guard rule 30).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 TAG="${1:?usage: extract-rules.sh <tag>}"
-OUT="bench/permission/${TAG}.rules.json"
-mkdir -p bench/permission
+OUT="crates/ocserve-tools/assets/permission/${TAG}.rules.json"
+mkdir -p "$(dirname "$OUT")"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/ocserve-rules.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """P6c — embedded-UI version-skew guard.
 
-The pinned web UI (bench/webui/app/<tag>.pack.zst) is a Vite build of
+The pinned web UI (crates/ocserve-http/assets/webui/<tag>.pack.zst) is a Vite build of
 `packages/app` at the freeze tag, so every API route it calls must exist in the
 frozen OpenAPI contract (bench/openapi/<tag>.json). If they ever disagree, the
 extraction captured the wrong build (or the spec is stale) and the UI would

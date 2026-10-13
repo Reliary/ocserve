@@ -24,7 +24,7 @@ closure + guard + acceptance (the maintenance-collapse core) are done.
 ## Phases
 
 ### P0 — Contract + self-description
-- Vendor `bench/openapi/1.18.31.json` (tag-extracted, byte-equal to live /doc).
+- Vendor `crates/ocserve-core/assets/openapi/1.18.31.json` (tag-extracted, byte-equal to live /doc).
 - `GET /doc` serves it (freeze parity; also the runtime oracle for P4).
 - `scripts/extract-spec.sh <tag>` regenerates on version bump.
 

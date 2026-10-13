@@ -61,15 +61,15 @@ jobs:
             echo "FAIL: test count $count below floor $FLOOR — tests removed or skipping"; exit 1
           fi
 
-      # Every crate must be publishable (package + verify). `cargo package`
-      # builds the tarball that `cargo install` ships, which contains only the
-      # crate directory — an include_str! reaching above it, or a missing
-      # workspace member (the 2026-10-12 ocserve-pty omission), fails here.
-      # Every crate must be packageable. `cargo package --list` validates the
-      # tarball contents WITHOUT resolving the registry, so it catches a crate
-      # whose files are missing / whose package layout is broken (the class we
-      # want) while staying offline and non-circular on a release that adds a
-      # new crate. The registry-resolving `cargo package` runs in publish.yml.
+      # Every crate's tarball must contain its files. `cargo package --list`
+      # validates the package layout offline (the missing-file class) without
+      # resolving the registry — `cargo package` proper compiles the packed
+      # crate against PUBLISHED siblings, which is circular on a release that
+      # bumps versions (the local fix isn't on crates.io yet), so it can only
+      # run post-publish. The compiled-in-asset class it would catch (0.3.0:
+      # include_*! escaping the crate root breaks `cargo install`) is caught
+      # pre-publish by check-guards rule 30; the end-to-end `cargo install`
+      # smoke runs in publish.yml after upload.
       - name: crates are packageable
         run: |
           set -euo pipefail

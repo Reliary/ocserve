@@ -17,6 +17,7 @@ pub mod question;
 pub mod revert;
 pub mod sift_boundary;
 pub mod snapshot;
+pub mod spec;
 pub mod system_prompt;
 pub mod wire;
 pub mod zen;

@@ -84,5 +84,5 @@ them.
 ## Per-upstream-bump cost
 
 Unchanged discipline: the wire contract is the frozen spec
-(`bench/openapi/1.18.31.json`) already vendored for the coverage/field guards.
+(`crates/ocserve-core/assets/openapi/1.18.31.json`) already vendored for the coverage/field guards.
 No new hand-maintained truth. `extract-spec.sh` + gates.

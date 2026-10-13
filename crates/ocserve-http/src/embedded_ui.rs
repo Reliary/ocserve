@@ -9,7 +9,7 @@
 //! back to the proxy only under `OCSERVE_DISABLE_EMBEDDED_WEB_UI=1` (mirroring
 //! upstream's `OPENCODE_DISABLE_EMBEDDED_WEB_UI`).
 //!
-//! The pinned build is a single zstd pack (`bench/webui/app/<tag>.pack.zst`,
+//! The pinned build is a single zstd pack (`assets/webui/<tag>.pack.zst`,
 //! produced by `scripts/extract-app.sh` through the freeze's PUBLIC HTTP
 //! interface — not binary scraping). Pack format before zstd: `OCAP1\n` +
 //! u32 count + (u16 pathlen, path, u64 datalen, data)*. Decompressed once at
@@ -24,7 +24,13 @@ use std::sync::OnceLock;
 
 /// The pinned pack. `include_bytes!` keeps `/` working on a bare machine with
 /// no network and no data dir (the "boots with defaults" invariant).
-static PACK_ZST: &[u8] = include_bytes!("../../../bench/webui/app/1.18.31.pack.zst");
+///
+/// Lives INSIDE this crate (`assets/webui/<tag>.pack.zst`) so it is packaged
+/// and published with the crate; embedding from `bench/` (outside the crate
+/// root) is not in the `.crate` tarball, so `cargo install ocserve` fails to
+/// compile it (the 0.3.0 defect; guard rule 30). Produced by
+/// `scripts/extract-app.sh` through the freeze's public HTTP interface.
+static PACK_ZST: &[u8] = include_bytes!("../assets/webui/1.18.31.pack.zst");
 
 /// The freeze tag the pack was built from — must match `FREEZE_VERSION`.
 pub const APP_TAG: &str = "1.18.31";

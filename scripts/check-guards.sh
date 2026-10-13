@@ -173,17 +173,17 @@ fi
 
 echo "== guard: full API coverage (rule 16, spec-driven) =="
 # Supersedes rules 14 + 15 + the web-bundle extractor with ONE generated check
-# over the frozen server's own OpenAPI contract (bench/openapi/1.18.31.json,
+# over the frozen server's own OpenAPI contract (crates/ocserve-core/assets/openapi/1.18.31.json,
 # served at /doc). Every operation must be bound in the router or carry an
 # exact `METHOD /path` citation in PLAN.md. Citations match on whole-token
 # boundaries (a substring test vacuously cited `POST /mcp` as a prefix of
 # `POST /mcp/{name}/connect`). Cannot drift the way three hand-maintained
 # route lists did (the /pty/shells and /session/{id}/diff gaps).
-if [ -f bench/openapi/1.18.31.json ]; then
+if [ -f crates/ocserve-core/assets/openapi/1.18.31.json ]; then
   # NB: check-coverage.py exits 1 when gaps exist; with `set -o pipefail`
   # a `if $(... | grep)` construct would inherit that nonzero and report ok
   # vacuously. Capture full output and test for the GAP marker explicitly.
-  cov_out=$(python3 bench/openapi/check-coverage.py bench/openapi/1.18.31.json crates/ocserve-http/src/lib.rs PLAN.md 2>&1) || true
+  cov_out=$(python3 bench/openapi/check-coverage.py crates/ocserve-core/assets/openapi/1.18.31.json crates/ocserve-http/src/lib.rs PLAN.md 2>&1) || true
   gaps=$(printf '%s\n' "$cov_out" | grep '^  GAP' || true)
   if [ -n "$gaps" ]; then
     echo "$gaps"; echo "FAIL: spec operation unbound and uncited (rule 16)"; fail=1
@@ -198,8 +198,8 @@ echo "== guard: embedded UI version-skew (rule 17) =="
 # The pinned web UI must call only routes present in the frozen spec (same
 # tag); a mismatch means the extraction captured the wrong build. Replaces the
 # old Cloudflare-latest webui-routes.txt. Planted control: sabotaged spec → red.
-if [ -f bench/webui/app/1.18.31.pack.zst ] && [ -f bench/openapi/1.18.31.json ]; then
-  if out=$(python3 bench/webui/check-app-skew.py bench/webui/app/1.18.31.pack.zst bench/openapi/1.18.31.json 2>&1); then
+if [ -f crates/ocserve-http/assets/webui/1.18.31.pack.zst ] && [ -f crates/ocserve-core/assets/openapi/1.18.31.json ]; then
+  if out=$(python3 bench/webui/check-app-skew.py crates/ocserve-http/assets/webui/1.18.31.pack.zst crates/ocserve-core/assets/openapi/1.18.31.json 2>&1); then
     echo "ok"
   else
     echo "$out"; echo "FAIL: embedded UI calls a route absent from the frozen spec (rule 17)"; fail=1
@@ -268,7 +268,7 @@ echo "== guard: handler request keys are contract-valid (rule 20) =="
 # scanner is vacuous and the gate fails.
 if out=$(python3 bench/openapi/check-request-keys.py --selftest 2>&1) \
   && scan=$(python3 bench/openapi/check-request-keys.py \
-      bench/openapi/1.18.31.json crates/ocserve-http/src 2>&1); then
+      crates/ocserve-core/assets/openapi/1.18.31.json crates/ocserve-http/src 2>&1); then
   echo "ok (selftest + scan: $(echo "$scan" | tail -1))"
 else
   echo "$out"; echo "$scan"
@@ -509,6 +509,29 @@ if [ -f bench/sidefx/check-effects.py ]; then
   fi
 else
   echo "ok (no effects classifier)"
+fi
+
+echo "== guard: compiled-in assets stay inside their crate (rule 30) =="
+# An include_str!/include_bytes! that resolves outside the owning crate root is
+# not packaged into the .crate tarball: cargo build/test pass locally and
+# `cargo publish --no-verify` uploads a broken crate — the failure only appears
+# when a user runs `cargo install` (the 0.3.0 defect: assets embedded from
+# bench/ broke `cargo install ocserve`). The static scan resolves each literal
+# include against its source file; the dynamic half is `cargo package` (which
+# compiles the packed crate) in ci.yml + publish.yml. Planted control: an
+# escaping include must be flagged.
+if [ -f scripts/check-crate-assets.py ]; then
+  if python3 scripts/check-crate-assets.py --selftest >/dev/null 2>&1; then
+    if out=$(python3 scripts/check-crate-assets.py 2>&1); then
+      echo "$out"
+    else
+      echo "$out"; echo "FAIL: compiled-in asset escapes its crate root (rule 30)"; fail=1
+    fi
+  else
+    echo "FAIL: crate-asset planted control not detected (rule 30 vacuous)"; fail=1
+  fi
+else
+  echo "FAIL: scripts/check-crate-assets.py missing (rule 30)"; fail=1
 fi
 
 exit $fail

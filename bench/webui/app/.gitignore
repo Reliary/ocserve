@@ -1,3 +1,0 @@
-# Loose extracted assets are regenerable (scripts/extract-app.sh). The
-# committed source of truth is <tag>.pack.zst + <tag>.manifest.json.
-1.18.31/

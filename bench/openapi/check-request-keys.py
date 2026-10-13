@@ -7,7 +7,7 @@ The 2026-10-09 oc-remote double-prompt bug was a request-key divergence:
 Typed decode (wire.rs) closed the prompt family at compile time — this
 guard extends the net to EVERY remaining axum `Json(...)` handler: every
 JSON key READ off an extractor-bound variable must exist as a property or
-query parameter in the frozen contract (bench/openapi/1.18.31.json) or be
+query parameter in the frozen contract (crates/ocserve-core/assets/openapi/1.18.31.json) or be
 on the named allowlist.
 
 Scope rules (tuned against the corpus — see FIELD-CONTRACT.md):

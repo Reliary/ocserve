@@ -59,7 +59,7 @@ Results → `bench/openapi/field-probes.md` (bytes verbatim).
   above + allowlist; planted control `messageId` red→green. Runs commit-time.
 - **B4 generated struct-key test (Rust)**: serialize fully-populated
   `PromptRequest`/`CommandRequest` → key set == spec requestBody properties
-  (generated from `bench/openapi/1.18.31.json`; upstream adds a field → spec
+  (generated from `crates/ocserve-core/assets/openapi/1.18.31.json`; upstream adds a field → spec
   refresh → red). Includes ignoring `messageId`-only bodies (negative pin).
 - **B5 behavioral differential (nightly)**: `scripts/field-contract-check.sh`
   — boots freeze+ocserve under fixture (parity stub provider), identity echo

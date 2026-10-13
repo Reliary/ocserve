@@ -32,7 +32,10 @@ import time
 
 import jsonschema
 
-SPEC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../openapi/1.18.31.json")
+SPEC = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "../../crates/ocserve-core/assets/openapi/1.18.31.json",
+)
 
 # Additive ocserve event types absent from the frozen union, each justified.
 # Empty today: ocserve emits only spec types (plus .N twins handled below).

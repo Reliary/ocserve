@@ -87,3 +87,16 @@ jobs:
                    ocserve-importer ocserve-tools ocserve-core ocserve-pty ocserve-http ocserve; do
             publish "$c"
           done
+
+      # End-to-end check that the uploaded crates actually build for a user —
+      # the registry-resolving `cargo install` compiles the real published
+      # tarballs (incl. compiled-in assets). This is where the 0.3.0 defect
+      # (include_*! escaping the crate root, so `cargo install ocserve` failed)
+      # would be caught after upload; rule 30 catches it pre-upload.
+      - name: cargo install smoke (published crates)
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          set -euo pipefail
+          CARGO_HOME="$(mktemp -d)" cargo install ocserve --root "$(mktemp -d)" --locked || \
+            CARGO_HOME="$(mktemp -d)" cargo install ocserve --root "$(mktemp -d)"
+          echo "cargo install ocserve: OK"

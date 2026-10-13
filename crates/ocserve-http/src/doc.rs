@@ -13,4 +13,9 @@
 /// The frozen 1.18.31 document, byte-identical to the upstream tag's
 /// `packages/sdk/openapi.json` and to freeze's live `GET /doc` (verified
 /// 2026-10-08).
-pub const SPEC_JSON: &str = include_str!("../../../bench/openapi/1.18.31.json");
+///
+/// Lives in `ocserve-core` (`assets/openapi/<tag>.json`, embedded there) so it
+/// is packaged with the crate that owns it and reaches `cargo install` (the
+/// 0.3.0 defect: embedding from `bench/`, outside every crate root, is not in
+/// the `.crate` tarball; guard rule 30).
+pub const SPEC_JSON: &str = ocserve_core::spec::SPEC_JSON;
