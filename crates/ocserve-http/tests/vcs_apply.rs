@@ -69,8 +69,11 @@ async fn post_to(
     wt: &std::path::Path,
     body: Value,
 ) -> axum::response::Response {
+    // The route path is a bare literal so rule 29's effects guard can resolve
+    // this citation to the spec op (it matches quoted URL literals).
+    const ROUTE: &str = "/vcs/apply";
     let uri = format!(
-        "/vcs/apply?directory={}",
+        "{ROUTE}?directory={}",
         urlencoding_simple(&wt.display().to_string())
     );
     post(app, &uri, body).await

@@ -23,9 +23,9 @@ POST	/api/session/{sessionID}/permission/{requestID}/reply	v2.session.permission
 POST	/api/session/{sessionID}/prompt	v2.session.prompt	tested:crates/ocserve-http/tests/field_contract.rs
 POST	/api/session/{sessionID}/question/{requestID}/reject	v2.session.question.reject	no-effect:no-sideefect-endpoint
 POST	/api/session/{sessionID}/question/{requestID}/reply	v2.session.question.reply	no-effect:no-sideefect-endpoint
-POST	/api/session/{sessionID}/revert/clear	v2.session.revert.clear	no-effect:no-sideefect-endpoint
-POST	/api/session/{sessionID}/revert/commit	v2.session.revert.commit	no-effect:no-sideefect-endpoint
-POST	/api/session/{sessionID}/revert/stage	v2.session.revert.stage	no-effect:no-sideefect-endpoint
+POST	/api/session/{sessionID}/revert/clear	v2.session.revert.clear	tested:crates/ocserve-http/tests/revert.rs
+POST	/api/session/{sessionID}/revert/commit	v2.session.revert.commit	tested:crates/ocserve-http/tests/revert.rs
+POST	/api/session/{sessionID}/revert/stage	v2.session.revert.stage	tested:crates/ocserve-http/tests/revert.rs
 POST	/api/session/{sessionID}/wait	v2.session.wait	no-effect:transport-or-control
 DELETE	/auth/{providerID}	auth.remove	tested:crates/ocserve-http/tests/admin.rs
 PUT	/auth/{providerID}	auth.set	tested:crates/ocserve-http/tests/admin.rs
@@ -80,12 +80,12 @@ DELETE	/session/{sessionID}/message/{messageID}/part/{partID}	part.delete	tested
 PATCH	/session/{sessionID}/message/{messageID}/part/{partID}	part.update	tested:crates/ocserve-http/tests/golden.rs
 POST	/session/{sessionID}/permissions/{permissionID}	permission.respond	tested:crates/ocserve-http/tests/compat_batch.rs
 POST	/session/{sessionID}/prompt_async	session.prompt_async	tested:crates/ocserve-http/tests/autonomy.rs
-POST	/session/{sessionID}/revert	session.revert	tested:crates/ocserve-http/tests/compat_batch.rs
+POST	/session/{sessionID}/revert	session.revert	tested:crates/ocserve-http/tests/revert.rs
 DELETE	/session/{sessionID}/share	session.unshare	tested:crates/ocserve-http/tests/v2_surface.rs
 POST	/session/{sessionID}/share	session.share	tested:crates/ocserve-http/tests/v2_surface.rs
 POST	/session/{sessionID}/shell	session.shell	tested:crates/ocserve-http/tests/field_contract.rs
 POST	/session/{sessionID}/summarize	session.summarize	tested:crates/ocserve-http/tests/hooks.rs
-POST	/session/{sessionID}/unrevert	session.unrevert	tested:crates/ocserve-http/tests/compat_batch.rs
+POST	/session/{sessionID}/unrevert	session.unrevert	tested:crates/ocserve-http/tests/revert.rs
 POST	/sync/history	sync.history.list	no-effect:transport-or-control
 POST	/sync/replay	sync.replay	no-effect:transport-or-control
 POST	/sync/start	sync.start	tested:crates/ocserve-http/tests/v2_surface.rs
@@ -102,4 +102,4 @@ POST	/tui/publish	tui.publish	tested:crates/ocserve-http/tests/tui.rs
 POST	/tui/select-session	tui.selectSession	tested:crates/ocserve-http/tests/tui.rs
 POST	/tui/show-toast	tui.showToast	tested:crates/ocserve-http/tests/tui.rs
 POST	/tui/submit-prompt	tui.submitPrompt	tested:crates/ocserve-http/tests/tui.rs
-POST	/vcs/apply	vcs.apply	tested:crates/ocserve-http/tests/v2_surface.rs
+POST	/vcs/apply	vcs.apply	tested:crates/ocserve-http/tests/vcs_apply.rs
