@@ -140,7 +140,7 @@ compares observable effects rather than a hand-maintained route list.
 
 | # | Attack | Disposition |
 |---|---|---|
-| A1 | per-turn `git add --all` expensive on huge repos / blocks prompt start | upstream also blocking; seed+alternates+tuning; `snapshot:false`; measured by histogram + perf gate |
+| A1 | per-turn `git add --all` expensive on huge repos / blocks prompt start | upstream also blocking; seed+alternates+tuning; `snapshot:false`; measured by histogram + perf gate. Measured 2026-10-13 on this repo (408 files): `track()` ≈4 ms warm, ≈128 ms cold (first shadow-repo seed), via `ocserve_snapshot_ops_seconds{op="track"}` |
 | A2 | destructive message removal deletes wrong rows | upstream-exact index math; partID-vs-full boundary tests; marker cleared only after success |
 | A3 | `git apply` from HTTP mutates user tree / path escape | confined to session dir; git rejects out-of-tree; size cap; side-effect test both ways |
 | A4 | stage→prompt race | busy-gate 409 on stage/clear/commit; cleanup under the prompt lock in one txn |
