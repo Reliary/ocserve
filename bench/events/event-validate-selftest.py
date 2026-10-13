@@ -50,6 +50,17 @@ cases = [
     ("permission.replied", {"sessionID": "ses_x", "requestID": "per_abc", "reply": "once"}, True),
     # sync twin suffix resolves to the base type
     ("session.updated.1", {"sessionID": "ses_x", "info": FULL_SESSION}, True),
+    # SNAPSHOT revert events require `timestamp` (added 2026-10-13)
+    ("session.next.revert.staged",
+     {"sessionID": "ses_x", "revert": {"messageID": "msg_x"}}, False),
+    ("session.next.revert.staged",
+     {"sessionID": "ses_x", "timestamp": 1, "revert": {"messageID": "msg_x"}}, True),
+    ("session.next.revert.cleared", {"sessionID": "ses_x"}, False),
+    ("session.next.revert.cleared", {"sessionID": "ses_x", "timestamp": 1}, True),
+    ("session.next.revert.committed",
+     {"sessionID": "ses_x", "messageID": "msg_x"}, False),
+    ("session.next.revert.committed",
+     {"sessionID": "ses_x", "messageID": "msg_x", "timestamp": 1}, True),
     # unknown type
     ("totally.made.up", {"x": 1}, False),
 ]
