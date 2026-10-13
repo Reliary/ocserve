@@ -8,6 +8,12 @@ updates:
     groups:
       rust-deps:
         patterns: ["*"]
+    ignore:
+      # reqwest 0.13 is a breaking major that renames the TLS features
+      # (`rustls-tls` -> `rustls`); ocserve-llm pins 0.12 deliberately.
+      # Migrate explicitly, not via a Dependabot bump.
+      - dependency-name: reqwest
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /
