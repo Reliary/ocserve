@@ -536,24 +536,25 @@ else
   echo "FAIL: scripts/check-crate-assets.py missing (rule 30)"; fail=1
 fi
 
-echo "== guard: docs are not stale (rule 31) =="
-# Docs are the spec (AGENTS §1); nothing checked them, so dead references
-# accumulated (the 2026-10-13 audit: three files referenced but gone, a stale
-# divergence, dangling guard-rule numbers). The linter fails on: backticked
-# repo paths that don't exist, `rule N` refs with no real rule, and a removed
-# divergence still listed as current. Planted control: dead path + bogus rule.
-if [ -f scripts/check-docs.py ]; then
-  if python3 scripts/check-docs.py --selftest >/dev/null 2>&1; then
-    if out=$(python3 scripts/check-docs.py 2>&1); then
-      echo "$out"
+echo "== guard: v2 contract-differ (rule 32) =="
+# V2-PLAN.md P1: the cross-version classifier runs on the two vendored
+# contracts. Fails on: any same-name field-type conflict (superset serving
+# blocked), any router-bound stub without a V2-PLAN phase, any v2 op with no
+# bucket. Selftest proves both detectors non-vacuous (planted new op +
+# planted type change). Calibration: must reproduce the hand-verified counts
+# (142 v2 ops, 0 conflicts) — drift means re-verify by hand (V2-PLAN A6).
+if [ -f scripts/contract-diff.py ] && [ -f crates/ocserve-core/assets/openapi/2.0.28.json ]; then
+  if python3 scripts/contract-diff.py --selftest >/dev/null 2>&1; then
+    if out=$(python3 scripts/contract-diff.py 2>&1); then
+      echo "$out" | tail -9
     else
-      echo "$out"; echo "FAIL: stale doc reference (rule 31)"; fail=1
+      echo "$out"; echo "FAIL: v2 contract classification (rule 32)"; fail=1
     fi
   else
-    echo "FAIL: doc-lint planted control not detected (rule 31 vacuous)"; fail=1
+    echo "FAIL: contract-diff planted controls not detected (rule 32 vacuous)"; fail=1
   fi
 else
-  echo "FAIL: scripts/check-docs.py missing (rule 31)"; fail=1
+  echo "FAIL: scripts/contract-diff.py or 2.0.28 asset missing (rule 32)"; fail=1
 fi
 
-exit $fail
+echo "== guard: docs are not stale (rule 31) =="

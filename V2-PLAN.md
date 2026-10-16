@@ -18,7 +18,7 @@ requirement land here as edits, never silently in code.
 - **D4 Migration endpoint**: adopt upstream's one-shot `migration.v1.status`
   semantics (project, don't convert).
 - **D5 Perf**: one event write per turn (projection, not a second event table).
-- **D6 Guard rule 32**: allocation budgets on all v2-path queries are a hard gate.
+- **D6 Guard rule 33**: allocation budgets on all v2-path queries are a hard gate.
 - **D7 Search**: v2 search exposure parked as post-parity differentiator.
 
 ## 1. Evidence base (all verified read-only, 2026-10-13)
@@ -62,12 +62,12 @@ requirement land here as edits, never silently in code.
 - Fix stale `PLAN.md:206-230` (v2 "pre-release/gated" is false; `latest=2.0.28`).
 - Kill: vendored asset byte-equals fresh regen; `git status` clean in worktree.
 
-### P1 — contract-differ (exit: machine gap table + rule 31)
+### P1 — contract-differ (exit: machine gap table + rule 32)
 
 - `scripts/contract-diff.py`: every op classified `identical / additive-superset /
   renamed-ref / ocserve-stub / new-v2 / v1-only / removed`; emits the committed
   table P2–P4 burn down. Includes `stale-asset` detector (regen ≠ vendored → red).
-- Guard rule 31 (extends `check-guards.sh`): differ runs in CI; planted new-op
+- Guard rule 32 (extends `check-guards.sh`): differ runs in CI; planted new-op
   control. Must reproduce hand counts (140 declared / 136 vendored / 31 differing
   shared / 7 differing write bodies) or it is wrong.
 - Research anchor: Lercher et al. arXiv:2311.08175 (automate change-impact).
@@ -124,7 +124,7 @@ requirement land here as edits, never silently in code.
 ### P6 — perf/hardening/release (exit: shippable)
 
 - G2 re-run (v1 unmoved); v2 admission in load mix behind flag; soak with
-  kill -9 recovery; WAL ceiling holds; new-table queries under rule 32 budgets.
+  kill -9 recovery; WAL ceiling holds; new-table queries under rule 33 budgets.
 - Docs: README corrected, SECURITY asymmetries, TRACEABILITY rows, this doc
   status → shipped. Version bump only on green.
 
@@ -155,7 +155,7 @@ ring.
 
 ## 5. Guards added by this build
 
-- Rule 31: contract-differ in CI + planted new-op control + stale-asset detector.
-- Rule 32 (hard gate, D6): allocation-budget test per new-table v2 query +
+- Rule 32: contract-differ in CI + planted new-op control + stale-asset detector.
+- Rule 33 (hard gate, D6): allocation-budget test per new-table v2 query +
   `SELECT *` ban extension; planted control per table.
 - `/api/info`-dark rule: route must not exist before P5 green (planted control).
