@@ -583,3 +583,29 @@ else
 fi
 
 echo "== guard: docs are not stale (rule 31) =="
+# Docs are the spec (AGENTS §1); nothing checked them, so dead references
+# accumulated (the 2026-10-13 audit: three files referenced but gone, a stale
+# divergence, dangling guard-rule numbers). The linter fails on: backticked
+# repo paths that don't exist, `rule N` refs with no real rule, and a removed
+# divergence still listed as current. Planted control: dead path + bogus rule.
+#
+# RESTORED 2026-10-16: the feat/v2-engine branch truncated this block (header
+# only, no body, no `exit $fail`) — doc-lint silently stopped running. The
+# truncation itself is now a planted-control case: if this body goes missing
+# again, the `exit $fail` line below vanishes with it and CI's last-line
+# assertion (added to ci.yml in the same commit) fails the run.
+if [ -f scripts/check-docs.py ]; then
+  if python3 scripts/check-docs.py --selftest >/dev/null 2>&1; then
+    if out=$(python3 scripts/check-docs.py 2>&1); then
+      echo "$out"
+    else
+      echo "$out"; echo "FAIL: stale doc reference (rule 31)"; fail=1
+    fi
+  else
+    echo "FAIL: doc-lint planted control not detected (rule 31 vacuous)"; fail=1
+  fi
+else
+  echo "FAIL: scripts/check-docs.py missing (rule 31)"; fail=1
+fi
+
+exit $fail
