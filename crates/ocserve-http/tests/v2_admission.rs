@@ -205,6 +205,155 @@ async fn v2_admit_shape_resume_false_and_readmit() {
 }
 
 #[tokio::test]
+async fn v2_inbox_list_cancel_update() {
+    let addr = spawn_stub_provider();
+    let st = setup_with_v2(addr, true);
+    let app = ocserve_http::router(st.clone());
+
+    // Park two items (resume:false → no drain).
+    let (s1, _) = post_prompt(&app, json!({"id": "msg_inbox00000000000001", "text": "one", "resume": false})).await;
+    let (s2, _) = post_prompt(&app, json!({"id": "msg_inbox00000000000002", "text": "two", "delivery": "queue", "resume": false})).await;
+    assert_eq!((s1, s2), (StatusCode::OK, StatusCode::OK));
+
+    // List: both, enqueued order.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/session/ses_v2a/inbox")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let list: Value = serde_json::from_slice(&bytes).unwrap();
+    let ids: Vec<&str> = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["msg_inbox00000000000001", "msg_inbox00000000000002"]);
+    assert_eq!(list["data"][0]["delivery"], "steer");
+    assert_eq!(list["data"][1]["delivery"], "queue");
+    assert_eq!(list["data"][0]["type"], "user");
+
+    // Flip the second to steer → wakes a drain (no resume:false here, but the
+    // flip itself wakes steer scope): both items drain.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/session/ses_v2a/inbox/msg_inbox00000000000002")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"delivery": "steer"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    wait_drain(&st).await;
+    assert!(ocserve_store::inbox::list(&st.db, "ses_v2a").unwrap().is_empty());
+
+    // Cancel a missing item is a no-op success (not 404).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/session/ses_v2a/inbox/msg_nope00000000000001")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Bad delivery value → 400 InvalidRequest.
+    let (s3, _) = post_prompt(&app, json!({"id": "msg_inbox00000000000003", "text": "x", "resume": false})).await;
+    assert_eq!(s3, StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/session/ses_v2a/inbox/msg_inbox00000000000003")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"delivery": "bogus"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // CONTROL: cancel of a delivered item returning 404 → red here.
+}
+
+#[tokio::test]
+async fn v2_log_replay_and_watermark() {
+    let addr = spawn_stub_provider();
+    let st = setup_with_v2(addr, true);
+    let app = ocserve_http::router(st.clone());
+
+    let (status, _) = post_prompt(&app, json!({"text": "replay me"})).await;
+    assert_eq!(status, StatusCode::OK);
+    wait_drain(&st).await;
+
+    // Full replay: every durable row + exactly one log.synced watermark.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/experimental/session/ses_v2a/log?after=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    // Split into frames (each "data: ..." runs to the next blank line).
+    let datas: Vec<&str> = text.split("data: ").skip(1).collect();
+    assert!(!datas.is_empty(), "replay must emit frames");
+    let synced = datas.iter().filter(|d| d.contains("log.synced")).count();
+    assert_eq!(synced, 1, "exactly one watermark, got {synced}");
+    assert!(datas.iter().any(|d| d.contains("session.inbox.enqueued")),
+        "admission must replay");
+    // v2 grammar: durable envelope present on replayed rows.
+    assert!(datas.iter().any(|d| d.contains("aggregateID")),
+        "replay rows carry the durable envelope");
+
+    // after=<watermark> replays nothing but the marker.
+    let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
+    let max_seq: i64 = conn
+        .query_row("SELECT COALESCE(MAX(seq),0) FROM event WHERE session_id='ses_v2a'", [], |r| r.get(0))
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/experimental/session/ses_v2a/log?after={max_seq}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let datas: Vec<&str> = text.split("data: ").skip(1).collect();
+    assert_eq!(datas.len(), 1, "caught-up replay = only the watermark, got {datas:?}");
+    assert!(datas[0].contains("log.synced"));
+    // CONTROL: watermark emitted per row → count > 1, red. Missing envelope
+    // on rows → aggregateID assert reds.
+}
+
+#[tokio::test]
 async fn v2_drain_runs_turn_and_releases_claim() {
     let addr = spawn_stub_provider();
     let st = setup_with_v2(addr, true);

@@ -324,7 +324,14 @@ pub(crate) fn emit_live(ctx: &PromptContext, event_type: &str, properties: Value
         1,
     );
     ctx.bus
-        .publish(frame(&ctx.directory, event_type, properties));
+        .publish(frame(&ctx.directory, event_type, properties.clone()));
+    // v2-grammar twin (V2-PLAN.md P4): the v2 client dispatches on type
+    // strings and ignores unknowns, so without the twin a v2 UI never
+    // updates. Ephemeral deltas publish live-only (never persisted —
+    // matches upstream's ephemeral Delta defs).
+    if let Some((v2type, v2data, _durable)) = crate::event::v2_twin(event_type, &properties) {
+        ctx.bus.publish(crate::event::frame_v2(&v2type, v2data));
+    }
 }
 
 /// Build the assistant message skeleton emitted at the START of a provider turn
@@ -792,11 +799,17 @@ pub async fn run_prompt_with(
         .filter(|a| !a.is_empty())
         .unwrap_or_else(|| ctx.agent.clone());
 
-    // ---- persist user message (text parts; file parts land with M3) ----
+    // ---- persist user message (text + file/agent attachment parts) ----
     // Boundary decode (wire.rs) validated `messageID` against `^msg` — the
     // upstream rule (isStartsWith only; probe: bare "msg" and 5000-char ids
     // pass, no length/charset cap). Internal constructors pass None →
     // generate (upstream `input.messageID ?? MessageID.ascending()`).
+    //
+    // File/agent parts persist alongside text (V2-PLAN.md P4): upstream's
+    // `Session.Message.User` carries `files[]`/`agents[]`, and the v2
+    // projector reads them from parts. v1 readers splice parts generically
+    // (no per-type filter), so the new part types are inert on the v1 path.
+    // Bounded: attachment objects are small request JSON (uri/name).
     let user_msg_id = req.message_id.clone().unwrap_or_else(msg_id);
     let mut user_parts = Vec::new();
     for p in &req.parts {
@@ -808,6 +821,15 @@ pub async fn run_prompt_with(
                 "messageID": user_msg_id,
                 "type": "text",
                 "text": text,
+            }));
+        } else if p["type"] == "file" || p["type"] == "agent" {
+            let ptype = p["type"].as_str().unwrap_or("file").to_string();
+            user_parts.push(json!({
+                "id": prt_id(),
+                "sessionID": session_id,
+                "messageID": user_msg_id,
+                "type": ptype,
+                ptype.clone(): p.get(&ptype).cloned().unwrap_or(json!({})),
             }));
         }
     }

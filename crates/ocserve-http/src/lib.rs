@@ -5060,6 +5060,17 @@ fn encode_event_frame(stored: &str, fmt: EventFormat) -> Option<String> {
         return Some(stored.to_string());
     }
     let v: Value = serde_json::from_str(stored).ok()?;
+    // Already-v2 frames (frame_v2 twins: {id,type,data}, no payload key)
+    // pass through untouched on the V2 stream; other formats drop them (the
+    // v1 clients never subscribed to v2 grammar — same ignore rule).
+    if v.get("payload").is_none() {
+        if matches!(fmt, EventFormat::V2)
+            && v.get("type").and_then(Value::as_str).is_some()
+        {
+            return Some(stored.to_string());
+        }
+        return None;
+    }
     let payload = v.get("payload")?;
     if payload.get("type").and_then(Value::as_str) == Some("sync") {
         return None;
@@ -5492,6 +5503,18 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/session/{sessionID}/prompt",
             axum::routing::post(v2::prompt),
+        )
+        .route(
+            "/api/session/{sessionID}/inbox",
+            get(v2::inbox_list),
+        )
+        .route(
+            "/api/session/{sessionID}/inbox/{inboxID}",
+            axum::routing::delete(v2::inbox_cancel).patch(v2::inbox_update),
+        )
+        .route(
+            "/api/experimental/session/{sessionID}/log",
+            get(v2::session_log),
         )
         .route(
             "/api/session/{sessionID}/interrupt",

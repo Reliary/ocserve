@@ -1110,6 +1110,189 @@ pub fn page_messages(
     ))
 }
 
+/// Project one page of messages to v2 `Session.Message` shapes with REAL
+/// `content[]` (V2-PLAN.md P4 — replaces the skeletal `"content": []`).
+///
+/// Reads parts for the page's messages in ONE `IN` query per 64-message chunk
+/// (same bound as F3 — never a per-message query, never a whole-session
+/// prefetch). Part-type mapping:
+/// - `text` → `{type:"text", text, state:"completed"}`
+/// - `reasoning` → `{type:"reasoning", text, state:"completed"}`
+/// - `tool` → `{type:"tool", id, name, state, time}` from the stored state
+///   envelope (`{status,input,output,error,time}` → v2
+///   `completed{input,output}|error{input,error}|running{input}`)
+/// - `step-start`/`step-finish`/`patch`/`idle`/`busy`/`function` →
+///   folded into the assistant envelope (`snapshot`, `cost`, `finish`), never
+///   content elements (upstream has no message.part.* in v2 either)
+/// - user messages → `{type:"user", text, files, agents}` from info + file
+///   parts (upstream `Session.Message.User`)
+///
+/// Blobbed parts decode through the same `BlobStore` path as production.
+/// Explicit columns everywhere (rule 25/33).
+pub fn project_page_v2(
+    db: &std::path::Path,
+    page: &[(String, String)],
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    use serde_json::{Value, json};
+    let conn = pragma::open_reader(db)?;
+    let blobs = crate::blob::BlobStore::new(
+        db.parent()
+            .ok_or_else(|| anyhow::anyhow!("db parent"))?
+            .join("blobs"),
+    )?;
+    // Batch parts per 64-chunk (F3 bound).
+    const CHUNK: usize = 64;
+    let placeholders = vec!["?"; CHUNK].join(",");
+    let mut pstmt = conn.prepare_cached(&format!(
+        "SELECT message_id, type, inline, blob_sha, byte_len FROM msg_part \
+         WHERE message_id IN ({placeholders}) ORDER BY message_id, seq"
+    ))?;
+    let mut parts: std::collections::HashMap<String, Vec<(String, Option<String>, Option<(String, i64)>)>> =
+        std::collections::HashMap::new();
+    let mut padded: Vec<Option<String>> = Vec::with_capacity(CHUNK);
+    let mut iter = page.iter();
+    loop {
+        let head: Vec<&(String, String)> = iter.by_ref().take(CHUNK).collect();
+        if head.is_empty() {
+            break;
+        }
+        padded.clear();
+        for (mid, _) in &head {
+            padded.push(Some((*mid).clone()));
+        }
+        while padded.len() < CHUNK {
+            padded.push(None);
+        }
+        let mut rows = pstmt.query(rusqlite::params_from_iter(padded.iter()))?;
+        while let Some(row) = rows.next()? {
+            let sha: Option<String> = row.get(3)?;
+            let len: i64 = row.get(4)?;
+            parts
+                .entry(row.get::<_, String>(0)?)
+                .or_default()
+                .push((row.get(1)?, row.get(2)?, sha.map(|s| (s, len))));
+        }
+    }
+    let empty = Vec::new();
+    let mut out = Vec::with_capacity(page.len());
+    for (mid, info_txt) in page {
+        let info: Value = serde_json::from_str(info_txt).unwrap_or(Value::Null);
+        let role = info.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let created = info.pointer("/time/created").cloned().unwrap_or(json!(0));
+        let time = json!({"created": created});
+        let plist = parts.get(mid).map(|v| v.as_slice()).unwrap_or(&empty);
+        let mut content = Vec::new();
+        for (ptype, inline, blob) in plist {
+            let text_of = || -> String {
+                if let Some(t) = inline {
+                    return t.clone();
+                }
+                if let Some((s, len)) = blob {
+                    if let Ok(bytes) = blobs.get(s, *len as u64) {
+                        return String::from_utf8_lossy(&bytes).into_owned();
+                    }
+                }
+                String::new()
+            };
+            match ptype.as_str() {
+                "text" => {
+                    let raw = text_of();
+                    let body: Value =
+                        serde_json::from_str(&raw).unwrap_or(json!({"text": ""}));
+                    content.push(json!({
+                        "type": "text",
+                        "text": body.get("text").cloned().unwrap_or(json!("")),
+                        "state": "completed",
+                    }));
+                }
+                "reasoning" => {
+                    let raw = text_of();
+                    let body: Value =
+                        serde_json::from_str(&raw).unwrap_or(json!({"text": ""}));
+                    content.push(json!({
+                        "type": "reasoning",
+                        "text": body.get("text").cloned().unwrap_or(json!("")),
+                        "state": "completed",
+                    }));
+                }
+                "tool" => {
+                    let raw = text_of();
+                    let body: Value = serde_json::from_str(&raw).unwrap_or(json!({}));
+                    let state = body.get("state").cloned().unwrap_or(json!({}));
+                    let status = state.get("status").and_then(|s| s.as_str()).unwrap_or("running");
+                    let input = state.get("input").cloned().unwrap_or(json!({}));
+                    let v2state = match status {
+                        "completed" => json!({
+                            "status": "completed",
+                            "input": input,
+                            "output": state.get("output").cloned().unwrap_or(json!([])),
+                        }),
+                        "error" => json!({
+                            "status": "error",
+                            "input": input,
+                            "error": state.get("error").cloned().unwrap_or(json!("")),
+                        }),
+                        _ => json!({"status": "running", "input": input}),
+                    };
+                    content.push(json!({
+                        "type": "tool",
+                        "id": body.get("callID").cloned().unwrap_or(json!("")),
+                        "name": body.get("tool").cloned().unwrap_or(json!("")),
+                        "state": v2state,
+                        "time": state.get("time").cloned().unwrap_or(json!({})),
+                    }));
+                }
+                _ => {} // step-start/finish, patch, idle, busy, compaction: envelope, not content
+            }
+        }
+        match role {
+            "user" => {
+                let text = info
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // file/agent attachments travel as parts; surface the file ones.
+                let mut files = Vec::new();
+                let mut agents = Vec::new();
+                for (ptype, inline, _blob) in plist {
+                    if ptype == "file" {
+                        if let Some(t) = inline {
+                            if let Ok(v) = serde_json::from_str::<Value>(t) {
+                                files.push(v);
+                            }
+                        }
+                    } else if ptype == "agent" {
+                        if let Some(t) = inline {
+                            if let Ok(v) = serde_json::from_str::<Value>(t) {
+                                agents.push(v);
+                            }
+                        }
+                    }
+                }
+                out.push(json!({
+                    "id": mid, "time": time, "type": "user",
+                    "text": text, "files": files, "agents": agents,
+                }));
+            }
+            "assistant" => {
+                out.push(json!({
+                    "id": mid, "time": time, "type": "assistant",
+                    "agent": info.get("agent").cloned().unwrap_or(json!("build")),
+                    "model": {
+                        "id": info.get("modelID").cloned().unwrap_or(json!("")),
+                        "providerID": info.get("providerID").cloned().unwrap_or(json!("")),
+                    },
+                    "content": content,
+                    "cost": info.get("cost").cloned().unwrap_or(json!(0)),
+                    "tokens": info.get("tokens").cloned().unwrap_or(json!({})),
+                }));
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
 /// Walk a session's messages one at a time, yielding each message's FULL
 /// response JSON object (`{"info":…,"parts":[…]}`) to `visit`. Bounded by
 /// design (AGENTS §2.3): peak = one message — the old Vec<Value> path
@@ -1799,6 +1982,27 @@ pub fn prune_events(
         )?;
     }
     Ok(aged + capped)
+}
+
+/// Events after a seq for durable replay (`log?after=` — V2-PLAN.md P4).
+/// Explicit columns (rule 25/33); ascending seq; unbounded LIMIT is safe
+/// here only because callers cap the session ring at EVENT_MAX_PER_SESSION
+/// — the result is at most one ring's worth of rows.
+pub fn events_after(
+    db: &std::path::Path,
+    session_id: &str,
+    after: i64,
+) -> anyhow::Result<Vec<(i64, String, String, i64)>> {
+    let conn = pragma::open_reader(db)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT seq, type, payload, time_created FROM event \
+         WHERE session_id = ?1 AND seq > ?2 ORDER BY seq ASC",
+    )?;
+    let rows = stmt.query_map((session_id, after), |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 /// Load a session's durable events (newest first, capped) projected to the v2

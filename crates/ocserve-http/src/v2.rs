@@ -875,6 +875,8 @@ pub async fn get_session(
 }
 
 /// GET /api/session/{sessionID}/message — paginated projected messages.
+/// Real `content[]` via `store::project_page_v2` (V2-PLAN.md P4 — the
+/// skeletal `"content": []` is gone).
 pub async fn list_messages(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -895,67 +897,28 @@ pub async fn list_messages(
         return Err(session_not_found(&id));
     }
     let sid = id.clone();
-    let msgs = run_blocking(&st.db, move |db| {
+    let (msgs, _more, next) = run_blocking(&st.db, move |db| {
         ocserve_store::page_messages(db, &sid, limit as u64, None)
     })
     .await
     .map_err(|e| crate::HttpError::Api(internal(e)))?;
-    let data: Vec<Value> = msgs
-        .0
-        .into_iter()
-        .filter_map(|(mid, info)| project_message_v2(&mid, &info))
-        .collect();
+    let sid2 = id.clone();
+    let data = run_blocking(&st.db, move |db| {
+        ocserve_store::project_page_v2(db, &msgs)
+    })
+    .await
+    .map_err(|e| crate::HttpError::Api(internal(e)))?;
     // freeze always emits BOTH cursor keys (previous/next), null when absent.
     let mut cursor = json!({"previous": Value::Null, "next": Value::Null});
-    if let Some(next) = msgs.2 {
-        cursor["next"] = json!(next);
+    if let Some(n) = next {
+        cursor["next"] = json!(n);
     }
     Ok(Json(json!({"data": data, "cursor": cursor})))
 }
 
-/// Project a stored v1 message `info` (JSON text) to a v2 `SessionMessage`.
-/// The v2 message model is a projection of the same durable stream; we map
-/// the role/type to the closest v2 variant and always return JSON.
-fn project_message_v2(id: &str, info: &str) -> Option<Value> {
-    let v: Value = serde_json::from_str(info).ok()?;
-    let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("");
-    let created = v.pointer("/time/created").cloned().unwrap_or(json!(0));
-    let time = json!({"created": created});
-    match role {
-        "user" => {
-            let text = v
-                .pointer("/summary/title")
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_string();
-            Some(json!({"id": id, "time": time, "type": "user", "text": text}))
-        }
-        "assistant" => Some(json!({
-            "id": id,
-            "time": time,
-            "type": "assistant",
-            "agent": v.get("agent").cloned().unwrap_or(json!("build")),
-            "model": {"id": v.get("modelID").cloned().unwrap_or(json!("")), "providerID": v.get("providerID").cloned().unwrap_or(json!(""))},
-            "content": [],
-            "cost": v.get("cost").cloned().unwrap_or(json!(0)),
-            "tokens": normalize_tokens(v.get("tokens")),
-        })),
-        _ => None,
-    }
-}
-
-fn normalize_tokens(t: Option<&Value>) -> Value {
-    let t = t.cloned().unwrap_or(json!({}));
-    let cache = t.get("cache").cloned().unwrap_or(json!({}));
-    json!({
-        "input": t.get("input").cloned().unwrap_or(json!(0)),
-        "output": t.get("output").cloned().unwrap_or(json!(0)),
-        "reasoning": t.get("reasoning").cloned().unwrap_or(json!(0)),
-        "cache": {"read": cache.get("read").cloned().unwrap_or(json!(0)), "write": cache.get("write").cloned().unwrap_or(json!(0))},
-    })
-}
-
 /// GET /api/session/{sessionID}/message/{messageID} — single message.
+/// Real `content[]` via `store::project_page_v2` (same projector as the
+/// list path — one projection, no drift).
 pub async fn get_message(
     State(st): State<Arc<AppState>>,
     Path((id, mid)): Path<(String, String)>,
@@ -967,10 +930,29 @@ pub async fn get_message(
     })
     .await
     .map_err(internal)?;
-    let info = row
-        .and_then(|v| v.get("info").map(|i| i.to_string()))
-        .and_then(|info| project_message_v2(&mid, &info));
-    match info {
+    let row_present = row.is_some();
+    let info = row.and_then(|v| {
+        v.get("info").map(|i| (mid.clone(), i.to_string()))
+    });
+    let mut projected: Option<Value> = match info {
+        Some((m, info)) => {
+            let sid3 = id.clone();
+            run_blocking(&st.db, move |db| {
+                ocserve_store::project_page_v2(db, &[(m, info)])
+            })
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .next()
+        }
+        None => None,
+    };
+    // Unknown roles project to nothing; fall back to the id shell so the
+    // route stays 200-shape-faithful for stored-but-unprojectable rows.
+    if projected.is_none() && row_present {
+        projected = Some(json!({"id": mid}));
+    }
+    match projected {
         Some(m) => Ok(Json(json!({"data": m}))),
         None => Err(ApiError {
             status: StatusCode::NOT_FOUND,
@@ -1243,7 +1225,7 @@ pub async fn prompt(
             let st2 = st.clone();
             let sid = id.clone();
             tokio::spawn(async move {
-                v2_drain(st2, sid).await;
+                drain_session(st2, sid).await;
             });
         }
     }
@@ -1295,7 +1277,9 @@ fn new_v2_msg_id() -> String {
 /// v2 drain loop for one session: promote-one + run-one-turn via the shared
 /// `run_prompt` executor, until nothing is promotable. Claims wrap the drain
 /// (write-ahead on start, released on terminal states).
-async fn v2_drain(st: Arc<AppState>, sid: String) {
+///
+/// `pub(crate)` so inbox-update wakes (steer flips) share the exact drain.
+pub(crate) async fn drain_session(st: Arc<AppState>, sid: String) {
     use ocserve_core::coordinator::WakeScope;
     let now_ms = || {
         std::time::SystemTime::now()
@@ -1307,7 +1291,20 @@ async fn v2_drain(st: Arc<AppState>, sid: String) {
     let _ = ocserve_store::claim::claim(&st.writer, &sid, now_ms());
     let _ = crate::emit_durable_http(&st, &sid, "session.execution.started", json!({}));
     loop {
-        let Some(scope) = st.coordinators.take_pending(&sid) else {
+        // Doorbell first, work-continuation second (upstream `advanceToStep`
+        // loops on promotability, not doorbells — otherwise a wake that
+        // arrives mid-turn strands the rest of the queue). `next_scope`
+        // keeps `draining` armed while work remains, so no second drain can
+        // spawn mid-loop.
+        let work_remains = ocserve_core::coordinator::next_for_scope(
+            &st.db,
+            &sid,
+            ocserve_core::coordinator::WakeScope::Input,
+        )
+        .ok()
+        .flatten()
+        .is_some();
+        let Some(scope) = st.coordinators.next_scope(&sid, work_remains) else {
             break;
         };
         let next = ocserve_core::coordinator::next_for_scope(&st.db, &sid, scope);
@@ -1332,7 +1329,6 @@ async fn v2_drain(st: Arc<AppState>, sid: String) {
 /// Run one admitted inbox item through the shared executor: deliver (delete
 /// the inbox row) then build the v1 request and run the turn body.
 async fn run_v2_turn(st: &Arc<AppState>, sid: &str, item_id: &str) -> anyhow::Result<()> {
-    use anyhow::Context;
     let Some((_isid, itype, payload_text, delivery, _seq)) =
         ocserve_store::inbox::get(&st.db, item_id)?
     else {
@@ -1383,6 +1379,204 @@ fn v2_payload_parts(payload: &Value) -> Vec<Value> {
     }
     let _ = payload.get("skills");
     parts
+}
+
+// ---------------------------------------------------------------------------
+// inbox routes — list / cancel / update (V2-PLAN.md P4, L3-lite)
+// ---------------------------------------------------------------------------
+
+/// Project one inbox row to `Session.Inbox.Info`
+/// (`{id, sessionID, time, type, payload, delivery}`).
+fn inbox_info(session_id: &str, row: &(String, String, String, String, i64)) -> Value {
+    let (id, itype, payload_text, delivery, _seq) = row;
+    let payload: Value = serde_json::from_str(payload_text).unwrap_or(json!({}));
+    // The stored payload is the v1-shape user/synthetic body; the v2 envelope
+    // carries it under `payload` with the item `type` alongside.
+    json!({
+        "id": id,
+        "sessionID": session_id,
+        "time": {"created": 0},
+        "type": itype,
+        "payload": payload,
+        "delivery": delivery,
+    })
+}
+
+/// GET /api/experimental/session/{sessionID}/log?after=&follow= — durable
+/// event replay (V2-PLAN.md P4). Upstream protocol (`bus.ts:149-160`):
+/// `after` = exclusive `Event.Seq`; `follow=false` completes at the
+/// watermark; `follow=true` replays then goes live; exactly one `log.synced
+/// {aggregateID, seq}` marker at the captured watermark.
+///
+/// Rows come from the always-on event log (D-EVENT-ALWAYSON: ours works by
+/// default where upstream needs `persist:true`). Versioned stored types
+/// (`type@v1`) project to v2 grammar `{id,type,durable,data}` — the same
+/// projection as `load_session_events`, plus the watermark marker.
+pub async fn session_log(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::response::Response, HttpError> {
+    use axum::response::sse::{Event, Sse};
+    use futures_util::stream::{self, StreamExt};
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    let after: i64 = q.get("after").and_then(|a| a.parse().ok()).unwrap_or(0);
+    let follow = q.get("follow").map(|f| f == "true").unwrap_or(false);
+    let sid = id.clone();
+    let rows = run_blocking(&st.db, move |db| {
+        ocserve_store::events_after(db, &sid, after)
+    })
+    .await
+    .map_err(|e| crate::HttpError::Api(internal(e)))?;
+    let watermark = rows.last().map(|(s, _, _, _)| *s).unwrap_or(after);
+    let sid2 = id.clone();
+    let frames: Vec<String> = rows
+        .into_iter()
+        .map(|(seq, ty, payload_text, _t)| {
+            let data: Value =
+                serde_json::from_str(&payload_text).unwrap_or(json!({}));
+            let body = data.pointer("/properties").cloned().unwrap_or(data);
+            let unversioned = ocserve_store::unversioned_event_type(&ty);
+            let version: i64 = ty
+                .rsplit_once('@')
+                .and_then(|(_, s)| s.strip_prefix('v')?.parse().ok())
+                .unwrap_or(1);
+            json!({
+                "id": format!("evt_{seq}"),
+                "type": unversioned,
+                "durable": {"aggregateID": sid2, "seq": seq, "version": version},
+                "data": body,
+            })
+            .to_string()
+        })
+        .collect();
+    let synced = json!({
+        "type": "log.synced", "aggregateID": sid2, "seq": watermark,
+    })
+    .to_string();
+    let stream = stream::iter(frames.into_iter().map(|f| Ok::<_, std::convert::Infallible>(Event::default().data(f))));
+    if follow {
+        // Replay-then-live: the watermark marker, then the live bus filtered
+        // to v2-grammar frames for this session. Bounded by the same ring
+        // subscription as /api/event (no new channel).
+        let rx = st.bus.subscribe();
+        let sid3 = id.clone();
+        let live = stream::unfold(rx, move |mut rx| {
+            let sid = sid3.clone();
+            async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(frame) => {
+                            // v2-grammar frames carry no payload key; live
+                            // here means v2 twins + durable projections for
+                            // this session (session check via data.sessionID).
+                            if frame.contains("sessionID") && frame.contains(&sid as &str) {
+                                return Some((Ok(Event::default().data(frame)), rx));
+                            }
+                        }
+                        Err(_) => return None,
+                    }
+                }
+            }
+        });
+        let synced_ev = Event::default().data(synced);
+        Ok(Sse::new(stream.chain(stream::once(async { Ok(synced_ev) })).chain(live)).into_response())
+    } else {
+        let synced_ev = Event::default().data(synced);
+        Ok(Sse::new(stream.chain(stream::once(async { Ok(synced_ev) }))).into_response())
+    }
+}
+/// GET /api/session/{sessionID}/inbox — list pending durable work, ordered by
+/// `enqueued_seq` (upstream `session.inbox.list`).
+pub async fn inbox_list(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    let rows = ocserve_store::inbox::list(&st.db, &id).map_err(internal)?;
+    Ok(Json(
+        json!({"data": rows.iter().map(|r| inbox_info(&id, r)).collect::<Vec<_>>()}),
+    ))
+}
+
+/// DELETE /api/session/{sessionID}/inbox/{inboxID} — cancel undelivered work
+/// (no-op when already delivered/missing — upstream treats cancel of a gone
+/// item as success, `session.ts:547`).
+pub async fn inbox_cancel(
+    State(st): State<Arc<AppState>>,
+    Path((id, inbox_id)): Path<(String, String)>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    // Scope the cancel to this session (no cross-session deletes).
+    match ocserve_store::inbox::get(&st.db, &inbox_id).map_err(internal)? {
+        Some((sid, _, _, _, _)) if sid == id => {
+            let _ = ocserve_store::inbox::cancel(&st.writer, &inbox_id).map_err(internal)?;
+        }
+        _ => {}
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// PATCH /api/session/{sessionID}/inbox/{inboxID} — change `delivery`
+/// (`{delivery: "steer"|"queue"}` required); a steer flip also wakes the
+/// coordinator (upstream `steerInbox` wakes, `session.ts:135-141`).
+pub async fn inbox_update(
+    State(st): State<Arc<AppState>>,
+    Path((id, inbox_id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    let delivery = body
+        .get("delivery")
+        .and_then(|v| v.as_str())
+        .filter(|s| *s == "steer" || *s == "queue");
+    let Some(delivery) = delivery else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "delivery must be \"steer\" | \"queue\""}),
+        });
+    };
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    match ocserve_store::inbox::get(&st.db, &inbox_id).map_err(internal)? {
+        Some((sid, _, _, _, _)) if sid == id => {
+            if !ocserve_store::inbox::set_delivery(&st.writer, &inbox_id, delivery)
+                .map_err(internal)?
+            {
+                return Err(session_not_found(&id));
+            }
+            if delivery == "steer"
+                && st.coordinators.wake(&id, ocserve_core::coordinator::WakeScope::Steer)
+            {
+                let st2 = st.clone();
+                let sid2 = id.clone();
+                tokio::spawn(async move {
+                    drain_session(st2, sid2).await;
+                });
+            }
+        }
+        _ => return Err(session_not_found(&id)),
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// POST /api/session/{sessionID}/interrupt — NoContent (abort the task).

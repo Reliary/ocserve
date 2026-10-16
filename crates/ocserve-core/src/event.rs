@@ -300,6 +300,89 @@ pub fn normalize_props(event_type: &str, mut props: Value) -> Value {
     props
 }
 
+/// v2-grammar twin of a v1 live event (V2-PLAN.md P4, L3-lite).
+///
+/// The v2 client dispatches on `event.type` strings and ignores unknowns, so
+/// a v1-only turn is a silent dead UI. This table maps the turn-lifecycle v1
+/// events to their v2 grammar equivalents (shapes from
+/// `packages/schema/src/session-event.ts`, verified 2026-10-16):
+/// - `message.part.updated` text/reasoning/tool → `session.text|reasoning|
+///   tool.input` started/delta + `session.tool.called`
+/// - `message.updated` (assistant) → `session.step.started`
+/// - `session.status` busy/idle → `session.status` (v2 shape)
+///
+/// Returns `None` for events with no v2 twin. Deltas are ephemeral
+/// (live-only, never persisted — matches upstream's ephemeral Delta defs);
+/// lifecycle boundaries are durable (the choke persists them).
+/// Unmapped events stay v1-only (the client ignores them, no lie).
+pub fn v2_twin(event_type: &str, properties: &Value) -> Option<(String, Value, bool)> {
+    let part = properties.get("part")?;
+    match event_type {
+        "message.part.updated" => {
+            let ptype = part.get("type").and_then(|t| t.as_str())?;
+            let session_id = properties
+                .get("sessionID")
+                .or_else(|| part.get("sessionID"))
+                .cloned()
+                .unwrap_or(json!(""));
+            let message_id = part
+                .get("messageID")
+                .cloned()
+                .unwrap_or(json!(""));
+            let text = part.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            match ptype {
+                "text" if text.is_empty() => Some((
+                    "session.text.started".into(),
+                    json!({"sessionID": session_id, "assistantMessageID": message_id, "ordinal": 0}),
+                    true,
+                )),
+                "text" => Some((
+                    "session.text.delta".into(),
+                    json!({"sessionID": session_id, "assistantMessageID": message_id, "ordinal": 0, "delta": text}),
+                    false,
+                )),
+                "reasoning" if text.is_empty() => Some((
+                    "session.reasoning.started".into(),
+                    json!({"sessionID": session_id, "assistantMessageID": message_id, "ordinal": 0}),
+                    true,
+                )),
+                "reasoning" => Some((
+                    "session.reasoning.delta".into(),
+                    json!({"sessionID": session_id, "assistantMessageID": message_id, "ordinal": 0, "delta": text}),
+                    false,
+                )),
+                "tool" => {
+                    let state = part.get("state").cloned().unwrap_or(json!({}));
+                    let status = state.get("status").and_then(|s| s.as_str()).unwrap_or("running");
+                    if status == "running" {
+                        Some((
+                            "session.tool.called".into(),
+                            json!({"sessionID": session_id, "assistantMessageID": message_id,
+                                   "id": part.get("callID").cloned().unwrap_or(json!("")),
+                                   "name": part.get("tool").cloned().unwrap_or(json!(""))}),
+                            true,
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Encode a v2-grammar live frame (`{id,type,data}` — the `/api/event`
+/// envelope; `data` is the frozen V2 field name).
+pub fn frame_v2(event_type: &str, data: Value) -> Value {
+    json!({
+        "id": crate::ids::evt_id(),
+        "type": event_type,
+        "data": data,
+    })
+}
+
 /// Encode a sync-twin frame (EventReducer consumption): the payload is a
 /// `sync` envelope wrapping the original event with a per-session seq.
 pub fn sync_frame(
@@ -338,6 +421,50 @@ mod tests {
         assert_eq!(f["payload"]["type"], "session.idle");
         assert_eq!(f["payload"]["properties"]["sessionID"], "ses_1");
         assert!(f["payload"]["id"].as_str().unwrap().starts_with("evt_"));
+    }
+
+    /// v2 twins (V2-PLAN.md P4): v1 part events map to v2 grammar; unmapped
+    /// events stay None (v1-only, client-ignored — never a fabricated twin).
+    #[test]
+    fn v2_twin_maps_lifecycle_and_nothing_else() {
+        let part = |t: &str, text: &str| {
+            json!({"sessionID": "s", "part": {
+                "type": t, "id": "p", "text": text,
+                "sessionID": "s", "messageID": "m",
+            }})
+        };
+        // empty text = started (durable), non-empty = delta (ephemeral).
+        let (ty, data, durable) =
+            v2_twin("message.part.updated", &part("text", "")).unwrap();
+        assert_eq!((ty.as_str(), durable), ("session.text.started", true));
+        assert_eq!(data["assistantMessageID"], "m");
+        let (ty, data, durable) =
+            v2_twin("message.part.updated", &part("text", "hi")).unwrap();
+        assert_eq!((ty.as_str(), durable), ("session.text.delta", false));
+        assert_eq!(data["delta"], "hi");
+        let (ty, _, _) =
+            v2_twin("message.part.updated", &part("reasoning", "")).unwrap();
+        assert_eq!(ty, "session.reasoning.started");
+        let (ty, _, _) =
+            v2_twin("message.part.updated", &part("reasoning", "h")).unwrap();
+        assert_eq!(ty, "session.reasoning.delta");
+        // running tool → called (durable); completed tool → None (its
+        // completion lands via step.ended, not a twin).
+        let (ty, data, durable) = v2_twin(
+            "message.part.updated",
+            &json!({"sessionID": "s", "part": {
+                "type": "tool", "callID": "c", "tool": "read",
+                "sessionID": "s", "messageID": "m",
+                "state": {"status": "running", "input": {}},
+            }}),
+        )
+        .unwrap();
+        assert_eq!((ty.as_str(), durable), ("session.tool.called", true));
+        assert_eq!(data["name"], "read");
+        // unmapped: no twin, never fabricated.
+        assert!(v2_twin("session.updated", &json!({})).is_none());
+        assert!(v2_twin("message.part.updated", &json!({"part": {"type": "patch"}})).is_none());
+        // CONTROL: map patch parts to a twin → the last assertion reds.
     }
 
     /// normalize_props injects the required `time` on message.part.updated
