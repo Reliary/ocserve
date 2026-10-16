@@ -1372,6 +1372,31 @@ fn v2_payload_parts(payload: &Value) -> Vec<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// server info — version probe (V2-PLAN.md D2)
+// ---------------------------------------------------------------------------
+
+/// GET /api/info — the v2 version probe (`ServerInfo{version,pid,urls,paths,
+/// capabilities}`). DARK until P5 acceptance: JSON 404 while `v2_enabled`
+/// is false (never SPA fallthrough — a client probing the version must get
+/// a version signal, not HTML).
+pub async fn server_info(State(st): State<Arc<AppState>>) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "SessionNotFoundError",
+            fields: json!({"message": "v2 runtime disabled".to_string()}),
+        });
+    }
+    Ok(Json(json!({
+        "version": ocserve_core::spec::V2_TAG,
+        "pid": std::process::id(),
+        "urls": [],
+        "paths": {"tmp": std::env::temp_dir().to_string_lossy()},
+        "capabilities": {"persistentPty": false},
+    })))
+}
+
+// ---------------------------------------------------------------------------
 // form routes — create/list/get/reply/cancel + global list (V2-PLAN.md P4)
 // ---------------------------------------------------------------------------
 

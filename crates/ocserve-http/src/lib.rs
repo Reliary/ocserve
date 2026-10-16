@@ -5549,6 +5549,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::post(v2::form_reply),
         )
         .route("/api/form", get(v2::form_list_global))
+        // Version probe (V2-PLAN.md D2): bound EXPLICITLY so it never falls
+        // through to the SPA catch-all (freeze serves HTML 200 for unknown
+        // paths — v1-faithful, but a v2 client probing /api/info must get a
+        // version signal, not HTML). Dark (JSON 404) until P5 acceptance.
+        .route("/api/info", get(v2::server_info))
         .route(
             "/api/session/{sessionID}/interrupt",
             axum::routing::post(v2::interrupt),

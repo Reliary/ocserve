@@ -428,11 +428,11 @@ async fn v2_form_lifecycle() {
         )
     }
 
-    // Create with explicit id.
+    // Create with explicit id (upstream Field union requires `key`).
     let (s, v) = post(
         &app,
         "/api/session/ses_v2a/form",
-        json!({"id": "frm_test00000000000001", "title": "pick", "fields": [{"label": "a"}]}),
+        json!({"id": "frm_test00000000000001", "title": "pick", "fields": [{"key": "k", "type": "string", "title": "a"}]}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -489,7 +489,7 @@ async fn v2_form_lifecycle() {
     let (s, v) = post(
         &app,
         "/api/session/ses_v2a/form",
-        json!({"title": "c", "fields": [{"label": "b"}]}),
+        json!({"title": "c", "fields": [{"key": "k2", "type": "string", "title": "b"}]}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
