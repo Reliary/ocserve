@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -105,6 +105,47 @@ CREATE TABLE todo (
 CREATE INDEX idx_todo_session ON todo(session_id);
 
 -- FTS5 external-content projection, MAIN DB only (STORAGE.md §1 — ATTACH impossible)
+-- v2 inbox + instruction state (V2-PLAN.md P2, schema v13). Additive tables
+-- only — the hot-path tables above are byte-stable. `session_inbox` holds
+-- ONLY unconsumed work (deliver deletes the row in the same txn that inserts
+-- the visible message, so the table is small by construction — no prune loop).
+-- `instruction_*` mirrors upstream's content-addressed delta store.
+CREATE TABLE session_inbox (
+    id           TEXT PRIMARY KEY,
+    session_id   TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+    type         TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    delivery     TEXT NOT NULL DEFAULT 'steer',
+    enqueued_seq INTEGER NOT NULL,
+    time_created INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX idx_inbox_session ON session_inbox(session_id, delivery, enqueued_seq);
+CREATE UNIQUE INDEX idx_inbox_seq ON session_inbox(session_id, enqueued_seq);
+
+CREATE TABLE instruction_blob (
+    hash  TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE instruction_state (
+    session_id     TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+    epoch_start    INTEGER NOT NULL DEFAULT 0,
+    through_seq    INTEGER NOT NULL DEFAULT 0,
+    initial_values TEXT NOT NULL DEFAULT '{}',
+    current_values TEXT NOT NULL DEFAULT '{}'
+) STRICT;
+
+CREATE TABLE instruction_entry (
+    session_id   TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+    key          TEXT NOT NULL,
+    value        TEXT NOT NULL,
+    removed      INTEGER NOT NULL DEFAULT 0,
+    time_created INTEGER NOT NULL,
+    time_updated INTEGER NOT NULL,
+    PRIMARY KEY (session_id, key)
+) STRICT;
+
 -- legacy-delta sync state (dev bridge: legacy -> ocserve additive pulls;
 -- dropped relevance once the final migration lands — PLAN §17)
 CREATE TABLE import_sync (
@@ -605,6 +646,49 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                         "CREATE INDEX IF NOT EXISTS idx_event_time ON event(time_created);",
                     )?;
                 }
+            }
+            12 => {
+                // v12->v13: v2 inbox + instruction state (V2-PLAN.md P2).
+                // Additive tables only (see DDL above); the migration is a
+                // pure CREATE — no data movement, no index rebuild, fast on
+                // any DB size. Guard: rewind-based test arms may re-run this
+                // step without dropping the tables (same composability rule
+                // as v10->v11 / v11->v12).
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS session_inbox (
+                        id           TEXT PRIMARY KEY,
+                        session_id   TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+                        type         TEXT NOT NULL,
+                        payload      TEXT NOT NULL,
+                        delivery     TEXT NOT NULL DEFAULT 'steer',
+                        enqueued_seq INTEGER NOT NULL,
+                        time_created INTEGER NOT NULL
+                    ) STRICT;
+                    CREATE INDEX IF NOT EXISTS idx_inbox_session
+                        ON session_inbox(session_id, delivery, enqueued_seq);
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_seq
+                        ON session_inbox(session_id, enqueued_seq);
+                    CREATE TABLE IF NOT EXISTS instruction_blob (
+                        hash  TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    ) STRICT;
+                    CREATE TABLE IF NOT EXISTS instruction_state (
+                        session_id     TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+                        epoch_start    INTEGER NOT NULL DEFAULT 0,
+                        through_seq    INTEGER NOT NULL DEFAULT 0,
+                        initial_values TEXT NOT NULL DEFAULT '{}',
+                        current_values TEXT NOT NULL DEFAULT '{}'
+                    ) STRICT;
+                    CREATE TABLE IF NOT EXISTS instruction_entry (
+                        session_id   TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+                        key          TEXT NOT NULL,
+                        value        TEXT NOT NULL,
+                        removed      INTEGER NOT NULL DEFAULT 0,
+                        time_created INTEGER NOT NULL,
+                        time_updated INTEGER NOT NULL,
+                        PRIMARY KEY (session_id, key)
+                    ) STRICT;",
+                )?;
             }
             other => {
                 bail!(

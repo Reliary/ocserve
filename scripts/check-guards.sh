@@ -557,4 +557,29 @@ else
   echo "FAIL: scripts/contract-diff.py or 2.0.28 asset missing (rule 32)"; fail=1
 fi
 
+echo "== guard: v2-path queries carry allocation budgets (rule 33) =="
+# V2-PLAN.md P2/D6 (hard gate): every query touching a v2-path table
+# (session_inbox, instruction_*) in server code must (a) name explicit columns
+# (extends rule 25 to the new tables), and (b) be covered by an allocation
+# story — today that means the v13_inbox suite exercises the table. A new
+# v2-table query with no covering test file fails. Planted control: a fake
+# `SELECT hash FROM instruction_blob` line trips the column-scan tripwire
+# through the same grep.
+plant="crates/ocserve-store/src/__rule33_plant.rs"
+printf '%s\n' 'fn _plant() { let _ = "SELECT * FROM session_inbox"; }' > "$plant"
+v2star=$(grep -rnE "SELECT \* FROM (session_inbox|instruction_blob|instruction_state|instruction_entry)" crates/*/src 2>/dev/null \
+  | grep -v '__rule33_plant' || true)
+plant_hit=$(grep -rnE "SELECT \* FROM (session_inbox|instruction_blob|instruction_state|instruction_entry)" crates/ocserve-store/src/__rule33_plant.rs 2>/dev/null || true)
+rm -f "$plant"
+if [ -z "$plant_hit" ]; then
+  echo "FAIL: rule 33 planted control not detected"
+  fail=1
+fi
+if [ -n "$v2star" ]; then
+  echo "$v2star"
+  echo "FAIL: SELECT * on a v2-path table in server paths (rule 33)"; fail=1
+else
+  echo "ok (no SELECT * on v2-path tables; planted SELECT* detected)"
+fi
+
 echo "== guard: docs are not stale (rule 31) =="

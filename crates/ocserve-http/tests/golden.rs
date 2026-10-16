@@ -1423,7 +1423,7 @@ async fn command_unknown_400_emits_session_error_and_lists_available() {
     let conn = ocserve_store::pragma::open_reader(&events).unwrap();
     let n: i64 = conn
         .query_row(
-            "SELECT count(*) FROM event WHERE type = 'session.error'",
+            "SELECT count(*) FROM event WHERE type IN ('session.error', 'session.error@v1')",
             [],
             |r| r.get(0),
         )

@@ -146,6 +146,11 @@ pub(crate) fn message_tokens(u: &Usage) -> Value {
 
 /// Emit a durable event: persist to ring, publish plain frame + sync twin.
 /// `seq` is a session-local counter seeded once (avoids re-opening readers).
+///
+/// V2-PLAN.md P2: this is the single emission choke alongside
+/// `emit_durable_http` — both flow through `ocserve_store::emit_event`, which
+/// stamps the versioned durable type (`type@v1`) and mints the stable id from
+/// the allocated seq. One write, two grammars (D5).
 pub(crate) fn emit_durable(
     ctx: &PromptContext,
     writer: &ocserve_store::Writer,
@@ -157,7 +162,8 @@ pub(crate) fn emit_durable(
     // normalize ONCE so the persisted payload and every published frame agree
     // (the event-log validator reads the persisted copy).
     let properties = crate::event::normalize_props(event_type, properties);
-    ocserve_store::append_event(writer, Some(session_id), event_type, &properties)?;
+    let (stored_seq, _id) =
+        ocserve_store::emit_event(writer, Some(session_id), event_type, &properties)?;
     ocserve_metrics::labeled_counter(
         "ocserve_events_emitted_total",
         &format!("type=\"{event_type}\""),
@@ -165,6 +171,12 @@ pub(crate) fn emit_durable(
     );
     let this_seq = *seq;
     *seq += 1;
+    // The stored row carries the versioned type; the live v1 frames carry the
+    // unversioned type (validator + clients operate on unversioned names).
+    debug_assert_eq!(
+        stored_seq, this_seq,
+        "prompt-local seq drifted from the stored event seq"
+    );
     ctx.bus
         .publish(frame(&ctx.directory, event_type, properties.clone()));
     ctx.bus.publish(sync_frame(

@@ -1475,6 +1475,66 @@ pub fn next_event_seq(db: &std::path::Path, session_id: &str) -> anyhow::Result<
 pub const EVENT_MAX_PER_SESSION: i64 = 200_000;
 pub const EVENT_MAX_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
+/// Versioned event type discipline (V2-PLAN.md P2, C1 amendment).
+///
+/// Upstream v2 versions durable event types (`type@vN`) and addresses events
+/// by stable `evt_` ids with a per-aggregate `{aggregateID, seq, version}`
+/// envelope. Our `event` table carries the unversioned v1 type and an
+/// AUTOINCREMENT seq, and the two emitters (`prompt.rs emit_durable`,
+/// `lib.rs emit_durable_http`) each mint ids differently. This function is the
+/// SINGLE choke through which every durable emission flows (rule: no direct
+/// `append_event` calls from server paths — the guard enforces it):
+/// it stamps the versioned type, mints the stable id from the allocated seq,
+/// appends the row, and returns `(seq, id)` so the live frames and the stored
+/// row agree byte-for-byte. One write, two grammars (D5).
+pub fn emit_event(
+    writer: &Writer,
+    session_id: Option<&str>,
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> anyhow::Result<(i64, String)> {
+    let versioned = versioned_event_type(event_type);
+    append_event(writer, session_id, &versioned, payload)?;
+    // The row seq is AUTOINCREMENT; read back the row we just wrote on this
+    // writer's own connection path (MAX(seq) scoped to the session is exact
+    // here because the writer serializes all appends).
+    let seq: i64 = {
+        let conn = pragma::open_reader(writer.db_path_ref())?;
+        conn.query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM event WHERE \
+             (session_id = ?1 OR (?1 IS NULL AND session_id IS NULL))",
+            [session_id],
+            |r| r.get(0),
+        )?
+    };
+    Ok((seq, format!("evt_{seq}")))
+}
+
+/// Suffix the durable version onto an event type (`type` → `type@v1`).
+/// Already-versioned types pass through; the v1 sync-twin suffix (`.1`) is
+/// preserved (it addresses the sync envelope, not the durable version).
+pub fn versioned_event_type(event_type: &str) -> String {
+    if event_type.contains('@') {
+        return event_type.to_string();
+    }
+    format!("{event_type}@v1")
+}
+
+/// Strip the durable version suffix (`type@vN` → `type`). The live v1 frames
+/// and the event-log validator operate on unversioned types.
+pub fn unversioned_event_type(event_type: &str) -> &str {
+    match event_type.rsplit_once('@') {
+        Some((base, suffix))
+            if suffix.len() > 1
+                && suffix.starts_with('v')
+                && suffix[1..].chars().all(|c| c.is_ascii_digit()) =>
+        {
+            base
+        }
+        _ => event_type,
+    }
+}
+
 /// Enforce the ring bound: keep the newest `max_per_session` rows per
 /// session and drop rows older than `max_age_ms` (explicit `now_ms` for
 /// deterministic tests). Returns rows deleted.
@@ -1550,10 +1610,17 @@ pub fn load_session_events(
             .pointer("/properties")
             .cloned()
             .unwrap_or_else(|| data.clone());
+        // Stored types carry the durable version suffix (`type@v1`); the v2
+        // projection strips it (the envelope's `version` carries it).
+        let unversioned = unversioned_event_type(&ty);
+        let version: i64 = ty
+            .rsplit_once('@')
+            .and_then(|(_, s)| s.strip_prefix('v')?.parse().ok())
+            .unwrap_or(1);
         out.push(serde_json::json!({
             "id": format!("evt_{seq}"),
-            "type": ty,
-            "durable": {"aggregateID": session_id, "seq": seq, "version": 1},
+            "type": unversioned,
+            "durable": {"aggregateID": session_id, "seq": seq, "version": version},
             "data": body,
         }));
     }

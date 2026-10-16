@@ -2635,7 +2635,9 @@ async fn global_dispose(State(st): State<Arc<AppState>>) -> Result<Json<Value>, 
     // spec Event.server.instance.disposed.properties: {directory} (required).
     let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
     let props = json!({"directory": dir});
-    ocserve_store::append_event(&st.writer, None, "server.instance.disposed", &props).map_err(
+    // Global (session-less) emission through the single choke: versioned
+    // durable type + stable id, no session sync twin (V2-PLAN.md P2).
+    let (_seq, _id) = ocserve_store::emit_event(&st.writer, None, "server.instance.disposed", &props).map_err(
         |e| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             name: "InternalError",
@@ -4594,23 +4596,9 @@ fn emit_session_error_event(st: &Arc<AppState>, sid: &str, message: &str) {
         "sessionID": sid,
         "error": {"name": "UnknownError", "data": {"message": message}},
     });
-    if let Err(e) = ocserve_store::append_event(&st.writer, Some(sid), "session.error", &props) {
-        tracing::warn!("session.error persist failed: {e:#}");
+    if let Err(e) = emit_durable_http(&st, sid, "session.error", props.clone()) {
+        tracing::warn!("session.error emit failed: {} {}", e.name, e.message);
     }
-    let seq = ocserve_store::next_event_seq(&st.db, sid).unwrap_or(0);
-    let dir = st.paths["directory"].as_str().unwrap_or("/");
-    st.bus.publish(ocserve_core::event::frame(
-        dir,
-        "session.error",
-        props.clone(),
-    ));
-    st.bus.publish(ocserve_core::event::sync_frame(
-        dir,
-        "session.error",
-        props,
-        seq as u64,
-        sid,
-    ));
 }
 
 /// Busy rejection (v1 mapBusy → SessionBusyError): command/shell never queue
@@ -4971,14 +4959,16 @@ pub(crate) fn emit_durable_http(
     props: Value,
 ) -> Result<(), ApiError> {
     let props = ocserve_core::event::normalize_props(event_type, props);
-    ocserve_store::append_event(&st.writer, Some(sid), event_type, &props).map_err(|e| {
-        ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            name: "InternalError",
-            message: format!("{e:#}"),
-        }
-    })?;
-    let seq = ocserve_store::next_event_seq(&st.db, sid).unwrap_or(0);
+    // Single choke (V2-PLAN.md P2): versioned durable type + stable id from
+    // the allocated seq — the same path the prompt loop uses (D5).
+    let (seq, _id) =
+        ocserve_store::emit_event(&st.writer, Some(sid), event_type, &props).map_err(|e| {
+            ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                name: "InternalError",
+                message: format!("{e:#}"),
+            }
+        })?;
     let dir = st.paths["directory"].as_str().unwrap_or("/");
     st.bus
         .publish(ocserve_core::event::frame(dir, event_type, props.clone()));
