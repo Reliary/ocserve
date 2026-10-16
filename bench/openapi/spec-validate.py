@@ -69,6 +69,14 @@ ALLOW_V2_UNION = {
     # v2-only route, but the envelope is the shared cached location value
     # (one shape everywhere — cache design over per-route exactness).
     "/api/form": "shared envelope project (no v1 shape; envelope uniformity)",
+    # Phase A routes: same union class (v1-required keys in v2 objects).
+    "/api/mcp": "v1 envelope project required (data projected to Mcp.Server array)",
+    "/api/mcp/resource": "v1 envelope project required",
+    "/api/vcs": "v1 envelope project required (data is per-contract Vcs.Info)",
+    "/api/vcs/status": "v1 envelope project required",
+    "/api/vcs/base": "v1 envelope project required",
+    "/api/vcs/branch": "v1 envelope project required",
+    "/api/project": "v1 Project.worktree+time.initialized required",
 }
 
 

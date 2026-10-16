@@ -68,10 +68,14 @@ Locked decisions (user-approved 2026-10-16):
 ## 3. Phases
 
 ### Phase A — TUI boot closure (exit: real v2 TUI reaches session list)
-`/api/project` (+PATCH), `/api/mcp` + resource catalog, `/api/vcs*` aliases,
+/api/project (+PATCH), `/api/mcp` + resource catalog, `/api/vcs*` aliases,
 `/api/session/active` check, `file.list` vs `/api/fs/*` resolution. Shell
-registry verdict by probing the real TUI (fail-open → Phase D). Each route:
-bind → pair-v2 vector → spec-validate. Technique: strangler route-by-route.
+registry verdict 2026-10-16: FAIL-OPEN by code reading (per-resource
+`locationResource` syncs with independent keys; bootstrap collects errors
+via `runAll` + toast and continues — `bootstrap.ts:122-175`,
+`data.ts:146-200,1301-1330`). Shell registry deferred to Phase D; the
+real-TUI-boot kill still arbitrates. Each route: bind → pair-v2 vector →
+spec-validate. Technique: strangler route-by-route.
 
 ### Phase B — near-miss aliases, ~15 ops (exit: new-v2 −15, vectors green)
 `diff`, `fork|command|shell`, `mcp`, `project`, `vcs`, `background`, `wait`

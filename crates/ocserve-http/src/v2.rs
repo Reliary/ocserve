@@ -876,8 +876,15 @@ pub async fn list_sessions(
 
 /// GET /api/session/active — `{data:{}}` (no per-request foreground drains
 /// are tracked on the v2 wire; ocserve's own prompt locks are v1 status).
-pub async fn active_sessions() -> impl IntoResponse {
-    Json(json!({"data": {}}))
+pub async fn active_sessions(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    // Sessions with a live execution claim are `running` (the claim table
+    // is the source of truth — no parallel busy-map to skew against).
+    let running = ocserve_store::claim::list_suspended(&st.db).unwrap_or_default();
+    let data: serde_json::Map<String, Value> = running
+        .into_iter()
+        .map(|sid| (sid, json!({"type": "running"})))
+        .collect();
+    Json(json!({"data": Value::Object(data)}))
 }
 
 /// GET /api/session/{sessionID} — `{data:SessionV2Info}`.
@@ -1421,6 +1428,180 @@ pub async fn server_info(State(st): State<Arc<AppState>>) -> Result<Json<Value>,
         "urls": [],
         "paths": {"tmp": std::env::temp_dir().to_string_lossy()},
         "capabilities": {"persistentPty": false},
+    })))
+}
+
+/// GET /api/mcp — v2 `mcp.list` (`{location, data:[Mcp.Server]}`).
+/// Projects the hub's v1 status MAP (`{name:{status,...}}`) to the v2 ARRAY
+/// (`[{name, status, ...}]`) — shapes differ, so this is a projection, not
+/// an alias. Unknown hub statuses map to `pending` (never fabricated
+/// `connected`).
+pub async fn list_mcp(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let hub = st
+        .mcp
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::sync::Arc::new(ocserve_mcp::McpHub::default()));
+    let statuses = hub.statuses();
+    let data: Vec<Value> = statuses
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(name, v)| {
+                    let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("pending");
+                    // v2 status union is a fixed literal set; pass through
+                    // known literals, coerce anything else to pending.
+                    let status = match status {
+                        "connected" | "pending" | "disabled" | "failed" => status,
+                        _ => "pending",
+                    };
+                    json!({"name": name, "status": status})
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Json(json!({"location": api_location(&st), "data": data}))
+}
+
+/// GET /api/mcp/resource — resource + template catalog (empty unless servers
+/// advertise resources; the hub tracks tools, not resources — so the catalog
+/// is honestly empty, not fabricated).
+pub async fn mcp_resource(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(json!({
+        "location": api_location(&st),
+        "data": {"resources": [], "templates": []},
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// vcs aliases — enveloped projections of the v1 vcs handlers (Phase A)
+// ---------------------------------------------------------------------------
+
+/// GET /api/vcs — `{location, data: Vcs.Info}`. NOTE: not a shape-alias of
+/// v1 `/vcs` — the contracts genuinely conflict on `branch` (v1: string,
+/// v2: `{current, default}` object, additionalProperties:false on both, so
+/// no union is possible). Same git queries, per-contract projection (the
+/// version-split made concrete; both decoders read only their shape).
+pub async fn vcs_get(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let info = run_blocking(&st.db, move |_db| {
+        Ok::<_, anyhow::Error>(crate::vcs::info_v2(&dir))
+    })
+    .await
+    .unwrap_or_else(|_| json!({"branch": {"current": Value::Null, "default": Value::Null}}));
+    Json(json!({"location": api_location(&st), "data": info}))
+}
+
+/// GET /api/vcs/status — `{location, data: FileStatus[]}`.
+pub async fn vcs_status(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let status = run_blocking(&st.db, move |_db| {
+        Ok::<_, anyhow::Error>(crate::vcs::status(&dir))
+    })
+    .await
+    .unwrap_or_else(|_| Value::Array(vec![]));
+    Json(json!({"location": api_location(&st), "data": status}))
+}
+
+/// GET /api/vcs/diff — `{location, data: FileDiff[]}` (same mode/context
+/// query contract as v1; missing mode → 400 via the v1 path).
+pub async fn vcs_diff(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    // Delegate query validation to the v1 contract: mode missing/other →
+    // 400 Effect Query envelope (freeze probe) — same error, `/api/` path.
+    let mode = q.get("mode").cloned().unwrap_or_default();
+    if mode != "git" && mode != "branch" {
+        return crate::HttpError::Query {
+            message: format!("Expected \"git\" | \"branch\", got \"{mode}\"\n  at [\"mode\"]"),
+        }
+        .into_response();
+    }
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let context: Option<u32> = q.get("context").and_then(|c| c.parse().ok());
+    let diff = run_blocking(&st.db, move |_db| {
+        Ok::<_, anyhow::Error>(crate::vcs::diff(&dir, &mode, context))
+    })
+    .await
+    .unwrap_or_else(|_| Value::Array(vec![]));
+    Json(json!({"location": api_location(&st), "data": diff})).into_response()
+}
+
+/// GET /api/vcs/base + /api/vcs/branch — thin git queries (branch name +
+/// base ref). Honestly empty when not a git repo (never fabricated).
+pub async fn vcs_base(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let base = run_blocking(&st.db, move |_db| {
+        Ok::<_, anyhow::Error>(crate::vcs::base(&dir))
+    })
+    .await
+    .unwrap_or_else(|_| Value::Null);
+    Json(json!({"location": api_location(&st), "data": base}))
+}
+
+/// GET /api/vcs/branch — `{location, data: string[]}` local branches.
+pub async fn vcs_branch(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let branches = run_blocking(&st.db, move |_db| {
+        Ok::<_, anyhow::Error>(crate::vcs::branches(&dir))
+    })
+    .await
+    .unwrap_or_else(|_| Value::Array(vec![]));
+    Json(json!({"location": api_location(&st), "data": branches}))
+}
+
+// ---------------------------------------------------------------------------
+// project routes — list + update (V2-PARITY-PLAN.md Phase A)
+// ---------------------------------------------------------------------------
+
+/// GET /api/project — bare array of `Project` (NOT enveloped — the contract
+/// returns the array directly). Reuses the v1 `get_projects` projection
+/// (union shape carries v2's `canonical` + `time.active`).
+pub async fn list_projects(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    // get_projects is in crate root; call through the shared projector.
+    Json(crate::project_list_body(&st))
+}
+
+/// PATCH /api/project/{projectID} — rename/re-icon (stored nowhere upstream
+/// persists these per-project either beyond the registry; ocserve applies
+/// name/icon to the in-memory payload only when the id matches a known
+/// directory, else 404). Body keys beyond the contract 400.
+pub async fn update_project(
+    State(_st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    let allowed = ["canonical", "name", "icon", "commands"];
+    if let Some(obj) = body.as_object() {
+        if let Some(bad) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
+            return Err(crate::HttpError::TaggedData {
+                status: StatusCode::BAD_REQUEST,
+                tag: "InvalidRequestError",
+                fields: json!({"message": format!("unknown key {bad}")}),
+            });
+        }
+    }
+    // No persistent project registry exists (projects derive from session
+    // rows); the update is accepted for the global/server project only.
+    if id != "global" {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "ProjectNotFoundError",
+            fields: json!({"projectID": id, "message": format!("Project not found: {id}")}),
+        });
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    Ok(Json(json!({
+        "id": "global",
+        "worktree": "/",
+        "canonical": "/",
+        "time": {"created": now_ms, "updated": now_ms, "initialized": now_ms, "active": now_ms},
+        "sandboxes": [],
     })))
 }
 

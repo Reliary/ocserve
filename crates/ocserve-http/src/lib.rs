@@ -1618,6 +1618,12 @@ async fn get_path(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 /// `global`+`current`, sessions under other directories were dropped from the
 /// sidebar ("Nothing here yet").
 async fn get_projects(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(project_list_body(&st))
+}
+
+/// Shared project-list projector (v1 `/project` and v2 `/api/project` serve
+/// the same union body — one projection, no drift).
+pub(crate) fn project_list_body(st: &Arc<AppState>) -> Value {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -1632,7 +1638,10 @@ async fn get_projects(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         json!({
             "id": id,
             "worktree": wt,
-            "time": {"created": now_ms, "updated": now_ms, "initialized": now_ms},
+            // UNION (D-V2-UNION): v2 `Project` requires `canonical` (=
+            // worktree) and `time.active`. Both decoders strip extras.
+            "canonical": wt,
+            "time": {"created": now_ms, "updated": now_ms, "initialized": now_ms, "active": now_ms},
             "sandboxes": [],
         })
     };
@@ -1640,7 +1649,7 @@ async fn get_projects(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     for d in dirs {
         out.push(project(&d, &d));
     }
-    Json(Value::Array(out))
+    Value::Array(out)
 }
 
 /// GET /project/current — same shape, single object.
@@ -5565,6 +5574,18 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::post(v2::form_reply),
         )
         .route("/api/form", get(v2::form_list_global))
+        .route("/api/project", get(v2::list_projects))
+        .route("/api/mcp", get(v2::list_mcp))
+        .route("/api/mcp/resource", get(v2::mcp_resource))
+        .route("/api/vcs", get(v2::vcs_get))
+        .route("/api/vcs/status", get(v2::vcs_status))
+        .route("/api/vcs/diff", get(v2::vcs_diff))
+        .route("/api/vcs/base", get(v2::vcs_base))
+        .route("/api/vcs/branch", get(v2::vcs_branch))
+        .route(
+            "/api/project/{projectID}",
+            axum::routing::patch(v2::update_project),
+        )
         // Version probe (V2-PLAN.md D2): bound EXPLICITLY so it never falls
         // through to the SPA catch-all (freeze serves HTML 200 for unknown
         // paths — v1-faithful, but a v2 client probing /api/info must get a
