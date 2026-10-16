@@ -203,8 +203,19 @@ recovery. **No savings percentages are claimed until the benchmark harness measu
   gitignored); any change to a live freeze artifact (§3 tables) is its own
   `test(corpus): …` commit. This keeps the maintenance load at the "30–60 min per minor"
   level already designed for.
-- **v2 is gated, not chased.** The v2 line (v2.0.*) is recorded as *pre-release* in our
-  workspace: intentionally breaks plugins, server API contracts, and TUI config (upstream's
+- **v2 is adopted, not chased.** CORRECTION 2026-10-16: the "pre-release" premise
+  below is stale. v2 ships on npm as a separate scope — `@opencode/cli@2.0.28`,
+  `@opencode/client`, `@opencode/server`, `@opencode/protocol` (all 2.0.28,
+  published 2026-10-13; ten 2.0.x releases in the preceding month) — while
+  `opencode-ai@latest` stays the v1 line (1.19.0). The adoption trigger
+  ("a v2 stable tag exists on npm") has therefore FIRED, and the v2 backend
+  build is tracked in `V2-PLAN.md` (`feat/v2-engine`). What remains true from the
+  original posture: v2 intentionally breaks v1 plugins/server/TUI contracts, so
+  the v1 freeze stays the v1 contract and v2 is a second, additive surface —
+  never a rewrite of the v1 routes. The original gated text is preserved below
+  for the audit trail.
+- **v2 was gated, not chased (historical, superseded 2026-10-16).** The v2 line
+  (v2.0.*) was recorded as *pre-release* in our workspace: intentionally breaks plugins, server API contracts, and TUI config (upstream's
   own docs: "V1 plugin implementations do not run in V2"). Benefits v2 actually gives us —
   domain-scoped hook registrations with per-provider scoping (`ModelHookOptions.providerID`),
   native `http.request`/`http.response`/`experimental.ws.*` hooks, session request kinds
@@ -225,10 +236,12 @@ recovery. **No savings percentages are claimed until the benchmark harness measu
   architecture (our Node/Bun sidecar stays a v1-semantic pragmatic clone); writing v2 plugins
   ourselves for the plugins we run (magic-context/codex-auth/context-mode must ship the v2
   form; our adapter accepts it).
-- **Trigger for v2 adoption work**: a plugin in `{magic-context, codex-auth, context-mode}`
+- **Trigger for v2 adoption work (FIRED 2026-10-16)**: a plugin in `{magic-context, codex-auth, context-mode}`
   declares a minimum `@opencode/plugin` version with no v1 entrypoint preserved *and* a v2
   stable tag exists on npm (not just the `v2` branch pre-release tags). Until then, the
   nightly watch on `latest` (v1) + version-tagged replay on `v2` stays read-only triage.
+  (Trigger fired via the second condition: `@opencode/cli@latest=2.0.28` on npm.
+  See `V2-PLAN.md`.)
 
 (Deep-dive evidence for the posture: `~/src/opencode-v1-v2-diff.md` at v1.18.34/v2.0.21;
 v2 migration guide at `opencode.ai/v2/docs/build/plugins/migrate-v1`; v2 hook surfaces from
