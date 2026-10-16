@@ -5582,6 +5582,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/vcs/diff", get(v2::vcs_diff))
         .route("/api/vcs/base", get(v2::vcs_base))
         .route("/api/vcs/branch", get(v2::vcs_branch))
+        .route("/api/session/{sessionID}/diff", get(v2::session_diff_api))
+        .route(
+            "/api/session/{sessionID}/background",
+            axum::routing::post(v2::session_background_api),
+        )
+        .route(
+            "/api/session/{sessionID}/fork",
+            axum::routing::post(v2::session_fork_api),
+        )
         .route(
             "/api/project/{projectID}",
             axum::routing::patch(v2::update_project),
@@ -5601,6 +5610,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/session/{sessionID}/wait",
+            axum::routing::post(v2::wait),
+        )
+        .route(
+            "/experimental/session/{sessionID}/wait",
             axum::routing::post(v2::wait),
         )
         .route(

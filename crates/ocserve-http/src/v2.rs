@@ -699,6 +699,115 @@ pub async fn fs_read(
 }
 
 // ---------------------------------------------------------------------------
+// Phase B aliases — same-handler binds under /api/ paths (V2-PARITY-PLAN.md)
+// ---------------------------------------------------------------------------
+
+/// GET /api/session/{sessionID}/diff — `{data: FileDiff.Info[]}` envelope
+/// over the v1 `session_diff` projection (same rows, `/api/` path + envelope).
+pub async fn session_diff_api(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(files) = session_diff(State(st), Path(id)).await?;
+    let arr = files.as_array().cloned().unwrap_or_default();
+    Ok(Json(json!({"data": arr})))
+}
+
+/// POST /api/session/{sessionID}/background — 204. Upstream moves active
+/// foreground backgroundable tools into background observation; idle is a
+/// no-op. Our turns run tools inline (no foreground/background distinction),
+/// so this is honestly a no-op that records the request (named divergence
+/// D-BACKGROUND-NOOP — not a fake state change).
+pub async fn session_background_api(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    let _ = crate::emit_durable_http(&st, &id, "session.background", json!({}));
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/session/{sessionID}/fork — `{before?: ^msg_}` → copy history
+/// strictly before the message, `{data: Session.Info}`. Same `fork_session`
+/// engine as v1; the cut key is `before` (v2 brand), not `messageID`.
+/// Unknown body keys → 400 (contract additionalProperties:false).
+pub async fn session_fork_api(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    let obj = body.as_object().cloned().unwrap_or_default();
+    if let Some(bad) = obj.keys().find(|k| *k != "before") {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": format!("unknown key {bad}")}),
+        });
+    }
+    let before = match obj.get("before") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s.starts_with("msg_") => Some(s.clone()),
+        Some(other) => {
+            return Err(crate::HttpError::TaggedData {
+                status: StatusCode::BAD_REQUEST,
+                tag: "InvalidRequestError",
+                fields: json!({"message": format!("Expected ^msg_ message id, got {other}")}),
+            });
+        }
+    };
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    // Delegate the copy to the fork engine (messageID == before; both
+    // brands address the same rows).
+    let new_id = ocserve_core::ids::ses_id();
+    let sid = id.clone();
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let fork_info = serde_json::json!({
+        "id": new_id, "projectID": "global", "directory": dir,
+        "path": new_id, "slug": new_id, "title": "", "version": "1",
+        "time": {"created": 0, "updated": 0},
+    });
+    let writer = st.writer.clone();
+    let blobs = st.blobs.clone();
+    let db = st.db.clone();
+    let upto = before;
+    run_blocking(&st.db, move |_db| {
+        let env = ocserve_store::fork::ForkEnv {
+            writer: &writer,
+            blobs: Some(&*blobs),
+            db: &db,
+        };
+        ocserve_store::fork_session(
+            &env,
+            &fork_info,
+            &sid,
+            upto.as_deref(),
+            ocserve_core::ids::msg_id,
+            ocserve_core::ids::prt_id,
+        )
+    })
+    .await
+    .map_err(|e| crate::HttpError::Api(internal(e)))?;
+    let sid2 = new_id.clone();
+    let s = run_blocking(&st.db, move |db| ocserve_store::load_session_wire(db, &sid2))
+        .await
+        .map_err(|e| crate::HttpError::Api(internal(e)))?;
+    match s {
+        Some(info) => Ok(Json(json!({"data": session_v2(&info)}))),
+        None => Err(crate::HttpError::Api(internal(anyhow::anyhow!("fork copy lost")))),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // session diff — the proven TUI sidebar crash path
 // ---------------------------------------------------------------------------
 

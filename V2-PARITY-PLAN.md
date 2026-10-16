@@ -77,9 +77,14 @@ via `runAll` + toast and continues — `bootstrap.ts:122-175`,
 real-TUI-boot kill still arbitrates. Each route: bind → pair-v2 vector →
 spec-validate. Technique: strangler route-by-route.
 
-### Phase B — near-miss aliases, ~15 ops (exit: new-v2 −15, vectors green)
-`diff`, `fork|command|shell`, `mcp`, `project`, `vcs`, `background`, `wait`
-— same-handler binds to existing logic.
+### Phase B — session write/read adapters (exit: vectors green)
+`diff` (envelope), `fork` (`before` brand adapter), `background` (honest
+204 + D-BACKGROUND-NOOP), `wait` (`/experimental/` alias), `mcp`/`project`/
+`vcs` (Phase A). SCOPE DECISION 2026-10-16: `command|shell|move|synthetic|
+view|environment|generate` are NOT aliases — their bodies differ from v1
+(admit-typed-inbox vs sync-turn), so they move to Phase D as typed inbox
+execution under branch-by-abstraction. An alias that hides a semantic
+difference is the compatibility-trap class.
 
 ### Phase C — S-family, ~25 ops (exit: spec-validate v2 stays 0)
 worktree, debug, metadata, credential stubs (cut, not fake), plugin list,

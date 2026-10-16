@@ -92,6 +92,84 @@ async fn phase_a_vcs_aliases_answer() {
 }
 
 #[tokio::test]
+async fn phase_b_session_aliases() {
+    let (app, st) = app();
+    // Seed a session with a user message to fork from.
+    ocserve_store::insert_session(
+        &st.writer,
+        &json!({
+            "id": "ses_pb", "projectID": "global", "directory": "/w",
+            "path": "ses_pb", "slug": "ses_pb", "title": "pb", "version": "1",
+            "time": {"created": 1, "updated": 2},
+        }),
+    )
+    .unwrap();
+    ocserve_store::insert_message(
+        &st.writer,
+        None,
+        "ses_pb",
+        &json!({"id": "msg_pb000000000000000001", "role": "user", "time": {"created": 10}, "text": "hi"}),
+        &[json!({"id": "prt_pb01", "type": "text", "text": "hi"})],
+    )
+    .unwrap();
+
+    async fn post(app: &axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    // diff: enveloped (empty without revert markers).
+    let (s, v) = get(&app, "/api/session/ses_pb/diff").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(v.get("data").and_then(|d| d.as_array()).is_some());
+
+    // fork with before: copies history strictly before the message.
+    let (s, v) = post(
+        &app,
+        "/api/session/ses_pb/fork",
+        json!({"before": "msg_pb000000000000000001"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "fork body {v}");
+    assert!(v["data"].get("id").and_then(|i| i.as_str()).is_some());
+    assert_ne!(v["data"]["id"], "ses_pb");
+
+    // fork unknown key → 400 (additionalProperties enforced).
+    let (s, _) = post(&app, "/api/session/ses_pb/fork", json!({"messageID": "msg_x"})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    // fork bad brand → 400.
+    let (s, _) = post(&app, "/api/session/ses_pb/fork", json!({"before": "msgx"})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    // fork unknown session → tagged 404.
+    let (s, v) = post(&app, "/api/session/ses_nope/fork", json!({})).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // background: 204 + recorded; unknown session → 404.
+    let (s, _) = post(&app, "/api/session/ses_pb/background", json!({})).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = post(&app, "/api/session/ses_nope/background", json!({})).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // experimental wait alias: same 503 honesty as /api wait.
+    let (s, _) = post(&app, "/experimental/session/ses_pb/wait", json!({})).await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    // CONTROL: fork accepting messageID → second assert reds.
+}
+
+#[tokio::test]
 async fn phase_a_project_update_guards() {
     let (app, _st) = app();
     // Unknown project → tagged 404 (never blind 204).
