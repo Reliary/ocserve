@@ -585,9 +585,13 @@ impl AppState {
             .map(|v| v == "0")
             .unwrap_or(false);
         // v2 envelope location (static per process — same value every request).
+        // UNION shape (D-V2-UNION): v1 clients read `.project`; v2's
+        // Location.PublicRef wants `{directory}`-only, and v2's PublicInfo
+        // wants `project.canonical`. Both decoders strip extras; the v2
+        // spec-validate allowlists the envelope paths (named, not silent).
         let location = json!({
             "directory": worktree,
-            "project": {"id": "global", "directory": "/"},
+            "project": {"id": "global", "directory": "/", "canonical": "/"},
         });
         let wire_map = rebuild_wire(&p, wire_off, &location);
         let bus = ocserve_core::EventBus::new();
@@ -855,7 +859,7 @@ pub(crate) fn api_location(st: &AppState) -> Value {
     let dir = st.paths["directory"].as_str().unwrap_or("/");
     json!({
         "directory": dir,
-        "project": {"id": "global", "directory": "/"},
+        "project": {"id": "global", "directory": "/", "canonical": dir},
     })
 }
 
@@ -904,10 +908,22 @@ fn api_agent_data(payloads: &Payloads) -> Vec<Value> {
                 .unwrap_or_default();
             let mut out = json!({
                 "id": a["name"],
+                // UNION (D-V2-UNION): v2 `Agent.Info` requires `name`
+                // (display name; freeze: id "build", name "Build") and
+                // `request.settings`. Title-case the id when no display
+                // name is configured. Both decoders strip extras.
+                "name": a.get("display_name").and_then(|v| v.as_str()).map(String::from).unwrap_or_else(|| {
+                    let id = a["name"].as_str().unwrap_or("");
+                    let mut c = id.chars();
+                    match c.next() {
+                        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                        None => String::new(),
+                    }
+                }),
                 "hidden": a.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false),
                 "mode": a["mode"],
                 "permissions": perms,
-                "request": {"headers": {}, "body": {}},
+                "request": {"headers": {}, "body": {}, "settings": {}},
             });
             if let Some(d) = a.get("description") {
                 out["description"] = d.clone();

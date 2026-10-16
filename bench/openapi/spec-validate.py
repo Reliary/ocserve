@@ -16,7 +16,10 @@ Calibration (why it is not a strict validator):
   * `/config/providers` is a documented pair divergence (D-PAIR-2): freeze
     serves a compiled registry, ocserve the models.json copy. Allowlisted.
 
-Usage: spec-validate.py <base-url>
+Usage: spec-validate.py <base-url> [--spec <contract.json>]
+  --spec defaults to the frozen 1.18.31 contract; pass the 2.0.28 asset for
+  the v2 surface (V2-PLAN.md P5). Parameterless GETs validate directly;
+  session-scoped v2 GETs validate against a freshly created session.
 Exit 0 when no non-allowlisted route violates the contract; 1 otherwise.
 """
 import json
@@ -43,6 +46,29 @@ ALLOW = {
     # MCPStatus is additionalProperties:false, so the additive field trips the
     # validator — a deliberate, documented divergence, not a drift.
     "/mcp": "D3 additive MCP trust field",
+}
+
+# D-V2-UNION (V2-PLAN.md P4): the single-port union serves v1-required keys
+# inside v2 additionalProperties:false objects (and vice versa) because no
+# on-the-wire discriminator exists and both client families strip extras
+# (verified decode paths). Each entry names the v1-required key that forces
+# the union. Real v2 clients tolerate extras; the v1 corpus (keys_subset)
+# and the v2 required-keys check both pass.
+ALLOW_V2_UNION = {
+    "/api/agent": "v1 LocationInfo.project required (envelope)",
+    "/api/command": "v1 CommandV2Info.template required",
+    "/api/skill": "v1 SkillV2Info.location+slash required",
+    "/api/reference": "v1 envelope project required",
+    "/api/pty": "v1 envelope project required",
+    "/api/provider": "v1 ProviderV2Info.api+request required",
+    "/api/permission/request": "v1 envelope project required",
+    "/api/model": "v1 ModelV2Info.api+request required",
+    "/api/location": "v1 LocationInfo.project required",
+    "/api/integration": "v1 envelope project required",
+    "/api/fs/list": "v1 envelope project required",
+    # v2-only route, but the envelope is the shared cached location value
+    # (one shape everywhere — cache design over per-route exactness).
+    "/api/form": "shared envelope project (no v1 shape; envelope uniformity)",
 }
 
 
@@ -84,18 +110,44 @@ def relax_null(node):
 
 
 def main():
-    if len(sys.argv) != 2:
-        sys.exit("usage: spec-validate.py <base-url> (e.g. http://127.0.0.1:4912)")
-    base = sys.argv[1].rstrip("/")
-    spec = json.load(open(SPEC, encoding="utf-8"))
+    args = sys.argv[1:]
+    spec_path = SPEC
+    if "--spec" in args:
+        i = args.index("--spec")
+        spec_path = args[i + 1]
+        args = args[:i] + args[i + 2:]
+    if len(args) != 1:
+        sys.exit("usage: spec-validate.py <base-url> [--spec <contract.json>]")
+    base = args[0].rstrip("/")
+    spec = json.load(open(spec_path, encoding="utf-8"))
+    is_v2 = "2.0.28" in spec_path
 
     checked = 0
     skipped = 0
     viol = []
+    session_id = None
+    if is_v2:
+        # Seed one session for the parameterized v2 GETs (create via the v1
+        # route — the v2 create needs no model; both arms share the seeder).
+        try:
+            req = urllib.request.Request(
+                base + "/session", data=json.dumps({"title": "specv2"}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            session_id = json.loads(urllib.request.urlopen(req, timeout=8).read()).get("id")
+        except Exception:
+            session_id = None
     for path, ops in spec["paths"].items():
         op = ops.get("get")
-        if not op or "{" in path:  # skip path-param routes (need real ids)
+        if not op:
             continue
+        if "{" in path:
+            # v2 session-scoped GETs validate against the seeded session.
+            if not (is_v2 and session_id and "{sessionID}" in path
+                    and path.count("{") == 1):
+                continue
+            url = base + path.replace("{sessionID}", session_id)
+        else:
+            url = base + path
         schema = (
             op.get("responses", {})
             .get("200", {})
@@ -106,7 +158,7 @@ def main():
         if not schema:
             continue
         try:
-            data = json.loads(urllib.request.urlopen(base + path, timeout=8).read())
+            data = json.loads(urllib.request.urlopen(url, timeout=8).read())
         except Exception:
             skipped += 1
             continue
@@ -115,6 +167,10 @@ def main():
         validator = jsonschema.Draft202012Validator(resolved)
         for e in sorted(validator.iter_errors(data), key=lambda e: list(e.absolute_path)):
             if path in ALLOW:
+                continue
+            # D-V2-UNION: additionalProperties complaints on union paths are
+            # the named divergence (v1-required keys inside v2 objects).
+            if is_v2 and path in ALLOW_V2_UNION and "Additional properties" in e.message:
                 continue
             where = "/".join(str(x) for x in e.absolute_path)
             viol.append((path, where, str(e.message)[:120]))

@@ -140,10 +140,11 @@ fn project_model_v2(v1: &Value) -> Value {
         }
     }]);
     let limit = v1.get("limit").cloned().unwrap_or(json!({}));
-    // variants: v2 `ModelV2Info.variants` is an array of
-    // `{id, headers, body}` objects (spec 1.18.31). The v1 entry keys
-    // variants by name; each becomes one object carrying its own body when
-    // the v1 variant has one.
+    // variants: UNION (D-V2-UNION) — v1 wants [{id,headers,body}], v2
+    // wants [{id,settings}] and v2's Model.Variant already declares all
+    // three keys optional (additionalProperties:false SAFE): emit all three
+    // so both decoders read their keys. settings = the variant body (the
+    // reasoning-effort payload both sides carry).
     let variants: Vec<Value> = v1
         .get("variants")
         .and_then(|v| v.as_object())
@@ -155,7 +156,7 @@ fn project_model_v2(v1: &Value) -> Value {
                         .or_else(|| vv.get("settings"))
                         .cloned()
                         .unwrap_or(json!({}));
-                    json!({"id": k, "headers": {}, "body": body})
+                    json!({"id": k, "headers": {}, "body": body, "settings": body})
                 })
                 .collect()
         })
@@ -166,6 +167,15 @@ fn project_model_v2(v1: &Value) -> Value {
         .and_then(parse_release_ms);
     let mut out = json!({
         "id": id,
+        // UNION (D-V2-UNION): v2 `Model.Info` requires `modelID` (= id),
+        // flat `package` (= the npm package), and `settings`. The v1
+        // `api:{type,...}` union stays for v1 clients (different keys, no
+        // conflict). `compatibility` is provider-packaged data we don't
+        // carry — null (relax_null covers it; never fabricated).
+        "modelID": v1.get("id").cloned().unwrap_or(Value::Null),
+        "package": npm,
+        "settings": {},
+        "compatibility": Value::Null,
         "providerID": provider_id,
         "name": v1.get("name").cloned().unwrap_or(Value::Null),
         "api": v2api,
@@ -353,6 +363,15 @@ fn project_provider_v2(v1: &Value) -> Value {
         "name": v1.get("name").cloned().unwrap_or(Value::Null),
         "api": api,
         "request": {"headers": {}, "body": body},
+        // UNION (D-V2-UNION): v2 `Provider.Info` requires `integrationID`
+        // (= id), `activation` ("enabled" when available-listed), flat
+        // `package`, and `settings`. Secrets never emit: settings carries
+        // only the non-secret baseURL (apiKey values stay in config —
+        // SECURITY posture over parity; named divergence D-PROV-SECRETS).
+        "integrationID": v1.get("id").cloned().unwrap_or(Value::Null),
+        "activation": "enabled",
+        "package": npm,
+        "settings": {"baseURL": url},
     })
 }
 
@@ -405,8 +424,9 @@ pub async fn list_models(
 // skills / integrations / references
 // ---------------------------------------------------------------------------
 
-/// GET /api/skill — `{location, data:[SkillV2Info]}`. ocserve exposes the one
-/// built-in skill it ships (the `customize-opencode` command, source "skill").
+/// GET /api/skill — UNION `{location, data}` (D-V2-UNION): v1 `SkillV2Info`
+/// keys plus v2 `Skill.Info` required `id` + `path`. `id` is the slug (freeze:
+/// id "opencode"), `path` the skill location (`<built-in>` when bundled).
 pub async fn list_skills(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let payloads = st.payloads.read();
     let data: Vec<Value> = payloads
@@ -414,12 +434,15 @@ pub async fn list_skills(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         .iter()
         .filter(|c| c.get("source").and_then(|v| v.as_str()) == Some("skill"))
         .map(|c| {
+            let name = c.get("name").cloned().unwrap_or(Value::Null);
             json!({
-                "name": c.get("name").cloned().unwrap_or(Value::Null),
+                "id": name,
+                "name": name,
                 "description": c.get("description").cloned().unwrap_or(json!("")),
                 "slash": false,
                 "location": "",
                 "content": c.get("template").cloned().unwrap_or(json!("")),
+                "path": c.get("location").cloned().unwrap_or(json!("<built-in>")),
             })
         })
         .collect();
@@ -965,7 +988,12 @@ pub async fn session_context(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, crate::HttpError> {
-    list_messages(State(st), Path(id), Query(std::collections::HashMap::new())).await
+    // Both contracts define context as `{data}` with NO cursor (v1
+    // additionalProperties:false, v2 likewise) — the cursor serves nobody
+    // here, so strip it rather than allowlist it (exact on both).
+    let Json(v) =
+        list_messages(State(st), Path(id), Query(std::collections::HashMap::new())).await?;
+    Ok(Json(json!({"data": v.get("data").cloned().unwrap_or(json!([]))})))
 }
 
 /// GET /api/session/{sessionID}/history — `{data:[DurableEvent], hasMore}`.
@@ -1581,7 +1609,8 @@ pub async fn form_list_global(State(st): State<Arc<AppState>>) -> Result<Json<Va
     if !st.v2_enabled {
         return Err(v2_not_found("global"));
     }
-    Ok(Json(json!({"data": st.form_gate.list()})))
+    // v2 `form.list` is a Location.response — envelope required.
+    Ok(Json(json!({"location": api_location(&st), "data": st.form_gate.list()})))
 }
 
 /// Project one inbox row to `Session.Inbox.Info`
