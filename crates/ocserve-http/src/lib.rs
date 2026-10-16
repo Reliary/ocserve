@@ -511,6 +511,21 @@ impl AppState {
     /// Build from pre-assembled route payloads with a temp-backed store
     /// (tests / simple construction — real pieces, no placeholders).
     pub fn with_payloads(auth: Option<(String, String)>, p: Payloads) -> Arc<Self> {
+        Self::with_payloads_and_v2(
+            auth,
+            p,
+            std::env::var("OCSERVE_V2").unwrap_or_default() == "1",
+        )
+    }
+
+    /// `with_payloads` with an explicit v2 flag (contract tests: hermetic
+    /// per-state gate — env is process-global and parallel tests sharing it
+    /// flake by construction).
+    pub fn with_payloads_and_v2(
+        auth: Option<(String, String)>,
+        p: Payloads,
+        v2: bool,
+    ) -> Arc<Self> {
         // pid + nanos + counter: parallel tests calling this on the same clock
         // tick must not share a temp data dir (writer/db contention → flaky).
         static NEW_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -530,7 +545,7 @@ impl AppState {
         let blobs = std::sync::Arc::new(
             ocserve_store::BlobStore::new(dir.join("blobs")).expect("temp blobs"),
         );
-        Self::with_wiring(
+        Self::with_wiring_and_v2(
             auth,
             p,
             Wires {
@@ -539,12 +554,18 @@ impl AppState {
                 writer,
                 llm: LlmRegistry::default(),
             },
+            v2,
         )
     }
 
     /// One-shot construction with real runtime wiring (CLI path).
     pub fn with_wiring(auth: Option<(String, String)>, p: Payloads, w: Wires) -> Arc<Self> {
-        Self::with_wiring_and_v2(auth, p, w, std::env::var("OCSERVE_V2").unwrap_or_default() == "1")
+        Self::with_wiring_and_v2(
+            auth,
+            p,
+            w,
+            std::env::var("OCSERVE_V2").unwrap_or_default() == "1",
+        )
     }
 
     /// Construction with an explicit v2 flag (tests: hermetic per-state gate,
@@ -2663,13 +2684,14 @@ async fn global_dispose(State(st): State<Arc<AppState>>) -> Result<Json<Value>, 
     let props = json!({"directory": dir});
     // Global (session-less) emission through the single choke: versioned
     // durable type + stable id, no session sync twin (V2-PLAN.md P2).
-    let (_seq, _id) = ocserve_store::emit_event(&st.writer, None, "server.instance.disposed", &props).map_err(
-        |e| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            name: "InternalError",
-            message: format!("{e:#}"),
-        },
-    )?;
+    let (_seq, _id) =
+        ocserve_store::emit_event(&st.writer, None, "server.instance.disposed", &props).map_err(
+            |e| ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                name: "InternalError",
+                message: format!("{e:#}"),
+            },
+        )?;
     st.bus.publish(ocserve_core::event::frame(
         &dir,
         "server.instance.disposed",
@@ -5067,9 +5089,7 @@ fn encode_event_frame(stored: &str, fmt: EventFormat) -> Option<String> {
     // pass through untouched on the V2 stream; other formats drop them (the
     // v1 clients never subscribed to v2 grammar — same ignore rule).
     if v.get("payload").is_none() {
-        if matches!(fmt, EventFormat::V2)
-            && v.get("type").and_then(Value::as_str).is_some()
-        {
+        if matches!(fmt, EventFormat::V2) && v.get("type").and_then(Value::as_str).is_some() {
             return Some(stored.to_string());
         }
         return None;
@@ -5507,10 +5527,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/session/{sessionID}/prompt",
             axum::routing::post(v2::prompt),
         )
-        .route(
-            "/api/session/{sessionID}/inbox",
-            get(v2::inbox_list),
-        )
+        .route("/api/session/{sessionID}/inbox", get(v2::inbox_list))
         .route(
             "/api/session/{sessionID}/inbox/{inboxID}",
             axum::routing::delete(v2::inbox_cancel).patch(v2::inbox_update),
@@ -5519,7 +5536,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/experimental/session/{sessionID}/log",
             get(v2::session_log),
         )
-        .route("/api/session/{sessionID}/form", get(v2::form_list).post(v2::form_create))
+        .route(
+            "/api/session/{sessionID}/form",
+            get(v2::form_list).post(v2::form_create),
+        )
         .route(
             "/api/session/{sessionID}/form/{formID}",
             get(v2::form_get).delete(v2::form_cancel),

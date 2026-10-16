@@ -289,7 +289,10 @@ async fn streaming_deltas_carry_partid_and_precede_persist() {
     let mut streamed_text_ids: Vec<String> = Vec::new();
     let mut final_text_ids: Vec<String> = Vec::new();
     for f in &frames {
-        let p = f.get("payload").unwrap();
+        // v2-grammar twins (frame_v2: {id,type,data}, no payload key) ride
+        // the same bus — skip them here; the v2 contract is asserted in
+        // v2_admission, not in the v1 delta validator.
+        let Some(p) = f.get("payload") else { continue };
         if p.get("type").and_then(Value::as_str) == Some("message.part.updated")
             && p.pointer("/properties/part/type").and_then(Value::as_str) == Some("text")
         {
@@ -311,7 +314,7 @@ async fn streaming_deltas_carry_partid_and_precede_persist() {
     );
     // every delta-targeted text id must be one the final part reuses
     for d in &frames {
-        let p = d.get("payload").unwrap();
+        let Some(p) = d.get("payload") else { continue }; // v2 twins: no payload key
         if p.get("type").and_then(Value::as_str) == Some("message.part.delta")
             && p.pointer("/properties/field").and_then(Value::as_str) == Some("text")
         {

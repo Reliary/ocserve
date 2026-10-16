@@ -67,7 +67,11 @@ impl FormGate {
     /// Register a pending ask; returns the outcome receiver. The abort guard
     /// is held INSIDE the gate and released on settle (reply/cancel/timeout).
     /// Over-cap registers fail closed (None).
-    pub fn register(self: &Arc<Self>, id: &str, request: Value) -> Option<tokio::sync::oneshot::Receiver<FormOutcome>> {
+    pub fn register(
+        self: &Arc<Self>,
+        id: &str,
+        request: Value,
+    ) -> Option<tokio::sync::oneshot::Receiver<FormOutcome>> {
         let mut pending = self.pending.lock();
         if pending.len() >= FORM_CAP && !pending.contains_key(id) {
             return None;
@@ -124,7 +128,11 @@ impl FormGate {
 
     /// All pending requests (global `/api/form` list).
     pub fn list(&self) -> Vec<Value> {
-        self.pending.lock().values().map(|p| p.request.clone()).collect()
+        self.pending
+            .lock()
+            .values()
+            .map(|p| p.request.clone())
+            .collect()
     }
 }
 
@@ -168,10 +176,16 @@ mod tests {
             FormOutcome::Answered(v) => assert_eq!(v, json!({"a": 1})),
             other => panic!("wrong outcome: {other:?}"),
         }
-        assert!(!gate.reply("frm_1", json!(null)), "settled forms stay settled");
+        assert!(
+            !gate.reply("frm_1", json!(null)),
+            "settled forms stay settled"
+        );
         let rx2 = gate.register("frm_2", json!({"id": "frm_2"})).unwrap();
         assert!(gate.cancel("frm_2"));
-        assert!(matches!(gate.wait("frm_2", rx2).await, FormOutcome::Cancelled));
+        assert!(matches!(
+            gate.wait("frm_2", rx2).await,
+            FormOutcome::Cancelled
+        ));
         // CONTROL: reply that does not remove → second reply succeeds, red.
     }
 

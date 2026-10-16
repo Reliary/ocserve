@@ -30,8 +30,10 @@ fn seeded_db() -> (tempfile::TempDir, std::path::PathBuf) {
         None,
         "ses_p",
         &json!({"id": "msg_u", "role": "user", "time": {"created": 10}, "text": "do it"}),
-        &[json!({"id": "prt_seed01", "type": "text", "text": "do it"}),
-          json!({"id": "prt_seed02", "type": "file", "file": {"uri": "file:///a.txt"}})],
+        &[
+            json!({"id": "prt_seed01", "type": "text", "text": "do it"}),
+            json!({"id": "prt_seed02", "type": "file", "file": {"uri": "file:///a.txt"}}),
+        ],
     )
     .unwrap();
     // Assistant with text + reasoning + completed tool + error tool +
@@ -78,8 +80,14 @@ fn content_projection_maps_all_part_kinds() {
     // Assistant: envelope part excluded; 2 text-ish + 3 tools.
     let content = out[1]["content"].as_array().unwrap();
     assert_eq!(content.len(), 5, "text+reasoning+3 tools, no step-start");
-    assert_eq!((content[0]["type"].as_str(), content[0]["text"].as_str()), (Some("text"), Some("here")));
-    assert_eq!((content[1]["type"].as_str(), content[1]["text"].as_str()), (Some("reasoning"), Some("hmm")));
+    assert_eq!(
+        (content[0]["type"].as_str(), content[0]["text"].as_str()),
+        (Some("text"), Some("here"))
+    );
+    assert_eq!(
+        (content[1]["type"].as_str(), content[1]["text"].as_str()),
+        (Some("reasoning"), Some("hmm"))
+    );
     assert_eq!(content[2]["name"], "read");
     assert_eq!(content[2]["state"]["status"], "completed");
     assert_eq!(content[2]["state"]["output"][0]["text"], "x");
@@ -121,7 +129,10 @@ fn blobbed_parts_decode_like_production() {
     )];
     let out = ocserve_store::project_page_v2(&db, &page).unwrap();
     assert_eq!(out.len(), 1);
-    assert_eq!(out[0]["content"][0]["text"].as_str().unwrap().len(), big.len());
+    assert_eq!(
+        out[0]["content"][0]["text"].as_str().unwrap().len(),
+        big.len()
+    );
     // CONTROL: skip blob decode (empty text) → len 0, red.
 }
 
@@ -132,7 +143,11 @@ fn unknown_roles_drop_and_empty_page_is_empty() {
         "msg_x".to_string(),
         "{\"id\":\"msg_x\",\"role\":\"system\",\"time\":{\"created\":1}}".to_string(),
     )];
-    assert!(ocserve_store::project_page_v2(&db, &page).unwrap().is_empty());
+    assert!(
+        ocserve_store::project_page_v2(&db, &page)
+            .unwrap()
+            .is_empty()
+    );
     assert!(ocserve_store::project_page_v2(&db, &[]).unwrap().is_empty());
     // CONTROL: project system rows → non-empty, red.
 }
@@ -148,7 +163,13 @@ fn inbox_list_shapes_match_inbox_info() {
     inbox::admit(&w, "ses_p", "m2", "compaction", &json!({}), "steer", 2).unwrap();
     let rows = inbox::list(&db, "ses_p").unwrap();
     assert_eq!(rows.len(), 2);
-    assert_eq!((rows[0].0.as_str(), rows[0].1.as_str(), rows[0].3.as_str()), ("m1", "user", "steer"));
-    assert_eq!((rows[1].0.as_str(), rows[1].1.as_str()), ("m2", "compaction"));
+    assert_eq!(
+        (rows[0].0.as_str(), rows[0].1.as_str(), rows[0].3.as_str()),
+        ("m1", "user", "steer")
+    );
+    assert_eq!(
+        (rows[1].0.as_str(), rows[1].1.as_str()),
+        ("m2", "compaction")
+    );
     // CONTROL: reorder list by id → m2 first, red.
 }

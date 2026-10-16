@@ -79,6 +79,14 @@ Expected { readonly "type": "text", ... } | { readonly "type": "file", ... } | {
 
 ## v2 `/api/session/{id}/prompt`
 
+SCOPE: the vectors below were probed against the **1.18.31 freeze**, whose
+`/api` prompt body is NESTED (`prompt:{text,...}`). The **2.0.28** contract
+(regenerated, `SPEC_V2_JSON`) changed the body to FLAT (`{id?,text!,...}`) —
+ocserve's decoder targets 2.0.28 (V2-PLAN.md P3). The 1.18.31 nested vectors
+stay valid for the freeze arm only; the 2.0.28 differential (P5) carries flat
+vectors against the real 2.0.28 binary. Do not "fix" these rows to flat —
+they are the 1.18.31 truth.
+
 | request | message (envelope `_tag:InvalidRequestError`) |
 |---|---|
 | `{}` | `Missing key\n  at ["prompt"]` |

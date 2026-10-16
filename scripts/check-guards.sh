@@ -270,7 +270,7 @@ echo "== guard: handler request keys are contract-valid (rule 20) =="
 # scanner is vacuous and the gate fails.
 if out=$(python3 bench/openapi/check-request-keys.py --selftest 2>&1) \
   && scan=$(python3 bench/openapi/check-request-keys.py \
-      crates/ocserve-core/assets/openapi/1.18.31.json crates/ocserve-http/src 2>&1); then
+      crates/ocserve-core/assets/openapi/1.18.31.json crates/ocserve-core/assets/openapi/2.0.28.json crates/ocserve-http/src 2>&1); then
   echo "ok (selftest + scan: $(echo "$scan" | tail -1))"
 else
   echo "$out"; echo "$scan"

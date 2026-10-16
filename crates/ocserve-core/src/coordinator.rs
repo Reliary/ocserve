@@ -96,6 +96,28 @@ impl CoordinatorSet {
         scope
     }
 
+    /// Drain-continuation check: returns the scope to run next, or `None` to
+    /// end the drain. Prefers an explicit doorbell; otherwise continues while
+    /// `work_remains` (the caller re-checks promotability — upstream
+    /// `advanceToStep` loops on work, not doorbells). Crucially, continuing
+    /// on work does NOT clear `draining`, so no second drain can spawn
+    /// mid-loop (the bug a naive take-then-recheck would introduce).
+    pub fn next_scope(&self, session_id: &str, work_remains: bool) -> Option<WakeScope> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let coord = inner.get_mut(session_id)?;
+        if let Some(scope) = coord.pending.take() {
+            return Some(scope);
+        }
+        if work_remains {
+            return Some(WakeScope::Input);
+        }
+        coord.draining = false;
+        if !claim_would_hold(session_id) {
+            inner.remove(session_id);
+        }
+        None
+    }
+
     /// Drop the draining flag unconditionally (drain abort paths).
     pub fn abort(&self, session_id: &str) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -192,5 +214,22 @@ mod tests {
         set.wake("c", WakeScope::Steer);
         assert_eq!(set.take_pending("c"), Some(WakeScope::Input));
         // CONTROL: last-write-wins instead of widest-wins → Steer here, red.
+    }
+
+    #[test]
+    fn next_scope_continues_on_work_without_doorbell() {
+        let set = CoordinatorSet::new();
+        assert!(set.wake("d", WakeScope::Steer));
+        assert_eq!(set.next_scope("d", false), Some(WakeScope::Steer));
+        // No doorbell, but work remains → continue WITHOUT clearing draining.
+        assert_eq!(set.next_scope("d", true), Some(WakeScope::Input));
+        // A concurrent wake now must doorbell, not spawn (draining armed).
+        assert!(!set.wake("d", WakeScope::Steer));
+        assert_eq!(set.next_scope("d", false), Some(WakeScope::Steer));
+        // No doorbell, no work → end (clears + drops).
+        assert_eq!(set.next_scope("d", false), None);
+        assert_eq!(set.len(), 0);
+        // CONTROL: clear draining on work-continue → the mid-test wake
+        // returns true (second drain) → red.
     }
 }

@@ -325,10 +325,7 @@ pub fn v2_twin(event_type: &str, properties: &Value) -> Option<(String, Value, b
                 .or_else(|| part.get("sessionID"))
                 .cloned()
                 .unwrap_or(json!(""));
-            let message_id = part
-                .get("messageID")
-                .cloned()
-                .unwrap_or(json!(""));
+            let message_id = part.get("messageID").cloned().unwrap_or(json!(""));
             let text = part.get("text").and_then(|t| t.as_str()).unwrap_or("");
             match ptype {
                 "text" if text.is_empty() => Some((
@@ -353,7 +350,10 @@ pub fn v2_twin(event_type: &str, properties: &Value) -> Option<(String, Value, b
                 )),
                 "tool" => {
                     let state = part.get("state").cloned().unwrap_or(json!({}));
-                    let status = state.get("status").and_then(|s| s.as_str()).unwrap_or("running");
+                    let status = state
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("running");
                     if status == "running" {
                         Some((
                             "session.tool.called".into(),
@@ -434,19 +434,15 @@ mod tests {
             }})
         };
         // empty text = started (durable), non-empty = delta (ephemeral).
-        let (ty, data, durable) =
-            v2_twin("message.part.updated", &part("text", "")).unwrap();
+        let (ty, data, durable) = v2_twin("message.part.updated", &part("text", "")).unwrap();
         assert_eq!((ty.as_str(), durable), ("session.text.started", true));
         assert_eq!(data["assistantMessageID"], "m");
-        let (ty, data, durable) =
-            v2_twin("message.part.updated", &part("text", "hi")).unwrap();
+        let (ty, data, durable) = v2_twin("message.part.updated", &part("text", "hi")).unwrap();
         assert_eq!((ty.as_str(), durable), ("session.text.delta", false));
         assert_eq!(data["delta"], "hi");
-        let (ty, _, _) =
-            v2_twin("message.part.updated", &part("reasoning", "")).unwrap();
+        let (ty, _, _) = v2_twin("message.part.updated", &part("reasoning", "")).unwrap();
         assert_eq!(ty, "session.reasoning.started");
-        let (ty, _, _) =
-            v2_twin("message.part.updated", &part("reasoning", "h")).unwrap();
+        let (ty, _, _) = v2_twin("message.part.updated", &part("reasoning", "h")).unwrap();
         assert_eq!(ty, "session.reasoning.delta");
         // running tool → called (durable); completed tool → None (its
         // completion lands via step.ended, not a twin).

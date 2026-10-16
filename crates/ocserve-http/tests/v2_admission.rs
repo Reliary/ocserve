@@ -211,7 +211,11 @@ async fn v2_inbox_list_cancel_update() {
     let app = ocserve_http::router(st.clone());
 
     // Park two items (resume:false → no drain).
-    let (s1, _) = post_prompt(&app, json!({"id": "msg_inbox00000000000001", "text": "one", "resume": false})).await;
+    let (s1, _) = post_prompt(
+        &app,
+        json!({"id": "msg_inbox00000000000001", "text": "one", "resume": false}),
+    )
+    .await;
     let (s2, _) = post_prompt(&app, json!({"id": "msg_inbox00000000000002", "text": "two", "delivery": "queue", "resume": false})).await;
     assert_eq!((s1, s2), (StatusCode::OK, StatusCode::OK));
 
@@ -236,7 +240,10 @@ async fn v2_inbox_list_cancel_update() {
         .iter()
         .map(|i| i["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, vec!["msg_inbox00000000000001", "msg_inbox00000000000002"]);
+    assert_eq!(
+        ids,
+        vec!["msg_inbox00000000000001", "msg_inbox00000000000002"]
+    );
     assert_eq!(list["data"][0]["delivery"], "steer");
     assert_eq!(list["data"][1]["delivery"], "queue");
     assert_eq!(list["data"][0]["type"], "user");
@@ -257,7 +264,11 @@ async fn v2_inbox_list_cancel_update() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     wait_drain(&st).await;
-    assert!(ocserve_store::inbox::list(&st.db, "ses_v2a").unwrap().is_empty());
+    assert!(
+        ocserve_store::inbox::list(&st.db, "ses_v2a")
+            .unwrap()
+            .is_empty()
+    );
 
     // Cancel a missing item is a no-op success (not 404).
     let resp = app
@@ -274,7 +285,11 @@ async fn v2_inbox_list_cancel_update() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // Bad delivery value → 400 InvalidRequest.
-    let (s3, _) = post_prompt(&app, json!({"id": "msg_inbox00000000000003", "text": "x", "resume": false})).await;
+    let (s3, _) = post_prompt(
+        &app,
+        json!({"id": "msg_inbox00000000000003", "text": "x", "resume": false}),
+    )
+    .await;
     assert_eq!(s3, StatusCode::OK);
     let resp = app
         .clone()
@@ -322,23 +337,33 @@ async fn v2_log_replay_and_watermark() {
     assert!(!datas.is_empty(), "replay must emit frames");
     let synced = datas.iter().filter(|d| d.contains("log.synced")).count();
     assert_eq!(synced, 1, "exactly one watermark, got {synced}");
-    assert!(datas.iter().any(|d| d.contains("session.inbox.enqueued")),
-        "admission must replay");
+    assert!(
+        datas.iter().any(|d| d.contains("session.inbox.enqueued")),
+        "admission must replay"
+    );
     // v2 grammar: durable envelope present on replayed rows.
-    assert!(datas.iter().any(|d| d.contains("aggregateID")),
-        "replay rows carry the durable envelope");
+    assert!(
+        datas.iter().any(|d| d.contains("aggregateID")),
+        "replay rows carry the durable envelope"
+    );
 
     // after=<watermark> replays nothing but the marker.
     let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
     let max_seq: i64 = conn
-        .query_row("SELECT COALESCE(MAX(seq),0) FROM event WHERE session_id='ses_v2a'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM event WHERE session_id='ses_v2a'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     let resp = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!("/api/experimental/session/ses_v2a/log?after={max_seq}"))
+                .uri(format!(
+                    "/api/experimental/session/ses_v2a/log?after={max_seq}"
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -347,7 +372,11 @@ async fn v2_log_replay_and_watermark() {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8_lossy(&bytes).to_string();
     let datas: Vec<&str> = text.split("data: ").skip(1).collect();
-    assert_eq!(datas.len(), 1, "caught-up replay = only the watermark, got {datas:?}");
+    assert_eq!(
+        datas.len(),
+        1,
+        "caught-up replay = only the watermark, got {datas:?}"
+    );
     assert!(datas[0].contains("log.synced"));
     // CONTROL: watermark emitted per row → count > 1, red. Missing envelope
     // on rows → aggregateID assert reds.
@@ -374,17 +403,29 @@ async fn v2_form_lifecycle() {
             .unwrap();
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
     async fn get(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
         let resp = app
             .clone()
-            .oneshot(Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     // Create with explicit id.
@@ -399,14 +440,25 @@ async fn v2_form_lifecycle() {
     assert_eq!(v["data"]["sessionID"], "ses_v2a");
 
     // Empty fields → 400.
-    let (s, _) = post(&app, "/api/session/ses_v2a/form", json!({"title": "x", "fields": []})).await;
+    let (s, _) = post(
+        &app,
+        "/api/session/ses_v2a/form",
+        json!({"title": "x", "fields": []}),
+    )
+    .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
     // List shows it; global list shows it.
     let (_, l) = get(&app, "/api/session/ses_v2a/form").await;
     assert_eq!(l["data"].as_array().unwrap().len(), 1);
     let (_, g) = get(&app, "/api/form").await;
-    assert!(g["data"].as_array().unwrap().iter().any(|f| f["id"] == "frm_test00000000000001"));
+    assert!(
+        g["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "frm_test00000000000001")
+    );
 
     // Get Detail carries state.
     let (_, d) = get(&app, "/api/session/ses_v2a/form/frm_test00000000000001").await;
@@ -478,7 +530,11 @@ async fn v2_drain_runs_turn_and_releases_claim() {
     wait_drain(&st).await;
 
     // Inbox consumed, claim released, assistant message landed.
-    assert!(ocserve_store::inbox::list(&st.db, "ses_v2a").unwrap().is_empty());
+    assert!(
+        ocserve_store::inbox::list(&st.db, "ses_v2a")
+            .unwrap()
+            .is_empty()
+    );
     assert!(!ocserve_store::claim::held(&st.db, "ses_v2a").unwrap());
     let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
     let assistants: i64 = conn
@@ -490,10 +546,20 @@ async fn v2_drain_runs_turn_and_releases_claim() {
         .unwrap();
     if assistants < 1 {
         let conn2 = ocserve_store::pragma::open_reader(&st.db).unwrap();
-        let msgs: Vec<String> = conn2.prepare("SELECT id || ':' || role FROM msg").unwrap()
-            .query_map([], |r| r.get(0)).unwrap().flatten().collect();
-        let evts: Vec<String> = conn2.prepare("SELECT type FROM event").unwrap()
-            .query_map([], |r| r.get(0)).unwrap().flatten().collect();
+        let msgs: Vec<String> = conn2
+            .prepare("SELECT id || ':' || role FROM msg")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        let evts: Vec<String> = conn2
+            .prepare("SELECT type FROM event")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .flatten()
+            .collect();
         panic!("drain must run the turn body");
     }
     // Execution lifecycle events bracketed the turn.

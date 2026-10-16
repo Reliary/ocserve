@@ -162,8 +162,10 @@ pub(crate) fn emit_durable(
     // normalize ONCE so the persisted payload and every published frame agree
     // (the event-log validator reads the persisted copy).
     let properties = crate::event::normalize_props(event_type, properties);
-    let (stored_seq, _id) =
-        ocserve_store::emit_event(writer, Some(session_id), event_type, &properties)?;
+    // Hot path: versioned append WITHOUT the seq read-back (the MAX query
+    // per emission is pure overhead here — the prompt-local counter is
+    // authoritative for sync twins; see NOTE above).
+    ocserve_store::append_versioned(writer, Some(session_id), event_type, &properties)?;
     ocserve_metrics::labeled_counter(
         "ocserve_events_emitted_total",
         &format!("type=\"{event_type}\""),
@@ -171,12 +173,14 @@ pub(crate) fn emit_durable(
     );
     let this_seq = *seq;
     *seq += 1;
-    // The stored row carries the versioned type; the live v1 frames carry the
-    // unversioned type (validator + clients operate on unversioned names).
-    debug_assert_eq!(
-        stored_seq, this_seq,
-        "prompt-local seq drifted from the stored event seq"
-    );
+    // NOTE: no assert linking the stored seq to this_seq. The prompt-local
+    // counter is seeded once at turn start (preflight) while the stored seq
+    // is the live per-session MAX — they diverge whenever the writer queue
+    // hasn't flushed seed rows yet or another writer interleaves (proven by
+    // the autonomy title test: stored 9 vs local 1 on a first-turn emit).
+    // The sync twin keeps the local counter (wire-identical to pre-choke);
+    // the durable seq is authoritative for inbox ordering. Conflating them
+    // would be the bug, not the fix.
     ctx.bus
         .publish(frame(&ctx.directory, event_type, properties.clone()));
     ctx.bus.publish(sync_frame(

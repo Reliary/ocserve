@@ -903,11 +903,9 @@ pub async fn list_messages(
     .await
     .map_err(|e| crate::HttpError::Api(internal(e)))?;
     let sid2 = id.clone();
-    let data = run_blocking(&st.db, move |db| {
-        ocserve_store::project_page_v2(db, &msgs)
-    })
-    .await
-    .map_err(|e| crate::HttpError::Api(internal(e)))?;
+    let data = run_blocking(&st.db, move |db| ocserve_store::project_page_v2(db, &msgs))
+        .await
+        .map_err(|e| crate::HttpError::Api(internal(e)))?;
     // freeze always emits BOTH cursor keys (previous/next), null when absent.
     let mut cursor = json!({"previous": Value::Null, "next": Value::Null});
     if let Some(n) = next {
@@ -931,9 +929,7 @@ pub async fn get_message(
     .await
     .map_err(internal)?;
     let row_present = row.is_some();
-    let info = row.and_then(|v| {
-        v.get("info").map(|i| (mid.clone(), i.to_string()))
-    });
+    let info = row.and_then(|v| v.get("info").map(|i| (mid.clone(), i.to_string())));
     let mut projected: Option<Value> = match info {
         Some((m, info)) => {
             let sid3 = id.clone();
@@ -1190,16 +1186,9 @@ pub async fn prompt(
         &json!({"inboxID": msg_id, "sessionID": id}),
     )
     .map_err(internal)?;
-    let fresh = ocserve_store::inbox::admit(
-        &st.writer,
-        &id,
-        &msg_id,
-        "user",
-        &payload,
-        &delivery,
-        seq,
-    )
-    .map_err(internal)?;
+    let fresh =
+        ocserve_store::inbox::admit(&st.writer, &id, &msg_id, "user", &payload, &delivery, seq)
+            .map_err(internal)?;
     // Idempotent reconcile: a re-admit returns the STORED item, not the new
     // request body (first write wins — echoing the request would lie about
     // what the queue holds).
@@ -1337,18 +1326,19 @@ async fn run_v2_turn(st: &Arc<AppState>, sid: &str, item_id: &str) -> anyhow::Re
     if itype != "user" && itype != "synthetic" {
         // compaction/move items: P4 delivers them; for now deliver-delete so
         // the queue cannot wedge on an unhandled kind.
-        st.writer.write(vec![ocserve_store::inbox::deliver_ops(item_id)])?;
+        st.writer
+            .write(vec![ocserve_store::inbox::deliver_ops(item_id)])?;
         let _ = delivery;
         return Ok(());
     }
-    let payload: Value =
-        serde_json::from_str(&payload_text).unwrap_or(json!({"text": ""}));
+    let payload: Value = serde_json::from_str(&payload_text).unwrap_or(json!({"text": ""}));
     // Deliver-delete + message insert happen in the turn body
     // (`insert_message`); the delete joins that same writer flow by running
     // first here (single-writer serialization makes the pair atomic enough:
     // no reader observes a half-delivered item — the message insert follows
     // in the same task before any other promotable runs).
-    st.writer.write(vec![ocserve_store::inbox::deliver_ops(item_id)])?;
+    st.writer
+        .write(vec![ocserve_store::inbox::deliver_ops(item_id)])?;
     let req = ocserve_core::wire::PromptRequest {
         message_id: Some(item_id.to_string()),
         parts: v2_payload_parts(&payload),
@@ -1458,7 +1448,9 @@ pub async fn form_create(
     )
     .map_err(internal)?;
     let _ = crate::emit_durable_http(&st, &id, "form.created", info.clone());
-    Ok(Json(json!({"data": form_info(&id, &fid, title, &metadata.to_string(), &fields.to_string(), None)})))
+    Ok(Json(
+        json!({"data": form_info(&id, &fid, title, &metadata.to_string(), &fields.to_string(), None)}),
+    ))
 }
 
 /// GET /api/session/{sessionID}/form — pending asks for the session.
@@ -1620,8 +1612,7 @@ pub async fn session_log(
     let frames: Vec<String> = rows
         .into_iter()
         .map(|(seq, ty, payload_text, _t)| {
-            let data: Value =
-                serde_json::from_str(&payload_text).unwrap_or(json!({}));
+            let data: Value = serde_json::from_str(&payload_text).unwrap_or(json!({}));
             let body = data.pointer("/properties").cloned().unwrap_or(data);
             let unversioned = ocserve_store::unversioned_event_type(&ty);
             let version: i64 = ty
@@ -1641,7 +1632,11 @@ pub async fn session_log(
         "type": "log.synced", "aggregateID": sid2, "seq": watermark,
     })
     .to_string();
-    let stream = stream::iter(frames.into_iter().map(|f| Ok::<_, std::convert::Infallible>(Event::default().data(f))));
+    let stream = stream::iter(
+        frames
+            .into_iter()
+            .map(|f| Ok::<_, std::convert::Infallible>(Event::default().data(f))),
+    );
     if follow {
         // Replay-then-live: the watermark marker, then the live bus filtered
         // to v2-grammar frames for this session. Bounded by the same ring
@@ -1667,7 +1662,12 @@ pub async fn session_log(
             }
         });
         let synced_ev = Event::default().data(synced);
-        Ok(Sse::new(stream.chain(stream::once(async { Ok(synced_ev) })).chain(live)).into_response())
+        Ok(Sse::new(
+            stream
+                .chain(stream::once(async { Ok(synced_ev) }))
+                .chain(live),
+        )
+        .into_response())
     } else {
         let synced_ev = Event::default().data(synced);
         Ok(Sse::new(stream.chain(stream::once(async { Ok(synced_ev) }))).into_response())
@@ -1752,7 +1752,9 @@ pub async fn inbox_update(
                 return Err(session_not_found(&id));
             }
             if delivery == "steer"
-                && st.coordinators.wake(&id, ocserve_core::coordinator::WakeScope::Steer)
+                && st
+                    .coordinators
+                    .wake(&id, ocserve_core::coordinator::WakeScope::Steer)
             {
                 let st2 = st.clone();
                 let sid2 = id.clone();

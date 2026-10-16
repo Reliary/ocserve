@@ -1147,8 +1147,10 @@ pub fn project_page_v2(
         "SELECT message_id, type, inline, blob_sha, byte_len FROM msg_part \
          WHERE message_id IN ({placeholders}) ORDER BY message_id, seq"
     ))?;
-    let mut parts: std::collections::HashMap<String, Vec<(String, Option<String>, Option<(String, i64)>)>> =
-        std::collections::HashMap::new();
+    let mut parts: std::collections::HashMap<
+        String,
+        Vec<(String, Option<String>, Option<(String, i64)>)>,
+    > = std::collections::HashMap::new();
     let mut padded: Vec<Option<String>> = Vec::with_capacity(CHUNK);
     let mut iter = page.iter();
     loop {
@@ -1167,10 +1169,11 @@ pub fn project_page_v2(
         while let Some(row) = rows.next()? {
             let sha: Option<String> = row.get(3)?;
             let len: i64 = row.get(4)?;
-            parts
-                .entry(row.get::<_, String>(0)?)
-                .or_default()
-                .push((row.get(1)?, row.get(2)?, sha.map(|s| (s, len))));
+            parts.entry(row.get::<_, String>(0)?).or_default().push((
+                row.get(1)?,
+                row.get(2)?,
+                sha.map(|s| (s, len)),
+            ));
         }
     }
     let empty = Vec::new();
@@ -1197,8 +1200,7 @@ pub fn project_page_v2(
             match ptype.as_str() {
                 "text" => {
                     let raw = text_of();
-                    let body: Value =
-                        serde_json::from_str(&raw).unwrap_or(json!({"text": ""}));
+                    let body: Value = serde_json::from_str(&raw).unwrap_or(json!({"text": ""}));
                     content.push(json!({
                         "type": "text",
                         "text": body.get("text").cloned().unwrap_or(json!("")),
@@ -1207,8 +1209,7 @@ pub fn project_page_v2(
                 }
                 "reasoning" => {
                     let raw = text_of();
-                    let body: Value =
-                        serde_json::from_str(&raw).unwrap_or(json!({"text": ""}));
+                    let body: Value = serde_json::from_str(&raw).unwrap_or(json!({"text": ""}));
                     content.push(json!({
                         "type": "reasoning",
                         "text": body.get("text").cloned().unwrap_or(json!("")),
@@ -1219,7 +1220,10 @@ pub fn project_page_v2(
                     let raw = text_of();
                     let body: Value = serde_json::from_str(&raw).unwrap_or(json!({}));
                     let state = body.get("state").cloned().unwrap_or(json!({}));
-                    let status = state.get("status").and_then(|s| s.as_str()).unwrap_or("running");
+                    let status = state
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("running");
                     let input = state.get("input").cloned().unwrap_or(json!({}));
                     let v2state = match status {
                         "completed" => json!({
@@ -1746,7 +1750,8 @@ pub mod inbox {
                 r.get::<_, i64>(4)?,
             ))
         })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     /// Cancel a pending item. Returns `true` when a row was deleted,
@@ -1873,8 +1878,7 @@ pub mod claim {
     /// sessions with live claims — claims release on terminal states.
     pub fn list_suspended(db: &std::path::Path) -> Result<Vec<String>> {
         let conn = crate::pragma::open_reader(db)?;
-        let mut stmt =
-            conn.prepare_cached("SELECT session_id FROM execution_claim")?;
+        let mut stmt = conn.prepare_cached("SELECT session_id FROM execution_claim")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
@@ -1906,6 +1910,11 @@ pub fn emit_event(
     // The row seq is AUTOINCREMENT; read back the row we just wrote on this
     // writer's own connection path (MAX(seq) scoped to the session is exact
     // here because the writer serializes all appends).
+    //
+    // PERF NOTE: this read-back costs one indexed MAX per emission. It is
+    // load-bearing ONLY where the caller needs the durable seq (inbox
+    // enqueued_seq). The hot prompt path uses `append_versioned` (no
+    // read-back) and keeps its pre-seeded local counter for sync twins.
     let seq: i64 = {
         let conn = pragma::open_reader(writer.db_path_ref())?;
         conn.query_row(
@@ -1916,6 +1925,24 @@ pub fn emit_event(
         )?
     };
     Ok((seq, format!("evt_{seq}")))
+}
+
+/// Versioned append WITHOUT the seq read-back (hot prompt path — V2-PLAN.md
+/// P2/C4: the per-emission MAX query showed up as pure overhead once the
+/// prompt-local counter proved authoritative for sync twins; admission paths
+/// that need the durable seq keep using `emit_event`).
+pub fn append_versioned(
+    writer: &Writer,
+    session_id: Option<&str>,
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> anyhow::Result<()> {
+    append_event(
+        writer,
+        session_id,
+        &versioned_event_type(event_type),
+        payload,
+    )
 }
 
 /// Suffix the durable version onto an event type (`type` → `type@v1`).
@@ -2027,22 +2054,12 @@ pub mod form {
     /// Settle a form (answered/cancelled). Answer JSON text or None.
     /// Returns `true` only when a pending row transitioned (re-settle is a
     /// no-op false — settled forms stay settled).
-    pub fn settle(
-        writer: &Writer,
-        id: &str,
-        state: &str,
-        answer: Option<&str>,
-    ) -> Result<bool> {
+    pub fn settle(writer: &Writer, id: &str, state: &str, answer: Option<&str>) -> Result<bool> {
         let n = writer.write(vec![WriteOp::Sql {
             sql: "UPDATE form SET state = ?2, answer = ?3, time_updated = ?4 \
                   WHERE id = ?1 AND state = 'pending'"
                 .into(),
-            params: vec![
-                id.into(),
-                state.into(),
-                answer.into(),
-                now_ms().into(),
-            ],
+            params: vec![id.into(), state.into(), answer.into(), now_ms().into()],
         }])?;
         Ok(n == 1)
     }

@@ -1127,13 +1127,11 @@ mod wire_tests {
         );
         assert_eq!(
             v2err(&json!({"text": "x", "files": [123]})),
-            r#"Expected PromptInput.FileAttachment, got 123"#.to_string()
-                + "\n  at [\"files\"][0]"
+            r#"Expected PromptInput.FileAttachment, got 123"#.to_string() + "\n  at [\"files\"][0]"
         );
         assert_eq!(
             v2err(&json!({"text": "x", "agents": [123]})),
-            r#"Expected Prompt.AgentAttachment, got 123"#.to_string()
-                + "\n  at [\"agents\"][0]"
+            r#"Expected Prompt.AgentAttachment, got 123"#.to_string() + "\n  at [\"agents\"][0]"
         );
         assert_eq!(
             v2err(&json!({"text": "x", "agents": [{}]})),
@@ -1175,8 +1173,7 @@ mod wire_tests {
         assert_eq!(ok.prompt_files.len(), 1);
         assert_eq!(ok.prompt_agents.len(), 1);
         assert_eq!(ok.prompt_skills.len(), 1);
-        let q =
-            V2PromptInput::decode(&json!({"text": "x", "delivery": "queue"})).unwrap();
+        let q = V2PromptInput::decode(&json!({"text": "x", "delivery": "queue"})).unwrap();
         assert_eq!(q.delivery.as_deref(), Some("queue"));
     }
 
@@ -1250,8 +1247,7 @@ mod wire_tests {
     #[test]
     fn v2_prompt_keys_come_from_the_v2_contract() {
         let v1: Value = serde_json::from_str(crate::spec::SPEC_JSON).expect("v1 parses");
-        let v2: Value =
-            serde_json::from_str(crate::spec::SPEC_V2_JSON).expect("v2 parses");
+        let v2: Value = serde_json::from_str(crate::spec::SPEC_V2_JSON).expect("v2 parses");
         let keys = |doc: &Value| {
             doc.get("paths")
                 .and_then(|p| p.get("/api/session/{sessionID}/prompt"))
@@ -1277,6 +1273,12 @@ mod wire_tests {
         assert_eq!(keys(&v2), want);
         // The v1 doc does not define this route — the pin cannot pass
         // vacuously against the wrong contract.
-        assert!(keys(&v1) != want || v1.get("paths").and_then(|p| p.get("/api/session/{sessionID}/prompt")).is_none());
+        assert!(
+            keys(&v1) != want
+                || v1
+                    .get("paths")
+                    .and_then(|p| p.get("/api/session/{sessionID}/prompt"))
+                    .is_none()
+        );
     }
 }
