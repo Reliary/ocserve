@@ -20,7 +20,9 @@ cd "$(dirname "$0")/.."
 PORT_F=4944
 PORT_R=4945
 OCSERVE_BIN="${OCSERVE_BIN:-$PWD/target/release/ocserve}"
-V2BIN="${V2_BIN:-/tmp/opencode/ocli/node_modules/@opencode/cli-linux-x64/bin/opencode}"
+# The 2.0.28 CLI binary (201 MB ELF, from @opencode/cli-linux-x64@2.0.28).
+# Default: the scratch copy outside /tmp (tmpfs fills); override with V2_BIN.
+V2BIN="${V2_BIN:-/var/tmp/ocserve-scratch/ocli/node_modules/@opencode/cli-linux-x64/bin/opencode}"
 
 HF=""; HR=""; PID_F=""; PID_R=""
 cleanup() {

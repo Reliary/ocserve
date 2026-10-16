@@ -3,6 +3,12 @@
 Status (2026-10-13): plan committed; P0 in progress. Reference pin: `@opencode/cli@2.0.28`
 + contract regenerated from `@opencode/protocol@2.0.28` sources (never the stale checked-in file).
 
+Progress 2026-10-16: P0–P5 built and green (see TRACEABILITY K-V2-P0…K-V2-P5).
+P6 perf note: union metadata routes 0.16–0.42 ms, admit 0.51 ms, inbox list
+0.26 ms, content[] page 0.64 ms (release binary, 11-run trimmed means —
+indicative, not a G2 gate). `/api/info` serves only when `OCSERVE_V2=1`
+(dark JSON 404 otherwise).
+
 This document is specification for the v2 build. Precedence: TESTING.md gates >
 PLAN.md > this document for v2-domain decisions. Resolutions that change a
 requirement land here as edits, never silently in code.
