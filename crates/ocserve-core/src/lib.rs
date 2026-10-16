@@ -8,6 +8,7 @@
 
 pub mod compact;
 pub mod compaction;
+pub mod coordinator;
 pub mod event;
 pub mod ids;
 pub mod loop_guard;

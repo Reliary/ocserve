@@ -146,6 +146,14 @@ CREATE TABLE instruction_entry (
     PRIMARY KEY (session_id, key)
 ) STRICT;
 
+-- v2 execution claims (V2-PLAN.md P3): restart-recovery markers, own table
+-- (never the instruction journal). Pending-only by release discipline.
+CREATE TABLE execution_claim (
+    session_id      TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+    claimed_ms      INTEGER NOT NULL,
+    resume_attempts INTEGER NOT NULL DEFAULT 0
+) STRICT;
+
 -- legacy-delta sync state (dev bridge: legacy -> ocserve additive pulls;
 -- dropped relevance once the final migration lands — PLAN §17)
 CREATE TABLE import_sync (
@@ -687,6 +695,11 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                         time_created INTEGER NOT NULL,
                         time_updated INTEGER NOT NULL,
                         PRIMARY KEY (session_id, key)
+                    ) STRICT;
+                    CREATE TABLE IF NOT EXISTS execution_claim (
+                        session_id      TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+                        claimed_ms      INTEGER NOT NULL,
+                        resume_attempts INTEGER NOT NULL DEFAULT 0
                     ) STRICT;",
                 )?;
             }

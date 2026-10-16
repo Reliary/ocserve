@@ -313,6 +313,15 @@ pub struct AppState {
     pub prompt_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Question rendezvous (v1 Question service): pending asks + reply/reject.
     pub question_gate: std::sync::Arc<ocserve_core::question::QuestionGate>,
+    /// v2 runtime kill-switch (V2-PLAN.md D2): read from `OCSERVE_V2` ONCE at
+    /// construction (never per-request env reads — env is process-global and
+    /// per-request reads make parallel tests flaky by construction).
+    pub v2_enabled: bool,
+    /// v2 run coordinators (V2-PLAN.md P3): one entry per session with live
+    /// work, dropped on idle drain-end. Gated by OCSERVE_V2=1 (D2: the whole
+    /// v2 runtime stays dark until acceptance; the set exists so construction
+    /// is uniform, but no v2 route touches it while disabled).
+    pub coordinators: ocserve_core::coordinator::SharedCoordinators,
     /// /tui/control rendezvous queues (v1 shared/tui-control.ts)
     pub tui: crate::tui::TuiControl,
     /// Web-UI reverse proxy (Phase 7; upstream serveUIEffect parity)
@@ -533,6 +542,18 @@ impl AppState {
 
     /// One-shot construction with real runtime wiring (CLI path).
     pub fn with_wiring(auth: Option<(String, String)>, p: Payloads, w: Wires) -> Arc<Self> {
+        Self::with_wiring_and_v2(auth, p, w, std::env::var("OCSERVE_V2").unwrap_or_default() == "1")
+    }
+
+    /// Construction with an explicit v2 flag (tests: hermetic per-state gate,
+    /// never process env — env is process-global and per-request reads make
+    /// parallel tests flaky by construction).
+    pub fn with_wiring_and_v2(
+        auth: Option<(String, String)>,
+        p: Payloads,
+        w: Wires,
+        v2: bool,
+    ) -> Arc<Self> {
         let home = std::env::var("HOME").unwrap_or_default();
         let worktree = std::env::current_dir()
             .map(|p| p.display().to_string())
@@ -587,6 +608,8 @@ impl AppState {
             )),
             prompt_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             question_gate: ocserve_core::question::QuestionGate::new(),
+            v2_enabled: v2,
+            coordinators: std::sync::Arc::new(ocserve_core::coordinator::CoordinatorSet::new()),
             tui: crate::tui::TuiControl::default(),
             ui: crate::ui::UiProxy::from_env(),
             pty,

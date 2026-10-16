@@ -1470,8 +1470,233 @@ pub fn next_event_seq(db: &std::path::Path, session_id: &str) -> anyhow::Result<
     Ok(seq)
 }
 
-/// Ring bound (STORAGE §4): per-session event cap + age window — declared
-/// at the call site (AGENTS §2.3: bounded by construction).
+/// v2 inbox engine (V2-PLAN.md P3). Server-owned pending-work queue mirroring
+/// upstream's admission → promote → deliver flow (`inbox.ts`):
+/// - admit: idempotent first-write-wins on `(session_id, type, id)`
+///   (cross-session/type reuse is a caller-level 409 — `reconcile` reports it)
+/// - deliver: delete the inbox row + insert the visible message in ONE op
+///   batch (atomic on the writer)
+/// - promote order: steers first, then exactly one queued item; compaction
+///   jumps ahead of steers but never across a move (caller enforces)
+/// - cancel/update: guarded (delivered/missing rows report `Gone`, not Ok)
+///
+/// All SQL names explicit columns (rule 25/33). Payloads are caller JSON.
+pub mod inbox {
+    use super::{WriteOp, Writer};
+    use anyhow::Result;
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Admit an inbox item. Returns `true` when newly inserted, `false` when
+    /// the id already exists (idempotent reconcile — first write wins).
+    pub fn admit(
+        writer: &Writer,
+        session_id: &str,
+        id: &str,
+        item_type: &str,
+        payload: &serde_json::Value,
+        delivery: &str,
+        enqueued_seq: i64,
+    ) -> Result<bool> {
+        let n = writer.write(vec![WriteOp::Sql {
+            sql: "INSERT OR IGNORE INTO session_inbox \
+                  (id, session_id, type, payload, delivery, enqueued_seq, time_created) \
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                .into(),
+            params: vec![
+                id.into(),
+                session_id.into(),
+                item_type.into(),
+                payload.to_string().into(),
+                delivery.into(),
+                enqueued_seq.into(),
+                now_ms().into(),
+            ],
+        }])?;
+        Ok(n == 1)
+    }
+
+    /// Fetch one pending item by id (explicit columns, rule 33).
+    pub fn get(
+        db: &std::path::Path,
+        id: &str,
+    ) -> Result<Option<(String, String, String, String, i64)>> {
+        let conn = crate::pragma::open_reader(db)?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT session_id, type, payload, delivery, enqueued_seq \
+             FROM session_inbox WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map([id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// List pending items for a session in promote order
+    /// (enqueued_seq; caller partitions steer/queue/compaction/move).
+    pub fn list(
+        db: &std::path::Path,
+        session_id: &str,
+    ) -> Result<Vec<(String, String, String, String, i64)>> {
+        let conn = crate::pragma::open_reader(db)?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, type, payload, delivery, enqueued_seq FROM session_inbox \
+             WHERE session_id = ?1 ORDER BY enqueued_seq ASC",
+        )?;
+        let rows = stmt.query_map([session_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Cancel a pending item. Returns `true` when a row was deleted,
+    /// `false` when already delivered/missing (caller maps to no-op/409).
+    pub fn cancel(writer: &Writer, id: &str) -> Result<bool> {
+        let n = writer.write(vec![WriteOp::Sql {
+            sql: "DELETE FROM session_inbox WHERE id = ?1".into(),
+            params: vec![id.into()],
+        }])?;
+        Ok(n == 1)
+    }
+
+    /// Flip a pending item's delivery. Returns `true` on update.
+    pub fn set_delivery(writer: &Writer, id: &str, delivery: &str) -> Result<bool> {
+        let n = writer.write(vec![WriteOp::Sql {
+            sql: "UPDATE session_inbox SET delivery = ?2 WHERE id = ?1".into(),
+            params: vec![id.into(), delivery.into()],
+        }])?;
+        Ok(n == 1)
+    }
+
+    /// Deliver: delete the inbox row. The caller appends the visible-message
+    /// insert ops to the SAME writer batch for atomicity — this helper builds
+    /// the delete op; see `deliver_ops`.
+    pub fn deliver_ops(id: &str) -> WriteOp {
+        WriteOp::Sql {
+            sql: "DELETE FROM session_inbox WHERE id = ?1".into(),
+            params: vec![id.to_string().into()],
+        }
+    }
+
+    /// Next promotable item id for a session: lowest-seq row, with the
+    /// caller's scope filter applied by choosing `deliveries` (e.g.
+    /// `("steer")` at a step boundary, `("steer","queue")` at idle).
+    /// Compaction-ahead-of-steers is a caller-side pick over `list()`.
+    pub fn next_promotable(
+        db: &std::path::Path,
+        session_id: &str,
+        deliveries: &[&str],
+    ) -> Result<Option<String>> {
+        let conn = crate::pragma::open_reader(db)?;
+        let placeholders = deliveries.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id FROM session_inbox WHERE session_id = ?1 \
+             AND delivery IN ({placeholders}) ORDER BY enqueued_seq ASC LIMIT 1"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&session_id];
+        for d in deliveries {
+            params.push(d);
+        }
+        let mut rows = stmt.query_map(params.as_slice(), |r| r.get::<_, String>(0))?;
+        Ok(rows.next().transpose()?)
+    }
+}
+
+/// Execution claims (V2-PLAN.md P3).
+///
+/// Claims are restart-recovery markers only (NOT fencing, NOT exactly-once):
+/// `claim` inserts iff no claim is held (re-claim no-op); `release` clears;
+/// `count_resume` increments the attempt budget (terminal at 10 — upstream
+/// `maxAttempts`). Boot recovery lists suspended sessions.
+///
+/// Claims live in their OWN table (`execution_claim`), not in
+/// `instruction_entry`: the journal is instruction domain state and a claim
+/// marker there would pollute epoch snapshots and entry listings.
+pub mod claim {
+    use super::{WriteOp, Writer};
+    use anyhow::Result;
+
+    /// Maximum resume attempts before a suspended session terminal-fails.
+    pub const MAX_RESUME_ATTEMPTS: i64 = 10;
+
+    /// Claim a session for execution. Returns `true` when newly claimed,
+    /// `false` when already held (re-claim no-op).
+    pub fn claim(writer: &Writer, session_id: &str, now_ms: i64) -> Result<bool> {
+        let n = writer.write(vec![WriteOp::Sql {
+            sql: "INSERT OR IGNORE INTO execution_claim (session_id, claimed_ms, resume_attempts) \
+                  VALUES (?1, ?2, 0)"
+                .into(),
+            params: vec![session_id.into(), now_ms.into()],
+        }])?;
+        Ok(n == 1)
+    }
+
+    /// Release a claim. Returns `true` when a claim was held.
+    pub fn release(writer: &Writer, session_id: &str) -> Result<bool> {
+        let n = writer.write(vec![WriteOp::Sql {
+            sql: "DELETE FROM execution_claim WHERE session_id = ?1".into(),
+            params: vec![session_id.into()],
+        }])?;
+        Ok(n == 1)
+    }
+
+    /// True when the session currently holds a claim.
+    pub fn held(db: &std::path::Path, session_id: &str) -> Result<bool> {
+        let conn = crate::pragma::open_reader(db)?;
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM execution_claim WHERE session_id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Increment the resume-attempt budget; returns the new total.
+    pub fn count_resume(writer: &Writer, session_id: &str, now_ms: i64) -> Result<i64> {
+        writer.write(vec![WriteOp::Sql {
+            sql: "UPDATE execution_claim SET resume_attempts = resume_attempts + 1, \
+                  claimed_ms = ?2 WHERE session_id = ?1"
+                .into(),
+            params: vec![session_id.into(), now_ms.into()],
+        }])?;
+        let conn = crate::pragma::open_reader(writer.db_path_ref())?;
+        conn.query_row(
+            "SELECT resume_attempts FROM execution_claim WHERE session_id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    /// Sessions holding claims (boot recovery scan). Bounded: at most the
+    /// sessions with live claims — claims release on terminal states.
+    pub fn list_suspended(db: &std::path::Path) -> Result<Vec<String>> {
+        let conn = crate::pragma::open_reader(db)?;
+        let mut stmt =
+            conn.prepare_cached("SELECT session_id FROM execution_claim")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+}
 pub const EVENT_MAX_PER_SESSION: i64 = 200_000;
 pub const EVENT_MAX_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 

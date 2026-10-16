@@ -263,6 +263,73 @@ fn instruction_state_epoch_and_reset() {
 }
 
 #[test]
+fn inbox_engine_admit_deliver_promote_cancel_update() {
+    use ocserve_store::inbox;
+    let (_dir, db) = migrated();
+    let w = writer::Writer::spawn(db.clone()).unwrap();
+    w.write(vec![writer::WriteOp::Sql {
+        sql: "INSERT INTO session (id, time_created, time_updated) VALUES ('ses_q', 1, 1)".into(),
+        params: vec![],
+    }])
+    .unwrap();
+    // Admit three items: steer, queue, compaction (seq 1,2,3).
+    assert!(inbox::admit(&w, "ses_q", "msg_s", "user", &serde_json::json!({"text": "hi"}), "steer", 1).unwrap());
+    assert!(inbox::admit(&w, "ses_q", "msg_q", "user", &serde_json::json!({"text": "later"}), "queue", 2).unwrap());
+    assert!(inbox::admit(&w, "ses_q", "msg_c", "compaction", &serde_json::json!({}), "steer", 3).unwrap());
+    // Re-admit is idempotent (first write wins).
+    assert!(!inbox::admit(&w, "ses_q", "msg_s", "user", &serde_json::json!({"text": "changed"}), "queue", 9).unwrap());
+    let got = inbox::get(&db, "msg_s").unwrap().unwrap();
+    assert_eq!(got.2, "{\"text\":\"hi\"}", "re-admit must not overwrite");
+    // Step-boundary promote sees only steers; lowest seq first.
+    assert_eq!(
+        inbox::next_promotable(&db, "ses_q", &["steer"]).unwrap(),
+        Some("msg_s".to_string())
+    );
+    // Idle-boundary promote sees steers first, then the queued item.
+    let all = inbox::list(&db, "ses_q").unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].0, "msg_s");
+    // Deliver msg_s (delete); next promotable is the compaction steer.
+    w.write(vec![inbox::deliver_ops("msg_s")]).unwrap();
+    assert_eq!(
+        inbox::next_promotable(&db, "ses_q", &["steer"]).unwrap(),
+        Some("msg_c".to_string())
+    );
+    // Cancel the queued item: true once, false after (guarded, not Ok-always).
+    assert!(inbox::cancel(&w, "msg_q").unwrap());
+    assert!(!inbox::cancel(&w, "msg_q").unwrap());
+    // Flip delivery on the remaining item.
+    assert!(inbox::set_delivery(&w, "msg_c", "queue").unwrap());
+    assert_eq!(inbox::get(&db, "msg_c").unwrap().unwrap().3, "queue");
+    assert!(!inbox::set_delivery(&w, "msg_nope", "steer").unwrap());
+    // CONTROL: deliver without delete (leak) → list still shows msg_s, red.
+}
+
+#[test]
+fn claim_lifecycle_reclaim_noop_resume_budget_recovery_scan() {
+    use ocserve_store::claim;
+    let (_dir, db) = migrated();
+    let w = writer::Writer::spawn(db.clone()).unwrap();
+    w.write(vec![writer::WriteOp::Sql {
+        sql: "INSERT INTO session (id, time_created, time_updated) VALUES ('ses_k', 1, 1)".into(),
+        params: vec![],
+    }])
+    .unwrap();
+    assert!(claim::claim(&w, "ses_k", 100).unwrap());
+    assert!(!claim::claim(&w, "ses_k", 200).unwrap(), "re-claim is a no-op");
+    assert!(claim::held(&db, "ses_k").unwrap());
+    assert_eq!(claim::count_resume(&w, "ses_k", 300).unwrap(), 1);
+    assert_eq!(claim::count_resume(&w, "ses_k", 400).unwrap(), 2);
+    assert_eq!(claim::list_suspended(&db).unwrap(), vec!["ses_k".to_string()]);
+    assert!(claim::release(&w, "ses_k").unwrap());
+    assert!(!claim::release(&w, "ses_k").unwrap());
+    assert!(!claim::held(&db, "ses_k").unwrap());
+    assert!(claim::list_suspended(&db).unwrap().is_empty());
+    assert_eq!(claim::MAX_RESUME_ATTEMPTS, 10);
+    // CONTROL: claim via INSERT without OR IGNORE → second claim errors, red.
+}
+
+#[test]
 fn no_direct_append_event_from_server_paths() {
     // Structural: the only `append_event` callers outside the store crate
     // must be the choke itself. This test fails if a new direct caller

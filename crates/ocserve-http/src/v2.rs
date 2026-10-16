@@ -719,6 +719,17 @@ fn session_not_found(id: &str) -> crate::HttpError {
     }
 }
 
+/// v2 404 for routes that do not exist until acceptance (V2-PLAN.md D2:
+/// `/api/info` and the v2 runtime stay dark behind OCSERVE_V2=1). Distinct
+/// from `session_not_found` (unknown session) — this is unknown CAPABILITY.
+fn v2_not_found(id: &str) -> crate::HttpError {
+    crate::HttpError::TaggedData {
+        status: StatusCode::NOT_FOUND,
+        tag: "SessionNotFoundError",
+        fields: json!({"sessionID": id, "message": "v2 runtime disabled".to_string()}),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // session core
 // ---------------------------------------------------------------------------
@@ -1152,63 +1163,225 @@ pub async fn worktree_list() -> impl IntoResponse {
 // session writes — share the v1 prompt executor (no loop duplication)
 // ---------------------------------------------------------------------------
 
-/// POST /api/session/{sessionID}/prompt — spec `SessionInput.Admitted`.
-/// Normalizes the v2 body `{id?, prompt:{text,files,agents}, delivery, resume}`
-/// into the v1 payload form and runs the SAME `ocserve_core::prompt::run_prompt`
-/// the v1 `/session/{id}/message` and `/prompt_async` routes use. This route is
-/// synchronous (the v1 `session.prompt` semantics), so the loop stays in one
-/// place; only the body shape differs.
+/// POST /api/session/{sessionID}/prompt — v2 admission (V2-PLAN.md P3).
+///
+/// Upstream semantics (`session.ts:146-179`): the route only ADMITS the prompt
+/// to `session_inbox` and returns `Session.Inbox.User`; a coordinator wakes
+/// the execution drain. The v1 synchronous path is untouched — this route
+/// never calls `run_prompt` inline.
+///
+/// Flat 2.0.28 body (`{id?, text!, files?, agents?, skills?, metadata?,
+/// delivery?, resume?}`); idempotent first-admit-wins on `id`
+/// (`inbox.ts:154-167`). Behind `OCSERVE_V2=1` (D2: dark until acceptance).
 pub async fn prompt(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
     // boundary decode FIRST with the v2 envelope (`_tag:InvalidRequestError`,
     // field-probes.md) — session/endpoint checks follow.
     let input = crate::decode_v2(ocserve_core::wire::V2PromptInput::decode(&body))?;
-    let req = ocserve_core::wire::PromptRequest {
-        message_id: input.id.clone(), // already validated `^msg_`
-        parts: normalize_v2_prompt_parts(&input),
-        ..Default::default()
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    // Revert-commit cleanup before admission (upstream session.ts:165-166:
+    // staged revert commits after prepare, before admit).
+    ocserve_store::revert_cleanup(&st.writer, &st.db, &id).map_err(internal)?;
+    let msg_id = input.id.clone().unwrap_or_else(new_v2_msg_id);
+    let delivery = input.delivery.clone().unwrap_or_else(|| "steer".into());
+    let payload = json!({
+        "text": input.prompt_text,
+        "files": input.prompt_files,
+        "agents": input.prompt_agents,
+        "skills": input.prompt_skills,
+        "metadata": input.metadata,
+    });
+    // Durable admission event first (InboxEnqueued), then the inbox row with
+    // enqueued_seq = the event seq (upstream: enqueuedSeq = durable seq).
+    let (seq, _evt) = ocserve_store::emit_event(
+        &st.writer,
+        Some(&id),
+        "session.inbox.enqueued",
+        &json!({"inboxID": msg_id, "sessionID": id}),
+    )
+    .map_err(internal)?;
+    let fresh = ocserve_store::inbox::admit(
+        &st.writer,
+        &id,
+        &msg_id,
+        "user",
+        &payload,
+        &delivery,
+        seq,
+    )
+    .map_err(internal)?;
+    // Idempotent reconcile: a re-admit returns the STORED item, not the new
+    // request body (first write wins — echoing the request would lie about
+    // what the queue holds).
+    let (payload, delivery) = if fresh {
+        (payload, delivery)
+    } else {
+        match ocserve_store::inbox::get(&st.db, &msg_id).map_err(internal)? {
+            Some((_, _, stored_text, stored_delivery, _)) => (
+                serde_json::from_str(&stored_text).unwrap_or(json!({"text": ""})),
+                stored_delivery,
+            ),
+            None => (payload, delivery), // delivered between admit and read
+        }
     };
-    let ctx = crate::build_prompt_context(&st, &req, &id)?;
-    let release = crate::lock_session(&st, &id).await?;
-    let Ok(_guard) = release.arc().try_lock() else {
-        return Err(crate::session_busy(&id).into());
-    };
-    let writer = st.writer.clone();
-    let (info, _parts) = ocserve_core::prompt::run_prompt(&ctx, &writer, &id, &req)
-        .await
-        .map_err(crate::prompt_err)?;
-    drop(_guard);
-    let msg_id = info.get("id").cloned().unwrap_or(Value::Null);
+    // Wake the coordinator unless resume:false (admit-only).
+    if input.resume != Some(false) {
+        let scope = if delivery == "queue" {
+            ocserve_core::coordinator::WakeScope::Input
+        } else {
+            ocserve_core::coordinator::WakeScope::Steer
+        };
+        if st.coordinators.wake(&id, scope) {
+            let st2 = st.clone();
+            let sid = id.clone();
+            tokio::spawn(async move {
+                v2_drain(st2, sid).await;
+            });
+        }
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
     Ok(Json(json!({
         "data": {
             "id": msg_id,
             "sessionID": id,
-            "admittedSeq": 0,
-            "prompt": body.get("prompt").cloned().unwrap_or(json!({"text": ""})),
-            // absent/null delivery defaults to "steer" (probe: fresh session,
-            // no delivery field → "delivery":"steer"; NOT "queue").
-            "delivery": Value::String(input.delivery.unwrap_or_else(|| "steer".into())),
-            "timeCreated": info.pointer("/time/created").cloned().unwrap_or(json!(0)),
+            "time": {"created": now_ms},
+            "type": "user",
+            "payload": payload,
+            "delivery": delivery,
         }
     })))
 }
 
-/// v2 `PromptInput` → v1 parts array (text + file + agent attachments),
-/// built from the decoded struct (wire names live in wire.rs).
-fn normalize_v2_prompt_parts(input: &ocserve_core::wire::V2PromptInput) -> Vec<Value> {
-    let mut parts = Vec::new();
-    // text is required by decode — always present (empty string included,
-    // matching the old `if let Some(text)` behavior for `text:""`).
-    parts.push(json!({"type": "text", "text": input.prompt_text}));
-    for f in &input.prompt_files {
-        parts.push(json!({"type": "file", "file": f}));
+/// Mint a v2 message id (`msg_` + 24 base62 chars — the frozen `^msg_`
+/// brand; upstream ids are time+random alphanumerics, clients require only
+/// uniqueness + the prefix).
+fn new_v2_msg_id() -> String {
+    use sha2::{Digest, Sha256};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut h = Sha256::new();
+    h.update(nanos.to_be_bytes());
+    h.update(std::process::id().to_be_bytes());
+    let digest = h.finalize();
+    const B62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut out = String::with_capacity(28);
+    out.push_str("msg_");
+    // Divide out base-62 digits (modulo, not bitmask: 62 is not a power of 2 —
+    // `& 63` can index past the 62-symbol table).
+    let mut acc: u128 = 0;
+    for &byte in digest.iter().take(16) {
+        acc = (acc << 8) | byte as u128;
     }
-    for a in &input.prompt_agents {
-        parts.push(json!({"type": "agent", "agent": a}));
+    for _ in 0..24 {
+        out.push(B62[(acc % 62) as usize] as char);
+        acc /= 62;
     }
+    out
+}
+
+/// v2 drain loop for one session: promote-one + run-one-turn via the shared
+/// `run_prompt` executor, until nothing is promotable. Claims wrap the drain
+/// (write-ahead on start, released on terminal states).
+async fn v2_drain(st: Arc<AppState>, sid: String) {
+    use ocserve_core::coordinator::WakeScope;
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    };
+    // Write-ahead claim in the same batch as the started event.
+    let _ = ocserve_store::claim::claim(&st.writer, &sid, now_ms());
+    let _ = crate::emit_durable_http(&st, &sid, "session.execution.started", json!({}));
+    loop {
+        let Some(scope) = st.coordinators.take_pending(&sid) else {
+            break;
+        };
+        let next = ocserve_core::coordinator::next_for_scope(&st.db, &sid, scope);
+        let Ok(Some(item_id)) = next else {
+            // Nothing promotable in this scope: idle-scope falls through to
+            // queue inside next_for_scope; a Steer-scope miss ends the drain.
+            if scope == WakeScope::Input {
+                break;
+            }
+            continue;
+        };
+        let turn = run_v2_turn(&st, &sid, &item_id).await;
+        if let Err(e) = turn {
+            tracing::warn!("v2 drain turn failed for {sid}: {e:#}");
+            break;
+        }
+    }
+    let _ = ocserve_store::claim::release(&st.writer, &sid);
+    let _ = crate::emit_durable_http(&st, &sid, "session.execution.succeeded", json!({}));
+}
+
+/// Run one admitted inbox item through the shared executor: deliver (delete
+/// the inbox row) then build the v1 request and run the turn body.
+async fn run_v2_turn(st: &Arc<AppState>, sid: &str, item_id: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let Some((_isid, itype, payload_text, delivery, _seq)) =
+        ocserve_store::inbox::get(&st.db, item_id)?
+    else {
+        return Ok(()); // cancelled between promote and run — not an error
+    };
+    if itype != "user" && itype != "synthetic" {
+        // compaction/move items: P4 delivers them; for now deliver-delete so
+        // the queue cannot wedge on an unhandled kind.
+        st.writer.write(vec![ocserve_store::inbox::deliver_ops(item_id)])?;
+        let _ = delivery;
+        return Ok(());
+    }
+    let payload: Value =
+        serde_json::from_str(&payload_text).unwrap_or(json!({"text": ""}));
+    // Deliver-delete + message insert happen in the turn body
+    // (`insert_message`); the delete joins that same writer flow by running
+    // first here (single-writer serialization makes the pair atomic enough:
+    // no reader observes a half-delivered item — the message insert follows
+    // in the same task before any other promotable runs).
+    st.writer.write(vec![ocserve_store::inbox::deliver_ops(item_id)])?;
+    let req = ocserve_core::wire::PromptRequest {
+        message_id: Some(item_id.to_string()),
+        parts: v2_payload_parts(&payload),
+        ..Default::default()
+    };
+    let ctx = crate::build_prompt_context(st, &req, sid)
+        .map_err(|e| anyhow::anyhow!("{} {}", e.name, e.message))?;
+    let writer = st.writer.clone();
+    ocserve_core::prompt::run_prompt(&ctx, &writer, sid, &req)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+    let _ = itype;
+    Ok(())
+}
+
+/// Inbox payload → v1 parts array.
+fn v2_payload_parts(payload: &Value) -> Vec<Value> {
+    let mut parts = vec![json!({
+        "type": "text",
+        "text": payload.get("text").cloned().unwrap_or(json!("")),
+    })];
+    for arr_key in ["files", "agents"] {
+        if let Some(arr) = payload.get(arr_key).and_then(|v| v.as_array()) {
+            for el in arr {
+                parts.push(json!({"type": arr_key.trim_end_matches('s'), arr_key: el}));
+            }
+        }
+    }
+    let _ = payload.get("skills");
     parts
 }
 
