@@ -313,6 +313,8 @@ pub struct AppState {
     pub prompt_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Question rendezvous (v1 Question service): pending asks + reply/reject.
     pub question_gate: std::sync::Arc<ocserve_core::question::QuestionGate>,
+    /// Form rendezvous (v2 Form service): pending asks + reply/cancel.
+    pub form_gate: std::sync::Arc<ocserve_core::form::FormGate>,
     /// v2 runtime kill-switch (V2-PLAN.md D2): read from `OCSERVE_V2` ONCE at
     /// construction (never per-request env reads — env is process-global and
     /// per-request reads make parallel tests flaky by construction).
@@ -608,6 +610,7 @@ impl AppState {
             )),
             prompt_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             question_gate: ocserve_core::question::QuestionGate::new(),
+            form_gate: ocserve_core::form::FormGate::new(),
             v2_enabled: v2,
             coordinators: std::sync::Arc::new(ocserve_core::coordinator::CoordinatorSet::new()),
             tui: crate::tui::TuiControl::default(),
@@ -5516,6 +5519,16 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/experimental/session/{sessionID}/log",
             get(v2::session_log),
         )
+        .route("/api/session/{sessionID}/form", get(v2::form_list).post(v2::form_create))
+        .route(
+            "/api/session/{sessionID}/form/{formID}",
+            get(v2::form_get).delete(v2::form_cancel),
+        )
+        .route(
+            "/api/session/{sessionID}/form/{formID}/reply",
+            axum::routing::post(v2::form_reply),
+        )
+        .route("/api/form", get(v2::form_list_global))
         .route(
             "/api/session/{sessionID}/interrupt",
             axum::routing::post(v2::interrupt),

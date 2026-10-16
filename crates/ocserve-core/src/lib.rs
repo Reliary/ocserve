@@ -10,6 +10,7 @@ pub mod compact;
 pub mod compaction;
 pub mod coordinator;
 pub mod event;
+pub mod form;
 pub mod ids;
 pub mod loop_guard;
 pub mod permission;

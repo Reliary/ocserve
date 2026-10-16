@@ -1984,6 +1984,114 @@ pub fn prune_events(
     Ok(aged + capped)
 }
 
+/// v2 forms (V2-PLAN.md P4, L3-lite): persistent ask rendezvous state.
+/// The waiters live in `core::form::FormGate`; this module is the durable
+/// state (create/settle/get/list). Explicit columns (rule 25/33).
+pub mod form {
+    use super::{WriteOp, Writer};
+    use anyhow::Result;
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Create a pending form. `fields`/`metadata` are caller JSON text.
+    pub fn create(
+        writer: &Writer,
+        session_id: &str,
+        id: &str,
+        title: &str,
+        metadata: &str,
+        fields: &str,
+    ) -> Result<()> {
+        let now = now_ms();
+        writer.write(vec![WriteOp::Sql {
+            sql: "INSERT INTO form (id, session_id, title, metadata, fields, state, time_created, time_updated) \
+                  VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6)"
+                .into(),
+            params: vec![
+                id.into(),
+                session_id.into(),
+                title.into(),
+                metadata.into(),
+                fields.into(),
+                now.into(),
+            ],
+        }])?;
+        Ok(())
+    }
+
+    /// Settle a form (answered/cancelled). Answer JSON text or None.
+    /// Returns `true` only when a pending row transitioned (re-settle is a
+    /// no-op false — settled forms stay settled).
+    pub fn settle(
+        writer: &Writer,
+        id: &str,
+        state: &str,
+        answer: Option<&str>,
+    ) -> Result<bool> {
+        let n = writer.write(vec![WriteOp::Sql {
+            sql: "UPDATE form SET state = ?2, answer = ?3, time_updated = ?4 \
+                  WHERE id = ?1 AND state = 'pending'"
+                .into(),
+            params: vec![
+                id.into(),
+                state.into(),
+                answer.into(),
+                now_ms().into(),
+            ],
+        }])?;
+        Ok(n == 1)
+    }
+
+    /// One form by id (explicit columns).
+    pub fn get(
+        db: &std::path::Path,
+        id: &str,
+    ) -> Result<Option<(String, String, String, String, String, Option<String>)>> {
+        let conn = crate::pragma::open_reader(db)?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT session_id, title, metadata, fields, state, answer FROM form WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map([id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Pending forms for a session, oldest first.
+    pub fn list_pending(
+        db: &std::path::Path,
+        session_id: &str,
+    ) -> Result<Vec<(String, String, String, String)>> {
+        let conn = crate::pragma::open_reader(db)?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, title, metadata, fields FROM form \
+             WHERE session_id = ?1 AND state = 'pending' ORDER BY time_created ASC",
+        )?;
+        let rows = stmt.query_map([session_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+}
+
 /// Events after a seq for durable replay (`log?after=` — V2-PLAN.md P4).
 /// Explicit columns (rule 25/33); ascending seq; unbounded LIMIT is safe
 /// here only because callers cap the session ring at EVENT_MAX_PER_SESSION

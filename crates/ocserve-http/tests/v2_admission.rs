@@ -354,6 +354,117 @@ async fn v2_log_replay_and_watermark() {
 }
 
 #[tokio::test]
+async fn v2_form_lifecycle() {
+    let addr = spawn_stub_provider();
+    let st = setup_with_v2(addr, true);
+    let app = ocserve_http::router(st.clone());
+
+    async fn post(app: &axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+    async fn get(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    // Create with explicit id.
+    let (s, v) = post(
+        &app,
+        "/api/session/ses_v2a/form",
+        json!({"id": "frm_test00000000000001", "title": "pick", "fields": [{"label": "a"}]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["data"]["id"], "frm_test00000000000001");
+    assert_eq!(v["data"]["sessionID"], "ses_v2a");
+
+    // Empty fields → 400.
+    let (s, _) = post(&app, "/api/session/ses_v2a/form", json!({"title": "x", "fields": []})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // List shows it; global list shows it.
+    let (_, l) = get(&app, "/api/session/ses_v2a/form").await;
+    assert_eq!(l["data"].as_array().unwrap().len(), 1);
+    let (_, g) = get(&app, "/api/form").await;
+    assert!(g["data"].as_array().unwrap().iter().any(|f| f["id"] == "frm_test00000000000001"));
+
+    // Get Detail carries state.
+    let (_, d) = get(&app, "/api/session/ses_v2a/form/frm_test00000000000001").await;
+    assert_eq!(d["data"]["state"]["status"], "pending");
+
+    // Reply settles; re-reply is 409; get shows answered.
+    let (s, _) = post(
+        &app,
+        "/api/session/ses_v2a/form/frm_test00000000000001/reply",
+        json!({"answer": {"a": 1}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = post(
+        &app,
+        "/api/session/ses_v2a/form/frm_test00000000000001/reply",
+        json!({"answer": {"a": 2}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    let (_, d) = get(&app, "/api/session/ses_v2a/form/frm_test00000000000001").await;
+    assert_eq!(d["data"]["state"]["status"], "answered");
+    // Settled forms leave the pending list.
+    let (_, l) = get(&app, "/api/session/ses_v2a/form").await;
+    assert_eq!(l["data"].as_array().unwrap().len(), 0);
+
+    // Cancel path: create + cancel + idempotent second cancel.
+    let (s, v) = post(
+        &app,
+        "/api/session/ses_v2a/form",
+        json!({"title": "c", "fields": [{"label": "b"}]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let fid = v["data"]["id"].as_str().unwrap().to_string();
+    assert!(fid.starts_with("frm_"));
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/session/ses_v2a/form/{fid}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let (_, d) = get(&app, &format!("/api/session/ses_v2a/form/{fid}")).await;
+    assert_eq!(d["data"]["state"]["status"], "cancelled");
+
+    // Unknown form → tagged 404.
+    let (_, d) = get(&app, "/api/session/ses_v2a/form/frm_nope00000000000001").await;
+    assert!(d.to_string().contains("FormNotFoundError"));
+    // CONTROL: reply that re-opens a settled form → second reply 204, red.
+}
+
+#[tokio::test]
 async fn v2_drain_runs_turn_and_releases_claim() {
     let addr = spawn_stub_provider();
     let st = setup_with_v2(addr, true);

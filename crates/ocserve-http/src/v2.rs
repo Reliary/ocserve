@@ -1382,8 +1382,190 @@ fn v2_payload_parts(payload: &Value) -> Vec<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// inbox routes — list / cancel / update (V2-PLAN.md P4, L3-lite)
+// form routes — create/list/get/reply/cancel + global list (V2-PLAN.md P4)
 // ---------------------------------------------------------------------------
+
+/// Project a form row to `Form.Info` (+ `state` for Detail).
+fn form_info(
+    session_id: &str,
+    id: &str,
+    title: &str,
+    metadata_text: &str,
+    fields_text: &str,
+    state: Option<&str>,
+) -> Value {
+    let metadata: Value = serde_json::from_str(metadata_text).unwrap_or(json!({}));
+    let fields: Value = serde_json::from_str(fields_text).unwrap_or(json!([]));
+    let mut out = json!({
+        "id": id, "sessionID": session_id, "title": title,
+        "metadata": metadata, "fields": fields,
+    });
+    if let Some(s) = state {
+        out["state"] = json!({"status": s});
+    }
+    out
+}
+
+/// POST /api/session/{sessionID}/form — create a pending ask. Registers the
+/// waiter, persists the row, emits `form.created`.
+pub async fn form_create(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    let title = body.get("title").and_then(|t| t.as_str()).unwrap_or("");
+    let fields = body.get("fields").cloned().unwrap_or(json!([]));
+    if fields.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "fields must be a non-empty array"}),
+        });
+    }
+    let fid = body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| s.starts_with("frm_"))
+        .map(str::to_string)
+        .unwrap_or_else(ocserve_core::form::frm_id);
+    let metadata = body.get("metadata").cloned().unwrap_or(json!({}));
+    let info = json!({"id": fid, "sessionID": id, "title": title,
+                      "metadata": metadata, "fields": fields});
+    let Some(rx) = st.form_gate.register(&fid, info.clone()) else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            tag: "ServiceUnavailableError",
+            fields: json!({"message": "too many pending forms"}),
+        });
+    };
+    // The abort guard lives inside the gate (released on settle); the
+    // receiver is the runner's end. HTTP create does not wait — reply/cancel
+    // routes settle. (A runner-side wait path arrives with the tool adapter.)
+    let _ = rx;
+    ocserve_store::form::create(
+        &st.writer,
+        &id,
+        &fid,
+        title,
+        &metadata.to_string(),
+        &fields.to_string(),
+    )
+    .map_err(internal)?;
+    let _ = crate::emit_durable_http(&st, &id, "form.created", info.clone());
+    Ok(Json(json!({"data": form_info(&id, &fid, title, &metadata.to_string(), &fields.to_string(), None)})))
+}
+
+/// GET /api/session/{sessionID}/form — pending asks for the session.
+pub async fn form_list(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    let rows = ocserve_store::form::list_pending(&st.db, &id).map_err(internal)?;
+    Ok(Json(json!({"data": rows
+        .iter()
+        .map(|(fid, title, meta, fields)| form_info(&id, fid, title, meta, fields, None))
+        .collect::<Vec<_>>()})))
+}
+
+/// GET /api/session/{sessionID}/form/{formID} — Detail (with state).
+pub async fn form_get(
+    State(st): State<Arc<AppState>>,
+    Path((id, fid)): Path<(String, String)>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    match ocserve_store::form::get(&st.db, &fid).map_err(internal)? {
+        Some((sid, title, meta, fields, state, _answer)) if sid == id => Ok(Json(
+            json!({"data": form_info(&id, &fid, &title, &meta, &fields, Some(&state))}),
+        )),
+        _ => Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "FormNotFoundError",
+            fields: json!({"message": format!("Form not found: {fid}")}),
+        }),
+    }
+}
+
+/// POST /api/session/{sessionID}/form/{formID}/reply — answer a pending ask.
+/// Settles the row + wakes the waiter; re-settle of a settled form is a 409
+/// (upstream `FormAlreadySettledError`).
+pub async fn form_reply(
+    State(st): State<Arc<AppState>>,
+    Path((id, fid)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    let answer = body.get("answer").cloned().unwrap_or(Value::Null);
+    match ocserve_store::form::get(&st.db, &fid).map_err(internal)? {
+        Some((sid, _, _, _, state, _)) if sid == id => {
+            if state != "pending" {
+                return Err(crate::HttpError::TaggedData {
+                    status: StatusCode::CONFLICT,
+                    tag: "FormAlreadySettledError",
+                    fields: json!({"message": format!("Form already settled: {fid}")}),
+                });
+            }
+        }
+        _ => {
+            return Err(crate::HttpError::TaggedData {
+                status: StatusCode::NOT_FOUND,
+                tag: "FormNotFoundError",
+                fields: json!({"message": format!("Form not found: {fid}")}),
+            });
+        }
+    }
+    ocserve_store::form::settle(&st.writer, &fid, "answered", Some(&answer.to_string()))
+        .map_err(internal)?;
+    st.form_gate.reply(&fid, answer);
+    let _ = crate::emit_durable_http(&st, &id, "form.replied", json!({"id": fid}));
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// DELETE /api/session/{sessionID}/form/{formID}[?message=] — cancel a
+/// pending ask (settles as cancelled; idempotent success on settled/missing
+/// rows within the session scope).
+pub async fn form_cancel(
+    State(st): State<Arc<AppState>>,
+    Path((id, fid)): Path<(String, String)>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    match ocserve_store::form::get(&st.db, &fid).map_err(internal)? {
+        Some((sid, _, _, _, _, _)) if sid == id => {
+            let _ = ocserve_store::form::settle(&st.writer, &fid, "cancelled", None)
+                .map_err(internal)?;
+            st.form_gate.cancel(&fid);
+            let _ = crate::emit_durable_http(&st, &id, "form.cancelled", json!({"id": fid}));
+        }
+        _ => {}
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /api/form — pending asks across sessions (gate-backed, location
+///-agnostic; the durable rows scope per session via the session routes).
+pub async fn form_list_global(State(st): State<Arc<AppState>>) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found("global"));
+    }
+    Ok(Json(json!({"data": st.form_gate.list()})))
+}
 
 /// Project one inbox row to `Session.Inbox.Info`
 /// (`{id, sessionID, time, type, payload, delivery}`).
@@ -1491,6 +1673,11 @@ pub async fn session_log(
         Ok(Sse::new(stream.chain(stream::once(async { Ok(synced_ev) }))).into_response())
     }
 }
+
+// ---------------------------------------------------------------------------
+// inbox routes — list / cancel / update (V2-PLAN.md P4, L3-lite)
+// ---------------------------------------------------------------------------
+
 /// GET /api/session/{sessionID}/inbox — list pending durable work, ordered by
 /// `enqueued_seq` (upstream `session.inbox.list`).
 pub async fn inbox_list(
