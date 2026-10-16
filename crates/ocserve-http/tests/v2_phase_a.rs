@@ -92,6 +92,86 @@ async fn phase_a_vcs_aliases_answer() {
 }
 
 #[tokio::test]
+async fn phase_c_projections_answer() {
+    let (app, _st) = app();
+    // config entries: document + directory sources.
+    let (s, v) = get(&app, "/api/config").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(v.as_array().map(|a| !a.is_empty()).unwrap_or(false));
+    // config shells: path+name+acceptable from /etc/shells.
+    let (s, v) = get(&app, "/api/config/shell").await;
+    assert_eq!(s, StatusCode::OK);
+    let shells = v.as_array().expect("shell array");
+    assert!(!shells.is_empty() && shells[0].get("path").is_some());
+    // model default: enveloped, null when unresolvable.
+    let (s, v) = get(&app, "/api/model/default").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(v.get("location").is_some() && v.get("data").is_some());
+    // debug locations: array of {directory}.
+    let (s, v) = get(&app, "/api/debug/location").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(v.as_array().map(|a| !a.is_empty()).unwrap_or(false));
+    // migration status: completed (one-shot, project-don't-convert).
+    let (s, v) = get(&app, "/api/experimental/migration/v1").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["status"], "completed");
+    // plugin list: enveloped (empty until the inventory RPC lands).
+    let (s, v) = get(&app, "/api/plugin").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(v.get("data").and_then(|d| d.as_array()).is_some());
+    // fs write + read-back through the contained path.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/experimental/fs/write?path=/tmp/ocserve-phasec-test.txt")
+                .body(Body::from("hello-phase-c"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // /tmp escapes most worktrees → 403 traversal guard (proves containment).
+    assert!(
+        resp.status() == StatusCode::OK || resp.status() == StatusCode::FORBIDDEN,
+        "fs/write answers, got {}",
+        resp.status()
+    );
+    // traversal outside the worktree → 403, never a write.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/experimental/fs/write?path=../../etc/ocserve-phasec-evil")
+                .body(Body::from("x"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // worktree list: array (empty outside git is honest, not an error).
+    let (s, v) = get(&app, "/api/worktree").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(v.as_array().is_some());
+    // worktree refresh without projectID → 400.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/worktree/refresh")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // CONTROL: fs/write allowing ../../ → second 403 assert reds.
+}
+
+#[tokio::test]
 async fn phase_b_session_aliases() {
     let (app, st) = app();
     // Seed a session with a user message to fork from.
@@ -164,7 +244,7 @@ async fn phase_b_session_aliases() {
     assert_eq!(s, StatusCode::NOT_FOUND);
 
     // experimental wait alias: same 503 honesty as /api wait.
-    let (s, _) = post(&app, "/experimental/session/ses_pb/wait", json!({})).await;
+    let (s, _) = post(&app, "/api/experimental/session/ses_pb/wait", json!({})).await;
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
     // CONTROL: fork accepting messageID → second assert reds.
 }

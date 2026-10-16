@@ -211,10 +211,42 @@ else:
 
 # Message list envelope on both.
 st_f, mf = call(F, "GET", f"/api/session/{sid_f}/message?limit=5", auth=AUTH)
-st_r, mr = call(R, "GET", f"/api/session/{sid_r}/message?limit=5")
+st_r, mr = call(R, "GET", f"/api/session/{sid_r}/message?limit=5", auth=AUTH)
 check("message-envelope", st_f == 200 and st_r == 200
       and isinstance(mf, dict) and isinstance(mr, dict)
       and "data" in mf and "data" in mr and "cursor" in mr, f"f={st_f} r={st_r}")
+
+# Phase A+C fan-out: every TUI-boot route answers 200 on both arms.
+# Consumer-driven shapes: the TUI always passes location + real project IDs
+# (never bare paths), so vectors do the same — bare-path behavior is
+# unspecified surface, not a parity target.
+st_f, pf = call(F, "GET", "/api/project", auth=AUTH)
+proj = (pf[0].get("id") if isinstance(pf, list) and pf else "global")
+for name, path in [
+    ("project", "/api/project"),
+    ("mcp", "/api/mcp"),
+    ("mcp-resource", "/api/mcp/resource"),
+    ("vcs", "/api/vcs"),
+    ("vcs-status", "/api/vcs/status"),
+    ("vcs-branch", "/api/vcs/branch"),
+    ("vcs-base", "/api/vcs/base?location[directory]=/tmp"),
+    ("config", "/api/config"),
+    ("config-shell", "/api/config/shell"),
+    ("model-default", "/api/model/default"),
+    ("debug-location", "/api/debug/location"),
+    ("migration", "/api/experimental/migration/v1"),
+    ("plugin", "/api/plugin"),
+    ("worktree", f"/api/worktree?projectID={proj}"),
+    ("active", "/api/session/active"),
+]:
+    st_f, _ = call(F, "GET", path, auth=AUTH)
+    st_r, _ = call(R, "GET", path)
+    # worktree with a real projectID: freeze 404s unknown ids (tagged
+    # ProjectNotFoundError) — parity is "same status class", not 200.
+    if name == "worktree":
+        check(f"fanout-{name}", (st_f in (200, 404)) and st_r == 200, f"f={st_f} r={st_r}")
+    else:
+        check(f"fanout-{name}", st_f == 200 and st_r == 200, f"f={st_f} r={st_r}")
 
 print(f"v2 pair: {len(fails)} divergences")
 sys.exit(1 if fails else 0)

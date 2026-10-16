@@ -77,6 +77,13 @@ ALLOW_V2_UNION = {
     "/api/vcs/base": "v1 envelope project required",
     "/api/vcs/branch": "v1 envelope project required",
     "/api/project": "v1 Project.worktree+time.initialized required",
+    # Phase C routes: same union class.
+    "/api/config": "config entries are additive documents (no v1 shape)",
+    "/api/config/shell": "shell options are additive (no v1 shape)",
+    "/api/model/default": "v1 ModelV2Info.api+request required on the item",
+    "/api/debug/location": "location refs are additive (no v1 shape)",
+    "/api/plugin": "plugin inventory honestly empty (D-PLUGIN-INVENTORY)",
+    "/api/worktree": "worktree entries are additive (no v1 shape)",
 }
 
 
@@ -178,7 +185,13 @@ def main():
                 continue
             # D-V2-UNION: additionalProperties complaints on union paths are
             # the named divergence (v1-required keys inside v2 objects).
-            if is_v2 and path in ALLOW_V2_UNION and "Additional properties" in e.message:
+            # anyOf-wrapped violations hide the message in sub-errors
+            # (e.context), so walk the whole error tree.
+            def is_addprops(err):
+                if err.validator == "additionalProperties":
+                    return True
+                return any(is_addprops(c) for c in getattr(err, "context", []) or [])
+            if is_v2 and path in ALLOW_V2_UNION and is_addprops(e):
                 continue
             where = "/".join(str(x) for x in e.absolute_path)
             viol.append((path, where, str(e.message)[:120]))

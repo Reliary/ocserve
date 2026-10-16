@@ -171,11 +171,11 @@ fn project_model_v2(v1: &Value) -> Value {
         // flat `package` (= the npm package), and `settings`. The v1
         // `api:{type,...}` union stays for v1 clients (different keys, no
         // conflict). `compatibility` is provider-packaged data we don't
-        // carry — null (relax_null covers it; never fabricated).
+        // carry — OMITTED (not null: the schema isn't nullable and the key
+        // isn't required; relax_null can't save a $ref-typed null).
         "modelID": v1.get("id").cloned().unwrap_or(Value::Null),
         "package": npm,
         "settings": {},
-        "compatibility": Value::Null,
         "providerID": provider_id,
         "name": v1.get("name").cloned().unwrap_or(Value::Null),
         "api": v2api,
@@ -696,6 +696,259 @@ pub async fn fs_read(
         bytes,
     )
         .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// worktree routes — real git worktree management (Phase C)
+// ---------------------------------------------------------------------------
+
+/// GET /api/worktree — `Worktree.List` from `git worktree list`.
+pub async fn worktree_list_api(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    if !st.v2_enabled {
+        return v2_not_found("global").into_response();
+    }
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let list = run_blocking(&st.db, move |_db| {
+        Ok::<_, anyhow::Error>(crate::vcs::worktrees(&dir))
+    })
+    .await
+    .unwrap_or_else(|_| Value::Array(vec![]));
+    Json(list).into_response()
+}
+
+/// POST /api/worktree — create (`git worktree add`). Requires projectID +
+/// directory (branch optional). Non-git → 400 WorktreeNotGitError (not a
+/// fake success); git failure → 400 with stderr.
+pub async fn worktree_create_api(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !st.v2_enabled {
+        return v2_not_found("global").into_response();
+    }
+    let obj = body.as_object().cloned().unwrap_or_default();
+    if let Some(bad) = obj.keys().find(|k| !["projectID", "from", "branch", "directory", "name"].contains(&k.as_str())) {
+        return bad_request(&format!("unknown key {bad}")).into_response();
+    }
+    let (Some(_pid), Some(directory)) = (
+        obj.get("projectID").and_then(|v| v.as_str()),
+        obj.get("directory").and_then(|v| v.as_str()),
+    ) else {
+        return bad_request("Missing key\n  at [\"projectID\"] / [\"directory\"]").into_response();
+    };
+    let branch = obj.get("branch").and_then(|v| v.as_str());
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let directory = directory.to_string();
+    let branch = branch.map(str::to_string);
+    match run_blocking(&st.db, move |_db| {
+        Ok::<_, anyhow::Error>(crate::vcs::worktree_add(&dir, &directory, branch.as_deref()))
+    })
+    .await
+    {
+        Ok(Ok(path)) => Json(json!({"directory": path})).into_response(),
+        Ok(Err(e)) if e == "not a git repository" => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"name": "WorktreeNotGitError", "data": {"message": e}})),
+        )
+            .into_response(),
+        Ok(Err(e)) => bad_request(&e).into_response(),
+        Err(e) => internal(e).into_response(),
+    }
+}
+
+/// DELETE /api/worktree — remove (`git worktree remove`). Requires
+/// projectID + directory + force.
+pub async fn worktree_remove_api(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !st.v2_enabled {
+        return v2_not_found("global").into_response();
+    }
+    let obj = body.as_object().cloned().unwrap_or_default();
+    let (Some(_pid), Some(directory), force) = (
+        obj.get("projectID").and_then(|v| v.as_str()),
+        obj.get("directory").and_then(|v| v.as_str()),
+        obj.get("force").and_then(|v| v.as_bool()).unwrap_or(false),
+    ) else {
+        return bad_request("Missing key\n  at [\"projectID\"] / [\"directory\"]").into_response();
+    };
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let directory = directory.to_string();
+    match run_blocking(&st.db, move |_db| {
+        Ok::<_, anyhow::Error>(crate::vcs::worktree_remove(&dir, &directory, force))
+    })
+    .await
+    {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => bad_request(&e).into_response(),
+        Err(e) => internal(e).into_response(),
+    }
+}
+
+/// POST /api/worktree/refresh — re-scan (stateless: the list is always live
+/// from git, so refresh is an honest 204 no-op, not a fake rebuild).
+pub async fn worktree_refresh_api(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !st.v2_enabled {
+        return v2_not_found("global").into_response();
+    }
+    if body.get("projectID").and_then(|v| v.as_str()).is_none() {
+        return bad_request("Missing key\n  at [\"projectID\"]").into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+fn bad_request(msg: &str) -> HttpError {
+    crate::HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidRequestError",
+        fields: json!({"message": msg.to_string()}),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase C projections — config, shells, model default, debug, migration,
+// plugin list, fs write
+// ---------------------------------------------------------------------------
+
+/// GET /api/config — `Config.Entry[]` (document + directory sources). The
+/// global config path + the worktree config path, lowest-to-highest
+/// priority (upstream summary verbatim). Document entries carry the parsed
+/// file as `info` when readable JSON; unreadable/missing files are omitted
+/// (the directory entry still covers discovery — never a fabricated info).
+pub async fn config_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let worktree = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let mut out = vec![json!({"type": "directory", "path": format!("{home}/.config/opencode")})];
+    for path in [
+        format!("{home}/.config/opencode/opencode.json"),
+        format!("{worktree}/opencode.json"),
+    ] {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(info) = serde_json::from_str::<Value>(&text) {
+                if info.is_object() {
+                    out.push(json!({"type": "document", "info": info}));
+                }
+            }
+        }
+    }
+    Json(Value::Array(out))
+}
+
+/// GET /api/config/shell — `ConfigShell.Option[]` from `/etc/shells`
+/// (same source as the PTY shells route: path + lowercased name +
+/// fish/nu-deny acceptability).
+pub async fn config_shells(State(_st): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(ocserve_pty::shells::list())
+}
+
+/// GET /api/model/default — `{location, data: Model.Info|null}`. The
+/// configured default model projected through the union projector (null
+/// when unresolvable — contract allows null).
+pub async fn model_default(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let payloads = st.payloads.read();
+    let (pid, mid) = st.llm.read().default_model.clone();
+    let found = payloads
+        .provider
+        .get("all")
+        .and_then(|v| v.as_array())
+        .and_then(|all| {
+            all.iter().find(|p| p.get("id").and_then(|i| i.as_str()) == Some(&pid))
+        })
+        .and_then(|p| p.get("models"))
+        .and_then(|m| m.get(&mid))
+        .cloned();
+    let data = found.map(|m| project_model_v2(&m)).unwrap_or(Value::Null);
+    Json(json!({"location": api_location(&st), "data": data}))
+}
+
+/// GET /api/debug/location — known location directories (the session
+/// directories plus the server worktree — the debug surface for location
+/// state). DELETE evicts nothing (locations derive from live rows; the
+/// contract's evict is a no-op against derived state, honestly 204).
+pub async fn debug_location_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut dirs = ocserve_store::distinct_session_directories(&st.db).unwrap_or_default();
+    let worktree = st.paths["worktree"].as_str().unwrap_or("/").to_string();
+    if !dirs.iter().any(|d| d == &worktree) {
+        dirs.insert(0, worktree);
+    }
+    Json(dirs.into_iter().map(|d| json!({"directory": d})).collect::<Vec<_>>())
+}
+
+pub async fn debug_location_evict(State(_st): State<Arc<AppState>>) -> impl IntoResponse {
+    // Derived state has nothing to evict — honest 204, not a fake purge.
+    StatusCode::NO_CONTENT
+}
+
+/// GET /api/experimental/migration/v1 — one-shot migration status (D4:
+/// project-don't-convert). `completed` (no legacy import pending in this
+/// process) — the bridge is the dev-only OCSERVE_LEGACY_SYNC path.
+pub async fn migration_v1_status() -> impl IntoResponse {
+    Json(json!({"status": "completed"}))
+}
+
+/// GET /api/plugin — `{location, data: Plugin.Info[]}`. The loaded plugins
+/// from the sidecar registry (id + source + features + state).
+pub async fn plugin_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let data: Vec<Value> = st
+        .plugins
+        .get()
+        .map(|_| vec![])
+        .unwrap_or_default();
+    // The sidecar exposes no plugin inventory RPC today (hook dispatch only);
+    // the catalog is honestly empty until the inventory RPC lands (named gap
+    // D-PLUGIN-INVENTORY — not a fabricated list).
+    Json(json!({"location": api_location(&st), "data": data}))
+}
+
+/// POST /api/experimental/fs/write?path= — write request body bytes to the
+/// path (parents created). Contained via `resolve_within` (the traversal
+/// fix); returns `{location, data:{path}}`.
+pub async fn fs_write(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let base = std::path::PathBuf::from(st.paths["directory"].as_str().unwrap_or("/"));
+    let Some(rel) = q.get("path") else {
+        return bad_request("Missing key\n  at [\"path\"]").into_response();
+    };
+    let dest = match resolve_within(&base, rel) {
+        Ok(d) => d,
+        Err(_) => {
+            return crate::HttpError::TaggedData {
+                status: StatusCode::FORBIDDEN,
+                tag: "FileNotFoundError",
+                fields: json!({"message": "path escapes the project directory"}),
+            }
+            .into_response();
+        }
+    };
+    let write_result = run_blocking(&st.db, move |_db| {
+        (|| -> anyhow::Result<()> {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&dest, &body)?;
+            Ok(())
+        })()
+    })
+    .await;
+    match write_result {
+        Ok(()) => Json(json!({
+            "location": api_location(&st),
+            "data": {"path": rel},
+        }))
+        .into_response(),
+        Err(e) => internal(e).into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------

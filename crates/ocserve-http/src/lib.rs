@@ -5582,6 +5582,18 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/vcs/diff", get(v2::vcs_diff))
         .route("/api/vcs/base", get(v2::vcs_base))
         .route("/api/vcs/branch", get(v2::vcs_branch))
+        .route("/api/config", get(v2::config_list))
+        .route("/api/config/shell", get(v2::config_shells))
+        .route("/api/model/default", get(v2::model_default))
+        .route("/api/debug/location", get(v2::debug_location_list).delete(v2::debug_location_evict))
+        .route("/api/experimental/migration/v1", get(v2::migration_v1_status))
+        .route("/api/plugin", get(v2::plugin_list))
+        .route("/api/experimental/fs/write", axum::routing::post(v2::fs_write))
+        .route("/api/worktree", get(v2::worktree_list_api).post(v2::worktree_create_api).delete(v2::worktree_remove_api))
+        .route(
+            "/api/worktree/refresh",
+            axum::routing::post(v2::worktree_refresh_api),
+        )
         .route("/api/session/{sessionID}/diff", get(v2::session_diff_api))
         .route(
             "/api/session/{sessionID}/background",
@@ -5613,7 +5625,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::post(v2::wait),
         )
         .route(
-            "/experimental/session/{sessionID}/wait",
+            "/api/experimental/session/{sessionID}/wait",
             axum::routing::post(v2::wait),
         )
         .route(

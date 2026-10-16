@@ -582,6 +582,29 @@ else
   echo "ok (no SELECT * on v2-path tables; planted SELECT* detected)"
 fi
 
+echo "== guard: serving path is Rust-native (rule 34) =="
+# V2-PARITY-PLAN.md Rust-native rule: no non-Rust runtime in the request
+# path. Allowed spawns: git/grep (vcs, find), sh (sidecar spawn only),
+# df/systemctl/kill (CLI-side ops). BANNED interpreter binaries anywhere in
+# crates/*/src: node, bun, deno, python, npm/npx, yarn, pnpm, ruby, perl,
+# php, java. The plugin sidecar (Node, frozen) spawns only via ocserve-plugin.
+plant="crates/ocserve-core/src/__rule34_plant.rs"
+printf '%s\n' 'fn _plant() { let _ = std::process::Command::new("node"); }' > "$plant"
+ban_hits=$(grep -rnE 'Command::new\("(node|bun|bunx|deno|python3?|npm|npx|yarn|pnpm|ruby|perl|php|java)"\)' crates/*/src 2>/dev/null \
+  | grep -v '__rule34_plant' || true)
+plant_hit=$(grep -rnE 'Command::new\("(node|bun|bunx|deno|python3?|npm|npx|yarn|pnpm|ruby|perl|php|java)"\)' crates/ocserve-core/src/__rule34_plant.rs 2>/dev/null || true)
+rm -f "$plant"
+if [ -z "$plant_hit" ]; then
+  echo "FAIL: rule 34 planted control not detected"
+  fail=1
+fi
+if [ -n "$ban_hits" ]; then
+  echo "$ban_hits"
+  echo "FAIL: interpreter spawn in server paths (rule 34)"; fail=1
+else
+  echo "ok (no interpreter spawns; planted node detected)"
+fi
+
 echo "== guard: docs are not stale (rule 31) =="
 # Docs are the spec (AGENTS §1); nothing checked them, so dead references
 # accumulated (the 2026-10-13 audit: three files referenced but gone, a stale

@@ -251,6 +251,64 @@ pub fn branches(dir: &str) -> Value {
         .unwrap_or_else(|| Value::Array(vec![]))
 }
 
+/// Worktree list (`Worktree.List`): `git worktree list --porcelain` parsed
+/// to `[{directory}]`. Empty when not a git repo (never an error — the
+/// caller decides 404-vs-empty per contract).
+pub fn worktrees(dir: &str) -> Value {
+    if !is_git(dir) {
+        return Value::Array(vec![]);
+    }
+    run_git(dir, &["worktree", "list", "--porcelain"])
+        .filter(|(_, c)| *c == 0)
+        .map(|(t, _)| {
+            Value::Array(
+                t.lines()
+                    .filter_map(|l| l.strip_prefix("worktree "))
+                    .map(|d| json!({"directory": d.trim()}))
+                    .collect(),
+            )
+        })
+        .unwrap_or_else(|| Value::Array(vec![]))
+}
+
+/// Create a worktree (`git worktree add [--detach] <dir> [<branch>]`).
+/// Returns the directory on success, None with stderr on failure.
+pub fn worktree_add(dir: &str, path: &str, branch: Option<&str>) -> Result<String, String> {
+    if !is_git(dir) {
+        return Err("not a git repository".to_string());
+    }
+    let mut args = vec!["worktree", "add"];
+    if branch.is_some() {
+        args.push("--detach");
+    }
+    args.push(path);
+    if let Some(b) = branch {
+        args.push(b);
+    }
+    match run_git(dir, &args) {
+        Some((_, 0)) => Ok(path.to_string()),
+        Some((t, _)) => Err(t.trim().to_string()),
+        None => Err("git failed to spawn".to_string()),
+    }
+}
+
+/// Remove a worktree (`git worktree remove [--force] <dir>`).
+pub fn worktree_remove(dir: &str, path: &str, force: bool) -> Result<(), String> {
+    if !is_git(dir) {
+        return Err("not a git repository".to_string());
+    }
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(path);
+    match run_git(dir, &args) {
+        Some((_, 0)) => Ok(()),
+        Some((t, _)) => Err(t.trim().to_string()),
+        None => Err("git failed to spawn".to_string()),
+    }
+}
+
 pub fn status(dir: &str) -> Value {
     if !is_git(dir) {
         return Value::Array(vec![]);
