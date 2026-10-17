@@ -248,6 +248,35 @@ for name, path in [
     else:
         check(f"fanout-{name}", st_f == 200 and st_r == 200, f"f={st_f} r={st_r}")
 
+# Phase 3: plugin inventory shape + RPC unregistered parity.
+# Both arms return `{location, data:[...]}`; with no plugins loaded on either
+# an empty data array is the honest shape (never fabricated on ocserve).
+st_f, pf = call(F, "GET", "/api/plugin", auth=AUTH)
+st_r, pr = call(R, "GET", "/api/plugin")
+check("plugin-envelope", st_f == 200 and st_r == 200 and isinstance(pf, dict) and isinstance(pr, dict)
+      and "location" in pf and "location" in pr and isinstance(pf.get("data"), list)
+      and isinstance(pr.get("data"), list), f"f={st_f} r={st_r}")
+# POST /api/rpc/{id}/{method} with an unregistered id: both arms answer the
+# RPC-unavailable error (status + `type`), the parity contract we depend on.
+rf = call(F, "POST", "/api/rpc/ghost/hello", body={"input": {}}, auth=AUTH)
+rr = call(R, "POST", "/api/rpc/ghost/hello", body={"input": {}})
+st_f, bf = rf if isinstance(rf, tuple) else (0, {})
+st_r, br = rr if isinstance(rr, tuple) else (0, {})
+
+
+def _rpc_type(b):
+    if isinstance(b, dict):
+        if b.get("type"):
+            return b.get("type")
+        d = b.get("data") or {}
+        if isinstance(d, dict):
+            return d.get("type")
+    return None
+
+
+check("rpc-unavailable", st_f == st_r and _rpc_type(bf) == _rpc_type(br) == "rpc.unavailable",
+      f"f={st_f}:{_rpc_type(bf)} r={st_r}:{_rpc_type(br)}")
+
 print(f"v2 pair: {len(fails)} divergences")
 sys.exit(1 if fails else 0)
 PY
