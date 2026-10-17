@@ -25,6 +25,7 @@ use tokio::sync::oneshot;
 /// Host files (written next to the data dir once; content-addressed by embed).
 pub const HOST_FILES: &[(&str, &str)] = &[
     ("host.mjs", include_str!("host/host.mjs")),
+    ("v2.mjs", include_str!("host/v2.mjs")),
     (
         "bun-sqlite-loader.mjs",
         include_str!("host/bun-sqlite-loader.mjs"),
@@ -630,6 +631,34 @@ impl Sidecar {
         self.request("event", json!({"event": event})).await
     }
 
+    /// v2 domain-hook dispatch (Phase 3): v2 hooks mutate the event object in
+    /// place (like v1's output), so this returns `{output, matched}`. `matched`
+    /// = 0 means no v2 plugin installed this hook (caller skips mutation).
+    pub async fn trigger_v2(&mut self, domain: &str, name: &str, input: Value) -> Result<Value> {
+        self.request(
+            "trigger_v2",
+            json!({"domain": domain, "name": name, "input": input}),
+        )
+        .await
+    }
+
+    /// v2 RPC dispatch (Phase 3): `{rpcID, method, input}` →
+    /// `{output}` (success) or `{error:{type,message}}` (unavailable /
+    /// method_not_found / handler_error).
+    pub async fn rpc_call(&mut self, rpc_id: &str, method: &str, input: Value) -> Result<Value> {
+        self.request(
+            "rpc_call",
+            json!({"rpcID": rpc_id, "method": method, "input": input}),
+        )
+        .await
+    }
+
+    /// v2 plugin inventory (real — id/dialect per loaded v2 plugin + the
+    /// registered RPC ids). Powers `/api/plugin` without fabricating a list.
+    pub async fn v2_inventory(&mut self) -> Result<Value> {
+        self.request("v2_inventory", json!({})).await
+    }
+
     pub async fn config(&mut self, cfg: Value) -> Result<Value> {
         self.request("config", json!({"config": cfg})).await
     }
@@ -846,6 +875,134 @@ export default PluginModule.server;
             st["reaper"]["ok"], true,
             "previously loaded plugins must be reloaded"
         );
+        sc.shutdown().await;
+        Ok(())
+    }
+
+    /// v2 plugin battery (Phase 3): both dialects through the real sidecar.
+    /// A promise-flavor plugin registers a session hook + an RPC; an
+    /// effect-flavor plugin (with its own `effect` runtime vendored beside it)
+    /// registers a tool hook. Asserts detection, dispatch, RPC round-trip, the
+    /// real inventory, and that unregistered/missing RPCs keep exact errors.
+    #[tokio::test]
+    async fn v2_battery_promise_and_effect_dialects() -> anyhow::Result<()> {
+        if !runtime_available() {
+            panic!(
+                "plugin-runtime binary ({}) required for plugin-host tests",
+                crate::plugin_runtime().program()
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("p_v2_promise.mjs"),
+            r#"export default {
+  id: "v2promise",
+  setup: async (ctx) => {
+    await ctx.session.hook("context", (ev) => { ev.promiseTouched = true; });
+    await ctx.tool.hook("execute.after", (ev) => { ev.result = "mutated-by-promise"; });
+    await ctx.rpc.register({ id: "sample" }, {
+      hello: async (input) => ({ echoed: input, from: "promise" }),
+    });
+    await ctx.storage.set("k", 41);
+    if ((await ctx.storage.get("k")) !== 41) throw new Error("storage broke");
+  },
+};"#,
+        )
+        .unwrap();
+        let eff = dir
+            .path()
+            .join("p_v2_effect")
+            .join("node_modules")
+            .join("effect");
+        std::fs::create_dir_all(eff.join("lib")).unwrap();
+        std::fs::write(
+            eff.join("package.json"),
+            r#"{"name":"effect","version":"3.0.0","type":"module","exports":{".":"./lib/index.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            eff.join("lib/index.js"),
+            "export const Effect = { scoped: (p) => p, runPromise: async (p) => { await p; } };\nexport const Scope = {};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("p_v2_effect").join("plug.mjs"),
+            r#"export default {
+  id: "v2effect",
+  effect: (ctx) => (async () => {
+    await ctx.tool.hook("execute.before", (ev) => { ev.input.before = "effect"; });
+  })(),
+};"#,
+        )
+        .unwrap();
+
+        let host = materialize_host(&dir.path().join("host"))?;
+        let mut sc = Sidecar::spawn(&host, "http://127.0.0.1:9", "/work").await?;
+        let input = json!({"directory": "/work", "serverUrl": "http://127.0.0.1:9"});
+
+        let h1 = sc
+            .load(
+                "v2promise",
+                &dir.path().join("p_v2_promise.mjs"),
+                &input,
+                &Value::Null,
+            )
+            .await?;
+        assert!(
+            h1.contains(&"session.context".to_string()),
+            "promise hooks: {h1:?}"
+        );
+        assert!(h1.contains(&"tool.execute.after".to_string()));
+        let h2 = sc
+            .load(
+                "v2effect",
+                &dir.path().join("p_v2_effect").join("plug.mjs"),
+                &input,
+                &Value::Null,
+            )
+            .await?;
+        assert!(
+            h2.contains(&"tool.execute.before".to_string()),
+            "effect hooks: {h2:?}"
+        );
+
+        let out = sc.trigger_v2("session", "context", json!({})).await?;
+        assert_eq!(out["matched"], 1);
+        assert_eq!(out["output"]["promiseTouched"], true);
+        let after = sc
+            .trigger_v2(
+                "tool",
+                "execute.after",
+                json!({"tool": "read", "result": "orig"}),
+            )
+            .await?;
+        assert_eq!(after["output"]["result"], "mutated-by-promise");
+        let before = sc
+            .trigger_v2(
+                "tool",
+                "execute.before",
+                json!({"tool": "read", "input": {}}),
+            )
+            .await?;
+        assert_eq!(before["output"]["input"]["before"], "effect");
+
+        let rpc = sc.rpc_call("sample", "hello", json!({"n": 7})).await?;
+        assert_eq!(rpc["output"]["echoed"]["n"], 7);
+        let miss = sc.rpc_call("sample", "nope", json!({})).await?;
+        assert_eq!(miss["error"]["type"], "rpc.method_not_found");
+        let unreg = sc.rpc_call("ghost", "hello", json!({})).await?;
+        assert_eq!(unreg["error"]["type"], "rpc.unavailable");
+
+        let inv = sc.v2_inventory().await?;
+        assert_eq!(inv["plugins"].as_array().unwrap().len(), 2, "{inv}");
+        assert!(
+            inv["rpcs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r == "sample")
+        );
+
         sc.shutdown().await;
         Ok(())
     }

@@ -914,13 +914,45 @@ pub async fn migration_v1_status() -> impl IntoResponse {
     Json(json!({"status": "completed"}))
 }
 
-/// GET /api/plugin — `{location, data: Plugin.Info[]}`. The loaded plugins
-/// from the sidecar registry (id + source + features + state).
+/// GET /api/plugin — `{location, data: Plugin.Info[]}`. Real inventory from
+/// the sidecar: every loaded v1 (spec + hooks) and v2 (id + dialect) plugin,
+/// plus the registered RPC ids. D-PLUGIN-INVENTORY is closed: the list is
+/// never fabricated and never empty-with-a-live-sidecar.
 pub async fn plugin_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let data: Vec<Value> = st.plugins.get().map(|_| vec![]).unwrap_or_default();
-    // The sidecar exposes no plugin inventory RPC today (hook dispatch only);
-    // the catalog is honestly empty until the inventory RPC lands (named gap
-    // D-PLUGIN-INVENTORY — not a fabricated list).
+    let mut data: Vec<Value> = Vec::new();
+    if let Some(plug) = st.plugins.get() {
+        let (statuses, inv) = {
+            let mut guard = plug.lock().await;
+            let statuses = guard.statuses();
+            let inv = guard.v2_inventory().await.ok();
+            (statuses, inv)
+        };
+        if let Some(map) = statuses.as_object() {
+            for (spec, v) in map {
+                data.push(json!({
+                    "id": spec,
+                    "source": spec,
+                    "dialect": "v1",
+                    "hooks": v.get("hooks").cloned().unwrap_or(json!([])),
+                    "state": if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) { "loaded" } else { "failed" },
+                }));
+            }
+        }
+        if let Some(pl) = inv
+            .as_ref()
+            .and_then(|v| v.get("plugins"))
+            .and_then(|v| v.as_array())
+        {
+            for p in pl {
+                data.push(json!({
+                    "id": p.get("id").cloned().unwrap_or(json!(null)),
+                    "source": p.get("spec").cloned().unwrap_or(json!(null)),
+                    "dialect": p.get("dialect").cloned().unwrap_or(json!("v2")),
+                    "state": "loaded",
+                }));
+            }
+        }
+    }
     Json(json!({"location": api_location(&st), "data": data}))
 }
 
@@ -2185,9 +2217,9 @@ pub async fn vcs_init_api(
 /// for same state = parity, not a stub).
 pub async fn rpc_unimplemented(
     State(st): State<Arc<AppState>>,
-    axum::extract::Path((rpc_id, _method)): axum::extract::Path<(String, String)>,
+    axum::extract::Path((rpc_id, method)): axum::extract::Path<(String, String)>,
     body: Option<Json<Value>>,
-) -> Result<StatusCode, HttpError> {
+) -> Result<axum::response::Response, HttpError> {
     if !st.v2_enabled {
         return Err(v2_not_found(&rpc_id));
     }
@@ -2198,12 +2230,54 @@ pub async fn rpc_unimplemented(
             fields: json!({"message": "Expected Rpc.Input", "kind": "Payload"}),
         });
     };
-    if !body.is_object() || body.get("input").is_none() {
+    let Some(input) = body.get("input") else {
         return Err(crate::HttpError::TaggedData {
             status: StatusCode::BAD_REQUEST,
             tag: "InvalidRequestError",
             fields: json!({"message": "Expected Rpc.Input", "kind": "Payload"}),
         });
+    };
+    // Phase 3: dispatch to a v2 plugin that registered {rpcID, method}. When a
+    // plugin serves the id this is a real call; otherwise the exact
+    // `rpc.unavailable` error (same behavior for the same state — parity).
+    if let Some(plug) = st.plugins.get() {
+        let reg = {
+            let mut guard = plug.lock().await;
+            guard.rpc_call(&rpc_id, &method, input.clone()).await
+        };
+        match reg {
+            Ok(v) => {
+                if let Some(err) = v.get("error") {
+                    let etype = err
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("rpc.unavailable");
+                    let msg = err
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("RPC error");
+                    // rpc.unavailable is a route/registry signal (400); a
+                    // handler error is a 500-class result the caller maps.
+                    let status = if etype == "rpc.unavailable" {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    };
+                    return Err(crate::HttpError::TaggedData {
+                        status,
+                        tag: "RpcError",
+                        fields: json!({"type": etype, "message": msg}),
+                    });
+                }
+                if let Some(out) = v.get("output") {
+                    use axum::response::IntoResponse;
+                    return Ok(Json(json!({"data": out})).into_response());
+                }
+            }
+            Err(e) => {
+                tracing::warn!("plugin rpc dispatch {rpc_id}.{method}: {e:#}");
+            }
+        }
     }
     Err(crate::HttpError::TaggedData {
         status: StatusCode::BAD_REQUEST,

@@ -404,10 +404,34 @@ pub async fn process(
         json!({"context": [], "prompt": Value::Null}),
     )
     .await;
+    // v2 Phase 3: session.compaction — v2's SessionCompaction carries a
+    // `result` override ({summary,...}) that SKIPS the model request when set
+    // (promise/session.ts). Map it onto the same prompt channel: a v2 plugin
+    // that sets result.summary overrides the built prompt, parity with v1's
+    // `prompt` field. A v2 `context` array appends like v1's.
+    let v2_out = crate::prompt::hook_v2(
+        ctx.plugins.as_ref(),
+        "session",
+        "compaction",
+        json!({
+            "sessionID": session_id,
+            "result": Value::Null,
+            "context": [],
+        }),
+    )
+    .await;
     let custom = c_out
         .get("prompt")
         .and_then(|p| p.as_str())
-        .map(str::to_string);
+        .map(str::to_string)
+        // v2 result.summary is the v2 equivalent of v1's prompt override.
+        .or_else(|| {
+            v2_out
+                .get("result")
+                .and_then(|r| r.get("summary"))
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+        });
     let extra: Vec<String> = c_out
         .get("context")
         .and_then(|c| c.as_array())

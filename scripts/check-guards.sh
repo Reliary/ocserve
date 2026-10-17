@@ -745,4 +745,14 @@ else
   echo "ok (planted trim+join without is_absolute flagged by rule 35)"
 fi
 
+echo "== guard: v2 plugin hooks accounted for (rule 36) =="
+# Every hook the vendored upstream v2 tree declares must be in the capability
+# matrix (README-v2.md) as bridged or a named divergence. Keeps the shim's
+# coverage claim mechanically honest across bumps. Selftest inside the script.
+if python3 scripts/check-v2-hooks.py; then
+  echo "ok (all upstream v2 hooks are in the capability matrix)"
+else
+  echo "FAIL: upstream v2 hooks missing from the capability matrix (rule 36)"; fail=1
+fi
+
 exit $fail

@@ -320,6 +320,42 @@ pub async fn hook_mutate(
     }
 }
 
+/// v2 domain-hook dispatch (Phase 3): the v2 shim normalizes both plugin
+/// dialects onto one table; a hook that no v2 plugin installed returns the
+/// input unchanged (no observable difference). Fail-open like `hook_mutate` —
+/// a plugin error never breaks the turn.
+pub async fn hook_v2(
+    plugins: Option<&Arc<tokio::sync::Mutex<ocserve_plugin::Sidecar>>>,
+    domain: &str,
+    name: &str,
+    input: Value,
+) -> Value {
+    let Some(plug) = plugins else {
+        return input;
+    };
+    let mut guard = plug.lock().await;
+    let t0 = std::time::Instant::now();
+    match guard.trigger_v2(domain, name, input.clone()).await {
+        Ok(v) => {
+            ocserve_metrics::observe(
+                "ocserve_plugin_hook_duration_seconds",
+                &format!("hook=\"v2.{domain}.{name}\",result=\"ok\""),
+                t0.elapsed().as_micros() as u64,
+            );
+            v.get("output").cloned().unwrap_or(input)
+        }
+        Err(e) => {
+            ocserve_metrics::labeled_counter(
+                "ocserve_plugin_hook_errors_total",
+                &format!("hook=\"v2.{domain}.{name}\""),
+                1,
+            );
+            tracing::warn!("plugin v2 {domain}.{name}: {e:#}");
+            input
+        }
+    }
+}
+
 /// Emit a non-durable live event (delta/status/idle/diff — no sync twin, per capture).
 pub(crate) fn emit_live(ctx: &PromptContext, event_type: &str, properties: Value) {
     ocserve_metrics::labeled_counter(
@@ -1183,6 +1219,42 @@ pub async fn run_prompt_with(
             // array is the messages PREFIX: splice replaces it each iteration
             // (upstream rebuilds system per request).
             let mut sys_vec = vec![ctx.system.clone()];
+            // v2 Phase 3: session.context — the v2 client mutates
+            // {system[], messages[], tools, model, options} immediately before
+            // provider dispatch (promise/session.ts). Map its system array onto
+            // the same sys_vec the v1 transform feeds (one prefix, two dialects).
+            let v2_ctx = hook_v2(
+                ctx.plugins.as_ref(),
+                "session",
+                "context",
+                json!({
+                    "sessionID": session_id,
+                    "agent": agent,
+                    "model": model,
+                    "system": sys_vec,
+                    "messages": [],
+                    "tools": {},
+                    "options": {},
+                }),
+            )
+            .await;
+            if let Some(arr) = v2_ctx.get("system").and_then(|a| a.as_array())
+                && !arr.is_empty()
+            {
+                // v2 SystemPart is a union (string | {type,text,…}); accept the
+                // string form and the text field — anything else is skipped.
+                let v: Vec<String> = arr
+                    .iter()
+                    .filter_map(|x| {
+                        x.as_str()
+                            .map(String::from)
+                            .or_else(|| x.get("text").and_then(|t| t.as_str()).map(String::from))
+                    })
+                    .collect();
+                if !v.is_empty() {
+                    sys_vec = v;
+                }
+            }
             let sys_out = hook_mutate(
                 ctx.plugins.as_ref(),
                 "experimental.chat.system.transform",
@@ -1876,6 +1948,29 @@ pub async fn run_prompt_with(
                         {
                             input = a.clone();
                         }
+                        // v2 Phase 3: tool.execute.before — v2 mutates `input`
+                        // (promise/tool.ts), same contract as v1's args. Runs
+                        // before the widened-args guard so a v2 mutation gets the
+                        // same re-evaluation as a v1 one.
+                        let v2_before = hook_v2(
+                            ctx.plugins.as_ref(),
+                            "tool",
+                            "execute.before",
+                            json!({
+                                "tool": call.name,
+                                "sessionID": session_id,
+                                "agent": agent,
+                                "messageID": assistant_id,
+                                "id": call.id,
+                                "input": input,
+                            }),
+                        )
+                        .await;
+                        if let Some(a) = v2_before.get("input")
+                            && a.is_object()
+                        {
+                            input = a.clone();
+                        }
                         // G1 soundness: `tool.execute.before` runs AFTER the
                         // permission gate, so a plugin (compromised via poisoned
                         // tool output) could widen the approved args (e.g. `rm x`
@@ -2065,6 +2160,32 @@ pub async fn run_prompt_with(
                                 1,
                             );
                             tracing::warn!("plugin tool.execute.after: {e:#}");
+                        }
+                    }
+                    // v2 Phase 3: tool.execute.after — the v2 tool-result shape
+                    // is a status union (promise/tool.ts): completed {result} or
+                    // error {error}. Map onto the same output string; a v2 hook
+                    // that replaces `result`/`error` mutates the tool output.
+                    {
+                        let v2_out = hook_v2(
+                            ctx.plugins.as_ref(),
+                            "tool",
+                            "execute.after",
+                            json!({
+                                "tool": call.name,
+                                "sessionID": session_id,
+                                "agent": agent,
+                                "messageID": assistant_id,
+                                "id": call.id,
+                                "input": serde_json::from_str::<Value>(&call.arguments)
+                                    .unwrap_or_else(|_| json!({})),
+                                "status": "completed",
+                                "result": output,
+                            }),
+                        )
+                        .await;
+                        if let Some(r) = v2_out.get("result").and_then(|v| v.as_str()) {
+                            output = r.to_string();
                         }
                     }
                     emit_durable(

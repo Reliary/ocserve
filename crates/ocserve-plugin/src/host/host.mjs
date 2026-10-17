@@ -10,6 +10,14 @@
  */
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import {
+  detectV2,
+  v2Definition,
+  setupV2,
+  newV2State,
+  triggerV2,
+  makeV2Context,
+} from "./v2.mjs";
 
 // Runtime detection: under real Bun (upstream's runtime, preferred) the
 // native surface exists — no shims needed. Under Node we install the Bun
@@ -73,6 +81,9 @@ process.stdout.write = (chunk, ...rest) => process.stderr.write(chunk, ...rest);
 // ---- plugin registry -------------------------------------------------
 /** @type {{spec: string, hooks: Record<string, Function>}[]} */
 const loaded = [];
+/** v2 plugins: {spec, id, dialect, cleanup} + shared dispatch state. */
+const loadedV2 = [];
+const v2State = newV2State();
 
 function makeClient(serverUrl, directory, headers = {}) {
   // Generic fetch-backed client: method path → HTTP (upper camel → kebab),
@@ -119,8 +130,88 @@ function makeClient(serverUrl, directory, headers = {}) {
   });
 }
 
+// ---- v2 support helpers (Phase 3) -----------------------------------
+/**
+ * v2 storage: an in-memory per-plugin KV (upstream is disk-backed under the
+ * plugin's data dir). Bounded and honest — a restart clears it (named
+ * divergence D-V2-STORAGE-MEM). Keyed per plugin id.
+ */
+const v2Stores = new Map();
+function makeV2Storage(pluginId) {
+  if (!v2Stores.has(pluginId)) v2Stores.set(pluginId, new Map());
+  const m = v2Stores.get(pluginId);
+  return {
+    get: async (key) => m.get(key),
+    set: async (key, value) => {
+      m.set(key, value);
+    },
+    remove: async (key) => {
+      m.delete(key);
+    },
+    scan: async ({ prefix = "", after, limit = 100 } = {}) => {
+      const keys = [...m.keys()].filter((k) => k.startsWith(prefix)).sort();
+      const start = after ? keys.findIndex((k) => k > after) : 0;
+      const slice = keys.slice(start < 0 ? 0 : start, (start < 0 ? 0 : start) + limit);
+      const entries = slice.map((k) => ({ key: k, value: m.get(k) }));
+      const next = entries.length === limit ? entries.at(-1).key : undefined;
+      return next ? { entries, next } : { entries };
+    },
+  };
+}
+
+/**
+ * Resolve a plugin's Effect runtime for effect-dialect plugins. We never
+ * bundle Effect; the plugin's own node_modules must provide it. Resolve
+ * relative to the plugin entry so `import("effect")` finds the copy the
+ * plugin was installed with.
+ */
+function resolveEffectFrom(pluginId, entry) {
+  return async () => {
+    const require = createRequire(pathToFileURL(entry).href);
+    let path;
+    try {
+      path = require.resolve("effect");
+    } catch {
+      return null;
+    }
+    const mod = await import(pathToFileURL(path).href);
+    // effect exports { Effect, Scope, ... } as named; runPromise/scoped on Effect.
+    return mod?.Effect ? mod : mod?.default?.Effect ? mod.default : null;
+  };
+}
+
 async function loadPlugin({ spec, entry, input, options }) {
   const mod = await import(pathToFileURL(entry).href);
+  // v2 detection FIRST (V2-EXECUTION-PLAN Phase 3): a v2 `Plugin.define`
+  // module carries {id, setup|effect}; v1 modules never do. Both dialects
+  // normalize onto the shared v2 hook table + RPC registry.
+  const dialect = detectV2(mod);
+  if (dialect) {
+    const def = v2Definition(mod);
+    const client = makeClient(input.serverUrl ?? "http://127.0.0.1", input.directory ?? "/");
+    const location = { directory: input.directory ?? "/" };
+    const ctx = makeV2Context({
+      pluginId: def.id,
+      options,
+      hooks: v2State.hooks,
+      rpcs: v2State.rpcs,
+      storage: makeV2Storage(def.id),
+      client,
+      location,
+    });
+    const cleanup = await setupV2(def, dialect, ctx, resolveEffectFrom(def.id, entry));
+    loadedV2.push({ spec, id: def.id, dialect, cleanup });
+    // Report the v2 hook names this plugin actually registered (observability).
+    const names = [];
+    for (const [domain, byName] of Object.entries(v2State.hooks)) {
+      if (domain === "event") {
+        if (byName.length) names.push("event");
+        continue;
+      }
+      for (const [n, list] of Object.entries(byName)) if (list.length) names.push(`${domain}.${n}`);
+    }
+    return { hooks: names, id: def.id, dialect: "v2" };
+  }
   // v1 extraction (plugin/index.ts readV1Plugin + getLegacyPlugins), in order:
   // PluginModule.server → default object's .server → default function (legacy)
   // → named plain-function exports (each IS a server factory)
@@ -199,7 +290,7 @@ process.stdin.on("data", (chunk) => {
   }
 });
 
-/** Forward one bus event to every plugin's `event` hook (v1 shape). */
+/** Forward one bus event to every plugin's `event` hook (v1 + v2 shapes). */
 async function deliverEvent(ev) {
   let delivered = 0;
   for (const p of loaded) {
@@ -212,7 +303,52 @@ async function deliverEvent(ev) {
       process.stderr.write(`[plugin:${p.spec}] event hook failed: ${e?.stack ?? e}\n`);
     }
   }
+  // v2 event.subscribe callbacks receive the raw event (EventDomain.subscribe).
+  for (const cb of v2State.hooks.event ?? []) {
+    try {
+      await cb(ev);
+      delivered++;
+    } catch (e) {
+      process.stderr.write(`[plugin:v2] event hook failed: ${e?.stack ?? e}\n`);
+    }
+  }
   return { delivered };
+}
+
+/**
+ * Dispatch a v2 domain hook (Phase 3). Returns the mutated input (v2 hooks
+ * mutate the event object in place, like v1's output). `matched` tells the
+ * caller whether any plugin installed the hook.
+ */
+async function triggerV2Dispatch(domain, name, input) {
+  const list = v2State.hooks[domain]?.[name] ?? [];
+  let matched = list.length;
+  const out = await triggerV2(v2State, domain, name, input);
+  return { output: out, matched };
+}
+
+/**
+ * Dispatch a registered plugin RPC. `rpcID` is the plugin-registered id; the
+ * method must exist in its definition. Errors map to the v2 RPC error union
+ * (method_not_found / unavailable); input is passed through as-is.
+ */
+async function callRpc(rpcID, method, input) {
+  const reg = v2State.rpcs[rpcID];
+  if (!reg) {
+    return { error: { type: "rpc.unavailable", message: `RPC is unavailable: ${rpcID}` } };
+  }
+  const handler = reg.handlers?.[method];
+  if (typeof handler !== "function") {
+    return { error: { type: "rpc.method_not_found", message: `RPC method not found: ${rpcID}.${method}` } };
+  }
+  try {
+    const signal = new AbortController().signal;
+    const errorFactory = (e) => ({ type: "rpc.handler_error", message: String(e) });
+    const result = await handler(input, { signal, error: errorFactory });
+    return { output: result };
+  } catch (e) {
+    return { error: { type: "rpc.handler_error", message: String(e?.message ?? e) } };
+  }
 }
 
 async function handle(line) {
@@ -225,6 +361,19 @@ async function handle(line) {
       case "ping": reply("pong"); break;
       case "load": reply(await loadPlugin(msg.params)); break;
       case "trigger": reply(await trigger(msg.params.name, msg.params.input, msg.params.output)); break;
+      // v2 domain hook dispatch (Phase 3): {domain, name, input} -> {output, matched}.
+      case "trigger_v2":
+        reply(await triggerV2Dispatch(msg.params.domain, msg.params.name, msg.params.input));
+        break;
+      // v2 RPC dispatch (Phase 3): {rpcID, method, input} -> {output}|{error}.
+      case "rpc_call": reply(await callRpc(msg.params.rpcID, msg.params.method, msg.params.input)); break;
+      // v2 plugin inventory (real, not fabricated): id + dialect + hook names.
+      case "v2_inventory":
+        reply({
+          plugins: loadedV2.map((p) => ({ spec: p.spec, id: p.id, dialect: p.dialect })),
+          rpcs: Object.keys(v2State.rpcs),
+        });
+        break;
       case "config": reply("ok"); break; // config() hooks: invoked at load-time parity, M4b
       // v1 parity (plugin/index.ts:255-259): per-plugin hooks["event"]
       // called with {event:{id,type,properties}}; each failure logged and
@@ -232,6 +381,7 @@ async function handle(line) {
       case "event": reply(await deliverEvent(msg.params.event)); break;
       case "dispose": {
         for (const p of loaded) { try { await p.hooks?.dispose?.(); } catch { /* documented: dispose errors logged, not fatal */ } }
+        for (const p of loadedV2) { try { await p.cleanup?.(); } catch { /* v2 cleanup errors logged, not fatal */ } }
         reply("ok");
         process.exit(0);
       }
