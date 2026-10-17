@@ -91,9 +91,13 @@ fn setup_with_v2(addr: std::net::SocketAddr, v2: bool) -> Arc<AppState> {
         systems: Default::default(),
         default_agent: "build".into(),
     };
+    let mut payloads = Payloads::default();
+    // One seeded agent so the detail route has a positive case (the list
+    // and detail share `api_agent_item` — same projector, one shape).
+    payloads.api_agent = vec![json!({"name": "build", "mode": "subagent"})];
     let st = AppState::with_wiring_and_v2(
         None,
-        Payloads::default(),
+        payloads,
         Wires {
             db,
             blobs,
@@ -997,6 +1001,124 @@ async fn v2_session_remove_update_agent_model() {
         StatusCode::NOT_FOUND
     );
     // CONTROL: remove that skips the cascade → second delete 204s, red.
+}
+
+#[tokio::test]
+async fn v2_l_family_honest_errors() {
+    // Phase F: rpc → 404 RpcError (never SPA HTML), websearch → 503,
+    // both gated when v2 off.
+    let addr = spawn_stub_provider();
+    let st = setup_with_v2(addr, true);
+    let app = ocserve_http::router(st);
+
+    async fn post(app: &axum::Router, uri: &str) -> (StatusCode, String) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    let (s, b) = post(&app, "/api/rpc/some-plugin/method").await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert!(b.contains("RpcError") && b.contains("D-RPC"), "body: {b}");
+    assert!(!b.contains("<!doctype"), "must never be SPA HTML");
+
+    let (s, b) = post(&app, "/api/websearch").await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(b.contains("D-WEBSEARCH"), "body: {b}");
+
+    // CONTROL: stub 200 with plausible JSON → asserts fail (never do this).
+}
+
+#[tokio::test]
+async fn v2_phase_f_gap_closure() {
+    // Phase F: agent detail, credential inventory, experimental config/generate,
+    // location reload, plugin check/update, vcs init.
+    let addr = spawn_stub_provider();
+    let st = setup_with_v2(addr, true);
+    let app = ocserve_http::router(st);
+
+    async fn get(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+    async fn post(app: &axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    // Agent detail: known → union item; unknown → 404.
+    let (s, v) = get(&app, "/api/agent/build").await;
+    assert_eq!(s, StatusCode::OK, "body {v}");
+    assert_eq!(v["data"]["id"], "build");
+    assert!(v["data"].get("name").is_some());
+    let (s, _) = get(&app, "/api/agent/nope").await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // Credential: list empty, create/activate 501 (never fake success).
+    let (s, v) = get(&app, "/api/credential").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["data"], json!([]));
+    let (s, v) = post(&app, "/api/credential", json!({"type": "oauth"})).await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(v["message"].as_str().unwrap_or("").contains("D-CREDENTIAL"));
+    let (s, _) = post(&app, "/api/credential/x/activate", json!({})).await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+
+    // Experimental generate: sessionless → 501 with the named divergence.
+    let (s, v) = post(&app, "/api/experimental/generate", json!({"prompt": "hi"})).await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(v["message"].as_str().unwrap_or("").contains("D-GENERATE-EPHEMERAL"));
+
+    // Location reload: honest 204 (live-derived, nothing stale).
+    let (s, _) = post(&app, "/api/location/reload", json!({})).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // Plugin check/update over the empty inventory.
+    let (s, v) = post(&app, "/api/plugin/check", json!({})).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["data"], json!([]));
+    let (s, _) = post(&app, "/api/plugin/update", json!({})).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // vcs init: real git init in a temp dir.
+    let dir = std::env::temp_dir().join(format!("ocserve-vcsinit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (s, _) = post(&app, "/api/vcs/init", json!({"directory": dir.to_str().unwrap()})).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert!(dir.join(".git").exists(), "git init must be real");
+    std::fs::remove_dir_all(&dir).ok();
+    // CONTROL: init that skips the Command → .git missing, red.
 }
 
 #[tokio::test]

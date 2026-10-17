@@ -196,6 +196,23 @@ else
   echo "ok (no vendored spec)"
 fi
 
+echo "== guard: v2 API coverage (rule 16b, spec-driven) =="
+# Same generated binding check as rule 16, over the 2.0.28 contract: every
+# op must be bound in the router or carry an exact `METHOD /path` citation
+# in V2-PARITY-PLAN.md (Phase F: D-RPC/D-WEBSEARCH/D-ENV/D-CREDENTIAL are
+# cited verdicts, not gaps). Planted control: remove a binding → GAP → red.
+if [ -f crates/ocserve-core/assets/openapi/2.0.28.json ]; then
+  cov2_out=$(python3 bench/openapi/check-coverage.py crates/ocserve-core/assets/openapi/2.0.28.json crates/ocserve-http/src/lib.rs V2-PARITY-PLAN.md 2>&1) || true
+  gaps2=$(printf '%s\n' "$cov2_out" | grep '^  GAP' || true)
+  if [ -n "$gaps2" ]; then
+    echo "$gaps2"; echo "FAIL: v2 spec operation unbound and uncited (rule 16b)"; fail=1
+  else
+    echo "ok"
+  fi
+else
+  echo "ok (no vendored v2 spec)"
+fi
+
 echo "== guard: embedded UI version-skew (rule 17) =="
 # Each pinned web UI must call only routes present in its SAME-TAG frozen
 # spec (Phase E: v1 + v2 packs). A mismatch means the extraction captured the

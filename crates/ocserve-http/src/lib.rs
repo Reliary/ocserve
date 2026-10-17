@@ -893,10 +893,12 @@ pub(crate) fn api_agent_body(payloads: &Payloads, location: &Value) -> Value {
 }
 
 fn api_agent_data(payloads: &Payloads) -> Vec<Value> {
-    let data: Vec<Value> = payloads
-        .api_agent
-        .iter()
-        .map(|a| {
+    payloads.api_agent.iter().map(api_agent_item).collect()
+}
+
+/// Single-agent union projection (shared by the list and the detail route —
+/// one projector, never two shapes for the same item).
+pub(crate) fn api_agent_item(a: &Value) -> Value {
             let perms: Vec<Value> = a["permission"]
                 .as_array()
                 .map(|rules| {
@@ -941,9 +943,6 @@ fn api_agent_data(payloads: &Payloads) -> Vec<Value> {
                 out["system"] = json!(BUILD_SYSTEM_BLURB);
             }
             out
-        })
-        .collect();
-    data
 }
 
 /// Captured from live /api/agent (build has no prompt; upstream serves this blurb).
@@ -2311,7 +2310,7 @@ async fn get_messages(
 /// swaps derived payloads so the next GET serves fresh config. Divergence:
 /// ocserve treats global==user config (single file); runtime endpoint
 /// registries refresh on restart (TESTING §1.6).
-async fn patch_config(
+pub(crate) async fn patch_config(
     State(st): State<Arc<AppState>>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
@@ -5735,6 +5734,41 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/experimental/session/{sessionID}/skill",
             axum::routing::post(v2::session_skill_api),
         )
+        .route(
+            "/api/rpc/{*path}",
+            axum::routing::post(v2::rpc_unimplemented),
+        )
+        .route(
+            "/api/websearch",
+            axum::routing::post(v2::websearch_unimplemented),
+        )
+        .route("/api/agent/{agentID}", get(v2::agent_detail_api))
+        .route("/api/credential", get(v2::credential_list_api).post(v2::credential_create_api))
+        .route(
+            "/api/credential/{credentialID}/activate",
+            axum::routing::post(v2::credential_activate_api),
+        )
+        .route(
+            "/api/experimental/config",
+            axum::routing::patch(v2::experimental_config_patch),
+        )
+        .route(
+            "/api/experimental/generate",
+            axum::routing::post(v2::experimental_generate_api),
+        )
+        .route(
+            "/api/location/reload",
+            axum::routing::post(v2::location_reload_api),
+        )
+        .route(
+            "/api/plugin/check",
+            axum::routing::post(v2::plugin_check_api),
+        )
+        .route(
+            "/api/plugin/update",
+            axum::routing::post(v2::plugin_update_api),
+        )
+        .route("/api/vcs/init", axum::routing::post(v2::vcs_init_api))
         .route(
             "/api/experimental/session/{sessionID}/instructions/entries",
             get(v2::instruction_list),

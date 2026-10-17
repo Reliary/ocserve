@@ -153,3 +153,14 @@ stats endpoint shreds JSON per request; ours is indexed SUM/COUNT).
   unread vars = shape-without-mutation). Injection point: `run_v2_turn`
   system rendering; store: `session_environment` table; oracle: capdiff
   bytes-axis proving vars reach the provider.
+  `PUT /api/session/{sessionID}/environment` — same verdict, exact path.
+- D-RPC: `POST /api/rpc/*` explicitly 404 `RpcError` (plugin-RPC dispatch
+  has no oracle; no caller at boot/basic flows). Build trigger: a real
+  client call observed in the boot-capture harness.
+  `POST /api/rpc/{rpcID}/{method}` — same handler (wildcard route), same verdict.
+- D-WEBSEARCH: `POST /api/websearch` explicitly 503 (route exists, no
+  provider backend). Build trigger: client demand + provider plumbing.
+  `GET /api/websearch/provider` — same verdict (no backend, no list).
+- D-CREDENTIAL: credential stubs only (204/401 inventory shapes, no secret
+  store). No fake success: nothing claims a credential was stored. Build
+  trigger: OAuth/pairing flow requirement.

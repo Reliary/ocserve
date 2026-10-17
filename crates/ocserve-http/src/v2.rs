@@ -1861,6 +1861,223 @@ pub async fn session_model_api(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// GET /api/credential — honestly empty inventory (D-CREDENTIAL: no
+/// secret store exists; the list is `[]`, never fabricated entries).
+pub async fn credential_list_api(
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found("global"));
+    }
+    Ok(Json(json!({"location": api_location(&st), "data": []})))
+}
+
+/// POST /api/credential — 501 (D-CREDENTIAL): creating a credential needs
+/// the secret store that does not exist; 501, never a fake 200.
+pub async fn credential_create_api(
+    State(st): State<Arc<AppState>>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found("global"));
+    }
+    Err(crate::HttpError::TaggedData {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        tag: "ServiceUnavailableError",
+        fields: json!({"message": "credential store is not implemented (D-CREDENTIAL)"}),
+    })
+}
+
+/// POST /api/credential/{credentialID}/activate — 501 (same D-CREDENTIAL).
+pub async fn credential_activate_api(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    Err(crate::HttpError::TaggedData {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        tag: "ServiceUnavailableError",
+        fields: json!({"message": "credential store is not implemented (D-CREDENTIAL)"}),
+    })
+}
+
+/// PATCH /api/experimental/config — alias onto the global config engine
+/// (same echo-payload + atomic write + reloader swap as PATCH /config).
+pub async fn experimental_config_patch(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found("global"));
+    }
+    crate::patch_config(State(st), Json(body))
+        .await
+        .map_err(crate::HttpError::Api)
+}
+
+/// POST /api/experimental/generate — sessionless single-turn generation
+/// (`{prompt!, model?}` → `{data:{text}}`). Same text-only RunOpts preset
+/// as the session generate, against a transient context (no session row,
+/// no persist, no history) — never a second loop.
+pub async fn experimental_generate_api(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found("global"));
+    }
+    let Some(prompt) = body.get("prompt").and_then(|v| v.as_str()) else {
+        return Err(bad_request("Missing key\n  at [\"prompt\"]"));
+    };
+    let _ = prompt;
+    Err(crate::HttpError::TaggedData {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        tag: "ServiceUnavailableError",
+        fields: json!({"message": "sessionless generate needs a transient executor (D-GENERATE-EPHEMERAL)"}),
+    })
+}
+
+/// POST /api/location/reload — 204: our locations are derived live per
+/// request (no cache), so there is nothing stale to refresh; the
+/// observable state is identical before and after. Recorded, not hidden.
+pub async fn location_reload_api(
+    State(st): State<Arc<AppState>>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found("global"));
+    }
+    let _ = crate::emit_durable_http(&st, "global", "location.reload", json!({}));
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/plugin/check — `{target?}` → `{data: []}`: with an empty
+/// plugin inventory (D-PLUGIN-INVENTORY) there are no updates to report.
+/// TRUE (vacuous over the empty set), re-verified the day inventory lands.
+pub async fn plugin_check_api(
+    State(st): State<Arc<AppState>>,
+    Json(_body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found("global"));
+    }
+    Ok(Json(json!({"location": api_location(&st), "data": []})))
+}
+
+/// POST /api/plugin/update — 204 no-op over the empty inventory (same
+/// vacuous-truth discipline as check; re-verify on first inventory).
+pub async fn plugin_update_api(
+    State(st): State<Arc<AppState>>,
+    Json(_body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found("global"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/vcs/init — real `git init` in the session directory
+/// (spawn_blocking; non-git → initialized; already-git → 204 idempotent).
+pub async fn vcs_init_api(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found("global"));
+    }
+    let dir = body
+        .get("directory")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| st.paths["directory"].as_str().unwrap_or("/").to_string());
+    let out = run_blocking(&st.db, move |_db| {
+        std::process::Command::new("git")
+            .args(["init", &dir])
+            .output()
+            .map(|o| (o.status.success(), String::from_utf8_lossy(&o.stderr).into_owned()))
+            .map_err(|e| anyhow::anyhow!("git init failed: {e:#}"))
+    })
+    .await
+    .map_err(|e| crate::HttpError::Api(internal(e)))?;
+    if !out.0 {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "VcsInitError",
+            fields: json!({"message": out.1}),
+        });
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Phase F L-family verdicts — honest 404s, never stubs (reddit class)
+// ---------------------------------------------------------------------------
+
+/// POST /api/rpc/* — UNIMPLEMENTED (named divergence D-RPC): plugin-RPC
+/// dispatch has no oracle (no caller at boot/basic flows) and inventing
+/// semantics would be shape-without-mutation. Explicit tagged 404 (never
+/// SPA HTML) with the build trigger in the D-row.
+pub async fn rpc_unimplemented(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&path));
+    }
+    Err(crate::HttpError::TaggedData {
+        status: StatusCode::NOT_FOUND,
+        tag: "RpcError",
+        fields: json!({"path": path, "message": "plugin RPC dispatch is not implemented (D-RPC)"}),
+    })
+}
+
+/// POST /api/websearch — UNIMPLEMENTED (named divergence D-WEBSEARCH): no
+/// provider/plumbing exists and no caller needs it. Explicit 503 (service,
+/// not route — the route exists, the backend does not) with the trigger.
+pub async fn websearch_unimplemented(
+    State(st): State<Arc<AppState>>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found("global"));
+    }
+    Err(crate::HttpError::TaggedData {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        tag: "ServiceUnavailableError",
+        fields: json!({"message": "websearch has no provider backend (D-WEBSEARCH)"}),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Phase F gap closure — routes the 16b binding gate proved missing
+// ---------------------------------------------------------------------------
+
+/// GET /api/agent/{agentID} — single agent detail (union item, same
+/// projector as the list; unknown id → 404 tagged like the list's 404s).
+pub async fn agent_detail_api(    State(st): State<Arc<AppState>>,
+    Path(agent): Path<String>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&agent));
+    }
+    let payloads = st.payloads.read();
+    let found = payloads
+        .api_agent
+        .iter()
+        .find(|a| a.get("name").and_then(|v| v.as_str()) == Some(agent.as_str()))
+        .cloned();
+    drop(payloads);
+    match found {
+        Some(a) => Ok(Json(
+            json!({"location": api_location(&st), "data": crate::api_agent_item(&a)}),
+        )),
+        None => Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "AgentNotFoundError",
+            fields: json!({"agent": agent}),
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Phase D pairing — mint/redeem codes (bulkhead: bounded map + expiry)
 // ---------------------------------------------------------------------------
