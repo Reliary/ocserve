@@ -291,13 +291,25 @@ async fn serve(
     // M4a: probe MCP servers before serving (statuses captured, never fatal)
     let mcp_cfgs =
         ocserve_mcp::parse_config(rt.config.get("mcp").unwrap_or(&serde_json::Value::Null));
-    let plugin_specs: Vec<String> = rt
+    // v1 config.plugin is `(string | [string, options])[]` (ConfigPluginV1.Spec).
+    // The tuple form carries per-plugin options delivered to the server
+    // factory; the plain-string form is options=Null. Non-string non-tuple
+    // entries are dropped (upstream schema rejects them upstream of here).
+    let plugin_specs: Vec<(String, serde_json::Value)> = rt
         .config
         .get("plugin")
         .and_then(|v| v.as_array())
         .map(|a| {
             a.iter()
-                .filter_map(|s| s.as_str().map(String::from))
+                .filter_map(|e| match e {
+                    serde_json::Value::String(s) => Some((s.clone(), serde_json::Value::Null)),
+                    serde_json::Value::Array(t) if !t.is_empty() => {
+                        let spec = t.first().and_then(|v| v.as_str())?.to_string();
+                        let opts = t.get(1).cloned().unwrap_or(serde_json::Value::Null);
+                        Some((spec, opts))
+                    }
+                    _ => None,
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -716,9 +728,9 @@ async fn serve(
                     "worktree": "/",
                     "serverUrl": server_url,
                 });
-                for spec in &plugin_specs {
+                for (spec, options) in &plugin_specs {
                     match ocserve_plugin::resolve_entry(spec, &home) {
-                        Ok(entry) => match sc.load(spec, &entry, &input).await {
+                        Ok(entry) => match sc.load(spec, &entry, &input, options).await {
                             Ok(hooks) => tracing::info!("plugin {spec} loaded: {hooks:?}"),
                             Err(e) => tracing::warn!("plugin {spec} load failed: {e:#}"),
                         },

@@ -173,7 +173,7 @@ async fn load_plugin(st: &AppState, tag: &str, plugin_js: &str) {
         .await
         .expect("spawn sidecar");
     let mut sc = sc;
-    sc.load("hooks-fixture", &entry, &json!({}))
+    sc.load("hooks-fixture", &entry, &json!({}), &serde_json::Value::Null)
         .await
         .expect("load fixture plugin");
     if st

@@ -176,9 +176,11 @@ pub struct Sidecar {
     server: (String, String),
     /// spawn identity for respawn-after-death
     args: SpawnArgs,
-    /// successful loads (spec, entry, input) — replayed on respawn
-    /// (entries stored RAW; load_raw re-normalizes on replay — D1-PLAN)
-    loads: Vec<(String, PathBuf, Value)>,
+    /// successful loads (spec, entry, input, options) — replayed on respawn
+    /// (entries stored RAW; load_raw re-normalizes on replay — D1-PLAN).
+    /// `options` is the v1 `[spec, options]` tuple's second element (Null when
+    /// the plain-string form was used) — passed to the server factory.
+    loads: Vec<(String, PathBuf, Value, Value)>,
     /// normalization output root (`data/normalized`); None = skip (tests,
     /// any sidecar without it — existing behavior untouched, D1-PLAN)
     normalize_root: Option<PathBuf>,
@@ -463,8 +465,8 @@ impl Sidecar {
         // D1-PLAN: replay must normalize too (warm no-op; rebuilds if outputs
         // were wiped mid-run — A1 stores raw, rebuilds here AND at next boot).
         fresh.normalize_root = self.normalize_root.clone();
-        for (spec, entry, input) in &loads {
-            if let Err(e) = fresh.load_raw(spec, entry, input).await {
+        for (spec, entry, input, options) in &loads {
+            if let Err(e) = fresh.load_raw(spec, entry, input, options).await {
                 tracing::warn!("plugin {spec} reload after respawn failed: {e:#}");
             }
         }
@@ -514,13 +516,27 @@ impl Sidecar {
     }
 
     /// Load one plugin (v1 server-factory extraction happens host-side).
-    pub async fn load(&mut self, spec: &str, entry: &Path, input: &Value) -> Result<Vec<String>> {
+    /// `options` is the v1 `[spec, options]` tuple's second element (pass
+    /// `Value::Null` for the plain-string form) — delivered to the factory.
+    pub async fn load(
+        &mut self,
+        spec: &str,
+        entry: &Path,
+        input: &Value,
+        options: &Value,
+    ) -> Result<Vec<String>> {
         self.ensure_alive().await?;
-        self.load_raw(spec, entry, input).await
+        self.load_raw(spec, entry, input, options).await
     }
 
     /// Unguarded load (respawn replay only — fresh child is alive).
-    async fn load_raw(&mut self, spec: &str, entry: &Path, input: &Value) -> Result<Vec<String>> {
+    async fn load_raw(
+        &mut self,
+        spec: &str,
+        entry: &Path,
+        input: &Value,
+        options: &Value,
+    ) -> Result<Vec<String>> {
         // D1: normalize for the RPC (CPU on spawn_blocking — A2 class); the
         // RAW entry is what gets recorded for respawn replay (A1).
         let root = self.normalize_root.clone();
@@ -574,7 +590,7 @@ impl Sidecar {
             "spec": spec,
             "entry": load_path.to_string_lossy(),
             "input": input,
-            "options": Value::Null,
+            "options": options,
         });
         let res = self.request_raw("load", params).await?;
         let hooks: Vec<String> = res["hooks"]
@@ -589,8 +605,12 @@ impl Sidecar {
             spec.to_string(),
             json!({"ok": true, "hooks": hooks, "id": res["id"]}),
         );
-        self.loads
-            .push((spec.to_string(), entry.to_path_buf(), input));
+        self.loads.push((
+            spec.to_string(),
+            entry.to_path_buf(),
+            input,
+            options.clone(),
+        ));
         Ok(hooks)
     }
 
@@ -711,7 +731,12 @@ export default PluginModule.server;
         let input =
             json!({"directory": "/work", "projectID": "global", "serverUrl": "http://127.0.0.1:9"});
         let hooks = sc
-            .load("synthetic", &dir.path().join("plug.mjs"), &input)
+            .load(
+                "synthetic",
+                &dir.path().join("plug.mjs"),
+                &input,
+                &Value::Null,
+            )
             .await
             .expect("load");
         assert_eq!(
@@ -791,9 +816,14 @@ export default PluginModule.server;
         .unwrap();
         let host = materialize_host(&dir.path().join("host"))?;
         let mut sc = Sidecar::spawn(&host, "http://127.0.0.1:9", "/work").await?;
-        sc.load("reaper", &dir.path().join("plug.mjs"), &json!({}))
-            .await
-            .expect("load");
+        sc.load(
+            "reaper",
+            &dir.path().join("plug.mjs"),
+            &json!({}),
+            &Value::Null,
+        )
+        .await
+        .expect("load");
         let pid = sc.child_pid();
         // force-kill the child (the live OOM class: sidecar dies, hooks
         // silently broken-piped until a respawn guard exists)
@@ -823,6 +853,132 @@ export default PluginModule.server;
     /// Test environment gate: the ACTUAL runtime (bun preferred) must exist.
     fn runtime_available() -> bool {
         crate::which(crate::plugin_runtime().program()).is_some()
+    }
+
+    /// Real-plugin battery (V2-EXECUTION-PLAN Phase 2): every v1 authoring
+    /// form the frozen client supports (plugin/index.ts readV1Plugin +
+    /// getLegacyPlugins) plus the `[spec, options]` tuple. Loads all forms
+    /// through ONE sidecar (as production does) and asserts each registered
+    /// the expected hook AND that options actually reach the factory (the
+    /// silently-dropped-tuple bug this battery exists to pin).
+    #[tokio::test]
+    async fn battery_all_authoring_forms_and_options() -> anyhow::Result<()> {
+        if !runtime_available() {
+            panic!(
+                "plugin-runtime binary ({}) required for plugin-host tests",
+                crate::plugin_runtime().program()
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // 1. PluginModule.server (v1 canonical)
+        std::fs::write(
+            dir.path().join("p_module.mjs"),
+            r#"export const PluginModule = {
+  id: "m",
+  server: async () => ({ "chat.message": async (_i, o) => { o.module = true; } }),
+};"#,
+        )
+        .unwrap();
+        // 2. default object with .server
+        std::fs::write(
+            dir.path().join("p_default_obj.mjs"),
+            r#"export default { server: async () => ({ "chat.params": async (_i, o) => { o.defaultobj = true; } }) };"#,
+        )
+        .unwrap();
+        // 3. default function (legacy)
+        std::fs::write(
+            dir.path().join("p_default_fn.mjs"),
+            r#"export default async () => ({ "tool.execute.after": async (_i, o) => { o.defaultfn = true; } });"#,
+        )
+        .unwrap();
+        // 4. named plain-function export (each IS a server factory)
+        std::fs::write(
+            dir.path().join("p_named.mjs"),
+            r#"export async function MyPlugin() { return { "event": async () => {} }; }"#,
+        )
+        .unwrap();
+        // 5. options tuple: the factory must SEE the second tuple element.
+        std::fs::write(
+            dir.path().join("p_options.mjs"),
+            r#"export const PluginModule = {
+  id: "opts",
+  server: async (_input, options) => ({
+    "chat.message": async (_i, o) => { o.sawOptions = options; },
+  }),
+};"#,
+        )
+        .unwrap();
+
+        let host = materialize_host(&dir.path().join("host"))?;
+        let mut sc = Sidecar::spawn(&host, "http://127.0.0.1:9", "/work").await?;
+        let input =
+            json!({"directory": "/work", "projectID": "global", "serverUrl": "http://127.0.0.1:9"});
+
+        let h1 = sc
+            .load("m", &dir.path().join("p_module.mjs"), &input, &Value::Null)
+            .await?;
+        assert_eq!(h1, vec!["chat.message"], "PluginModule.server form");
+        let h2 = sc
+            .load(
+                "dobj",
+                &dir.path().join("p_default_obj.mjs"),
+                &input,
+                &Value::Null,
+            )
+            .await?;
+        assert_eq!(h2, vec!["chat.params"], "default object with .server form");
+        let h3 = sc
+            .load(
+                "dfn",
+                &dir.path().join("p_default_fn.mjs"),
+                &input,
+                &Value::Null,
+            )
+            .await?;
+        assert_eq!(
+            h3,
+            vec!["tool.execute.after"],
+            "default function (legacy) form"
+        );
+        let h4 = sc
+            .load(
+                "named",
+                &dir.path().join("p_named.mjs"),
+                &input,
+                &Value::Null,
+            )
+            .await?;
+        assert_eq!(h4, vec!["event"], "named function export form");
+
+        let opts = json!({"token": "abc", "n": 3});
+        let h5 = sc
+            .load("opts", &dir.path().join("p_options.mjs"), &input, &opts)
+            .await?;
+        assert_eq!(
+            h5,
+            vec!["chat.message"],
+            "options-tuple form registers same hook"
+        );
+
+        // Dispatch across ALL loaded plugins: each form's hook fires.
+        let out = sc.trigger("chat.message", json!({}), json!({})).await?;
+        assert_eq!(out["module"], true, "form 1 hook fired");
+        // options reached the factory (the tuple was NOT dropped)
+        assert_eq!(out["sawOptions"], opts, "factory saw the tuple options");
+        let out2 = sc.trigger("chat.params", json!({}), json!({})).await?;
+        assert_eq!(out2["defaultobj"], true, "form 2 hook fired");
+        let out3 = sc
+            .trigger("tool.execute.after", json!({}), json!({}))
+            .await?;
+        assert_eq!(out3["defaultfn"], true, "form 3 hook fired");
+
+        // statuses carry all five loads (real inventory, not empty).
+        let st = sc.statuses();
+        for spec in ["m", "dobj", "dfn", "named", "opts"] {
+            assert_eq!(st[spec]["ok"], true, "status for {spec}");
+        }
+        sc.shutdown().await;
+        Ok(())
     }
 }
 
