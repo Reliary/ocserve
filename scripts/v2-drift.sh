@@ -47,6 +47,27 @@ echo "npm latest @opencode/cli: $latest"
     echo "- drift: VERSION MISMATCH — triage: adopt (bump.sh) / ignore"
     echo "- next: scripts/bump.sh v2 $latest (mechanical pipeline, monthly cadence)"
   fi
+  echo
+  # Plugin-surface drift (Phase 5): the contract check above watches the HTTP
+  # API; the PLUGIN hook surface is a different artifact. Re-extract it from
+  # the vendored tree and compare to the committed `bench/v2/hooks.json` — a
+  # change means the shim's capability matrix (guard rule 36) must be revisited.
+  if [ -n "${V2_TREE:-}" ] && [ -d "${V2_TREE}/packages/plugin/src" ]; then
+    # re-extract the hook surface from the (possibly newer) tree and diff it
+    # against the committed manifest. On change the shim's capability matrix
+    # (README-v2.md, guard rule 36) must be revisited. Restores the committed
+    # file afterwards (extract-v2-hooks.sh writes bench/v2/hooks.json).
+    cur="$(scripts/extract-v2-hooks.sh "$V2_TREE" >/dev/null 2>&1 && cat bench/v2/hooks.json)"
+    committed="$(git show HEAD:bench/v2/hooks.json 2>/dev/null || cat bench/v2/hooks.json)"
+    git checkout -- bench/v2/hooks.json 2>/dev/null || true
+    if [ -n "${cur:-}" ]; then
+      if [ "$cur" = "$committed" ]; then
+        echo "- plugin hooks: UNCHANGED vs committed bench/v2/hooks.json"
+      else
+        echo "- plugin hooks: CHANGED — re-review crates/ocserve-plugin/src/host/README-v2.md (guard rule 36)"
+      fi
+    fi
+  fi
 } >"$REPORT"
 # No regen here by design: the op-level delta is bump.sh's job (full
 # pipeline: acquire → re-vendor → contract-diff → oracles). This script
