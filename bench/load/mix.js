@@ -149,8 +149,18 @@ export function doIteration() {
 // Gated mode: pooled error-rate + pooled p95 thresholds (env-provided —
 // numbers come from thresholds.json AFTER the informational baseline run;
 // see README). Baseline runs pass --no-thresholds so options are inert.
+// ARRIVAL SEPARATION: closed-model bounds (LOAD_P95_MAX) must NEVER judge
+// open-model runs — different quantities (capacity vs achieved-rate). In
+// arrival mode only dropped_iterations + err rate gate in-k6; achieved% and
+// p95 acceptance are judged from the report against the pre-registered B
+// criteria (PERF-10X.md §A/B), never from these bounds.
 export function buildThresholds() {
   const th = {};
+  if (__ENV.LOAD_ARRIVAL_GATE) {
+    th.dropped_iterations = ['count==0'];
+    if (__ENV.LOAD_ERR_MAX) th.http_req_failed = ['rate<' + Number(__ENV.LOAD_ERR_MAX)];
+    return th;
+  }
   if (__ENV.LOAD_ERR_MAX) th.http_req_failed = ['rate<' + Number(__ENV.LOAD_ERR_MAX)];
   if (__ENV.LOAD_P95_MAX) th.http_req_duration = ['p(95)<' + Number(__ENV.LOAD_P95_MAX)];
   return th;

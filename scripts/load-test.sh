@@ -436,24 +436,51 @@ PY
   fi
 }
 
+arrival_thresholds_env() { # $1=arm → in-k6 arrival bounds (dropped==0 + err).
+  # Achieved% and p95 acceptance are NOT k6 thresholds — they are judged
+  # from the report against the pre-registered B criteria (PERF-10X.md).
+  # Baking them into k6 exit codes would conflate measurement with gating.
+  if [ "$GATED" = 1 ]; then
+    python3 - "$1" <<'PY'
+import json, sys
+t = json.load(open("bench/load/thresholds.json"))
+print(f"LOAD_ARRIVAL_GATE=1")
+print(f"LOAD_ERR_MAX={t['err_rate_max']}")
+PY
+  else
+    echo "K6_NO_THRESH=1"
+  fi
+}
+
 [ "$GATED" = 1 ] && [ ! -f bench/load/thresholds.json ] \
   && die2 "GATED=1 but bench/load/thresholds.json missing (run baseline first)"
 K6_NO_THRESH=1
 [ "$GATED" = 1 ] && K6_NO_THRESH=""
 export K6_NO_THRESH
 
-k6_run() { # $1=file $2=script $3=arm $4..=env assignments (K=V)
-  local out="$1" script="$2" arm="$3"; shift 3
+k6_run() { # $1=file $2=script $3=arm $4=gate-mode (closed|arrival) $5..=env assignments (K=V)
+  local out="$1" script="$2" arm="$3" gate_mode="${4:-closed}"; shift 4
   local -a envs=()
   local kv
   for kv in "$@"; do envs+=(-e "$kv"); done
   # experiment passthrough (E0 LOAD_ROUTES, query override, ladder)
+  # LOAD_INCLUDE_V2 is plumbed (not just documented): enabling it changes
+  # the mix, so v2-mix runs are gated SEPARATELY (own thresholds — folding
+  # new endpoints into the v1 pool silently re-bases the gate).
   local pv
-  for pv in LOAD_ROUTES LOAD_SEARCH_Q LOAD_TARGETS; do
+  for pv in LOAD_ROUTES LOAD_SEARCH_Q LOAD_TARGETS LOAD_INCLUDE_V2; do
     [ -n "${!pv:-}" ] && envs+=(-e "$pv=${!pv}")
   done
   if [ "$GATED" = 1 ]; then
-    while IFS= read -r kv; do envs+=(-e "$kv"); done < <(thresholds_env "$arm")
+    if [ "$gate_mode" = arrival ]; then
+      # Arrival runs are judged by the pre-registered B criteria from the
+      # report (achieved%, p95, dropped, err) — NEVER by closed-model p95
+      # bounds (different quantities; conflating them certified nothing).
+      # In-k6: dropped==0 + err rate only.
+      while IFS= read -r kv; do envs+=(-e "$kv"); done < <(arrival_thresholds_env "$arm")
+    else
+      while IFS= read -r kv; do envs+=(-e "$kv"); done < <(thresholds_env "$arm")
+    fi
   fi
   local -a flags=()
   [ "${K6_NO_THRESH:-0}" = 1 ] && flags+=(--no-thresholds)
@@ -483,7 +510,7 @@ urllib.request.urlopen('http://127.0.0.1:${port}/global/health',timeout=3)" 2>/d
     fi
     for mode in spread hot; do
       say "== r$round $arm/$mode (target ladder: $LOAD_TARGETS) =="
-      k6_run "r$round-$arm-$mode-readhot.summary.json" read-hot.js "$arm" \
+      k6_run "r$round-$arm-$mode-readhot.summary.json" read-hot.js "$arm" "closed" \
         "LOAD_BASE=http://127.0.0.1:$port" "LOAD_MODE=$mode" \
         "LOAD_SIDS=$POOL" "LOAD_DEEP=$DEEP" "LOAD_FILE_PATH=${FILE_PATH:-/tmp}" \
         "LOAD_TARGETS=$LOAD_TARGETS" || {
@@ -494,7 +521,7 @@ urllib.request.urlopen('http://127.0.0.1:${port}/global/health',timeout=3)" 2>/d
     done
     if [ "$LOAD_ARRIVAL" = 1 ]; then
       say "== r$round $arm/arrival (${LOAD_RPS} rps offered) =="
-      k6_run "r$round-$arm-arrival-arrival.summary.json" arrival.js "$arm" \
+      k6_run "r$round-$arm-arrival-arrival.summary.json" arrival.js "$arm" "arrival" \
         "LOAD_BASE=http://127.0.0.1:$port" "LOAD_MODE=spread" \
         "LOAD_SIDS=$POOL" "LOAD_DEEP=$DEEP" "LOAD_FILE_PATH=${FILE_PATH:-/tmp}" \
         "LOAD_RPS=$LOAD_RPS" || {

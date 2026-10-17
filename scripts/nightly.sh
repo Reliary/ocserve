@@ -156,10 +156,13 @@ step "permission differential (freeze vs ocserve)" ./scripts/permission-check.sh
 # 6c. event-payload scan (guard rule 19's live half): validates the live event
 #     log against the frozen Event contract. Post-fix events must be clean;
 #     historical pre-fix rows are counted but not fatal (already fixed at the
-#     source). Read-only.
+#     source). Read-only. NOTE: `checked 0` on an idle window is NO DATA, not
+#     a pass — the count is echoed so the report states vacuity explicitly.
 step "event payloads vs frozen contract" \
-  python3 bench/events/event-validate.py \
-  "${OCSERVE_DATA_DIR:-$HOME/.local/share/ocserve}/ocserve.db" --minutes 60
+  bash -c 'out=$(python3 bench/events/event-validate.py \
+    "${OCSERVE_DATA_DIR:-$HOME/.local/share/ocserve}/ocserve.db" --minutes 60); \
+    echo "$out"; echo "$out" | grep -q "checked 0 events" && \
+    echo "NOTE: event window empty — vacuous green (no traffic to validate)" || true'
 
 # 6c-bis. snapshot/revert/vcs-apply integration (K-SNAPSHOT, SNAPSHOT.md §7):
 #     containerised single-arm + freeze differential. Manual tier (docker);

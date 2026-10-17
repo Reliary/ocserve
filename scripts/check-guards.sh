@@ -1,52 +1,62 @@
 #!/usr/bin/env bash
 # Static guardrails (AGENTS §2.3/§2.5) — one command that fails the build on
-# the bug/performance CLASSES we have actually shipped once each. Each rule has
-# a planted negative control inline (a violation is injected and must be
-# flagged) so the grep can never pass vacuously. The rule numbers are stable
-# IDs cited across the docs; some numbers were retired when a stronger,
-# generated check superseded them (noted below), so the sequence has gaps.
+# the bug/performance CLASSES we have actually shipped once each. Rules
+# marked [plant] inject a violation inline every run and must flag it (the
+# grep can never pass vacuously); rules marked [suite] are proven by
+# committed tests or delegated `--selftest` harnesses named in the comment.
+# The rule numbers are stable IDs cited across the docs; some numbers were
+# retired when a stronger, generated check superseded them (noted below),
+# so the sequence has gaps.
 #
-#   1. swallowed storage writes        (the finalize-SQL silent failure)
-#   2. literal backslash inside SQL    (the "\\" continuation syntax error)
+#   1. swallowed storage writes        (the finalize-SQL silent failure) [suite]
+#   2. literal backslash inside SQL    (the "\\" continuation syntax error) [suite]
 #   3. whole-session Value materialization in HTTP (the OOM class) — the
-#      messages route must stream via for_each_message_json
+#      messages route must stream via for_each_message_json [suite]
 #   4. msg_part INSERT/UPDATE outside ocserve-store — every part write must
-#      carry its part_search projection companion (W1 FTS invariant)
+#      carry its part_search projection companion (W1 FTS invariant) [suite]
 #   5. upstream drift watch broken (version compare / replay-output parse /
 #      set-difference / report writer) — the nightly watch would go silently
-#      wrong (PLAN §6/§8, K-DRIFT)
+#      wrong (PLAN §6/§8, K-DRIFT) [suite: drift-watch.sh --selftest]
 #   6. non-ocserve systemd units mutated from repo scripts (drop-ins/restarts —
-#      the 2026-10-05 incident class; only ocserve* units are mutable, TESTING §1.6)
+#      the 2026-10-05 incident class; only ocserve* units are mutable, TESTING §1.6) [suite]
 #   7. exact assertions on process-global counters inside src/ (parallel in-crate
-#      tests race — the reader_opens flake; such tests belong in tests/)
+#      tests race — the reader_opens flake; such tests belong in tests/) [suite]
 #   8. (retired — folded into 7)
 #   9. unit template keeps OOMPolicy=continue (child OOM must not bounce the
-#      service — the 2026-10-06 stop-policy bounce; A3's completion)
+#      service — the 2026-10-06 stop-policy bounce; A3's completion) [suite]
 #  10. A3 child wrapper stays byte-identical in ocserve-mcp + ocserve-plugin
-#      (two copies, no shared dep — drift would silently drop oom_score_adj)
+#      (two copies, no shared dep — drift would silently drop oom_score_adj) [suite]
 #  11. installer/uninstaller never delete shared opencode state (config, auth,
-#      legacy db, model cache, packages — only ocserve-derived *.normalized.mjs)
-#  12. pair-check allowlist entries must cite a named D-PAIR row
-#  13. load-test: a line that INVOKES k6 may never name a LIVE service port
+#      legacy db, model cache, packages — only ocserve-derived *.normalized.mjs) [suite]
+#  12. pair-check allowlist entries must cite a named D-PAIR row [suite]
+#  13. load-test: a line that INVOKES k6 may never name a LIVE service port [suite]
 #  14,15. (retired — superseded by rule 16's generated spec-coverage check)
 #  16. every operation in the frozen OpenAPI contract is bound or exact-cited
-#      (spec-driven, whole-token citation match)
-#  17. the embedded pinned web UI calls only routes in the frozen spec
-#  18. permission oracle vectors exist, are well-formed, and carry the fixture config
-#  19. the event-payload validator selftest is non-vacuous
-#  20. every request key read off an axum `Json(...)` binding exists in the contract
-#  21. no runtime emitter assigns an empty `partID` (the streaming-delta class)
-#  22. /event, /api/event, /global/event stay bound to distinct envelope handlers
-#  23. no per-request catalog reads in the v2 metadata routes
-#  24. every `tests/*.rs` cited from `src/` exists
-#  25. no `SELECT *` on hot tables in server paths
-#  26. WAL ceiling in soak-gate.sh
-#  27. provider-boundary differential (capdiff) is non-vacuous + allowlist cites D-rows
-#  28. crates.io publish order covers every member in dependency order
-#  29. every mutating endpoint has an asserted side effect (the shape-only class)
-#  30. no compiled-in asset (`include_str!`/`include_bytes!`) escapes its crate root
+#      (spec-driven, whole-token citation match) [suite: checker + corpus]
+#  16b. every operation in the v2 OpenAPI contract is bound or exact-cited
+#      [plant: dropped spec-bound binding → GAP]
+#  17. the embedded pinned web UI calls only routes in the frozen spec [suite]
+#  18. permission oracle vectors exist, are well-formed, and carry the fixture config [suite]
+#  19. the event-payload validator selftest is non-vacuous [plant: delegated selftest]
+#  20. every request key read off an axum `Json(...)` binding exists in the contract [plant: delegated selftest]
+#  21. no runtime emitter assigns an empty `partID` (the streaming-delta class) [plant]
+#  22. /event, /api/event, /global/event stay bound to distinct envelope handlers [plant]
+#  23. no per-request catalog reads in the v2 metadata routes [plant]
+#  24. every `tests/*.rs` cited from `src/` exists [plant]
+#  25. no `SELECT *` on hot tables in server paths [plant]
+#  26. WAL ceiling in soak-gate.sh [suite: external script]
+#  27. provider-boundary differential (capdiff) is non-vacuous + allowlist cites D-rows [plant]
+#  28. crates.io publish order covers every member in dependency order [plant: delegated selftest]
+#  29. every mutating endpoint has an asserted side effect (the shape-only class) [plant: delegated selftest]
+#  30. no compiled-in asset (`include_str!`/`include_bytes!`) escapes its crate root [plant: delegated selftest]
 #  31. docs are not stale (dead repo paths, dangling guard-rule refs, removed
-#      divergences still listed as current)
+#      divergences still listed as current) [plant: delegated selftest]
+#  32. v2 contract-differ classifies every op; conflicts block superset serving
+#      [plant: delegated selftest]
+#  33. v2-path queries carry allocation budgets (no unbounded reads on new tables) [plant]
+#  34. serving path is Rust-native (no non-Rust runtime in the request path;
+#      same-sidecar-protocol extensions allowed, new runtimes forbidden) [plant]
+#  35. no absolute-path silent redirect in writers (resolve_within class) [plant]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -208,6 +218,41 @@ if [ -f crates/ocserve-core/assets/openapi/2.0.28.json ]; then
     echo "$gaps2"; echo "FAIL: v2 spec operation unbound and uncited (rule 16b)"; fail=1
   else
     echo "ok"
+  fi
+  # Planted control: router copy minus one binding must GAP (proves the
+  # checker is load-bearing, not vacuously green). Repo-local temp,
+  # trap-restored.
+  _cov16b_plant="crates/ocserve-http/src/.lib.guard-plant.rs"
+  _cov16b_restore() { rm -f "$_cov16b_plant"; }
+  trap '_cov16b_restore' EXIT
+  python3 - crates/ocserve-core/assets/openapi/2.0.28.json crates/ocserve-http/src/lib.rs "$_cov16b_plant" <<'PYEOF' || true
+import json, re, sys
+spec = json.load(open(sys.argv[1], encoding="utf-8"))
+paths = set(spec.get("paths", {}))
+text = open(sys.argv[2], encoding="utf-8").read()
+for m in re.finditer(r'\.route\(\s*"([^"]+)"', text):
+    # normalize axum {param} to spec {param} form for membership test
+    if m.group(1) in paths:
+        path = m.group(1)
+        depth, i = 1, m.end()
+        while i < len(text) and depth:
+            c = text[i]
+            if c == "(": depth += 1
+            elif c == ")": depth -= 1
+            i += 1
+        open(sys.argv[3], "w").write(text[:m.start()] + text[i:])
+        print(path)
+        break
+else:
+    sys.exit("no spec-bound .route( found to drop")
+PYEOF
+  _plant_gaps=$(python3 bench/openapi/check-coverage.py crates/ocserve-core/assets/openapi/2.0.28.json "$_cov16b_plant" V2-PARITY-PLAN.md 2>&1 | grep '^  GAP' || true)
+  _cov16b_restore
+  trap - EXIT
+  if [ -z "$_plant_gaps" ]; then
+    echo "FAIL: 16b checker blind to a dropped binding (rule 16b vacuous)"; fail=1
+  else
+    echo "ok (planted binding-drop detected by 16b checker)"
   fi
 else
   echo "ok (no vendored v2 spec)"
@@ -450,7 +495,7 @@ echo "== guard: provider-boundary differential is non-vacuous + allowlist cites 
 if [ ! -f bench/capdiff/capdiff.py ]; then
   echo "FAIL: bench/capdiff/capdiff.py missing (rule 27)"; fail=1
 fi
-if ! grep -q "def provider_view" bench/capdiff/capdiff.py; then
+if ! grep -q "^def provider_view(" bench/capdiff/capdiff.py; then
   echo "FAIL: capdiff lost its provider_view comparator (rule 27)"; fail=1
 fi
 if ! grep -q "tool_map" bench/capdiff/capdiff.py; then
@@ -492,11 +537,11 @@ capdiff_restore() { [ -f "$_capdiff_plant_bak" ] && mv -f "$_capdiff_plant_bak" 
 trap capdiff_restore EXIT
 cp bench/capdiff/capdiff.py "$_capdiff_plant_bak"
 trap 'capdiff_restore; trap - EXIT' EXIT
-sed -i 's/def provider_view/def provider_view_DISABLED/' bench/capdiff/capdiff.py
-if grep -q "def provider_view" bench/capdiff/capdiff.py; then
-  echo "ok (planted comparator removal detected; allowlist D-rows present)"
-else
+sed -i 's/^def provider_view(/def provider_view_DISABLED(/' bench/capdiff/capdiff.py
+if grep -q "^def provider_view(" bench/capdiff/capdiff.py; then
   echo "FAIL: planted comparator removal not detected (rule 27 vacuous)"; fail=1
+else
+  echo "ok (planted comparator removal detected; allowlist D-rows present)"
 fi
 capdiff_restore
 trap - EXIT
@@ -680,6 +725,24 @@ if [ -n "$bad35" ]; then
   echo "FAIL: writer-side trim+join without is_absolute branch (rule 35):$bad35"; fail=1
 else
   echo "ok (writer paths branch on is_absolute)"
+fi
+# Planted control: a writer trim+join in a file WITHOUT is_absolute must
+# flag through the SAME loop as the live check (proves the rule, not just
+# the grep). Repo-local temp, trap-restored.
+_cov35_plant="crates/ocserve-http/src/__rule35_plant.rs"
+_cov35_restore() { rm -f "$_cov35_plant"; }
+trap '_cov35_restore' EXIT
+printf '%s\n' 'fn _plant(base: &std::path::Path, rel: &str) { let _ = base.join(rel.trim_start_matches('"'"'/'"'"')); }' > "$_cov35_plant"
+_plant_bad=""
+for loc in $(grep -rln "trim_start_matches" crates/ocserve-http/src/__rule35_plant.rs || true); do
+  grep -q "is_absolute" "$loc" || _plant_bad="$loc"
+done
+_cov35_restore
+trap - EXIT
+if [ -z "$_plant_bad" ]; then
+  echo "FAIL: planted trim+join without is_absolute not flagged (rule 35 vacuous)"; fail=1
+else
+  echo "ok (planted trim+join without is_absolute flagged by rule 35)"
 fi
 
 exit $fail

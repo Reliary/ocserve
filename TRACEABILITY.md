@@ -162,6 +162,7 @@ no-inflation correct), PASS cost (−58.9% weighted) + score (median 1.0 both)
 | K-V2-GAPS | gap closure: generate/credential/env/rpc/websearch | Experimental generate via `RunOpts.transient` (verified live: upstream creates zero rows; e2e asserts text + zero phantom rows/events; also fixed latent empty-text in session generate); credential store (upstream table shape, single-active-per-integration, label default, value validation with exact Payload wording, 204-no-op activate, DB 600); session env PUT + bash injection with provider-cleanliness proof (first-body assert — tool-result echo is legitimate); RPC byte-exact 400 (no constructible enabling state); websearch list exact + keyed Tavily/Exa direct + keyless-empty + failure envelope (D-WEBSEARCH-PARTIAL for the rest). Guard fix: rule-27 plant backup moved repo-local (full /tmp silently broke restore and emptied capdiff.py — proven by the failure itself). 142/142 ops bound, spec-validate 43/0, guards 38/38 | green |
 | K-V2-MAINT | maintenance machine + stats hardening + writer-path fix | `bump.sh` (9-step pipeline, steps 1-4 mechanical + 5-9 checklist), `v2-drift.sh` (first run: 2.0.32 detected, monthly pin = information), `spec-validate-v2.sh` wrapper, nightly 6f column; `session_stats_full` (cost/tools-by-status/activeDays/streak/activity/models — all columnar GROUP BY; tool status from `state.status`); entries-as-array; credential/terminal contract-exact; `resolve_within` absolute-path silent-redirect fixed (trim+join → is_absolute branch + containment; rule 35 proven non-vacuous); spec-validate-v2 **43/0**. 550 tests, clippy clean, guards 38/38 | green |
 | K-V2-CORPUS | golden corpus union update (own commit, AGENTS §2.7) | 5 replay failures, all missing=[] extra=[union keys] (pure D-V2-UNION additive, zero behavior change) → manifest gains the union key paths; /project/current emits the same union Project shape as the list. Replay 26/0 | green |
+| K-INTEGRITY | guard self-proof (Phase 0, part 1) | Rule-27 plant fixed to `^def provider_view(` (substring match was vacuous — proven by the failure mode itself); inline red→green plants added for 16b (dropped spec-bound binding → GAP) and 35 (bare trim+join → flagged). Guards 40/40, zero FAIL | green |
 
 ## Test design techniques coverage (TESTING §4)
 
@@ -174,6 +175,6 @@ no-inflation correct), PASS cost (−58.9% weighted) + score (median 1.0 both)
 | Use case | 9 oc-remote flows, TUI attach | planned M1/M2 (F1) |
 | Error guessing | every antagonism-ledger finding | `crash_fuzz` (A2/A6), FTS tests (A1), cache test (A3), golden SSE (C1) |
 | White-box branch | blob crash-protocol ordering | `crash_fuzz` + `blob::tests` |
-| Mutation (TESTING §1) | cargo-mutants gate | planned — first run M2, threshold after baseline |
-| Fuzz | SSE/JSON/provider parsers | planned — cargo-fuzz M2 (corpus seeded from recordings) |
+| Mutation (TESTING §1) | cargo-mutants gate | nightly `--with-mutants` on store+core (SSE/`ocserve-llm` scope pending — Phase 2); threshold TBD at first baseline |
+| Fuzz | SSE/JSON/provider parsers | `fuzz/` 3 targets (sse/splice/wire) + weekly CI; nightly wiring + 5 missing targets pending (Phase 2) |
 | Property | chunker roundtrip arbitrary sizes | `blob::tests::roundtrip_multi_chunk_above_alloc_cap` + boundary set (proptest crate M2) |

@@ -111,9 +111,11 @@ jobs:
           echo "binary size: $SIZE bytes"
           # Ceiling re-baselined from measurement, never bypassed (SRE §5 / the
           # provenance rule): 9,279,528 (2026-10-03) -> 30,000,000 (web-UI
-          # embedded bundle, v2 surface). Headroom is intentional: rolldown +
-          # embedded UI are the large static contributors.
-          MAX=30000000
+          # embedded bundle, v2 surface) -> 34,000,000 (second embedded web
+          # pack, Phase E; see scripts/nightly.sh provenance chain).
+          # Headroom is intentional: rolldown + embedded UI are the large
+          # static contributors.
+          MAX=34000000
           if [ "$SIZE" -gt "$MAX" ]; then
             echo "FAIL: binary $SIZE exceeds ceiling $MAX — re-baseline with provenance";
             exit 1

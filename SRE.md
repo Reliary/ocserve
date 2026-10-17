@@ -255,9 +255,9 @@ other than the async worker (thread identity recorded by a test-only seam).
   Journal vacuum deliberately NOT done: the journal is shared with
   opencode and unit logs age via the retention floor.
 - **Release profile** (matches reliary8/stria): `lto="fat"`, `codegen-units=1`,
-  `opt-level=3`, `panic="abort"`, `strip=true`; **binary size ceiling 20,971,520 B (20 MiB)**
-  — re-baselined 2026-10-06 from the measured D1 build (20,359,600 B with
-  rolldown linked; original: 10,485,760 B from 9,279,528 B measured 2026-10-03).
+  `opt-level=3`, `panic="abort"`, `strip=true`; **binary size ceiling 34,000,000 B (34 MiB)**
+  — re-baselined 2026-10-17 from the measured Phase E build (32,965,584 B with
+  the second embedded web pack; prior: 20,971,520 B from D1 2026-10-06).
   Raise ONLY with a new measurement + provenance comment in `scripts/nightly.sh`
   (the tripwire re-sets from evidence, never moves to fit). Enforced there.
 - **Per-commit gates (AGENTS §3, run by hand before every commit):** clippy `-D warnings`,
