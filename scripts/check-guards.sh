@@ -652,4 +652,26 @@ else
   echo "FAIL: scripts/check-docs.py missing (rule 31)"; fail=1
 fi
 
+echo "== guard: no absolute-path silent redirect in writers (rule 35) =="
+# resolve_within class (V2-PARITY Phase F): trim-leading-slash + join
+# silently redirects an absolute request path INSIDE the base and reports
+# success — proven by in-crate test debris from an absolute /tmp write.
+# Writers must branch on is_absolute BEFORE joining; the containment gate
+# then applies to both shapes. Read-only fs_read is exempt (404 either way,
+# never creates). Planted control: a writer trim+join in a file without
+# is_absolute → red.
+bad35=""
+for loc in $(grep -rln "trim_start_matches" crates/ocserve-http/src/ --include='*.rs' || true); do
+  case "$loc" in
+    *v2.rs)
+      grep -q "is_absolute" "$loc" || bad35="$bad35 $loc"
+      ;;
+  esac
+done
+if [ -n "$bad35" ]; then
+  echo "FAIL: writer-side trim+join without is_absolute branch (rule 35):$bad35"; fail=1
+else
+  echo "ok (writer paths branch on is_absolute)"
+fi
+
 exit $fail

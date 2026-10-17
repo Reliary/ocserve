@@ -220,7 +220,9 @@ mod tests {
         );
         // v2 entry under _assets/ (proves the extract regex caught the prefix)
         assert!(
-            files_v2().keys().any(|k| k.starts_with("_assets/") && k.ends_with(".js")),
+            files_v2()
+                .keys()
+                .any(|k| k.starts_with("_assets/") && k.ends_with(".js")),
             "no v2 _assets entry"
         );
     }

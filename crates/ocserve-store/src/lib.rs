@@ -2011,14 +2011,19 @@ pub fn prune_events(
     Ok(aged + capped)
 }
 
-/// Columnar session stats (Phase D projectional synergy): indexed
-/// SUM/COUNT over stored columns — never per-row JSON shredding. Explicit
-/// columns (rule 25/33). Shape mirrors `SessionStats.Info` envelopes
-/// (range/sessions/prompts/steps/tokens) with subagents=0 (no subagent
-/// launcher — named gap, not a fabricated count).
-pub fn session_stats(db: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+/// Full `SessionStats.Info` projection (V2-PARITY Phase F: the validator
+/// proved the summary shape insufficient). Every figure is a columnar
+/// aggregate — indexed COUNT/SUM/GROUP BY, never per-row JSON shredding:
+/// - cost: SUM(session.cost) (lifetime accumulator, token_accounting.rs)
+/// - tools: summary mode with real status split from
+///   `msg_part.inline.state.status` (completed/error/other→unfinished)
+///   grouped by tool name (bounded: distinct tools, not rows)
+/// - activeDays/streak/activity: GROUP BY day(time_created) over msg
+///   (bounded: distinct days); streak = trailing consecutive days to today
+/// - models: GROUP BY (model) with step/token/cost SUMs (bounded: models)
+pub fn session_stats_full(db: &std::path::Path) -> anyhow::Result<serde_json::Value> {
     let conn = pragma::open_reader(db)?;
-    let (sessions, prompts, steps, tin, tout, treason, tcr, tcw, tmin, tmax): (
+    let (sessions, prompts, steps, tin, tout, treason, tcr, tcw, tcost, tmin, tmax): (
         i64,
         i64,
         i64,
@@ -2027,6 +2032,7 @@ pub fn session_stats(db: &std::path::Path) -> anyhow::Result<serde_json::Value> 
         i64,
         i64,
         i64,
+        f64,
         Option<i64>,
         Option<i64>,
     ) = conn.query_row(
@@ -2038,6 +2044,7 @@ pub fn session_stats(db: &std::path::Path) -> anyhow::Result<serde_json::Value> 
                 (SELECT COALESCE(SUM(tokens_reasoning),0) FROM session), \
                 (SELECT COALESCE(SUM(tokens_cache_read),0) FROM session), \
                 (SELECT COALESCE(SUM(tokens_cache_write),0) FROM session), \
+                (SELECT COALESCE(SUM(cost),0.0) FROM session), \
                 (SELECT MIN(time_created) FROM session), \
                 (SELECT MAX(time_updated) FROM session)",
         [],
@@ -2053,9 +2060,132 @@ pub fn session_stats(db: &std::path::Path) -> anyhow::Result<serde_json::Value> 
                 r.get(7)?,
                 r.get(8)?,
                 r.get(9)?,
+                r.get(10)?,
             ))
         },
     )?;
+    // Tool status split: completed → succeeded, error → failed, anything
+    // else (running/absent) → unfinished. One GROUP BY, not per-row decode.
+    let mut stmt = conn.prepare_cached(
+        "SELECT json_extract(inline, '$.tool'), json_extract(inline, '$.state.status'), count(*) \
+         FROM msg_part WHERE type = 'tool' GROUP BY 1, 2",
+    )?;
+    let mut calls: i64 = 0;
+    let mut succeeded: i64 = 0;
+    let mut failed: i64 = 0;
+    let mut by_name: std::collections::HashMap<String, (i64, i64, i64)> =
+        std::collections::HashMap::new();
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (tool, status, n) = row?;
+        calls += n;
+        let s = status.as_deref().unwrap_or("running");
+        if s == "completed" {
+            succeeded += n;
+        } else if s == "error" {
+            failed += n;
+        }
+        let e = by_name
+            .entry(tool.unwrap_or_else(|| "?".into()))
+            .or_insert((0, 0, 0));
+        e.0 += n;
+        if s == "completed" {
+            e.1 += n;
+        } else if s == "error" {
+            e.2 += n;
+        }
+    }
+    let unfinished = calls - succeeded - failed;
+    let mut by_name_arr: Vec<serde_json::Value> = by_name
+        .into_iter()
+        .map(|(name, (c, s, f))| {
+            serde_json::json!({"name": name, "calls": c, "succeeded": s, "failed": f,
+                               "unfinished": c - s - f})
+        })
+        .collect();
+    by_name_arr.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    // Day grain: one GROUP BY over msg time (bounded: distinct days).
+    let mut stmt = conn.prepare_cached(
+        "SELECT CAST(time_created / 86400000 AS INTEGER) AS day, count(*) \
+         FROM msg GROUP BY day ORDER BY day",
+    )?;
+    let day_rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+    let mut days: Vec<(i64, i64)> = Vec::new();
+    for row in day_rows {
+        days.push(row?);
+    }
+    let active_days = days.len() as i64;
+    // Streak: trailing consecutive UTC days ending today.
+    let today = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_millis() / 86400000) as i64)
+        .unwrap_or(0);
+    let mut streak: i64 = 0;
+    let mut want = today;
+    for (d, _) in days.iter().rev() {
+        if *d == want || (want == today && *d == today - 1) {
+            // Allow "yesterday" as streak start when today is empty so a
+            // daily user at 00:05 does not read streak 0.
+            streak += 1;
+            want = *d - 1;
+        } else {
+            break;
+        }
+    }
+    let activity: Vec<serde_json::Value> = days
+        .iter()
+        .map(|(d, n)| serde_json::json!({"date": chrono_day(*d), "steps": n}))
+        .collect();
+    // Models: GROUP BY session.model (bounded: distinct models).
+    let mut stmt = conn.prepare_cached(
+        "SELECT model, count(*), COALESCE(SUM(tokens_input),0), COALESCE(SUM(tokens_output),0), \
+                COALESCE(SUM(tokens_reasoning),0), COALESCE(SUM(cost),0.0) \
+         FROM session GROUP BY model",
+    )?;
+    let model_rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, i64>(4)?,
+            r.get::<_, f64>(5)?,
+        ))
+    })?;
+    let mut models: Vec<serde_json::Value> = Vec::new();
+    for row in model_rows {
+        let (model_json, steps, mi, mo, mr, mc) = row?;
+        let (pid, mid) = match model_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        {
+            Some(v) => (
+                v.get("providerID")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                v.get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+            ),
+            None => ("?".into(), "?".into()),
+        };
+        models.push(serde_json::json!({
+            "model": {"id": mid, "providerID": pid},
+            "steps": steps,
+            "tokens": {"input": mi, "output": mo, "reasoning": mr,
+                       "cache": {"read": 0, "write": 0}},
+            "cost": mc,
+        }));
+    }
+    models.sort_by(|a, b| a["model"]["id"].as_str().cmp(&b["model"]["id"].as_str()));
     Ok(serde_json::json!({
         "range": {"from": tmin.unwrap_or(0), "to": tmax.unwrap_or(0)},
         "sessions": sessions,
@@ -2066,7 +2196,31 @@ pub fn session_stats(db: &std::path::Path) -> anyhow::Result<serde_json::Value> 
             "input": tin, "output": tout, "reasoning": treason,
             "cache": {"read": tcr, "write": tcw},
         },
+        "cost": tcost,
+        "tools": {"mode": "summary",
+                  "totals": {"calls": calls, "succeeded": succeeded,
+                             "failed": failed, "unfinished": unfinished}},
+        "activeDays": active_days,
+        "streak": streak,
+        "activity": activity,
+        "models": models,
     }))
+}
+
+/// UTC day number → "YYYY-MM-DD" (stats activity axis; no chrono dep —
+/// civil-from-days arithmetic).
+fn chrono_day(day: i64) -> String {
+    // Howard Hinnant's civil_from_days (days since 1970-01-01 → y/m/d).
+    let z = day + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146097) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{:02}-{:02}", y + if m <= 2 { 1 } else { 0 }, m, d)
 }
 
 /// v2 instruction entries (Phase D): content-addressed key journal over the

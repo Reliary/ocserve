@@ -729,7 +729,8 @@ async fn v2_phase_d_state_machines() {
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["data"]["k1"], json!({"a": 1}));
+    // Entries are an ARRAY of {key, value} (contract-exact, not a map).
+    assert_eq!(v["data"], json!([{"key": "k1", "value": {"a": 1}}]));
     // Unknown body key → 400.
     assert_eq!(
         put(
@@ -753,9 +754,9 @@ async fn v2_phase_d_state_machines() {
         "/api/experimental/session/ses_v2a/instructions/entries",
     )
     .await;
-    assert_eq!(v["data"], json!({}));
+    assert_eq!(v["data"], json!([]));
 
-    // Stats: enveloped columnar aggregates.
+    // Stats: full SessionStats.Info (columnar; all required keys present).
     let (s, v) = get(&app, "/api/experimental/session/stats").await;
     assert_eq!(s, StatusCode::OK);
     assert!(
@@ -766,6 +767,23 @@ async fn v2_phase_d_state_machines() {
             >= 1
     );
     assert_eq!(v["data"]["subagents"], 0);
+    // Full-shape keys the validator requires (all columnar, all real).
+    for key in [
+        "range",
+        "prompts",
+        "steps",
+        "tokens",
+        "cost",
+        "tools",
+        "activeDays",
+        "streak",
+        "activity",
+        "models",
+    ] {
+        assert!(v["data"].get(key).is_some(), "stats missing {key}");
+    }
+    assert_eq!(v["data"]["tools"]["mode"], "summary");
+    assert!(v["data"]["tools"]["totals"]["calls"].as_i64().unwrap_or(0) >= 0);
 
     // Export: transfer envelope with real messages.
     let (s, v) = get(&app, "/api/experimental/session/ses_v2a/export").await;
@@ -1052,12 +1070,21 @@ async fn v2_phase_f_gap_closure() {
     async fn get(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
         let resp = app
             .clone()
-            .oneshot(Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
     async fn post(app: &axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
         let resp = app
@@ -1074,7 +1101,10 @@ async fn v2_phase_f_gap_closure() {
             .unwrap();
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     // Agent detail: known → union item; unknown → 404.
@@ -1098,7 +1128,12 @@ async fn v2_phase_f_gap_closure() {
     // Experimental generate: sessionless → 501 with the named divergence.
     let (s, v) = post(&app, "/api/experimental/generate", json!({"prompt": "hi"})).await;
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(v["message"].as_str().unwrap_or("").contains("D-GENERATE-EPHEMERAL"));
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("D-GENERATE-EPHEMERAL")
+    );
 
     // Location reload: honest 204 (live-derived, nothing stale).
     let (s, _) = post(&app, "/api/location/reload", json!({})).await;
@@ -1114,7 +1149,12 @@ async fn v2_phase_f_gap_closure() {
     // vcs init: real git init in a temp dir.
     let dir = std::env::temp_dir().join(format!("ocserve-vcsinit-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let (s, _) = post(&app, "/api/vcs/init", json!({"directory": dir.to_str().unwrap()})).await;
+    let (s, _) = post(
+        &app,
+        "/api/vcs/init",
+        json!({"directory": dir.to_str().unwrap()}),
+    )
+    .await;
     assert_eq!(s, StatusCode::NO_CONTENT);
     assert!(dir.join(".git").exists(), "git init must be real");
     std::fs::remove_dir_all(&dir).ok();
@@ -1122,8 +1162,7 @@ async fn v2_phase_f_gap_closure() {
 }
 
 #[tokio::test]
-async fn v2_shell_item_drains_through_executor() {
-    // A shell admit (default resume) wakes the drain; the turn runs through
+async fn v2_shell_item_drains_through_executor() {    // A shell admit (default resume) wakes the drain; the turn runs through
     // the shared executor (tools off, no title), the inbox empties, and the
     // claim releases. Proves typed execution, not just admission.
     let addr = spawn_stub_provider();

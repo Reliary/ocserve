@@ -151,10 +151,13 @@ async fn phase_c_projections_answer() {
         )
         .await
         .unwrap();
-    // /tmp escapes most worktrees → 403 traversal guard (proves containment).
-    assert!(
-        resp.status() == StatusCode::OK || resp.status() == StatusCode::FORBIDDEN,
-        "fs/write answers, got {}",
+    // /tmp escapes the fixture worktree → 403 traversal guard (an absolute
+    // path must NEVER silently redirect inside the base — the old
+    // trim+join did exactly that, proven by in-crate test debris).
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "absolute escape must 403, got {}",
         resp.status()
     );
     // traversal outside the worktree → 403, never a write.

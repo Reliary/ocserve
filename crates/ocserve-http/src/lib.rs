@@ -899,50 +899,50 @@ fn api_agent_data(payloads: &Payloads) -> Vec<Value> {
 /// Single-agent union projection (shared by the list and the detail route —
 /// one projector, never two shapes for the same item).
 pub(crate) fn api_agent_item(a: &Value) -> Value {
-            let perms: Vec<Value> = a["permission"]
-                .as_array()
-                .map(|rules| {
-                    rules
-                        .iter()
-                        .map(|r| {
-                            json!({
-                                "action": r["permission"],
-                                "resource": r["pattern"],
-                                "effect": r["action"],
-                            })
-                        })
-                        .collect()
+    let perms: Vec<Value> = a["permission"]
+        .as_array()
+        .map(|rules| {
+            rules
+                .iter()
+                .map(|r| {
+                    json!({
+                        "action": r["permission"],
+                        "resource": r["pattern"],
+                        "effect": r["action"],
+                    })
                 })
-                .unwrap_or_default();
-            let mut out = json!({
-                "id": a["name"],
-                // UNION (D-V2-UNION): v2 `Agent.Info` requires `name`
-                // (display name; freeze: id "build", name "Build") and
-                // `request.settings`. Title-case the id when no display
-                // name is configured. Both decoders strip extras.
-                "name": a.get("display_name").and_then(|v| v.as_str()).map(String::from).unwrap_or_else(|| {
-                    let id = a["name"].as_str().unwrap_or("");
-                    let mut c = id.chars();
-                    match c.next() {
-                        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                        None => String::new(),
-                    }
-                }),
-                "hidden": a.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false),
-                "mode": a["mode"],
-                "permissions": perms,
-                "request": {"headers": {}, "body": {}, "settings": {}},
-            });
-            if let Some(d) = a.get("description") {
-                out["description"] = d.clone();
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = json!({
+        "id": a["name"],
+        // UNION (D-V2-UNION): v2 `Agent.Info` requires `name`
+        // (display name; freeze: id "build", name "Build") and
+        // `request.settings`. Title-case the id when no display
+        // name is configured. Both decoders strip extras.
+        "name": a.get("display_name").and_then(|v| v.as_str()).map(String::from).unwrap_or_else(|| {
+            let id = a["name"].as_str().unwrap_or("");
+            let mut c = id.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
             }
-            // system: explicit prompt, else the captured build default
-            if let Some(p) = a.get("prompt") {
-                out["system"] = p.clone();
-            } else if a["name"] == "build" {
-                out["system"] = json!(BUILD_SYSTEM_BLURB);
-            }
-            out
+        }),
+        "hidden": a.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false),
+        "mode": a["mode"],
+        "permissions": perms,
+        "request": {"headers": {}, "body": {}, "settings": {}},
+    });
+    if let Some(d) = a.get("description") {
+        out["description"] = d.clone();
+    }
+    // system: explicit prompt, else the captured build default
+    if let Some(p) = a.get("prompt") {
+        out["system"] = p.clone();
+    } else if a["name"] == "build" {
+        out["system"] = json!(BUILD_SYSTEM_BLURB);
+    }
+    out
 }
 
 /// Captured from live /api/agent (build has no prompt; upstream serves this blurb).
@@ -5743,7 +5743,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::post(v2::websearch_unimplemented),
         )
         .route("/api/agent/{agentID}", get(v2::agent_detail_api))
-        .route("/api/credential", get(v2::credential_list_api).post(v2::credential_create_api))
+        .route(
+            "/api/credential",
+            get(v2::credential_list_api).post(v2::credential_create_api),
+        )
         .route(
             "/api/credential/{credentialID}/activate",
             axum::routing::post(v2::credential_activate_api),

@@ -189,6 +189,17 @@ step "field-contract differential (freeze vs ocserve)" \
 step "provider-boundary differential (freeze vs ocserve)" \
   bash -c './scripts/capdiff-check.sh --selftest && ./scripts/capdiff-check.sh --full && ./scripts/capdiff-check.sh --full --reverse' 
 
+# 6f. v2 column (K-V2-P5, V2-PARITY-PLAN.md §6): live differential vs the real
+#     2.0.28 binary (11 vectors: info/inbox/form/log/messages/admission) +
+#     v2 contract selftest + v2 shape validation + v2 drift detection.
+#     Local-nightly only (needs the 2.0.28 binary + password harness; hosted
+#     runners 500 on freeze probes — same reason as pair/capdiff).
+step "v2 live differential (2.0.28 vs ocserve)" ./scripts/pair-v2-check.sh
+step "v2 contract-differ selftest + classify" \
+  bash -c 'python3 scripts/contract-diff.py --selftest && python3 scripts/contract-diff.py'
+step "v2 shapes vs 2.0.28 contract" ./scripts/spec-validate-v2.sh
+step "v2 drift detection (npm latest vs vendored)" ./scripts/v2-drift.sh
+
 # 7. mutants (opt-in): survivor report is triaged like a defect (TESTING §9)
 if [ "$WITH_MUTANTS" = "1" ]; then
   if command -v cargo-mutants >/dev/null 2>&1; then

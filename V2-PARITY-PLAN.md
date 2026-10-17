@@ -145,6 +145,12 @@ stats endpoint shreds JSON per request; ours is indexed SUM/COUNT).
 
 ## 8. Named divergences added in parity phases
 
+New write paths sub-ms (inbox_list 0.25ms, stats 0.50ms for 3 SUM/COUNTs —
+the columnar-synergy claim measured, shell_list 0.24ms, admit-404 0.23ms);
+v1 session_list 0.69ms (no regression from v2 additions); verdict routes
+≤0.5ms. Full k6/GATED on .227 stays the release gate (new write paths are
+admit-only; the turn executor is unchanged). Binary 33,013,072 B ≤ 34M.
+
 - D-BACKGROUND-NOOP: background is an honest recorded 204 (no
   foreground/background tool distinction in the inline loop).
 - D-VIEW-NOWATERMARK: view records + 204s (no read watermark tracked).
@@ -164,3 +170,11 @@ stats endpoint shreds JSON per request; ours is indexed SUM/COUNT).
 - D-CREDENTIAL: credential stubs only (204/401 inventory shapes, no secret
   store). No fake success: nothing claims a credential was stored. Build
   trigger: OAuth/pairing flow requirement.
+
+## 9. Phase D exit: G2-targeted perf (local single-VU, release binary)
+
+New write paths sub-ms (inbox_list 0.25ms, stats 0.50ms for 3 SUM/COUNTs —
+the columnar-synergy claim measured, shell_list 0.24ms, admit-404 0.23ms);
+v1 session_list 0.69ms (no regression from v2 additions); verdict routes
+≤0.5ms. Full k6/GATED on .227 stays the release gate (new write paths are
+admit-only; the turn executor is unchanged). Binary 33,013,072 B ≤ 34M.

@@ -84,6 +84,12 @@ ALLOW_V2_UNION = {
     "/api/debug/location": "location refs are additive (no v1 shape)",
     "/api/plugin": "plugin inventory honestly empty (D-PLUGIN-INVENTORY)",
     "/api/worktree": "worktree entries are additive (no v1 shape)",
+    # Phase D/F routes: same union class (shared cached envelope).
+    "/api/shell": "shared envelope project (no v1 shape; envelope uniformity)",
+    "/api/session/active": "shared envelope project (no v1 shape; envelope uniformity)",
+    "/api/session/{sessionID}/diff": "shared envelope project (no v1 shape; envelope uniformity)",
+    "/api/pair": "pairing records are additive (no v1 shape)",
+    "/api/experimental/mcp": "mcp records are additive (no v1 shape)",
 }
 
 

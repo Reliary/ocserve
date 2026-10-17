@@ -624,7 +624,16 @@ pub async fn fs_list(
 /// silently passing). `..` that resolves outside `base` is rejected.
 fn resolve_within(base: &std::path::Path, rel: &str) -> std::io::Result<std::path::PathBuf> {
     let base_canon = base.canonicalize()?;
-    let joined = base_canon.join(rel.trim_start_matches('/'));
+    // Absolute request paths resolve against the filesystem (NOT joined onto
+    // the base — joining silently redirects /tmp/x to <base>/tmp/x and
+    // reports success, a silent-lie the phase-C test debris proved). Both
+    // shapes then face the same containment gate.
+    let requested = std::path::PathBuf::from(rel);
+    let joined = if requested.is_absolute() {
+        requested
+    } else {
+        base_canon.join(rel.trim_start_matches('/'))
+    };
     match joined.canonicalize() {
         Ok(real) => {
             if real.starts_with(&base_canon) {
@@ -1004,7 +1013,7 @@ pub async fn session_export_api(
 /// projectional synergy: indexed SUM/COUNT over stored columns, never
 /// per-row JSON shredding + Effect decode like upstream's stats endpoint).
 pub async fn session_stats_api(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let stats = run_blocking(&st.db, |db| ocserve_store::session_stats(db))
+    let stats = run_blocking(&st.db, |db| ocserve_store::session_stats_full(db))
         .await
         .unwrap_or_default();
     Json(json!({"data": stats}))
@@ -1078,11 +1087,16 @@ pub async fn instruction_list(
         return Err(session_not_found(&id));
     }
     let rows = ocserve_store::instruction::list(&st.db, &id).map_err(internal)?;
-    let map: serde_json::Map<String, Value> = rows
+    // Contract: entries are an ARRAY of {key, value} (InstructionEntry.Info),
+    // never a map (the validator proved the map shape on the fresh routes).
+    let mut arr: Vec<Value> = rows
         .into_iter()
-        .map(|(k, v)| (k, serde_json::from_str(&v).unwrap_or(json!({"raw": v}))))
+        .map(|(k, v)| {
+            json!({"key": k, "value": serde_json::from_str(&v).unwrap_or(json!({"raw": v}))})
+        })
         .collect();
-    Ok(Json(json!({"data": Value::Object(map)})))
+    arr.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
+    Ok(Json(json!({"data": arr})))
 }
 
 /// PUT .../entries/{key} — `{value!}` stores by content hash. Unknown keys
@@ -1521,7 +1535,8 @@ pub async fn ppty_session_list(
     if pty_v2_gate(&st).is_err() {
         return v2_not_found(&id).into_response();
     }
-    Json(json!({"location": api_location(&st), "data": st.pty.list_running()})).into_response()
+    // Contract-exact: `{data}` with NO location (v2-only route).
+    Json(json!({"data": st.pty.list_running()})).into_response()
 }
 
 /// POST /api/experimental/session/{sessionID}/terminal — create (same engine
@@ -1553,7 +1568,8 @@ pub async fn ppty_session_read(
         return v2_not_found(&id).into_response();
     }
     match st.pty.list_running().into_iter().next() {
-        Some(info) => Json(json!({"location": api_location(&st), "data": info})).into_response(),
+        // Contract-exact: `{data}` with NO location (v2-only route).
+        Some(info) => Json(json!({"data": info})).into_response(),
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({"name": "NotFoundError", "data": {"message": format!("no pty for session: {id}")}})),
@@ -1863,13 +1879,15 @@ pub async fn session_model_api(
 
 /// GET /api/credential — honestly empty inventory (D-CREDENTIAL: no
 /// secret store exists; the list is `[]`, never fabricated entries).
+/// Contract-exact: `{data}` with NO location envelope (v2-only route —
+/// nothing v1 requires here, so no union keys).
 pub async fn credential_list_api(
     State(st): State<Arc<AppState>>,
 ) -> Result<Json<Value>, HttpError> {
     if !st.v2_enabled {
         return Err(v2_not_found("global"));
     }
-    Ok(Json(json!({"location": api_location(&st), "data": []})))
+    Ok(Json(json!({"data": []})))
 }
 
 /// POST /api/credential — 501 (D-CREDENTIAL): creating a credential needs
@@ -1941,9 +1959,7 @@ pub async fn experimental_generate_api(
 /// POST /api/location/reload — 204: our locations are derived live per
 /// request (no cache), so there is nothing stale to refresh; the
 /// observable state is identical before and after. Recorded, not hidden.
-pub async fn location_reload_api(
-    State(st): State<Arc<AppState>>,
-) -> Result<StatusCode, HttpError> {
+pub async fn location_reload_api(State(st): State<Arc<AppState>>) -> Result<StatusCode, HttpError> {
     if !st.v2_enabled {
         return Err(v2_not_found("global"));
     }
@@ -1994,7 +2010,12 @@ pub async fn vcs_init_api(
         std::process::Command::new("git")
             .args(["init", &dir])
             .output()
-            .map(|o| (o.status.success(), String::from_utf8_lossy(&o.stderr).into_owned()))
+            .map(|o| {
+                (
+                    o.status.success(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                )
+            })
             .map_err(|e| anyhow::anyhow!("git init failed: {e:#}"))
     })
     .await
@@ -2053,7 +2074,8 @@ pub async fn websearch_unimplemented(
 
 /// GET /api/agent/{agentID} — single agent detail (union item, same
 /// projector as the list; unknown id → 404 tagged like the list's 404s).
-pub async fn agent_detail_api(    State(st): State<Arc<AppState>>,
+pub async fn agent_detail_api(
+    State(st): State<Arc<AppState>>,
     Path(agent): Path<String>,
 ) -> Result<Json<Value>, HttpError> {
     if !st.v2_enabled {
