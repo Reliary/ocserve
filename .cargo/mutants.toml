@@ -1,0 +1,21 @@
+# cargo-mutants configuration (TESTING §1 rule 1, K-MUTANTS).
+#
+# Checked in so `cargo mutants -p ocserve-store -p ocserve-core` runs with the
+# accelerated defaults documented in the mutation baseline plan. Jobs is NOT a
+# config key — pass `-j N` or set `CARGO_MUTANTS_JOBS` on the command line.
+#
+# profile = "mutants"  → inherits `test` but drops debug symbols (the dominant
+#   link-time cost; debug info is worthless when a mutant is *expected* to
+#   fail). Defined in the workspace Cargo.toml.
+# NO additional_cargo_test_args: a `--lib` here made the test BINARY receive
+#   `--lib` (cargo-mutants appends config test-args after any post-`--` args),
+#   and — more importantly — `--lib` drops ocserve-store's 14 integration-test
+#   binaries, so every store function covered ONLY by those binaries read as a
+#   survivor (measured: 933 false "missed" of 1165 in one shard). Full test
+#   scope is mandatory for an honest mutation score. The two known-slow harness
+#   tests are skipped via the caller's `-- -- --skip …` form (see nightly.sh).
+# minimum_test_timeout = 45s → mutated loops/conditions that hang a test are
+#   killed at 45s (checkpoint: test median 4.8s; the old 120s cap wasted 25×
+#   median on each of ~10% hanging mutants).
+profile = "mutants"
+minimum_test_timeout = 45.0

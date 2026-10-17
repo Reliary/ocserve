@@ -220,18 +220,24 @@ step "v2 drift detection (npm latest vs vendored)" ./scripts/v2-drift.sh
 # 7. mutants (opt-in): survivor report is triaged like a defect (TESTING §9)
 if [ "$WITH_MUTANTS" = "1" ]; then
   if command -v cargo-mutants >/dev/null 2>&1; then
-    # skip the 50s fuzz (per-mutant cost) — mutants target store/core logic
-    # per-mutant `cargo test` skips the 50s fuzz + SIGKILL harness (both run
-    # unmutated every gate/nightly anyway). QUIRK (observed twice): cargo-
-    # mutants joins test args WITHOUT inserting `--`, and cargo test rejects
-    # bare --skip — so the separator must be PASSED as the first test arg:
-    #   ... -- -- --skip <name>   →  cargo test ... -- --skip <name>
-    # TMPDIR on REAL disk: default /tmp is tmpfs on some hosts — the first
-    #529-mutant run filled the16G ramdisk and died with ENOSPC mid-build
+    # skip the two known-slow harness tests per mutant (the 50s chunk-split
+    # fuzz + the SIGKILL crash harness — both run unmutated every gate).
+    # Acceleration lives in .cargo/mutants.toml (profile=mutants debug=none,
+    # minimum_test_timeout=45). NOTE: cargo-mutants appends CONFIG test-args
+    # after the post-`--` test-binary args without re-inserting the separator,
+    # so `additional_cargo_test_args` must stay empty when using the
+    # `-- -- --skip X` form below (they were removed for this reason).
+    # jobs via CARGO_MUTANTS_JOBS (cargo-mutants defaults to 1; the measured
+    # baseline used 4 locally / 8 on the i9).
     mkdir -p target/mutants-tmp
     step "cargo mutants (store+core)" env TMPDIR="$PWD/target/mutants-tmp" \
-      cargo mutants -p ocserve-store -p ocserve-core --timeout 120 \
+      CARGO_MUTANTS_JOBS="${CARGO_MUTANTS_JOBS:-4}" \
+      cargo mutants -p ocserve-store -p ocserve-core \
       -- -- --skip chunk_split --skip sigkill
+    # Gate the survivor count against the agreed ceiling (TESTING §1 rule 1:
+    # threshold agreed at first run, then ratcheted down). Only meaningful if
+    # the run produced outcomes; absent results are a FAIL not a skip.
+    step "mutation-score gate" python3 scripts/check-mutants.py
   else
     echo "FAIL: --with-mutants but cargo-mutants not installed" | tee -a "$LOG"
     FAILS=$((FAILS + 1))

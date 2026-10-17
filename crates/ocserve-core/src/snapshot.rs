@@ -902,6 +902,16 @@ mod tests {
     fn non_git_directory_is_inactive() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
+        // Hermetic non-git precondition: the fixture must not depend on TMPDIR
+        // being outside any repo (the mutants harness sets TMPDIR inside the
+        // ocserve repo, so git would walk up and find it — flaky class). A
+        // bogus `.git` entry stops git's upward walk (rev-parse fails, no
+        // fall-through to a parent repo).
+        std::fs::write(tmp.path().join(".git"), "not a gitdir\n").unwrap();
+        assert!(
+            git_toplevel(&tmp.path().display().to_string()).is_none(),
+            "fixture must be hermetic (no git found upward)"
+        );
         let s = Snapshots::new(data.path(), tmp.path().display().to_string(), true);
         assert!(!s.is_active(), "non-git dir must be inactive");
         assert!(s.track().is_none());
