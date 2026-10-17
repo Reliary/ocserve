@@ -1147,10 +1147,9 @@ pub fn project_page_v2(
         "SELECT message_id, type, inline, blob_sha, byte_len FROM msg_part \
          WHERE message_id IN ({placeholders}) ORDER BY message_id, seq"
     ))?;
-    let mut parts: std::collections::HashMap<
-        String,
-        Vec<(String, Option<String>, Option<(String, i64)>)>,
-    > = std::collections::HashMap::new();
+    type PartRow = (String, Option<String>, Option<(String, i64)>);
+    let mut parts: std::collections::HashMap<String, Vec<PartRow>> =
+        std::collections::HashMap::new();
     let mut padded: Vec<Option<String>> = Vec::with_capacity(CHUNK);
     let mut iter = page.iter();
     loop {
@@ -1190,10 +1189,10 @@ pub fn project_page_v2(
                 if let Some(t) = inline {
                     return t.clone();
                 }
-                if let Some((s, len)) = blob {
-                    if let Ok(bytes) = blobs.get(s, *len as u64) {
-                        return String::from_utf8_lossy(&bytes).into_owned();
-                    }
+                if let Some((s, len)) = blob
+                    && let Ok(bytes) = blobs.get(s, *len as u64)
+                {
+                    return String::from_utf8_lossy(&bytes).into_owned();
                 }
                 String::new()
             };
@@ -1260,18 +1259,16 @@ pub fn project_page_v2(
                 let mut files = Vec::new();
                 let mut agents = Vec::new();
                 for (ptype, inline, _blob) in plist {
-                    if ptype == "file" {
-                        if let Some(t) = inline {
-                            if let Ok(v) = serde_json::from_str::<Value>(t) {
-                                files.push(v);
-                            }
-                        }
-                    } else if ptype == "agent" {
-                        if let Some(t) = inline {
-                            if let Ok(v) = serde_json::from_str::<Value>(t) {
-                                agents.push(v);
-                            }
-                        }
+                    if ptype == "file"
+                        && let Some(t) = inline
+                        && let Ok(v) = serde_json::from_str::<Value>(t)
+                    {
+                        files.push(v);
+                    } else if ptype == "agent"
+                        && let Some(t) = inline
+                        && let Ok(v) = serde_json::from_str::<Value>(t)
+                    {
+                        agents.push(v);
                     }
                 }
                 out.push(json!({
@@ -1672,6 +1669,9 @@ pub mod inbox {
     use super::{WriteOp, Writer};
     use anyhow::Result;
 
+    /// One inbox row: (id, item_type, payload_json, delivery, enqueued_seq).
+    pub type Item = (String, String, String, String, i64);
+
     fn now_ms() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1709,10 +1709,7 @@ pub mod inbox {
     }
 
     /// Fetch one pending item by id (explicit columns, rule 33).
-    pub fn get(
-        db: &std::path::Path,
-        id: &str,
-    ) -> Result<Option<(String, String, String, String, i64)>> {
+    pub fn get(db: &std::path::Path, id: &str) -> Result<Option<Item>> {
         let conn = crate::pragma::open_reader(db)?;
         let mut stmt = conn.prepare_cached(
             "SELECT session_id, type, payload, delivery, enqueued_seq \
@@ -1732,10 +1729,7 @@ pub mod inbox {
 
     /// List pending items for a session in promote order
     /// (enqueued_seq; caller partitions steer/queue/compaction/move).
-    pub fn list(
-        db: &std::path::Path,
-        session_id: &str,
-    ) -> Result<Vec<(String, String, String, String, i64)>> {
+    pub fn list(db: &std::path::Path, session_id: &str) -> Result<Vec<Item>> {
         let conn = crate::pragma::open_reader(db)?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, type, payload, delivery, enqueued_seq FROM session_inbox \
@@ -2023,6 +2017,7 @@ pub fn prune_events(
 /// - models: GROUP BY (model) with step/token/cost SUMs (bounded: models)
 pub fn session_stats_full(db: &std::path::Path) -> anyhow::Result<serde_json::Value> {
     let conn = pragma::open_reader(db)?;
+    #[allow(clippy::type_complexity)]
     let (sessions, prompts, steps, tin, tout, treason, tcr, tcw, tcost, tmin, tmax): (
         i64,
         i64,
@@ -2298,6 +2293,9 @@ pub mod form {
     use super::{WriteOp, Writer};
     use anyhow::Result;
 
+    /// One form row: (id, kind, title, fields_json, metadata_json, answered).
+    pub type Row = (String, String, String, String, String, Option<String>);
+
     fn now_ms() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2345,10 +2343,7 @@ pub mod form {
     }
 
     /// One form by id (explicit columns).
-    pub fn get(
-        db: &std::path::Path,
-        id: &str,
-    ) -> Result<Option<(String, String, String, String, String, Option<String>)>> {
+    pub fn get(db: &std::path::Path, id: &str) -> Result<Option<Row>> {
         let conn = crate::pragma::open_reader(db)?;
         let mut stmt = conn.prepare_cached(
             "SELECT session_id, title, metadata, fields, state, answer FROM form WHERE id = ?1",
@@ -2632,7 +2627,9 @@ pub fn credential_create(
             .into(),
         params: vec![
             id.into(),
-            integration_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+            integration_id
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
             label.into(),
             value.into(),
             (if active { 1 } else { 0 }).into(),
@@ -2645,7 +2642,9 @@ pub fn credential_create(
                   WHERE integration_id IS ?1 AND id != ?3"
                 .into(),
             params: vec![
-                integration_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+                integration_id
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null),
                 now_ms.into(),
                 id.into(),
             ],
@@ -2657,12 +2656,19 @@ pub fn credential_create(
 
 /// Activate one credential (target active + siblings inactive); unknown id =
 /// no-op Ok (upstream 204s unknown ids — idempotent, never 404).
-pub fn credential_activate(writer: &Writer, db: &std::path::Path, id: &str, now_ms: i64) -> anyhow::Result<()> {
+pub fn credential_activate(
+    writer: &Writer,
+    db: &std::path::Path,
+    id: &str,
+    now_ms: i64,
+) -> anyhow::Result<()> {
     let conn = pragma::open_reader(db)?;
     let row: Option<Option<String>> = conn
-        .query_row("SELECT integration_id FROM credential WHERE id = ?1", [id], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT integration_id FROM credential WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
         .ok();
     let Some(integration) = row else {
         return Ok(());
@@ -2674,7 +2680,9 @@ pub fn credential_activate(writer: &Writer, db: &std::path::Path, id: &str, now_
                   WHERE integration_id IS ?1 AND id != ?3"
                 .into(),
             params: vec![
-                flat.clone().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+                flat.clone()
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null),
                 now_ms.into(),
                 id.into(),
             ],
@@ -2749,7 +2757,10 @@ pub fn environment_get(
         && let Some(obj) = map.as_object()
     {
         for (k, v) in obj {
-            let s = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+            let s = v
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| v.to_string());
             out.push((k.clone(), s));
         }
     }

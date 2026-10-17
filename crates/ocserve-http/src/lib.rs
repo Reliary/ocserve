@@ -4678,7 +4678,7 @@ fn emit_session_error_event(st: &Arc<AppState>, sid: &str, message: &str) {
         "sessionID": sid,
         "error": {"name": "UnknownError", "data": {"message": message}},
     });
-    if let Err(e) = emit_durable_http(&st, sid, "session.error", props.clone()) {
+    if let Err(e) = emit_durable_http(st, sid, "session.error", props.clone()) {
         tracing::warn!("session.error emit failed: {} {}", e.name, e.message);
     }
 }
@@ -5263,6 +5263,15 @@ fn req_log() -> bool {
     })
 }
 
+/// Constant-time byte equality (no `subtle` dep for one call site).
+/// Length must be checked by the caller first (lengths differ → false).
+fn subtle_compare(a: &[u8], b: &[u8]) -> bool {
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
 async fn auth_gate(
     State(st): State<Arc<AppState>>,
     req: axum::extract::Request,
@@ -5293,6 +5302,8 @@ async fn auth_gate(
         tracing::info!("req {} {}", req.method(), req.uri().path());
     }
     if let Some((user, pass)) = &st.auth {
+        // Constant-time credential compare (timing oracle on a secret
+        // check is a real class; the tuple is short so cost is trivial).
         let authorized = req
             .headers()
             .get(axum::http::header::AUTHORIZATION)
@@ -5303,17 +5314,16 @@ async fn auth_gate(
                 base64::engine::general_purpose::STANDARD.decode(b64).ok()
             })
             .map(|raw| {
-                let text = String::from_utf8_lossy(&raw);
-                text == format!("{user}:{pass}")
+                let expect = format!("{user}:{pass}");
+                raw.len() == expect.len() && subtle_compare(&raw, expect.as_bytes())
             })
             .unwrap_or(false);
         if !authorized {
             record(metric_t0);
-            return Err(ApiError {
-                status: StatusCode::UNAUTHORIZED,
-                name: "UnauthorizedError",
-                message: "unauthorized".into(),
-            });
+            // Byte-exact upstream challenge (probed live on 2.0.28) — shared
+            // constructor with the method fallback (single source, no drift).
+            // Absent and wrong credentials are indistinguishable (no oracle).
+            return Ok(unauthorized_response());
         }
     }
     let resp = next.run(req).await;
@@ -5743,14 +5753,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/rpc/{rpcID}/{method}",
             axum::routing::post(v2::rpc_unimplemented),
         )
-        .route(
-            "/api/websearch",
-            axum::routing::post(v2::websearch_api),
-        )
-        .route(
-            "/api/websearch/provider",
-            get(v2::websearch_providers_api),
-        )
+        .route("/api/websearch", axum::routing::post(v2::websearch_api))
+        .route("/api/websearch/provider", get(v2::websearch_providers_api))
         .route(
             "/api/session/{sessionID}/environment",
             axum::routing::put(v2::session_environment_api),
@@ -5982,31 +5986,94 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/experimental/workspace/{id}",
             axum::routing::delete(v2::workspace_delete),
         )
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth_gate,
-        ))
         // CORS (upstream cors.ts parity) sits OUTSIDE auth: preflights must
-        // answer without credentials, exactly like upstream.
+        // answer without credentials, exactly like upstream. Layer order
+        // matters: in axum/Tower the FIRST .layer() is outermost (runs
+        // first) — so cors is registered BEFORE auth. (The previous order
+        // had auth outer, which 401'd preflights; browsers send no
+        // credentials on preflight, so every browser client broke under
+        // password mode. Probed upstream: preflight → 204, no auth.)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::ui::cors_gate,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_gate,
         ))
         // Catch-all: unmatched paths serve the web UI (embedded upstream-side
         // or proxied to app.opencode.ai), matching v1 serveUIEffect. Disabled
         // via OCSERVE_UI=0 → JSON 404.
         .fallback(crate::ui::ui_fallback)
-        // Upstream's catch-all is a *route*, not a fallback: a known path with
-        // an unknown method (e.g. PATCH /pty/{id}) also gets the SPA, not a
-        // 405. Probed against freeze 2026-10-08.
-        .method_not_allowed_fallback(crate::ui::ui_fallback)
+        // Wrong-method on a bound path: version-split (probed live).
+        // v1 freeze (2026-10-08) serves the SPA; v2 2.0.28 answers 401
+        // unauthenticated / 404 authenticated (probed 2026-10-17) — so
+        // `/api/*` (the v2 surface) must never SPA here. Anything else
+        // keeps the v1 UI fallback.
+        .method_not_allowed_fallback(api_method_fallback)
         .with_state(state)
+}
+
+/// Wrong-method fallback: `/api/*` challenges (unauth) or 404s (authed),
+/// matching v2 exactly; all other paths keep the v1 SPA fallback.
+async fn api_method_fallback(
+    State(st): State<Arc<AppState>>,
+    req: axum::extract::Request,
+) -> Response {
+    if !req.uri().path().starts_with("/api/") {
+        return crate::ui::ui_fallback(State(st), req).await;
+    }
+    if st.auth.is_some() {
+        let authorized = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Basic "))
+            .and_then(|b64| {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.decode(b64).ok()
+            })
+            .map(|raw| {
+                let (user, pass) = st.auth.as_ref().expect("checked is_some");
+                let expect = format!("{user}:{pass}");
+                raw.len() == expect.len() && subtle_compare(&raw, expect.as_bytes())
+            })
+            .unwrap_or(false);
+        if !authorized {
+            return unauthorized_response();
+        }
+    }
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"_tag": "NotFoundError", "message": "Not Found"})),
+    )
+        .into_response()
+}
+
+/// The byte-exact upstream 401 (probed live on 2.0.28). Shared by the auth
+/// gate and the method fallback so the two can never drift apart.
+fn unauthorized_response() -> Response {
+    let body =
+        serde_json::json!({"_tag": "UnauthorizedError", "message": "Authentication required"})
+            .to_string();
+    (
+        StatusCode::UNAUTHORIZED,
+        [
+            (
+                axum::http::header::WWW_AUTHENTICATE,
+                "Basic realm=\"Secure Area\"",
+            ),
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// CORS extras: OCSERVE_CORS (comma-separated) — the `--cors` equivalent.
 /// Config-file `server.cors` support arrives with the config passthrough;
 /// env is the runtime-tunable equivalent until then.
-fn read_cors_env() -> Vec<String> {
+pub(crate) fn read_cors_env() -> Vec<String> {
     std::env::var("OCSERVE_CORS")
         .ok()
         .map(|v| {

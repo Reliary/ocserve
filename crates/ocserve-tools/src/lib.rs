@@ -309,7 +309,12 @@ fn truncate(mut output: String) -> (String, bool) {
 /// subprocess-bearing tools (bash); other tools ignore it. Session vars
 /// supplement (never replace) the process environment — `cmd.envs` only
 /// adds/overrides the named keys.
-pub fn execute(name: &str, input: &Value, cwd: &Path, env: &[(String, String)]) -> Result<ToolResult> {
+pub fn execute(
+    name: &str,
+    input: &Value,
+    cwd: &Path,
+    env: &[(String, String)],
+) -> Result<ToolResult> {
     match name {
         "bash" => bash(input, cwd, env),
         "read" => read(input, cwd),
@@ -832,7 +837,13 @@ mod tests {
 
     #[test]
     fn bash_echo() {
-        let r = execute("bash", &json!({"command": "echo TOOL_OK"}), Path::new("/"), &[]).unwrap();
+        let r = execute(
+            "bash",
+            &json!({"command": "echo TOOL_OK"}),
+            Path::new("/"),
+            &[],
+        )
+        .unwrap();
         assert_eq!(r.output.trim(), "TOOL_OK");
         assert_eq!(r.exit, Some(0));
         assert!(!r.error);
@@ -843,9 +854,7 @@ mod tests {
     fn bash_receives_session_env() {
         // D-ENV unit level: session vars reach the subprocess env; absent
         // keys stay absent (supplement, never replace — PATH survives).
-        let env = vec![
-            ("OCSERVE_UNIT_PROBE".to_string(), "unit_value_7".to_string()),
-        ];
+        let env = vec![("OCSERVE_UNIT_PROBE".to_string(), "unit_value_7".to_string())];
         let r = execute(
             "bash",
             &json!({"command": "echo $OCSERVE_UNIT_PROBE; echo $PATH"}),
@@ -951,7 +960,13 @@ mod tests {
             &[],
         )
         .unwrap();
-        let r = execute("read", &json!({"filePath": fp.to_str().unwrap()}), d.path(), &[]).unwrap();
+        let r = execute(
+            "read",
+            &json!({"filePath": fp.to_str().unwrap()}),
+            d.path(),
+            &[],
+        )
+        .unwrap();
         assert_eq!(r.output, "hello world");
         execute(
             "edit",
@@ -960,7 +975,13 @@ mod tests {
             &[],
         )
         .unwrap();
-        let r2 = execute("read", &json!({"filePath": fp.to_str().unwrap()}), d.path(), &[]).unwrap();
+        let r2 = execute(
+            "read",
+            &json!({"filePath": fp.to_str().unwrap()}),
+            d.path(),
+            &[],
+        )
+        .unwrap();
         assert_eq!(r2.output, "hello ocserve");
         // duplicate match must fail
         let e = execute(
@@ -1090,7 +1111,12 @@ mod drain_tests {
     /// small outputs unaffected (byte-parity path)
     #[test]
     fn small_output_untouched() {
-        let r = bash(&json!({"command": "printf 'hello\n'"}), Path::new("/tmp"), &[]).unwrap();
+        let r = bash(
+            &json!({"command": "printf 'hello\n'"}),
+            Path::new("/tmp"),
+            &[],
+        )
+        .unwrap();
         assert_eq!(r.exit, Some(0));
         assert_eq!(r.output.trim(), "hello");
         assert!(!r.truncated);

@@ -121,7 +121,10 @@ pub async fn search(
                     Some(Hit {
                         url: r.get("url")?.as_str()?.to_string(),
                         title: r.get("title").and_then(|t| t.as_str()).map(str::to_string),
-                        content: r.get("content").and_then(|t| t.as_str()).map(str::to_string),
+                        content: r
+                            .get("content")
+                            .and_then(|t| t.as_str())
+                            .map(str::to_string),
                         published_ms: None,
                     })
                 })
@@ -235,14 +238,9 @@ mod tests {
             );
             sock.write_all(resp.as_bytes()).await.unwrap();
         });
-        let hits = search(
-            "tavily",
-            "k",
-            "q",
-            Some(&format!("http://{addr}")),
-        )
-        .await
-        .expect("stub search works");
+        let hits = search("tavily", "k", "q", Some(&format!("http://{addr}")))
+            .await
+            .expect("stub search works");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].url, "https://example.com/a");
         assert_eq!(hits[0].title.as_deref(), Some("A"));
@@ -255,6 +253,9 @@ mod tests {
     #[tokio::test]
     async fn unknown_provider_is_an_error_not_empty() {
         let r = search("nope", "k", "q", None).await;
-        assert!(r.is_err(), "unknown provider must error (handler maps to 400/503, never empty)");
+        assert!(
+            r.is_err(),
+            "unknown provider must error (handler maps to 400/503, never empty)"
+        );
     }
 }

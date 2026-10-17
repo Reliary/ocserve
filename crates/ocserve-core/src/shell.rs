@@ -47,14 +47,13 @@ impl ShellRegistry {
         }
         // Evict one exited shell to make room (oldest id first = insertion
         // order is not tracked; any exited entry frees the slot).
-        if inner.len() >= SHELL_REGISTRY_CAP {
-            if let Some(victim) = inner
+        if inner.len() >= SHELL_REGISTRY_CAP
+            && let Some(victim) = inner
                 .iter()
                 .find(|(_, e)| e.status != "running")
                 .map(|(k, _)| k.clone())
-            {
-                inner.remove(&victim);
-            }
+        {
+            inner.remove(&victim);
         }
         let id = sh_id();
         let child = std::process::Command::new("sh")
@@ -113,15 +112,15 @@ impl ShellRegistry {
                             }
                         }
                     };
-                    if let Some(mut stdout) = child.stdout.take() {
+                    if let Some(stdout) = child.stdout.take() {
                         // Child has exited: pipes are EOF-terminated, so
                         // blocking reads terminate — no nonblocking needed.
-                        let mut boxed: Box<dyn Read> = Box::new(stdout);
+                        let boxed: Box<dyn Read> = Box::new(stdout);
                         let mut opt = Some(boxed);
                         drain(&mut opt);
                     }
                     if let Some(stderr) = child.stderr.take() {
-                        let mut boxed: Box<dyn Read> = Box::new(stderr);
+                        let boxed: Box<dyn Read> = Box::new(stderr);
                         let mut opt = Some(boxed);
                         drain(&mut opt);
                     }

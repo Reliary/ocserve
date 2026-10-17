@@ -30,6 +30,25 @@ enum Cmd {
         /// 127.0.0.1 default (loopback-only unless overridden).
         #[arg(long)]
         hostname: Option<String>,
+        /// Auth mode. Precedence: --auth-mode flag > OCSERVE_AUTH_MODE env >
+        /// ocserve.toml [server].auth_mode > "off" default (v1 freeze parity:
+        /// passwordless loopback). "basic" challenges EVERY route (incl. SSE,
+        /// /metrics, fallback/405s) with upstream's exact 401
+        /// (`UnauthorizedError`/`Authentication required` +
+        /// `WWW-Authenticate: Basic realm="Secure Area"`).
+        #[arg(long)]
+        auth_mode: Option<String>,
+        /// File containing the basic-auth password (mode 600 enforced at
+        /// read; the path itself is never logged). Precedence:
+        /// --auth-password-file flag > OCSERVE_AUTH_PASSWORD_FILE env >
+        /// ocserve.toml [server].auth_password_file >
+        /// OCSERVE_SERVER_PASSWORD env. Required when mode is "basic"
+        /// (fail-fast otherwise). Deliberate deviation from upstream v2 UX:
+        /// no generated-password-to-stdout (rule 8 absolute — secrets never
+        /// in logs; upstream's `server password` line is read from THEIR log
+        /// by pair-v2, never emitted by us).
+        #[arg(long)]
+        auth_password_file: Option<std::path::PathBuf>,
         #[arg(long)]
         data_dir: Option<std::path::PathBuf>,
     },
@@ -84,10 +103,10 @@ enum ModelsCmd {
     Refresh,
 }
 
-/// Port precedence: explicit `--port` > `OCSERVE_PORT` > 4096 default.
-/// A malformed env value is a fail-fast boot error (SRE §1) — a typo'd port
-/// silently serving elsewhere is worse than refusing to start.
-fn resolve_port(flag: Option<u16>) -> u16 {
+/// Port precedence: explicit `--port` > `OCSERVE_PORT` > ocserve.toml >
+/// 4096 default. A malformed env value is a fail-fast boot error (SRE §1) —
+/// a typo'd port silently serving elsewhere is worse than refusing to start.
+fn resolve_port_with_file(flag: Option<u16>, file: Option<u16>) -> u16 {
     if let Some(p) = flag {
         return p;
     }
@@ -95,11 +114,11 @@ fn resolve_port(flag: Option<u16>) -> u16 {
         Ok(v) if !v.is_empty() => v
             .parse::<u16>()
             .unwrap_or_else(|_| panic!("OCSERVE_PORT is not a valid port number: {v:?}")),
-        _ => 4096,
+        _ => file.unwrap_or(4096),
     }
 }
 
-/// Hostname precedence: explicit flag > env > default. Empty env = unset.
+/// Hostname precedence: explicit flag > env > default. Empty env = unset. Empty env = unset.
 fn resolve_net(flag: Option<String>, env_key: &str, default: &str) -> String {
     if let Some(h) = flag {
         return h;
@@ -126,6 +145,7 @@ mod partition;
 mod replay;
 mod resilience;
 mod runtime;
+mod server_config;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -140,12 +160,27 @@ fn main() -> Result<()> {
         Cmd::Serve {
             port,
             hostname,
+            auth_mode,
+            auth_password_file,
             data_dir,
-        } => rt::block_on(serve(
-            resolve_net(hostname, "OCSERVE_HOSTNAME", "127.0.0.1"),
-            resolve_port(port),
-            data_dir.unwrap_or_else(default_data_dir),
-        )),
+        } => {
+            let data_dir = data_dir.unwrap_or_else(default_data_dir);
+            // ocserve.toml is read AFTER the data dir resolves (it lives
+            // inside it); missing file = defaults (bare-machine invariant).
+            let file_cfg = server_config::load(&data_dir)?;
+            rt::block_on(serve(
+                resolve_net(
+                    hostname,
+                    "OCSERVE_HOSTNAME",
+                    file_cfg.hostname.as_deref().unwrap_or("127.0.0.1"),
+                ),
+                resolve_port_with_file(port, file_cfg.port),
+                auth_mode,
+                auth_password_file,
+                &file_cfg,
+                data_dir,
+            ))
+        }
         Cmd::Doctor { data_dir } => doctor(data_dir.unwrap_or_else(default_data_dir)),
         Cmd::Backup { dest, data_dir } => {
             let dir = data_dir.unwrap_or_else(default_data_dir);
@@ -228,7 +263,14 @@ mod rt {
     }
 }
 
-async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Result<()> {
+async fn serve(
+    hostname: String,
+    port: u16,
+    auth_mode: Option<String>,
+    auth_password_file: Option<std::path::PathBuf>,
+    file_cfg: &server_config::ServerCfg,
+    data_dir: std::path::PathBuf,
+) -> Result<()> {
     use ocserve_http::{AppState, FREEZE_VERSION};
 
     std::fs::create_dir_all(&data_dir)
@@ -343,7 +385,15 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
         }
     }
     let state = AppState::with_wiring(
-        None,
+        // Password mode (SECURITY.md): off = freeze parity (passwordless
+        // loopback); basic = upstream-exact 401 on every route. Resolved
+        // flag > env > ocserve.toml > off; fail-fast on bad mode or missing
+        // password (an open server by typo is the failure to avoid).
+        server_config::resolve_password(
+            &server_config::resolve_auth_mode(auth_mode, file_cfg.auth_mode.as_deref())?,
+            auth_password_file,
+            file_cfg.auth_password_file.clone(),
+        )?,
         payloads,
         ocserve_http::Wires {
             db: db_path,
@@ -714,6 +764,12 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     tracing::info!("  TUI:     opencode attach http://{addr}");
     tracing::info!("  web UI:  open http://{addr}");
 
+    // Perimeter CORS (Phase 1 auth work): preflights must 204 before
+    // routing/auth/fallbacks see them (fallback + MNF responses bypass router
+    // middleware when layers are registered before .fallback() — proven
+    // empirically). Router::layer wraps the fully-built router including its
+    // fallbacks; only short-circuits preflights, passes everything else.
+    let app = app.layer(axum::middleware::from_fn(ocserve_http::ui::perimeter_cors));
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;

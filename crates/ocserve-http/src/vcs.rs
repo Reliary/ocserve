@@ -241,7 +241,7 @@ pub fn branches(dir: &str) -> Value {
         dir,
         &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
     )
-    .filter(|(t, c)| *c == 0)
+    .filter(|(_t, c)| *c == 0)
     .map(|(t, _)| {
         Value::Array(
             t.lines()

@@ -55,7 +55,7 @@ pub fn per_id() -> String {
 pub fn cred_id() -> String {
     let ms = now_ms();
     let nonce: Vec<u8> = std::iter::repeat_with(rand_byte).take(8).collect();
-    format!("cred_{}", encode(ms, &nonce[..8])[..22].to_string())
+    format!("cred_{}", &encode(ms, &nonce[..8])[..22])
 }
 
 /// Upstream `Identifier.ascending()` tail: 13 hex chars = ms*4096+counter

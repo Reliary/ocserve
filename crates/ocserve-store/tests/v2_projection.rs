@@ -1,9 +1,11 @@
 //! V2-PLAN.md P4: real `content[]` projection over stored rows.
 //!
-//! `project_page_v2` maps the v1 part stream (text/reasoning/tool +
-//! envelope parts) to v2 `Session.Message` shapes. Proves: text + reasoning
-//! + completed/error/running tool states, user files/agents, blobbed parts,
+//! `project_page_v2` maps the v1 part stream (text/reasoning/tool and
+//! envelope parts) to v2 `Session.Message` shapes. Proves text and reasoning,
+//! completed/error/running tool states, user files/agents, blobbed parts,
 //! envelope parts excluded, unknown roles dropped, one-IN-query batching.
+//!
+//! Run: `cargo test -p ocserve-store --test v2_projection`.
 
 use ocserve_store::{inbox, writer};
 use serde_json::json;

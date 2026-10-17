@@ -1516,7 +1516,12 @@ pub async fn run_prompt_with(
             // noop, but skipping keeps the writer queue clean); the
             // in-memory aggregate below still feeds the response path.
             if !opts.transient {
-                ocserve_store::accumulate_session_usage(writer, session_id, &step_tokens, step_cost)?;
+                ocserve_store::accumulate_session_usage(
+                    writer,
+                    session_id,
+                    &step_tokens,
+                    step_cost,
+                )?;
             }
             {
                 let bump = |agg: &mut Value, key: &str, v: i64| {
@@ -1934,7 +1939,10 @@ pub async fn run_prompt_with(
                                     metadata: None,
                                 }),
                                 Some(Err(e)) => Err(e),
-                                None => spawn_tool(&call.name, input, &ctx.directory, &session_env).await,
+                                None => {
+                                    spawn_tool(&call.name, input, &ctx.directory, &session_env)
+                                        .await
+                                }
                             }
                         } else {
                             spawn_tool(&call.name, input, &ctx.directory, &session_env).await
@@ -2367,7 +2375,10 @@ pub async fn run_prompt_with(
             );
             // Transient runs never auto-compact (single prompt, no history
             // to relieve — and no session to anchor). The answer stands.
-            if !opts.transient && ctx.compaction.auto && crate::compact::is_overflow(a_total, usable_t) {
+            if !opts.transient
+                && ctx.compaction.auto
+                && crate::compact::is_overflow(a_total, usable_t)
+            {
                 if auto_doom.over() {
                     emit_live(
                         ctx,

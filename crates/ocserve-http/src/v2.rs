@@ -847,12 +847,11 @@ pub async fn config_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         format!("{home}/.config/opencode/opencode.json"),
         format!("{worktree}/opencode.json"),
     ] {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(info) = serde_json::from_str::<Value>(&text) {
-                if info.is_object() {
-                    out.push(json!({"type": "document", "info": info}));
-                }
-            }
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && let Ok(info) = serde_json::from_str::<Value>(&text)
+            && info.is_object()
+        {
+            out.push(json!({"type": "document", "info": info}));
         }
     }
     Json(Value::Array(out))
@@ -1013,7 +1012,7 @@ pub async fn session_export_api(
 /// projectional synergy: indexed SUM/COUNT over stored columns, never
 /// per-row JSON shredding + Effect decode like upstream's stats endpoint).
 pub async fn session_stats_api(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let stats = run_blocking(&st.db, |db| ocserve_store::session_stats_full(db))
+    let stats = run_blocking(&st.db, ocserve_store::session_stats_full)
         .await
         .unwrap_or_default();
     Json(json!({"data": stats}))
@@ -1798,13 +1797,12 @@ async fn regenerate_session_title(st: &Arc<AppState>, sid: &str) -> anyhow::Resu
         Ok::<_, anyhow::Error>(rows.next().transpose()?)
     })
     .await?;
-    if let Some(info_text) = first {
-        if let Ok(info) = serde_json::from_str::<Value>(&info_text) {
-            if let Some(text) = info.get("text").and_then(|v| v.as_str()) {
-                let title: String = text.chars().take(60).collect();
-                ocserve_store::update_session_title(&st.writer, sid, &title)?;
-            }
-        }
+    if let Some(info_text) = first
+        && let Ok(info) = serde_json::from_str::<Value>(&info_text)
+        && let Some(text) = info.get("text").and_then(|v| v.as_str())
+    {
+        let title: String = text.chars().take(60).collect();
+        ocserve_store::update_session_title(&st.writer, sid, &title)?;
     }
     Ok(())
 }
@@ -1882,18 +1880,14 @@ pub async fn session_model_api(
 /// loopback/tailnet clients only, DB file is 600).
 /// Contract-exact: `{data}` with NO location envelope (v2-only route —
 /// nothing v1 requires here, so no union keys).
-pub async fn credential_list_api(
-    State(st): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn credential_list_api(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     use axum::response::IntoResponse;
     if !st.v2_enabled {
         return v2_not_found("global").into_response();
     }
     match ocserve_store::credential_list(&st.db) {
-        Ok(rows) => Json(
-            json!({"data": rows.iter().map(|c| c.to_wire()).collect::<Vec<_>>()}),
-        )
-        .into_response(),
+        Ok(rows) => Json(json!({"data": rows.iter().map(|c| c.to_wire()).collect::<Vec<_>>()}))
+            .into_response(),
         Err(e) => internal(e).into_response(),
     }
 }
@@ -1923,7 +1917,10 @@ pub async fn credential_create_api(
         .and_then(|v| v.as_str())
         .unwrap_or("default")
         .to_string();
-    let active = obj.get("activate").and_then(|v| v.as_bool()).unwrap_or(true);
+    let active = obj
+        .get("activate")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let id = ocserve_core::ids::cred_id();
     let now = now_ms();
     let value_text = value.to_string();
@@ -1952,11 +1949,9 @@ fn validate_credential_value(value: &Value) -> Result<(), HttpError> {
     let t = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let ok = match t {
         "key" => value.get("key").and_then(|v| v.as_str()).is_some(),
-        "oauth" => {
-            ["methodID", "refresh", "access", "expires"]
-                .iter()
-                .all(|k| value.get(k).is_some())
-        }
+        "oauth" => ["methodID", "refresh", "access", "expires"]
+            .iter()
+            .all(|k| value.get(k).is_some()),
         "external" => value.get("methodID").is_some(),
         _ => false,
     };
@@ -2236,9 +2231,7 @@ pub async fn websearch_unimplemented(
 /// GET /api/websearch/provider — the five providers (static id+name list,
 /// verified bytes against 2.0.28). Location is the server directory
 /// (verified live — Instance.directory, not session-scoped).
-pub async fn websearch_providers_api(
-    State(st): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn websearch_providers_api(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     use axum::response::IntoResponse;
     if !st.v2_enabled {
         return v2_not_found("global").into_response();
@@ -2295,15 +2288,13 @@ pub async fn websearch_api(
             }),
         });
     }
-    let fail = || {
-        crate::HttpError::TaggedData {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            tag: "ServiceUnavailableError",
-            fields: json!({
-                "message": format!("Web search request failed: {provider_id}"),
-                "service": provider_id,
-            }),
-        }
+    let fail = || crate::HttpError::TaggedData {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        tag: "ServiceUnavailableError",
+        fields: json!({
+            "message": format!("Web search request failed: {provider_id}"),
+            "service": provider_id,
+        }),
     };
     // Active key for this integration, else the keyless empty path.
     let key = ocserve_store::credential_active_value(&st.db, provider_id)
@@ -3144,7 +3135,6 @@ pub async fn list_messages(
     })
     .await
     .map_err(|e| crate::HttpError::Api(internal(e)))?;
-    let sid2 = id.clone();
     let data = run_blocking(&st.db, move |db| ocserve_store::project_page_v2(db, &msgs))
         .await
         .map_err(|e| crate::HttpError::Api(internal(e)))?;
@@ -3173,16 +3163,13 @@ pub async fn get_message(
     let row_present = row.is_some();
     let info = row.and_then(|v| v.get("info").map(|i| (mid.clone(), i.to_string())));
     let mut projected: Option<Value> = match info {
-        Some((m, info)) => {
-            let sid3 = id.clone();
-            run_blocking(&st.db, move |db| {
-                ocserve_store::project_page_v2(db, &[(m, info)])
-            })
-            .await
-            .map_err(internal)?
-            .into_iter()
-            .next()
-        }
+        Some((m, info)) => run_blocking(&st.db, move |db| {
+            ocserve_store::project_page_v2(db, &[(m, info)])
+        })
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .next(),
         None => None,
     };
     // Unknown roles project to nothing; fall back to the id shell so the
@@ -3280,60 +3267,8 @@ pub async fn session_question(
 // NOTE: the agent/model switch routes are served by `session_agent_api` /
 // `session_model_api` (Phase D: v2 gate, missing-key 400, unknown-session
 // 404, prompt-consistent persist). The older `switch_agent`/`switch_model`
-// pair was removed (single owner per route).
-
-async fn set_session_field(
-    st: &AppState,
-    id: &str,
-    field: &str,
-    val: Value,
-) -> Result<(), crate::HttpError> {
-    let col = match field {
-        "agent" => "agent",
-        "model" => "model",
-        _ => {
-            return Err(crate::HttpError::Api(ApiError {
-                status: StatusCode::BAD_REQUEST,
-                name: "BadRequest",
-                message: format!("unknown field {field}"),
-            }));
-        }
-    };
-    // freeze 404s an unknown session (SessionNotFoundError); the old code ran
-    // the UPDATE blind and 204'd regardless of rows affected.
-    // Perf dive 2026-10-11: blocking store calls on this async handler's
-    // worker — move both the existence check and the write to the blocking
-    // pool (F1 class).
-    let db = st.db.clone();
-    let id_check = id.to_string();
-    let exists = tokio::task::spawn_blocking(move || ocserve_store::session_exists(&db, &id_check))
-        .await
-        .map_err(|e| crate::HttpError::Api(internal(anyhow::anyhow!("exists join: {e}"))))?
-        .map_err(|e| crate::HttpError::Api(internal(e)))?;
-    if !exists {
-        return Err(session_not_found(id));
-    }
-    let text = if field == "model" && val.is_object() {
-        val.to_string()
-    } else if let Some(s) = val.as_str() {
-        s.to_string()
-    } else {
-        val.to_string()
-    };
-    let w = st.writer.clone();
-    let id_w = id.to_string();
-    let col_w = col.to_string();
-    tokio::task::spawn_blocking(move || {
-        w.write(vec![ocserve_store::WriteOp::Sql {
-            sql: format!("UPDATE session SET {col_w} = ?2 WHERE id = ?1"),
-            params: vec![id_w.into(), text.into()],
-        }])
-    })
-    .await
-    .map_err(|e| crate::HttpError::Api(internal(anyhow::anyhow!("write join: {e}"))))?
-    .map_err(|e| crate::HttpError::Api(internal(e)))?;
-    Ok(())
-}
+// pair and the unused `set_session_field` helper were removed (single owner
+// per route).
 
 // ---------------------------------------------------------------------------
 // experimental stubs (freeze-probed shapes)
@@ -3969,14 +3904,14 @@ pub async fn update_project(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
     let allowed = ["canonical", "name", "icon", "commands"];
-    if let Some(obj) = body.as_object() {
-        if let Some(bad) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
-            return Err(crate::HttpError::TaggedData {
-                status: StatusCode::BAD_REQUEST,
-                tag: "InvalidRequestError",
-                fields: json!({"message": format!("unknown key {bad}")}),
-            });
-        }
+    if let Some(obj) = body.as_object()
+        && let Some(bad) = obj.keys().find(|k| !allowed.contains(&k.as_str()))
+    {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": format!("unknown key {bad}")}),
+        });
     }
     // No persistent project registry exists (projects derive from session
     // rows); the update is accepted for the global/server project only.
@@ -4066,7 +4001,7 @@ pub async fn form_create(
     // The abort guard lives inside the gate (released on settle); the
     // receiver is the runner's end. HTTP create does not wait — reply/cancel
     // routes settle. (A runner-side wait path arrives with the tool adapter.)
-    let _ = rx;
+    drop(rx);
     ocserve_store::form::create(
         &st.writer,
         &id,

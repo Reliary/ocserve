@@ -91,10 +91,12 @@ fn setup_with_v2(addr: std::net::SocketAddr, v2: bool) -> Arc<AppState> {
         systems: Default::default(),
         default_agent: "build".into(),
     };
-    let mut payloads = Payloads::default();
     // One seeded agent so the detail route has a positive case (the list
     // and detail share `api_agent_item` — same projector, one shape).
-    payloads.api_agent = vec![json!({"name": "build", "mode": "subagent"})];
+    let payloads = Payloads {
+        api_agent: vec![json!({"name": "build", "mode": "subagent"})],
+        ..Default::default()
+    };
     let st = AppState::with_wiring_and_v2(
         None,
         payloads,
@@ -1152,7 +1154,12 @@ async fn v2_phase_f_gap_closure() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|e| (e["id"].as_str().unwrap().to_string(), e["active"].as_bool().unwrap()))
+        .map(|e| {
+            (
+                e["id"].as_str().unwrap().to_string(),
+                e["active"].as_bool().unwrap(),
+            )
+        })
         .collect();
     assert!(states.iter().find(|(id, _)| id == &cid).map(|(_, a)| *a) == Some(false));
     assert!(states.iter().find(|(id, _)| id == &cid2).map(|(_, a)| *a) == Some(true));
@@ -1164,7 +1171,12 @@ async fn v2_phase_f_gap_closure() {
     // Validation: missing integrationID/value → 400; bad value → Payload error.
     let (s, _) = post(&app, "/api/credential", json!({"label": "x"})).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
-    let (s, v) = post(&app, "/api/credential", json!({"integrationID": "t", "value": {"type": "api", "key": "k"}})).await;
+    let (s, v) = post(
+        &app,
+        "/api/credential",
+        json!({"integrationID": "t", "value": {"type": "api", "key": "k"}}),
+    )
+    .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert_eq!(v["kind"], "Payload");
     // CONTROL: store without single-active → both active, red.
@@ -1226,7 +1238,8 @@ async fn v2_phase_f_gap_closure() {
 }
 
 #[tokio::test]
-async fn v2_shell_item_drains_through_executor() {    // A shell admit (default resume) wakes the drain; the turn runs through
+async fn v2_shell_item_drains_through_executor() {
+    // A shell admit (default resume) wakes the drain; the turn runs through
     // the shared executor (tools off, no title), the inbox empties, and the
     // claim releases. Proves typed execution, not just admission.
     let addr = spawn_stub_provider();
@@ -1315,14 +1328,14 @@ async fn v2_drain_runs_turn_and_releases_claim() {
         .unwrap();
     if assistants < 1 {
         let conn2 = ocserve_store::pragma::open_reader(&st.db).unwrap();
-        let msgs: Vec<String> = conn2
+        let _msgs: Vec<String> = conn2
             .prepare("SELECT id || ':' || role FROM msg")
             .unwrap()
             .query_map([], |r| r.get(0))
             .unwrap()
             .flatten()
             .collect();
-        let evts: Vec<String> = conn2
+        let _evts: Vec<String> = conn2
             .prepare("SELECT type FROM event")
             .unwrap()
             .query_map([], |r| r.get(0))
@@ -1418,9 +1431,7 @@ fn spawn_env_provider(
     addr
 }
 
-fn setup_with_env_provider(
-    addr: std::net::SocketAddr,
-) -> Arc<AppState> {
+fn setup_with_env_provider(addr: std::net::SocketAddr) -> Arc<AppState> {
     let dir = std::env::temp_dir().join(format!(
         "ocserve-v2env-{}-{}",
         std::process::id(),
@@ -1530,7 +1541,12 @@ async fn v2_environment_injects_into_tools_not_provider() {
     }
     let (s, _) = put(&app, "/api/session/ses_env/environment", json!({})).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
-    let (s, _) = put(&app, "/api/session/ses_nope/environment", json!({"variables": {}})).await;
+    let (s, _) = put(
+        &app,
+        "/api/session/ses_nope/environment",
+        json!({"variables": {}}),
+    )
+    .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     // Replace semantics: second PUT overwrites the first wholesale.
     let (s, _) = put(
@@ -1578,7 +1594,12 @@ async fn v2_environment_injects_into_tools_not_provider() {
                 .filter_map(|r| r.ok())
                 .collect();
             for id in asked {
-                let (s, _) = post(&app, &format!("/permission/{id}/reply"), json!({"reply": "always"})).await;
+                let (s, _) = post(
+                    &app,
+                    &format!("/permission/{id}/reply"),
+                    json!({"reply": "always"}),
+                )
+                .await;
                 assert_eq!(s, StatusCode::OK);
             }
         }
@@ -1665,7 +1686,10 @@ async fn v2_rpc_exact_unavailable_bytes() {
         assert_eq!(s, StatusCode::BAD_REQUEST, "rpc {rpc_id}");
         assert_eq!(v["_tag"], "RpcError");
         assert_eq!(v["type"], "rpc.unavailable");
-        assert_eq!(v["message"], format!("RPC is unavailable: {rpc_id}").as_str());
+        assert_eq!(
+            v["message"],
+            format!("RPC is unavailable: {rpc_id}").as_str()
+        );
     }
     // Missing/invalid body → the exact Payload error (verified live).
     let (s, v) = post(&app, "/api/rpc/fakeplugin/m", json!({})).await;
@@ -1689,7 +1713,7 @@ async fn v2_websearch_validation_keyless_and_partial() {
         uri: &str,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
-        let mut b = Request::builder().method(method).uri(uri);
+        let b = Request::builder().method(method).uri(uri);
         let req = match body {
             Some(v) => b
                 .header("content-type", "application/json")

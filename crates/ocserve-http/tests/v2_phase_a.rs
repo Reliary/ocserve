@@ -265,7 +265,7 @@ async fn phase_b_session_aliases() {
     let (s, _) = post(&app, "/api/session/ses_pb/fork", json!({"before": "msgx"})).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     // fork unknown session → tagged 404.
-    let (s, v) = post(&app, "/api/session/ses_nope/fork", json!({})).await;
+    let (s, _v) = post(&app, "/api/session/ses_nope/fork", json!({})).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 
     // background: 204 + recorded; unknown session → 404.

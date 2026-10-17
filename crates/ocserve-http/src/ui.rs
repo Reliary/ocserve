@@ -75,7 +75,61 @@ fn is_opencode_ai_origin(origin: &str) -> bool {
     })
 }
 
-/// Hand-rolled CORS middleware with exact freeze parity (probed live):
+/// Build a 204 preflight response for an allowed origin (shared constructor:
+/// the perimeter layer and the in-router gate must never drift apart).
+pub fn preflight_response(origin: &str, req_headers: &axum::http::HeaderMap) -> Response {
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        "access-control-allow-origin",
+        HeaderValue::from_str(origin).unwrap_or(HeaderValue::from_static("*")),
+    );
+    h.insert(
+        "vary",
+        HeaderValue::from_static("Access-Control-Request-Headers, Origin"),
+    );
+    h.insert(
+        "access-control-allow-methods",
+        HeaderValue::from_static("GET, HEAD, PUT, PATCH, POST, DELETE"),
+    );
+    // echo the requested headers (freeze behavior; empty when absent)
+    if let Some(reqh) = req_headers.get("access-control-request-headers").cloned() {
+        h.insert("access-control-allow-headers", reqh);
+    } else {
+        h.insert("access-control-allow-headers", HeaderValue::from_static(""));
+    }
+    h.insert("access-control-max-age", HeaderValue::from_static("86400"));
+    resp
+}
+
+/// Perimeter CORS layer (serve-time, OUTSIDE the router): answers preflights
+/// before routing/auth/fallbacks ever see them. This exists because fallback
+/// and method-not-allowed responses bypass router middleware in our builder
+/// order (proven empirically: preflights resolved to ui_fallback/MNF with no
+/// 204 and no ACAO, while routed responses carry ACAO). Passes everything
+/// else through untouched (the in-router gate still decorates routed
+/// responses; no double headers — this layer only short-circuits).
+pub async fn perimeter_cors(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    use axum::http::Method;
+    let is_preflight = req.method() == Method::OPTIONS
+        && req.headers().contains_key("access-control-request-method");
+    if is_preflight {
+        let origin = req
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        // Same predicate as the in-router gate, including OCSERVE_CORS extras
+        // (one source of truth; the two must never disagree on an origin).
+        let extra = crate::read_cors_env();
+        if let Some(o) = origin
+            && is_allowed_cors_origin(&o, &extra)
+        {
+            return preflight_response(&o, req.headers());
+        }
+    }
+    next.run(req).await
+}
 /// preflight → 204 with ACAO + echoed ACAH + ACM 4 methods... actually the
 /// freeze method list is GET, HEAD, PUT, PATCH, POST, DELETE, ACAH echoes the
 /// requested list, max-age 86400, `Vary: Access-Control-Request-Headers,
@@ -103,28 +157,8 @@ pub async fn cors_gate(
         let Some(origin) = origin else {
             return next.run(req).await;
         };
-        let mut resp = StatusCode::NO_CONTENT.into_response();
-        let h = resp.headers_mut();
-        h.insert(
-            "access-control-allow-origin",
-            HeaderValue::from_str(&origin).unwrap_or(HeaderValue::from_static("*")),
-        );
-        h.insert(
-            "vary",
-            HeaderValue::from_static("Access-Control-Request-Headers, Origin"),
-        );
-        h.insert(
-            "access-control-allow-methods",
-            HeaderValue::from_static("GET, HEAD, PUT, PATCH, POST, DELETE"),
-        );
-        // echo the requested headers (freeze behavior; empty when absent)
-        if let Some(reqh) = req.headers().get("access-control-request-headers").cloned() {
-            h.insert("access-control-allow-headers", reqh);
-        } else {
-            h.insert("access-control-allow-headers", HeaderValue::from_static(""));
-        }
-        h.insert("access-control-max-age", HeaderValue::from_static("86400"));
-        return resp;
+        // Shared constructor (perimeter layer uses the same one).
+        return preflight_response(&origin, req.headers());
     }
 
     let mut resp = next.run(req).await;

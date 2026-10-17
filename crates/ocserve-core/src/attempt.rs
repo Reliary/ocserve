@@ -6,7 +6,7 @@
 //! Attempts are IN-MEMORY (upstream attempts don't survive restarts either —
 //! they gate live OAuth/command handshakes, not durable state).
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -153,6 +153,7 @@ pub fn att_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[tokio::test]
     async fn complete_delivers_cancel_settles() {
