@@ -106,6 +106,17 @@ embed second pack, `OCSERVE_UI_PACK` flag, per-tag skew guard.
 rpc, websearch, credential-backend: tagged 404 + named divergence with build
 triggers. Revisit only on observed client demand.
 
+### Phase G — gap closure (exit: 142/142 bound, zero named gaps; landed 2026-10-17)
+All five Phase-F verdicts closed against live 2.0.28 probes (K-V2-GAPS):
+experimental generate via `RunOpts.transient` (zero session-side effects);
+credential store (single-active-per-integration, 600 DB mode); session env
+PUT + subprocess injection (provider-clean by construction); RPC byte-exact
+400 (no enabling state exists); websearch list + keyed Tavily/Exa direct
+(D-WEBSEARCH-PARTIAL for the rest). Techniques: live-oracle-first (every
+behavior probed against the real binary before building), branch-by-
+abstraction (one executor, one tools fn, additive tables), exact-error
+parity where no success state is constructible.
+
 ## 4. Maintenance machine
 
 `bump.sh <line> <version>`: acquire → re-vendor (6 artifacts) → contract-diff

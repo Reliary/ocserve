@@ -1029,7 +1029,7 @@ async fn v2_l_family_honest_errors() {
     let st = setup_with_v2(addr, true);
     let app = ocserve_http::router(st);
 
-    async fn post(app: &axum::Router, uri: &str) -> (StatusCode, String) {
+    async fn post(app: &axum::Router, uri: &str, body: &str) -> (StatusCode, String) {
         let resp = app
             .clone()
             .oneshot(
@@ -1037,7 +1037,7 @@ async fn v2_l_family_honest_errors() {
                     .method("POST")
                     .uri(uri)
                     .header("content-type", "application/json")
-                    .body(Body::from("{}"))
+                    .body(Body::from(body.to_string()))
                     .unwrap(),
             )
             .await
@@ -1047,14 +1047,18 @@ async fn v2_l_family_honest_errors() {
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    let (s, b) = post(&app, "/api/rpc/some-plugin/method").await;
-    assert_eq!(s, StatusCode::NOT_FOUND);
-    assert!(b.contains("RpcError") && b.contains("D-RPC"), "body: {b}");
+    // rpc/websearch are covered exactly by their dedicated tests
+    // (v2_rpc_exact_unavailable_bytes,
+    // v2_websearch_validation_keyless_and_partial); here only the
+    // never-HTML invariant is re-asserted on both paths.
+    let (s, b) = post(&app, "/api/rpc/some-plugin/method", r#"{"input":{}}"#).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(b.contains("RpcError"), "body: {b}");
     assert!(!b.contains("<!doctype"), "must never be SPA HTML");
 
-    let (s, b) = post(&app, "/api/websearch").await;
-    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(b.contains("D-WEBSEARCH"), "body: {b}");
+    let (s, b) = post(&app, "/api/websearch", r#"{"query":"q"}"#).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(b.contains("websearch_provider_required"), "body: {b}");
 
     // CONTROL: stub 200 with plausible JSON → asserts fail (never do this).
 }
@@ -1065,6 +1069,7 @@ async fn v2_phase_f_gap_closure() {
     // location reload, plugin check/update, vcs init.
     let addr = spawn_stub_provider();
     let st = setup_with_v2(addr, true);
+    let db_path = st.db.clone();
     let app = ocserve_http::router(st);
 
     async fn get(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
@@ -1115,25 +1120,84 @@ async fn v2_phase_f_gap_closure() {
     let (s, _) = get(&app, "/api/agent/nope").await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 
-    // Credential: list empty, create/activate 501 (never fake success).
+    // Credential: full CRUD cycle (verified live semantics on 2.0.28).
+    // Create with key value → entry echoed back (cred_ id, active default).
+    let (s, v) = post(
+        &app,
+        "/api/credential",
+        json!({"integrationID": "tavily", "label": "t1", "value": {"type": "key", "key": "k1"}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body {v}");
+    let cid = v["data"]["id"].as_str().unwrap().to_string();
+    assert!(cid.starts_with("cred_"), "id shape {cid}");
+    assert_eq!(v["data"]["active"], true);
+    assert_eq!(v["data"]["value"]["key"], "k1");
+    // List echoes the entry.
     let (s, v) = get(&app, "/api/credential").await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["data"], json!([]));
-    let (s, v) = post(&app, "/api/credential", json!({"type": "oauth"})).await;
-    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(v["message"].as_str().unwrap_or("").contains("D-CREDENTIAL"));
-    let (s, _) = post(&app, "/api/credential/x/activate", json!({})).await;
-    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(v["data"].as_array().map(|a| a.len()), Some(1));
+    // Second create single-actives the first (per-integration scope).
+    let (s, v) = post(
+        &app,
+        "/api/credential",
+        json!({"integrationID": "tavily", "label": "t2", "value": {"type": "key", "key": "k2"}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let cid2 = v["data"]["id"].as_str().unwrap().to_string();
+    let (s, v) = get(&app, "/api/credential").await;
+    assert_eq!(s, StatusCode::OK);
+    let states: Vec<(String, bool)> = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["id"].as_str().unwrap().to_string(), e["active"].as_bool().unwrap()))
+        .collect();
+    assert!(states.iter().find(|(id, _)| id == &cid).map(|(_, a)| *a) == Some(false));
+    assert!(states.iter().find(|(id, _)| id == &cid2).map(|(_, a)| *a) == Some(true));
+    // Activate flips back (204); unknown id = 204 no-op (verified live).
+    let (s, _) = post(&app, &format!("/api/credential/{cid}/activate"), json!({})).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = post(&app, "/api/credential/cred_nope/activate", json!({})).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    // Validation: missing integrationID/value → 400; bad value → Payload error.
+    let (s, _) = post(&app, "/api/credential", json!({"label": "x"})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, v) = post(&app, "/api/credential", json!({"integrationID": "t", "value": {"type": "api", "key": "k"}})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(v["kind"], "Payload");
+    // CONTROL: store without single-active → both active, red.
 
-    // Experimental generate: sessionless → 501 with the named divergence.
+    // Experimental generate: sessionless single-turn through the shared
+    // executor (transient) — real text back, zero session-side effects.
     let (s, v) = post(&app, "/api/experimental/generate", json!({"prompt": "hi"})).await;
-    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(
-        v["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("D-GENERATE-EPHEMERAL")
-    );
+    assert_eq!(s, StatusCode::OK, "body {v}");
+    assert_eq!(v["data"]["text"], "hi");
+    // No session row, no messages, no events for the phantom id.
+    let conn = ocserve_store::pragma::open_reader(&db_path).unwrap();
+    let sessions: i64 = conn
+        .query_row("SELECT count(*) FROM session", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(sessions, 1, "only the seeded ses_v2a may exist");
+    let phantom_msgs: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM msg WHERE session_id = 'ses_transient_generate'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(phantom_msgs, 0, "transient run must persist nothing");
+    let phantom_events: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM event WHERE session_id = 'ses_transient_generate'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(phantom_events, 0, "transient run must emit nothing durable");
+    // CONTROL: executor without the transient guards → 503 at the
+    // session-exists bail (proven by planting transient:false), red.
 
     // Location reload: honest 204 (live-derived, nothing stale).
     let (s, _) = post(&app, "/api/location/reload", json!({})).await;
@@ -1287,4 +1351,415 @@ async fn v2_drain_runs_turn_and_releases_claim() {
     assert_eq!((started, done), (1, 1));
 
     // CONTROL: drain that skips claim release → held stays true, red.
+}
+
+// ---------------------------------------------------------------------------
+// Gap closure e2e: environment PUT → turn injection → provider cleanliness.
+// ---------------------------------------------------------------------------
+
+/// Step 1 orders `bash echo $OCSERVE_ENV_PROBE`; step 2 finishes with text.
+/// Bodies are captured to prove session vars never reach the provider.
+const ENV_STEP1: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_env1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"echo $OCSERVE_ENV_PROBE\\\"}\"}}]}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\ndata: [DONE]\n\n";
+const ENV_STEP2: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\ndata: [DONE]\n\n";
+
+fn spawn_env_provider(
+    bodies: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+) -> std::net::SocketAddr {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    std::thread::spawn(move || {
+        for sock in listener.incoming().flatten() {
+            let bodies = bodies.clone();
+            let n = n.clone();
+            std::thread::spawn(move || {
+                let mut sock = sock;
+                let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut got = Vec::new();
+                let mut buf = [0u8; 8192];
+                let head_end = loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) => return,
+                        Ok(k) => got.extend_from_slice(&buf[..k]),
+                        Err(_) => return,
+                    }
+                    if let Some(pos) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&got[..head_end]).to_string();
+                let clen = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while got.len() < head_end + clen {
+                    match sock.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(k) => got.extend_from_slice(&buf[..k]),
+                        Err(_) => break,
+                    }
+                }
+                bodies
+                    .lock()
+                    .push(String::from_utf8_lossy(&got[head_end..]).into_owned());
+                let step = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let sse = if step == 0 { ENV_STEP1 } else { ENV_STEP2 };
+                let _ = sock.write_all(sse.as_bytes());
+                let _ = sock.flush();
+            });
+        }
+    });
+    addr
+}
+
+fn setup_with_env_provider(
+    addr: std::net::SocketAddr,
+) -> Arc<AppState> {
+    let dir = std::env::temp_dir().join(format!(
+        "ocserve-v2env-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // The session worktree must EXIST (bash spawns with cwd=directory;
+    // a phantom "/w" fails spawn with ENOENT — real sessions have dirs).
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let db = ocserve_store::writer::db_path(&dir);
+    let writer = Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
+    let blobs = Arc::new(ocserve_store::BlobStore::new(dir.join("blobs")).unwrap());
+    let llm = LlmRegistry {
+        limits: Default::default(),
+        endpoints: [("fake".into(), (format!("http://{addr}"), String::new()))]
+            .into_iter()
+            .collect(),
+        pricing: Default::default(),
+        default_model: ("fake".into(), "m".into()),
+        systems: Default::default(),
+        default_agent: "build".into(),
+    };
+    let st = AppState::with_wiring_and_v2(
+        None,
+        Payloads::default(),
+        Wires {
+            db,
+            blobs,
+            writer,
+            llm,
+        },
+        true,
+    );
+    ocserve_store::insert_session(
+        &st.writer,
+        &json!({
+            "id": "ses_env", "projectID": "global",
+            "directory": work.to_str().unwrap(),
+            "path": "ses_env", "slug": "ses_env", "title": "env", "version": "1",
+            "time": {"created": 1, "updated": 2},
+        }),
+    )
+    .unwrap();
+    st
+}
+
+#[tokio::test]
+async fn v2_environment_injects_into_tools_not_provider() {
+    // PUT vars → prompt a turn whose stub orders `bash echo $VAR` →
+    // the tool result carries the value (injection works) AND no captured
+    // provider body contains it (no prompt-text contamination).
+    let bodies = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+    let addr = spawn_env_provider(bodies.clone());
+    let st = setup_with_env_provider(addr);
+    let db_path = st.db.clone();
+    let app = ocserve_http::router(st);
+
+    async fn post(app: &axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    // PUT validation first: missing variables → 400; unknown session → 404.
+    // (Dedicated PUT helper: the shared `post` sends POST, which misses the
+    // PUT-only route and falls through to the SPA 200 — a test-harness trap,
+    // not server behavior.)
+    async fn put(app: &axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+    let (s, _) = put(&app, "/api/session/ses_env/environment", json!({})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = put(&app, "/api/session/ses_nope/environment", json!({"variables": {}})).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    // Replace semantics: second PUT overwrites the first wholesale.
+    let (s, _) = put(
+        &app,
+        "/api/session/ses_env/environment",
+        json!({"variables": {"OCSERVE_ENV_PROBE": "probe_value_42", "STALE": "x"}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = put(
+        &app,
+        "/api/session/ses_env/environment",
+        json!({"variables": {"OCSERVE_ENV_PROBE": "probe_value_42"}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    // Start the turn, auto-approve the bash ask, wait for idle.
+    let (s, _) = post(
+        &app,
+        "/session/ses_env/prompt_async",
+        json!({
+            "messageID": "msg_env00000000000000000001",
+            "parts": [{"type": "text", "text": "run it"}],
+            "model": {"providerID": "fake", "modelID": "m"},
+            "agent": "build",
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    for _ in 0..800 {
+        {
+            let conn = ocserve_store::pragma::open_reader(&db_path).unwrap();
+            let asked: Vec<String> = conn
+                .prepare(
+                    "SELECT json_extract(payload,'$.id') FROM event \
+                     WHERE session_id='ses_env' AND type IN ('permission.asked', 'permission.asked@v1') \
+                     AND (SELECT count(*) FROM event e2 WHERE e2.session_id='ses_env' \
+                          AND e2.type IN ('permission.replied', 'permission.replied@v1') \
+                          AND json_extract(e2.payload,'$.requestID') = json_extract(event.payload,'$.id')) = 0",
+                )
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            for id in asked {
+                let (s, _) = post(&app, &format!("/permission/{id}/reply"), json!({"reply": "always"})).await;
+                assert_eq!(s, StatusCode::OK);
+            }
+        }
+        let conn = ocserve_store::pragma::open_reader(&db_path).unwrap();
+        let busy: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM event WHERE session_id='ses_env' \
+                 AND type IN ('session.status', 'session.status@v1') \
+                 AND json_extract(payload,'$.status.type') = 'busy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let assistants: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM msg WHERE session_id='ses_env' AND role='assistant'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if busy == 0 && assistants >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    // The bash tool result carries the injected value.
+    let conn = ocserve_store::pragma::open_reader(&db_path).unwrap();
+    let outputs: Vec<String> = conn
+        .prepare("SELECT inline FROM msg_part WHERE session_id='ses_env'")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert!(
+        outputs.iter().any(|o| o.contains("probe_value_42")),
+        "tool result must carry the injected var"
+    );
+    // ...but the FIRST provider request (pre-tool, prompt construction)
+    // must not contain it (vars never enter the prompt — subprocess env
+    // only). Later requests legitimately echo the value INSIDE the bash
+    // tool result (tool outputs return to the model — same as upstream).
+    let locked = bodies.lock();
+    assert!(!locked.is_empty(), "stub must see provider traffic");
+    assert!(
+        !locked[0].contains("probe_value_42"),
+        "session vars must not leak into the constructed prompt"
+    );
+    // CONTROL: run without PUT vars → tool result lacks the value, red.
+}
+
+#[tokio::test]
+async fn v2_rpc_exact_unavailable_bytes() {
+    // Byte-exact RpcError for every state (verified live: no constructible
+    // state enables RPC — fake ids, real builtin plugin ids alike).
+    let addr = spawn_stub_provider();
+    let st = setup_with_v2(addr, true);
+    let app = ocserve_http::router(st);
+
+    async fn post(app: &axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    for rpc_id in ["fakeplugin", "opencode.websearch.tavily", "opencode.agent"] {
+        let (s, v) = post(&app, &format!("/api/rpc/{rpc_id}/m"), json!({"input": {}})).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "rpc {rpc_id}");
+        assert_eq!(v["_tag"], "RpcError");
+        assert_eq!(v["type"], "rpc.unavailable");
+        assert_eq!(v["message"], format!("RPC is unavailable: {rpc_id}").as_str());
+    }
+    // Missing/invalid body → the exact Payload error (verified live).
+    let (s, v) = post(&app, "/api/rpc/fakeplugin/m", json!({})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(v["message"], "Expected Rpc.Input");
+    assert_eq!(v["kind"], "Payload");
+    // CONTROL: 404-or-typeless error → asserts fail, red.
+}
+
+#[tokio::test]
+async fn v2_websearch_validation_keyless_and_partial() {
+    // Validation is byte-exact; keyless known providers return empty
+    // results (observed exa behavior); unsupported backends 503.
+    let addr = spawn_stub_provider();
+    let st = setup_with_v2(addr, true);
+    let app = ocserve_http::router(st);
+
+    async fn verb(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut b = Request::builder().method(method).uri(uri);
+        let req = match body {
+            Some(v) => b
+                .header("content-type", "application/json")
+                .body(Body::from(v.to_string()))
+                .unwrap(),
+            None => b.body(Body::empty()).unwrap(),
+        };
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    // Provider list: the verified five, server directory location.
+    let (s, v) = verb(&app, "GET", "/api/websearch/provider", None).await;
+    assert_eq!(s, StatusCode::OK);
+    let ids: Vec<&str> = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["exa", "firecrawl", "parallel", "tavily", "tinyfish"]);
+    // Missing providerID → required error; unknown → not-found error.
+    let (s, v) = verb(&app, "POST", "/api/websearch", Some(json!({"query": "q"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(v["kind"], "websearch_provider_required");
+    assert_eq!(v["field"], "providerID");
+    let (s, v) = verb(
+        &app,
+        "POST",
+        "/api/websearch",
+        Some(json!({"query": "q", "providerID": "nope"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(v["kind"], "websearch_provider_not_found");
+    // Keyless known provider → empty results (no keyring hit, no backend).
+    let (s, v) = verb(
+        &app,
+        "POST",
+        "/api/websearch",
+        Some(json!({"query": "q", "providerID": "tavily"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body {v}");
+    assert_eq!(v["data"]["providerID"], "tavily");
+    assert_eq!(v["data"]["results"], json!([]));
+    // Unsupported backend WITH a key → the backend-failure envelope
+    // (same shape upstream emits when ITS backend fails).
+    let (s, _) = verb(
+        &app,
+        "POST",
+        "/api/credential",
+        Some(json!({"integrationID": "firecrawl", "value": {"type": "key", "key": "k"}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, v) = verb(
+        &app,
+        "POST",
+        "/api/websearch",
+        Some(json!({"query": "q", "providerID": "firecrawl"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(v["message"], "Web search request failed: firecrawl");
+    assert_eq!(v["service"], "firecrawl");
+    // CONTROL: fabricated results for keyless → empty-results assert red.
 }

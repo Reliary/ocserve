@@ -104,6 +104,7 @@ pub mod tui;
 pub mod ui;
 pub mod v2;
 pub mod vcs;
+pub mod websearch;
 
 /// Upstream error envelope: {"name":"NotFoundError","data":{"message":"..."}} (captured live).
 pub struct ApiError {
@@ -4951,7 +4952,8 @@ async fn post_shell(
         let cmd = json!({"command": command});
         let d = dir.clone();
         tokio::task::spawn_blocking(move || {
-            ocserve_tools::execute("bash", &cmd, std::path::Path::new(&d))
+            // v1 shell route: no session scope, so no session env (empty).
+            ocserve_tools::execute("bash", &cmd, std::path::Path::new(&d), &[])
         })
         .await
         .map_err(|e| ApiError {
@@ -5738,12 +5740,20 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::post(v2::session_skill_api),
         )
         .route(
-            "/api/rpc/{*path}",
+            "/api/rpc/{rpcID}/{method}",
             axum::routing::post(v2::rpc_unimplemented),
         )
         .route(
             "/api/websearch",
-            axum::routing::post(v2::websearch_unimplemented),
+            axum::routing::post(v2::websearch_api),
+        )
+        .route(
+            "/api/websearch/provider",
+            get(v2::websearch_providers_api),
+        )
+        .route(
+            "/api/session/{sessionID}/environment",
+            axum::routing::put(v2::session_environment_api),
         )
         .route("/api/agent/{agentID}", get(v2::agent_detail_api))
         .route(

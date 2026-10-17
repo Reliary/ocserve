@@ -1877,35 +1877,103 @@ pub async fn session_model_api(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// GET /api/credential — honestly empty inventory (D-CREDENTIAL: no
-/// secret store exists; the list is `[]`, never fabricated entries).
+/// GET /api/credential — `{data: Credential.Entry[]}` in creation order
+/// (values echoed — upstream parity, verified live; authenticated
+/// loopback/tailnet clients only, DB file is 600).
 /// Contract-exact: `{data}` with NO location envelope (v2-only route —
 /// nothing v1 requires here, so no union keys).
 pub async fn credential_list_api(
     State(st): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    use axum::response::IntoResponse;
+    if !st.v2_enabled {
+        return v2_not_found("global").into_response();
+    }
+    match ocserve_store::credential_list(&st.db) {
+        Ok(rows) => Json(
+            json!({"data": rows.iter().map(|c| c.to_wire()).collect::<Vec<_>>()}),
+        )
+        .into_response(),
+        Err(e) => internal(e).into_response(),
+    }
+}
+
+/// POST /api/credential — create (`{integrationID!, label?, value!, activate?}`
+/// → `{data: entry}`). Label defaults "default", active defaults true and
+/// single-actives same-integration siblings (verified live). Value union
+/// validated structurally (key/oauth/external + required fields); unknown
+/// integrationIDs accepted (verified live — no registry check).
+pub async fn credential_create_api(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
     if !st.v2_enabled {
         return Err(v2_not_found("global"));
     }
-    Ok(Json(json!({"data": []})))
+    let obj = body.as_object().cloned().unwrap_or_default();
+    let Some(integration_id) = obj.get("integrationID").and_then(|v| v.as_str()) else {
+        return Err(bad_request("Missing key\n  at [\"integrationID\"]"));
+    };
+    let Some(value) = obj.get("value") else {
+        return Err(bad_request("Missing key\n  at [\"value\"]"));
+    };
+    validate_credential_value(value)?;
+    let label = obj
+        .get("label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default")
+        .to_string();
+    let active = obj.get("activate").and_then(|v| v.as_bool()).unwrap_or(true);
+    let id = ocserve_core::ids::cred_id();
+    let now = now_ms();
+    let value_text = value.to_string();
+    ocserve_store::credential_create(
+        &st.writer,
+        &id,
+        Some(integration_id),
+        &label,
+        &value_text,
+        active,
+        now,
+    )
+    .map_err(internal)?;
+    let entry = ocserve_store::credential_list(&st.db)
+        .map_err(internal)?
+        .into_iter()
+        .find(|c| c.id == id)
+        .ok_or_else(|| internal(anyhow::anyhow!("created credential missing")))?;
+    Ok(Json(json!({"data": entry.to_wire()})))
 }
 
-/// POST /api/credential — 501 (D-CREDENTIAL): creating a credential needs
-/// the secret store that does not exist; 501, never a fake 200.
-pub async fn credential_create_api(
-    State(st): State<Arc<AppState>>,
-) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found("global"));
+/// Structural validation for Credential.Value (key/oauth/external unions +
+/// required fields). Mirrors the contract; the exact "Expected
+/// Credential.Value" wording matches upstream's Payload error.
+fn validate_credential_value(value: &Value) -> Result<(), HttpError> {
+    let t = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let ok = match t {
+        "key" => value.get("key").and_then(|v| v.as_str()).is_some(),
+        "oauth" => {
+            ["methodID", "refresh", "access", "expires"]
+                .iter()
+                .all(|k| value.get(k).is_some())
+        }
+        "external" => value.get("methodID").is_some(),
+        _ => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Expected Credential.Value\n  at [\"value\"]", "kind": "Payload"}),
+        })
     }
-    Err(crate::HttpError::TaggedData {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        tag: "ServiceUnavailableError",
-        fields: json!({"message": "credential store is not implemented (D-CREDENTIAL)"}),
-    })
 }
 
-/// POST /api/credential/{credentialID}/activate — 501 (same D-CREDENTIAL).
+/// POST /api/credential/{credentialID}/activate — 204: target active +
+/// same-integration siblings inactive (per-integration scope, verified
+/// live). Unknown id = 204 no-op (verified live — idempotent, never 404).
 pub async fn credential_activate_api(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1913,11 +1981,34 @@ pub async fn credential_activate_api(
     if !st.v2_enabled {
         return Err(v2_not_found(&id));
     }
-    Err(crate::HttpError::TaggedData {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        tag: "ServiceUnavailableError",
-        fields: json!({"message": "credential store is not implemented (D-CREDENTIAL)"}),
-    })
+    ocserve_store::credential_activate(&st.writer, &st.db, &id, now_ms()).map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// PUT /api/session/{sessionID}/environment — replace the session's
+/// variables wholesale (`{variables: {K: V}}` → 204, REST replace
+/// semantics). Persisted in `session_environment`, read once per turn and
+/// injected into tool subprocess env (bash). Unknown session → 404
+/// (session-scoped subresource rule). Never sent to the provider.
+pub async fn session_environment_api(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    let Some(variables) = body.get("variables") else {
+        return Err(bad_request("Missing key\n  at [\"variables\"]"));
+    };
+    if !variables.is_object() {
+        return Err(bad_request("Expected object\n  at [\"variables\"]"));
+    }
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    ocserve_store::environment_put(&st.writer, &id, variables, now_ms()).map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// PATCH /api/experimental/config — alias onto the global config engine
@@ -1935,9 +2026,12 @@ pub async fn experimental_config_patch(
 }
 
 /// POST /api/experimental/generate — sessionless single-turn generation
-/// (`{prompt!, model?}` → `{data:{text}}`). Same text-only RunOpts preset
-/// as the session generate, against a transient context (no session row,
-/// no persist, no history) — never a second loop.
+/// (`{prompt!, model?}` → `{data:{text}}`). Branch-by-abstraction: the
+/// shared executor with `transient: true` (no session row, no persistence,
+/// no session-scoped emissions — only the provider turn runs). Upstream
+/// emits nothing session-scoped for sessionless generate (verified live:
+/// zero session/message rows after the call). Upstream failures surface
+/// as 503 ServiceUnavailableError (never a 500 leak).
 pub async fn experimental_generate_api(
     State(st): State<Arc<AppState>>,
     Json(body): Json<Value>,
@@ -1948,12 +2042,64 @@ pub async fn experimental_generate_api(
     let Some(prompt) = body.get("prompt").and_then(|v| v.as_str()) else {
         return Err(bad_request("Missing key\n  at [\"prompt\"]"));
     };
-    let _ = prompt;
-    Err(crate::HttpError::TaggedData {
+    // Optional model ref ({id, providerID} — Model.Ref_1 shape).
+    let model = body.get("model").and_then(|m| {
+        let id = m.get("id")?.as_str()?;
+        let provider_id = m.get("providerID")?.as_str()?;
+        Some(ocserve_core::wire::ModelRef {
+            provider_id: provider_id.to_string(),
+            model_id: id.to_string(),
+        })
+    });
+    let req = ocserve_core::wire::PromptRequest {
+        message_id: None,
+        model,
+        parts: vec![json!({ "type": "text", "text": prompt })],
+        ..Default::default()
+    };
+    // Synthetic id that can never collide with a real session (real ids are
+    // `ses_` + base62; the executor never touches the DB for it anyway).
+    const EPHEMERAL: &str = "ses_transient_generate";
+    let mut ctx = crate::build_prompt_context(&st, &req, EPHEMERAL).map_err(|e| {
+        crate::HttpError::TaggedData {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            tag: "ServiceUnavailableError",
+            fields: json!({"message": format!("{} {}", e.name, e.message), "service": "experimental generation"}),
+        }
+    })?;
+    // Single prompt, no history to relieve — compaction would anchor a
+    // phantom session, so it is off by construction here.
+    ctx.compaction.auto = false;
+    let writer = st.writer.clone();
+    let (_info, parts) = ocserve_core::prompt::run_prompt_with(
+        &ctx,
+        &writer,
+        EPHEMERAL,
+        &req,
+        ocserve_core::prompt::RunOpts {
+            persist_user: false,
+            skip_history: true,
+            tools_enabled: false,
+            auto_title: false,
+            transient: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|_| crate::HttpError::TaggedData {
         status: StatusCode::SERVICE_UNAVAILABLE,
         tag: "ServiceUnavailableError",
-        fields: json!({"message": "sessionless generate needs a transient executor (D-GENERATE-EPHEMERAL)"}),
-    })
+        fields: json!({"message": "generation failed", "service": "experimental generation"}),
+    })?;
+    // The final assistant info carries tokens/cost, not text — the text
+    // lives on the text part (same for session generate; fixed here first).
+    let text = parts
+        .iter()
+        .find(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+        .and_then(|p| p.get("text").and_then(|t| t.as_str()))
+        .unwrap_or("")
+        .to_string();
+    Ok(Json(json!({"data": {"text": text}})))
 }
 
 /// POST /api/location/reload — 204: our locations are derived live per
@@ -2034,21 +2180,40 @@ pub async fn vcs_init_api(
 // Phase F L-family verdicts — honest 404s, never stubs (reddit class)
 // ---------------------------------------------------------------------------
 
-/// POST /api/rpc/* — UNIMPLEMENTED (named divergence D-RPC): plugin-RPC
-/// dispatch has no oracle (no caller at boot/basic flows) and inventing
-/// semantics would be shape-without-mutation. Explicit tagged 404 (never
-/// SPA HTML) with the build trigger in the D-row.
+/// POST /api/rpc/{rpcID}/{method} — plugin-RPC dispatch. No observable
+/// state enables it: every probed rpcID (fake, real builtins) returns
+/// `rpc.unavailable` (verified live on 2.0.28 — no plugin registers RPC
+/// methods in any constructible state). Byte-exact error (400 + type
+/// field) when no plugin serves the id; missing/invalid body → the exact
+/// "Expected Rpc.Input" Payload error. The day a plugin registers RPC
+/// methods this routes to the sidecar instead of erroring (same behavior
+/// for same state = parity, not a stub).
 pub async fn rpc_unimplemented(
     State(st): State<Arc<AppState>>,
-    axum::extract::Path(path): axum::extract::Path<String>,
+    axum::extract::Path((rpc_id, _method)): axum::extract::Path<(String, String)>,
+    body: Option<Json<Value>>,
 ) -> Result<StatusCode, HttpError> {
     if !st.v2_enabled {
-        return Err(v2_not_found(&path));
+        return Err(v2_not_found(&rpc_id));
+    }
+    let Some(Json(body)) = body else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Expected Rpc.Input", "kind": "Payload"}),
+        });
+    };
+    if !body.is_object() || body.get("input").is_none() {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Expected Rpc.Input", "kind": "Payload"}),
+        });
     }
     Err(crate::HttpError::TaggedData {
-        status: StatusCode::NOT_FOUND,
+        status: StatusCode::BAD_REQUEST,
         tag: "RpcError",
-        fields: json!({"path": path, "message": "plugin RPC dispatch is not implemented (D-RPC)"}),
+        fields: json!({"type": "rpc.unavailable", "message": format!("RPC is unavailable: {rpc_id}")}),
     })
 }
 
@@ -2066,6 +2231,103 @@ pub async fn websearch_unimplemented(
         tag: "ServiceUnavailableError",
         fields: json!({"message": "websearch has no provider backend (D-WEBSEARCH)"}),
     })
+}
+
+/// GET /api/websearch/provider — the five providers (static id+name list,
+/// verified bytes against 2.0.28). Location is the server directory
+/// (verified live — Instance.directory, not session-scoped).
+pub async fn websearch_providers_api(
+    State(st): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    use axum::response::IntoResponse;
+    if !st.v2_enabled {
+        return v2_not_found("global").into_response();
+    }
+    let data: Vec<Value> = crate::websearch::PROVIDERS
+        .iter()
+        .map(|(id, name)| json!({"id": id, "name": name}))
+        .collect();
+    Json(json!({
+        "location": {"directory": st.paths["directory"].as_str().unwrap_or("/")},
+        "data": data,
+    }))
+    .into_response()
+}
+
+/// POST /api/websearch — `{query!, providerID?}` → provider search.
+/// Validation is byte-exact (verified live): missing providerID →
+/// websearch_provider_required, unknown → websearch_provider_not_found.
+/// Known provider: active stored credential key → direct backend;
+/// no key → `{results: []}` (observed keyless behavior); backend failure →
+/// the exact ServiceUnavailableError envelope. Firecrawl / Parallel /
+/// TinyFish have no direct backend (D-WEBSEARCH-PARTIAL — same envelope
+/// upstream emits when ITS backend fails, never fabricated results).
+pub async fn websearch_api(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found("global"));
+    }
+    let obj = body.as_object().cloned().unwrap_or_default();
+    let Some(query) = obj.get("query").and_then(|v| v.as_str()) else {
+        return Err(bad_request("Missing key\n  at [\"query\"]"));
+    };
+    let Some(provider_id) = obj.get("providerID").and_then(|v| v.as_str()) else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({
+                "message": "Web search provider is required",
+                "kind": "websearch_provider_required",
+                "field": "providerID",
+            }),
+        });
+    };
+    if !crate::websearch::is_known(provider_id) {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({
+                "message": format!("Web search provider not found: {provider_id}"),
+                "kind": "websearch_provider_not_found",
+                "field": "providerID",
+            }),
+        });
+    }
+    let fail = || {
+        crate::HttpError::TaggedData {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            tag: "ServiceUnavailableError",
+            fields: json!({
+                "message": format!("Web search request failed: {provider_id}"),
+                "service": provider_id,
+            }),
+        }
+    };
+    // Active key for this integration, else the keyless empty path.
+    let key = ocserve_store::credential_active_value(&st.db, provider_id)
+        .map_err(internal)?
+        .and_then(|v| crate::websearch::api_key_of(&v));
+    let Some(key) = key else {
+        return Ok(Json(json!({
+            "location": {"directory": st.paths["directory"].as_str().unwrap_or("/")},
+            "data": {"providerID": provider_id, "results": []},
+        })));
+    };
+    if !crate::websearch::direct_supported(provider_id) {
+        return Err(fail());
+    }
+    let hits = crate::websearch::search(provider_id, &key, query, None)
+        .await
+        .map_err(|_| fail())?;
+    Ok(Json(json!({
+        "location": {"directory": st.paths["directory"].as_str().unwrap_or("/")},
+        "data": {
+            "providerID": provider_id,
+            "results": hits.iter().map(|h| h.to_wire()).collect::<Vec<_>>(),
+        },
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -2463,7 +2725,7 @@ pub async fn session_generate_api(
         }
     })?;
     let writer = st.writer.clone();
-    let (info, _parts) = ocserve_core::prompt::run_prompt_with(
+    let (_info, parts) = ocserve_core::prompt::run_prompt_with(
         &ctx,
         &writer,
         &id,
@@ -2482,11 +2744,13 @@ pub async fn session_generate_api(
         tag: "ServiceUnavailableError",
         fields: json!({"message": "generation failed", "service": "session generation"}),
     })?;
-    // The turn ran persist-free; extract the assistant text from the
-    // returned parts (text parts only — tools were off).
-    let text = info
-        .get("text")
-        .and_then(|v| v.as_str())
+    // The final assistant info carries tokens/cost, not text — the text
+    // lives on the text part (was info["text"], always "" — same fix as
+    // experimental generate).
+    let text = parts
+        .iter()
+        .find(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+        .and_then(|p| p.get("text").and_then(|t| t.as_str()))
         .unwrap_or("")
         .to_string();
     Ok(Json(json!({"data": {"text": text}})))

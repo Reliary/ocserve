@@ -199,8 +199,8 @@ fi
 echo "== guard: v2 API coverage (rule 16b, spec-driven) =="
 # Same generated binding check as rule 16, over the 2.0.28 contract: every
 # op must be bound in the router or carry an exact `METHOD /path` citation
-# in V2-PARITY-PLAN.md (Phase F: D-RPC/D-WEBSEARCH/D-ENV/D-CREDENTIAL are
-# cited verdicts, not gaps). Planted control: remove a binding → GAP → red.
+# in V2-PARITY-PLAN.md (all 142 currently bound; citations remain as fallback
+# for future verdicts). Planted control: remove a binding → GAP → red.
 if [ -f crates/ocserve-core/assets/openapi/2.0.28.json ]; then
   cov2_out=$(python3 bench/openapi/check-coverage.py crates/ocserve-core/assets/openapi/2.0.28.json crates/ocserve-http/src/lib.rs V2-PARITY-PLAN.md 2>&1) || true
   gaps2=$(printf '%s\n' "$cov2_out" | grep '^  GAP' || true)
@@ -483,16 +483,24 @@ if [ -f bench/capdiff/allow.txt ]; then
   fi
 fi
 # planted control: a Python comparator sabotage that drops provider_view must
-# be detectable by the check above (prove the grep is load-bearing)
-cp bench/capdiff/capdiff.py /tmp/capdiff_bak.$$ 2>/dev/null || true
-sed -i 's/def provider_view/def provider_view_DISABLED/' bench/capdiff/capdiff.py 2>/dev/null || true
+# be detectable by the check above (prove the grep is load-bearing).
+# Backup lives NEXT TO the target (never /tmp — a full tmpfs silently broke
+# the restore and emptied the file, 2026-10-17), restored by trap so every
+# exit path heals.
+_capdiff_plant_bak="bench/capdiff/.capdiff.py.guard-bak"
+capdiff_restore() { [ -f "$_capdiff_plant_bak" ] && mv -f "$_capdiff_plant_bak" bench/capdiff/capdiff.py; }
+trap capdiff_restore EXIT
+cp bench/capdiff/capdiff.py "$_capdiff_plant_bak"
+trap 'capdiff_restore; trap - EXIT' EXIT
+sed -i 's/def provider_view/def provider_view_DISABLED/' bench/capdiff/capdiff.py
 if grep -q "def provider_view" bench/capdiff/capdiff.py; then
   echo "ok (planted comparator removal detected; allowlist D-rows present)"
 else
   echo "FAIL: planted comparator removal not detected (rule 27 vacuous)"; fail=1
 fi
-cp /tmp/capdiff_bak.$$ bench/capdiff/capdiff.py 2>/dev/null || true
-rm -f /tmp/capdiff_bak.$$
+capdiff_restore
+trap - EXIT
+rm -f "$_capdiff_plant_bak"
 
 echo "== guard: publish order covers every member in dependency order (rule 28) =="
 # The crates.io publish list must contain every workspace member, in dependency
