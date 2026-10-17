@@ -178,5 +178,5 @@ no-inflation correct), PASS cost (−58.9% weighted) + score (median 1.0 both)
 | Error guessing | every antagonism-ledger finding | `crash_fuzz` (A2/A6), FTS tests (A1), cache test (A3), golden SSE (C1) |
 | White-box branch | blob crash-protocol ordering | `crash_fuzz` + `blob::tests` |
 | Mutation (TESTING §1) | cargo-mutants gate | nightly `--with-mutants` on store+core (SSE/`ocserve-llm` scope pending — Phase 2); threshold TBD at first baseline |
-| Fuzz | SSE/JSON/provider parsers | `fuzz/` 3 targets (sse/splice/wire) + weekly CI; nightly wiring + 5 missing targets pending (Phase 2) |
+| Fuzz | SSE/JSON/provider parsers | `fuzz/` **8 targets** (sse, splice, wire, event, assembler, config-toml, substr-window, mcp-rpc) — all smoke-run clean; weekly CI matrix (60s each) + nightly smoke (10s each) |
 | Property | chunker roundtrip arbitrary sizes | `blob::tests::roundtrip_multi_chunk_above_alloc_cap` + boundary set (proptest crate M2) |

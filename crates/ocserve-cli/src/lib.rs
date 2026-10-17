@@ -3,6 +3,8 @@
 
 use anyhow::{Context, Result};
 
+pub mod server_config;
+
 pub fn boot_checks(data_dir: &std::path::Path) -> Result<()> {
     use ocserve_store::pragma;
     // 1. version gate

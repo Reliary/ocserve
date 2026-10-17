@@ -63,6 +63,20 @@ step "corpus: session-list wire parity over live db" \
 # 3. provider stream fuzz: 10k seeded chunk-boundary splits vs whole-buffer
 step "stream chunk-split fuzz" cargo test -p ocserve-llm chunk_split_fuzz
 
+# 3b. cargo-fuzz smoke pass (TESTING §6): every parser target for a bounded
+#     10s each. Weekly CI runs the 60s variants (fuzz.yml); this keeps the
+#     targets live in the local nightly too. Skipped-with-a-note (not FAIL)
+#     when the nightly toolchain/cargo-fuzz is absent — a missing dev tool is
+#     not a product defect, but it IS reported so the absence is visible.
+if rustup toolchain list 2>/dev/null | grep -q '^nightly' && command -v cargo-fuzz >/dev/null 2>&1; then
+  for t in sse_parser splice_parser wire_decode event_decoder stream_assembler config_toml substr_window mcp_jsonrpc; do
+    step "fuzz smoke: $t (10s)" \
+      cargo +nightly fuzz run "$t" -- -max_total_time=10 -timeout=30
+  done
+else
+  echo "== fuzz smoke: SKIPPED (nightly toolchain or cargo-fuzz absent) ==" | tee -a "$LOG"
+fi
+
 # 4. backup drill: online VACUUM INTO while serving, then integrity +
 #    row-count check on the COPY (live service never written)
 drill() {

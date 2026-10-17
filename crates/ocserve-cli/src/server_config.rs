@@ -32,6 +32,19 @@ struct File {
     server: ServerCfg,
 }
 
+/// Parse `ocserve.toml` contents (path-free, fuzzable). Missing file is the
+/// caller's concern; this is the pure decode+validate core.
+pub fn parse(raw: &str) -> Result<ServerCfg> {
+    let file: File = toml::from_str(raw).context("parse ocserve.toml")?;
+    if let Some(mode) = &file.server.auth_mode
+        && mode != "off"
+        && mode != "basic"
+    {
+        anyhow::bail!("[server].auth_mode must be \"off\" or \"basic\", got {mode:?}");
+    }
+    Ok(file.server)
+}
+
 /// Load `ocserve.toml` from the data dir. Missing file = all-defaults
 /// (fresh installs boot with zero config — the "bare machine" invariant).
 /// Present-but-unparseable = fail-fast with the path and reason.
@@ -41,17 +54,7 @@ pub fn load(data_dir: &std::path::Path) -> Result<ServerCfg> {
         return Ok(ServerCfg::default());
     }
     let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let file: File = toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
-    if let Some(mode) = &file.server.auth_mode
-        && mode != "off"
-        && mode != "basic"
-    {
-        anyhow::bail!(
-            "{}: [server].auth_mode must be \"off\" or \"basic\", got {mode:?}",
-            path.display()
-        );
-    }
-    Ok(file.server)
+    parse(&raw).with_context(|| format!("parse {}", path.display()))
 }
 
 /// Resolve auth mode: flag > `OCSERVE_AUTH_MODE` env > file > "off".

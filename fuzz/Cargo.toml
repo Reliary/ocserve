@@ -20,6 +20,12 @@ path = "../crates/ocserve-store"
 [dependencies.ocserve-core]
 path = "../crates/ocserve-core"
 
+[dependencies.ocserve-mcp]
+path = "../crates/ocserve-mcp"
+
+[dependencies.ocserve]
+path = "../crates/ocserve-cli"
+
 [[bin]]
 name = "sse_parser"
 path = "fuzz_targets/sse_parser.rs"
@@ -37,6 +43,41 @@ bench = false
 [[bin]]
 name = "wire_decode"
 path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "event_decoder"
+path = "fuzz_targets/event_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream_assembler"
+path = "fuzz_targets/stream_assembler.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "substr_window"
+path = "fuzz_targets/substr_window.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mcp_jsonrpc"
+path = "fuzz_targets/mcp_jsonrpc.rs"
 test = false
 doc = false
 bench = false
