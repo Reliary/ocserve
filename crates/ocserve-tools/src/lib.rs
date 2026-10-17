@@ -304,10 +304,14 @@ fn truncate(mut output: String) -> (String, bool) {
     (output, truncated)
 }
 
-/// Execute a tool by v1 name. `cwd` scopes relative paths.
-pub fn execute(name: &str, input: &Value, cwd: &Path) -> Result<ToolResult> {
+/// Execute a tool by v1 name. `cwd` scopes relative paths. `env` carries
+/// session environment variables (PUT /api/session/{id}/environment) into
+/// subprocess-bearing tools (bash); other tools ignore it. Session vars
+/// supplement (never replace) the process environment — `cmd.envs` only
+/// adds/overrides the named keys.
+pub fn execute(name: &str, input: &Value, cwd: &Path, env: &[(String, String)]) -> Result<ToolResult> {
     match name {
-        "bash" => bash(input, cwd),
+        "bash" => bash(input, cwd, env),
         "read" => read(input, cwd),
         "write" => write(input, cwd),
         "edit" => edit(input, cwd),
@@ -329,13 +333,14 @@ fn resolve(cwd: &Path, p: &str) -> PathBuf {
 }
 
 #[allow(unsafe_code)] // sole production unsafe: libc::killpg on timeout (below)
-fn bash(input: &Value, cwd: &Path) -> Result<ToolResult> {
+fn bash(input: &Value, cwd: &Path, env: &[(String, String)]) -> Result<ToolResult> {
     let command = input["command"].as_str().context("bash.command")?;
     let timeout_ms = input["timeout"].as_u64().unwrap_or(120_000).min(600_000);
     let mut cmd = std::process::Command::new("sh");
     cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -827,11 +832,31 @@ mod tests {
 
     #[test]
     fn bash_echo() {
-        let r = execute("bash", &json!({"command": "echo TOOL_OK"}), Path::new("/")).unwrap();
+        let r = execute("bash", &json!({"command": "echo TOOL_OK"}), Path::new("/"), &[]).unwrap();
         assert_eq!(r.output.trim(), "TOOL_OK");
         assert_eq!(r.exit, Some(0));
         assert!(!r.error);
         assert_eq!(r.title, "echo TOOL_OK");
+    }
+
+    #[test]
+    fn bash_receives_session_env() {
+        // D-ENV unit level: session vars reach the subprocess env; absent
+        // keys stay absent (supplement, never replace — PATH survives).
+        let env = vec![
+            ("OCSERVE_UNIT_PROBE".to_string(), "unit_value_7".to_string()),
+        ];
+        let r = execute(
+            "bash",
+            &json!({"command": "echo $OCSERVE_UNIT_PROBE; echo $PATH"}),
+            Path::new("/"),
+            &env,
+        )
+        .unwrap();
+        let mut lines = r.output.lines();
+        assert_eq!(lines.next().unwrap_or(""), "unit_value_7");
+        assert!(!lines.next().unwrap_or("").is_empty(), "PATH must survive");
+        // CONTROL: execute ignoring env → first line empty, red.
     }
 
     #[test]
@@ -840,6 +865,7 @@ mod tests {
             "bash",
             &json!({"command": "echo OOPS >&2; exit 3"}),
             Path::new("/"),
+            &[],
         )
         .unwrap();
         assert_eq!(r.exit, Some(3));
@@ -854,6 +880,7 @@ mod tests {
             "bash",
             &json!({"command": "sleep 10", "timeout": 300}),
             Path::new("/"),
+            &[],
         )
         .unwrap();
         assert_eq!(r.exit, Some(124));
@@ -870,6 +897,7 @@ mod tests {
                 {"content": "step two", "status": "pending", "priority": "high"}
             ]}),
             Path::new("/"),
+            &[],
         )
         .unwrap();
         let meta = r.metadata.expect("todos metadata for the part state");
@@ -880,7 +908,7 @@ mod tests {
         assert_eq!(r.title, "todowrite");
         assert!(!r.error);
         // missing todos → Err (model gets a tool failure, not a panic)
-        assert!(execute("todowrite", &json!({"nope": []}), Path::new("/")).is_err());
+        assert!(execute("todowrite", &json!({"nope": []}), Path::new("/"), &[]).is_err());
     }
 
     #[test]
@@ -920,23 +948,26 @@ mod tests {
             "write",
             &json!({"filePath": fp.to_str().unwrap(), "content": "hello world"}),
             d.path(),
+            &[],
         )
         .unwrap();
-        let r = execute("read", &json!({"filePath": fp.to_str().unwrap()}), d.path()).unwrap();
+        let r = execute("read", &json!({"filePath": fp.to_str().unwrap()}), d.path(), &[]).unwrap();
         assert_eq!(r.output, "hello world");
         execute(
             "edit",
             &json!({"filePath": fp.to_str().unwrap(), "oldText": "world", "newText": "ocserve"}),
             d.path(),
+            &[],
         )
         .unwrap();
-        let r2 = execute("read", &json!({"filePath": fp.to_str().unwrap()}), d.path()).unwrap();
+        let r2 = execute("read", &json!({"filePath": fp.to_str().unwrap()}), d.path(), &[]).unwrap();
         assert_eq!(r2.output, "hello ocserve");
         // duplicate match must fail
         let e = execute(
             "edit",
             &json!({"filePath": fp.to_str().unwrap(), "oldText": "e", "newText": "E"}),
             d.path(),
+            &[],
         );
         assert!(e.is_err(), "non-unique oldText must fail");
     }
@@ -947,18 +978,19 @@ mod tests {
         std::fs::write(d.path().join("a.rs"), "fn main() {}\n").unwrap();
         std::fs::create_dir(d.path().join("sub")).unwrap();
         std::fs::write(d.path().join("sub/b.rs"), "fn helper() {}\n").unwrap();
-        let g = execute("glob", &json!({"pattern": "*.rs"}), d.path()).unwrap();
+        let g = execute("glob", &json!({"pattern": "*.rs"}), d.path(), &[]).unwrap();
         assert!(
             g.output.contains("a.rs") && g.output.contains("sub/b.rs"),
             "{}",
             g.output
         );
-        let gr = execute("grep", &json!({"pattern": "helper"}), d.path()).unwrap();
+        let gr = execute("grep", &json!({"pattern": "helper"}), d.path(), &[]).unwrap();
         assert!(gr.output.contains("sub/b.rs:1"), "{}", gr.output);
         let gr2 = execute(
             "grep",
             &json!({"pattern": "main", "include": "*.rs"}),
             d.path(),
+            &[],
         )
         .unwrap();
         assert!(gr2.output.contains("a.rs"), "{}", gr2.output);
@@ -1040,7 +1072,7 @@ mod drain_tests {
             "command": "head -c 2000000 /dev/zero | tr '\\0' 'a'",
             "timeout": 5000,
         });
-        let r = bash(&input, Path::new("/tmp")).expect("run");
+        let r = bash(&input, Path::new("/tmp"), &[]).expect("run");
         assert_eq!(
             r.exit,
             Some(0),
@@ -1058,7 +1090,7 @@ mod drain_tests {
     /// small outputs unaffected (byte-parity path)
     #[test]
     fn small_output_untouched() {
-        let r = bash(&json!({"command": "printf 'hello\n'"}), Path::new("/tmp")).unwrap();
+        let r = bash(&json!({"command": "printf 'hello\n'"}), Path::new("/tmp"), &[]).unwrap();
         assert_eq!(r.exit, Some(0));
         assert_eq!(r.output.trim(), "hello");
         assert!(!r.truncated);

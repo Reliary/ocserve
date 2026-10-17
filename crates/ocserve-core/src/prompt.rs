@@ -669,12 +669,16 @@ async fn spawn_tool(
     name: &str,
     input: Value,
     directory: &str,
+    env: &[(String, String)],
 ) -> Result<ocserve_tools::ToolResult> {
     let name = name.to_string();
     let dir = directory.to_string();
-    tokio::task::spawn_blocking(move || ocserve_tools::execute(&name, &input, Path::new(&dir)))
-        .await
-        .map_err(|e| anyhow::anyhow!("tool join: {e}"))?
+    let env = env.to_vec();
+    tokio::task::spawn_blocking(move || {
+        ocserve_tools::execute(&name, &input, Path::new(&dir), &env)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("tool join: {e}"))?
 }
 
 /// Execution knobs for `run_prompt_with`. Defaults = every existing caller's
@@ -700,6 +704,15 @@ pub struct RunOpts {
     /// auto-title default-titled sessions from the first user message
     /// (false: command/shell flows must not name sessions after a command)
     pub auto_title: bool,
+    /// transient run against a session id that does not exist (experimental
+    /// generate): skips the session-exists bail, model/agent persistence,
+    /// ALL session-scoped emissions (session.updated, message.updated,
+    /// part deltas), assistant/user persistence, usage accumulation, and
+    /// finalize. The provider turn itself is identical (same system prompt,
+    /// same text-only preset) — only the session side effects are cut.
+    /// Upstream emits nothing session-scoped for sessionless generate
+    /// (verified live: zero sessions/messages rows after the call).
+    pub transient: bool,
 }
 
 impl Default for RunOpts {
@@ -715,6 +728,7 @@ impl Default for RunOpts {
             max_rounds: None,
             cost_ceiling: None,
             auto_title: true,
+            transient: false,
         }
     }
 }
@@ -745,7 +759,7 @@ pub async fn run_prompt_with(
     req: &crate::wire::PromptRequest,
     opts: RunOpts,
 ) -> Result<(Value, Vec<Value>)> {
-    if !ocserve_store::session_exists(&ctx.db, session_id)? {
+    if !opts.transient && !ocserve_store::session_exists(&ctx.db, session_id)? {
         anyhow::bail!("Session not found: {session_id}");
     }
     // K-ALWAYS: one DB read pulls this session's persisted always-grants
@@ -761,13 +775,16 @@ pub async fn run_prompt_with(
     // K-MODEL-STATE: resolved model+agent land at START (not finalize) —
     // cap/OOM/abort deaths keep the selection sticky for the next
     // payload-less send. Churn-free UPDATE (0 rows when unchanged).
-    ocserve_store::persist_prompt_model(
-        writer,
-        session_id,
-        &ctx.agent,
-        &json!({"id": ctx.model_id, "providerID": ctx.provider_id, "variant": "default"})
-            .to_string(),
-    )?;
+    // Transient runs have no session row — nothing to persist to.
+    if !opts.transient {
+        ocserve_store::persist_prompt_model(
+            writer,
+            session_id,
+            &ctx.agent,
+            &json!({"id": ctx.model_id, "providerID": ctx.provider_id, "variant": "default"})
+                .to_string(),
+        )?;
+    }
     // K-EFFICIENCY: RSS + reader-open probe — Drop-based so BAIL exits
     // (cap/provider errors) emit too (tail-only emission missed them:
     // proven by the cap e2e going red the first time).
@@ -778,6 +795,15 @@ pub async fn run_prompt_with(
     let mut pre = ocserve_store::compaction_preflight(&ctx.db, session_id)?;
     let mut seq = pre.seq;
     let mut pre_dirty = false;
+    // Session environment (D-ENV closure): read ONCE per turn (not per tool
+    // call — vars change via PUT between turns, never mid-turn), injected
+    // into tool subprocess env. Empty for transient runs (no session row).
+    // Never sent to the provider — subprocess env only.
+    let session_env: Vec<(String, String)> = if opts.transient {
+        Vec::new()
+    } else {
+        ocserve_store::environment_get(&ctx.db, session_id).unwrap_or_default()
+    };
     // Session-lifetime usage accumulator, seeded ONCE from the preflight row.
     // Mirrors upstream applyUsage (core/session/projector.ts:89-108): every
     // step-finish ADDS its usage to the session row; the running copy here lets
@@ -900,16 +926,21 @@ pub async fn run_prompt_with(
         .context("persist user message")?;
     }
 
-    emit_session_updated(
-        ctx,
-        writer,
-        session_id,
-        json!({
-            "model": {"id": model, "providerID": ctx.provider_id, "variant": "default"},
-            "agent": agent,
-        }),
-        &mut seq,
-    )?;
+    // Transient runs emit nothing session-scoped (no session.updated for a
+    // session that does not exist — clients key stores by sessionId and a
+    // phantom id would plant ghost entries).
+    if !opts.transient {
+        emit_session_updated(
+            ctx,
+            writer,
+            session_id,
+            json!({
+                "model": {"id": model, "providerID": ctx.provider_id, "variant": "default"},
+                "agent": agent,
+            }),
+            &mut seq,
+        )?;
+    }
     if opts.persist_user {
         emit_durable(
             ctx,
@@ -941,11 +972,14 @@ pub async fn run_prompt_with(
     if req.no_reply {
         return Ok((user_info, user_parts));
     }
-    emit_live(
-        ctx,
-        "session.status",
-        json!({"sessionID": session_id, "status": {"type": "busy"}}),
-    );
+    // No busy frame for transient runs (same ghost-entry rule as above).
+    if !opts.transient {
+        emit_live(
+            ctx,
+            "session.status",
+            json!({"sessionID": session_id, "status": {"type": "busy"}}),
+        );
+    }
 
     // ── M6 outer compaction loop (upstream runLoop, prompt.ts:1083+) ──
     // Rounds re-filter history, run the pending engine step, then rebuild
@@ -1271,20 +1305,27 @@ pub async fn run_prompt_with(
             // exactly once per part (upstream processor.ts:280-291/500-511 order).
             macro_rules! announce_part {
                 ($part_id:expr, $part_type:expr) => {{
-                    if !assistant_announced {
-                        emit_live(
-                            ctx,
-                            "message.updated",
-                            json!({"sessionID": session_id, "info": assistant_message_start(
-                                ctx, session_id, &turn_msg_id, &assistant_id, &agent, &model,
-                                turn_started,
-                            )}),
-                        );
+                    // Transient runs stream silently (no skeleton/parts for a
+                    // phantom session id — same ghost-entry rule; the text
+                    // still accumulates into the response).
+                    if opts.transient {
                         assistant_announced = true;
+                    } else {
+                        if !assistant_announced {
+                            emit_live(
+                                ctx,
+                                "message.updated",
+                                json!({"sessionID": session_id, "info": assistant_message_start(
+                                    ctx, session_id, &turn_msg_id, &assistant_id, &agent, &model,
+                                    turn_started,
+                                )}),
+                            );
+                            assistant_announced = true;
+                        }
+                        emit_part_start(
+                            ctx, session_id, &assistant_id, $part_id, $part_type, turn_started,
+                        );
                     }
-                    emit_part_start(
-                        ctx, session_id, &assistant_id, $part_id, $part_type, turn_started,
-                    );
                 }};
             }
 
@@ -1319,6 +1360,11 @@ pub async fn run_prompt_with(
                     // with overflow=true, then the outer loop re-filters.
                     let emsg = format!("{e:#}");
                     if ocserve_llm::looks_like_context_overflow(&emsg) {
+                        // Transient runs never compact (no session to anchor)
+                        // — the rejection surfaces as the run error directly.
+                        if opts.transient {
+                            anyhow::bail!("provider stream open: {emsg}");
+                        }
                         emit_live(
                             ctx,
                             "session.error",
@@ -1377,14 +1423,16 @@ pub async fn run_prompt_with(
                             // publish the text part before its first delta
                             announce_part!(&text_part_id, "text");
                         }
-                        emit_live(
-                            ctx,
-                            "message.part.delta",
-                            json!({
-                                "sessionID": session_id, "messageID": assistant_id,
-                                "partID": text_part_id, "field": "text", "delta": t,
-                            }),
-                        );
+                        if !opts.transient {
+                            emit_live(
+                                ctx,
+                                "message.part.delta",
+                                json!({
+                                    "sessionID": session_id, "messageID": assistant_id,
+                                    "partID": text_part_id, "field": "text", "delta": t,
+                                }),
+                            );
+                        }
                         text.push_str(&t);
                     }
                     StreamEvent::ReasoningDelta(r) => {
@@ -1396,15 +1444,17 @@ pub async fn run_prompt_with(
                             announce_part!(&rid, "reasoning");
                             live_reasoning_id = Some(rid);
                         }
-                        emit_live(
-                            ctx,
-                            "message.part.delta",
-                            json!({
-                                "sessionID": session_id, "messageID": assistant_id,
-                                "partID": live_reasoning_id.clone().unwrap_or_default(),
-                                "field": "reasoning", "delta": r,
-                            }),
-                        );
+                        if !opts.transient {
+                            emit_live(
+                                ctx,
+                                "message.part.delta",
+                                json!({
+                                    "sessionID": session_id, "messageID": assistant_id,
+                                    "partID": live_reasoning_id.clone().unwrap_or_default(),
+                                    "field": "reasoning", "delta": r,
+                                }),
+                            );
+                        }
                         reasoning.push_str(&r);
                     }
                     StreamEvent::ToolCallDelta {
@@ -1462,7 +1512,12 @@ pub async fn run_prompt_with(
             // in-memory copy in step with the queued DB op (writer.write is
             // ack-synchronous, so op + copy are always consistent).
             let step_tokens = message_tokens(&u);
-            ocserve_store::accumulate_session_usage(writer, session_id, &step_tokens, step_cost)?;
+            // No session row for transient runs (UPDATE would be a 0-row
+            // noop, but skipping keeps the writer queue clean); the
+            // in-memory aggregate below still feeds the response path.
+            if !opts.transient {
+                ocserve_store::accumulate_session_usage(writer, session_id, &step_tokens, step_cost)?;
+            }
             {
                 let bump = |agg: &mut Value, key: &str, v: i64| {
                     agg[key] = (agg[key].as_i64().unwrap_or(0) + v).into();
@@ -1501,7 +1556,11 @@ pub async fn run_prompt_with(
             // here so the streamed part and the persisted part share ONE id.
 
             // ---- tool-call turn ----
-            if finish_reason == "tool_calls" && !tool_calls.is_empty() {
+            // Transient runs never execute tools (text-only contract — no
+            // tools were sent, so tool_calls here are unsolicited; drop them
+            // and keep the text rather than running side effects for a
+            // phantom session).
+            if finish_reason == "tool_calls" && !tool_calls.is_empty() && !opts.transient {
                 let mut parts = vec![step_start_part(
                     round_base.as_deref(),
                     session_id,
@@ -1863,7 +1922,7 @@ pub async fn run_prompt_with(
                             // name → error (upstream Effect.die).
                             skill_exec(&ctx.skills, &input)
                         } else if builtin {
-                            spawn_tool(&call.name, input, &ctx.directory).await
+                            spawn_tool(&call.name, input, &ctx.directory, &session_env).await
                         } else if let Some(hub) = &ctx.mcp {
                             match hub.call(&call.name, input.clone()).await {
                                 Some(Ok(text)) => Ok(ocserve_tools::ToolResult {
@@ -1875,10 +1934,10 @@ pub async fn run_prompt_with(
                                     metadata: None,
                                 }),
                                 Some(Err(e)) => Err(e),
-                                None => spawn_tool(&call.name, input, &ctx.directory).await,
+                                None => spawn_tool(&call.name, input, &ctx.directory, &session_env).await,
                             }
                         } else {
-                            spawn_tool(&call.name, input, &ctx.directory).await
+                            spawn_tool(&call.name, input, &ctx.directory, &session_env).await
                         };
                         match exec {
                             Ok(r) => {
@@ -2242,48 +2301,52 @@ pub async fn run_prompt_with(
                     "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
                 }));
             }
-            insert_message(
-                writer,
-                Some(&*ctx.blobs),
-                session_id,
-                &assistant_info,
-                &parts,
-            )
-            .context("persist assistant message")?;
+            // Transient runs persist nothing (no assistant row, no part
+            // events, no session.updated — the response carries the text).
+            if !opts.transient {
+                insert_message(
+                    writer,
+                    Some(&*ctx.blobs),
+                    session_id,
+                    &assistant_info,
+                    &parts,
+                )
+                .context("persist assistant message")?;
 
-            for part in &parts {
+                for part in &parts {
+                    emit_durable(
+                        ctx,
+                        writer,
+                        session_id,
+                        "message.part.updated",
+                        json!({"sessionID": session_id, "part": part}),
+                        &mut seq,
+                    )?;
+                }
                 emit_durable(
                     ctx,
                     writer,
                     session_id,
-                    "message.part.updated",
-                    json!({"sessionID": session_id, "part": part}),
+                    "message.updated",
+                    json!({"sessionID": session_id, "info": assistant_info}),
+                    &mut seq,
+                )?;
+                emit_session_updated(
+                    ctx,
+                    writer,
+                    session_id,
+                    json!({
+                        "cost": session_cost,
+                        // Session-lifetime aggregate (upstream applyUsage), NOT the
+                        // assistant message's step tokens. Session.tokens has no
+                        // `total` (additionalProperties:false) — `session_usage` is
+                        // already in that shape.
+                        "tokens": session_usage.clone(),
+                        "time": {"updated": t_done},
+                    }),
                     &mut seq,
                 )?;
             }
-            emit_durable(
-                ctx,
-                writer,
-                session_id,
-                "message.updated",
-                json!({"sessionID": session_id, "info": assistant_info}),
-                &mut seq,
-            )?;
-            emit_session_updated(
-                ctx,
-                writer,
-                session_id,
-                json!({
-                    "cost": session_cost,
-                    // Session-lifetime aggregate (upstream applyUsage), NOT the
-                    // assistant message's step tokens. Session.tokens has no
-                    // `total` (additionalProperties:false) — `session_usage` is
-                    // already in that shape.
-                    "tokens": session_usage.clone(),
-                    "time": {"updated": t_done},
-                }),
-                &mut seq,
-            )?;
             // ── M6 post-turn trigger (upstream prompt.ts:1160-1167 + overflow.ts
             // isOverflow): the count is the STEP's tokens — `total` when the
             // provider reports it, else the component sum (upstream's sum omits
@@ -2302,7 +2365,9 @@ pub async fn run_prompt_with(
                 ctx.model_limit["context"].as_i64().unwrap_or(0),
                 ctx.model_limit["output"].as_i64().unwrap_or(0),
             );
-            if ctx.compaction.auto && crate::compact::is_overflow(a_total, usable_t) {
+            // Transient runs never auto-compact (single prompt, no history
+            // to relieve — and no session to anchor). The answer stands.
+            if !opts.transient && ctx.compaction.auto && crate::compact::is_overflow(a_total, usable_t) {
                 if auto_doom.over() {
                     emit_live(
                         ctx,
@@ -2329,33 +2394,36 @@ pub async fn run_prompt_with(
     record_rounds(if final_out.is_some() { "done" } else { "error" }, step);
 
     // ---- finalize ONCE after any outer exit (idle trio + session row) ----
+    // Transient runs skip both (no session to idle, no row to finalize).
     let t_end = now_ms();
-    emit_live(
-        ctx,
-        "session.status",
-        json!({"sessionID": session_id, "status": {"type": "idle"}}),
-    );
-    emit_live(
-        ctx,
-        "session.diff",
-        json!({"sessionID": session_id, "diff": []}),
-    );
-    emit_live(ctx, "session.idle", json!({"sessionID": session_id}));
-    ocserve_store::finalize_session_prompt(
-        writer,
-        session_id,
-        &ocserve_store::PromptStats {
-            agent: &agent,
-            model_json: &json!({
-                "id": model,
-                "providerID": ctx.provider_id,
-                "variant": "default"
-            })
-            .to_string(),
-            time_updated: t_end,
-        },
-    )
-    .context("finalize session prompt row")?;
+    if !opts.transient {
+        emit_live(
+            ctx,
+            "session.status",
+            json!({"sessionID": session_id, "status": {"type": "idle"}}),
+        );
+        emit_live(
+            ctx,
+            "session.diff",
+            json!({"sessionID": session_id, "diff": []}),
+        );
+        emit_live(ctx, "session.idle", json!({"sessionID": session_id}));
+        ocserve_store::finalize_session_prompt(
+            writer,
+            session_id,
+            &ocserve_store::PromptStats {
+                agent: &agent,
+                model_json: &json!({
+                    "id": model,
+                    "providerID": ctx.provider_id,
+                    "variant": "default"
+                })
+                .to_string(),
+                time_updated: t_end,
+            },
+        )
+        .context("finalize session prompt row")?;
+    }
     // (rss/opens gauges emit from PhaseProbe::Drop — every exit path.)
     // K-TITLE: auto-title only reached on success, and only for sessions
     // STILL carrying a default title (preflight rides title — named
