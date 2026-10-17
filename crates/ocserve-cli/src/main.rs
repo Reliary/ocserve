@@ -348,6 +348,9 @@ async fn serve(
             );
         }
     }
+    // The plugin `config` hook (v1 parity) needs the resolved config; capture
+    // it before `into_payloads` consumes rt.
+    let plugin_config = rt.config.clone();
     let payloads = rt.into_payloads(); // consumed after llm/mcp/plugins took their pieces
     let db_path = ocserve_store::writer::db_path(&data_dir);
     let writer = std::sync::Arc::new(
@@ -736,6 +739,14 @@ async fn serve(
                         },
                         Err(e) => tracing::warn!("plugin {spec} resolve failed: {e:#}"),
                     }
+                }
+                // v1 parity (plugin/index.ts:244-251): notify every loaded
+                // plugin of the resolved config via its `config` hook (called
+                // once, errors logged + ignored). Previously never dispatched —
+                // a registered-but-never-called hook (TESTING §1.6 class).
+                match sc.config(plugin_config.clone()).await {
+                    Ok(v) => tracing::info!("plugin config hook: {v}"),
+                    Err(e) => tracing::warn!("plugin config dispatch failed: {e:#}"),
                 }
                 tracing::info!("plugin statuses: {}", sc.statuses());
                 plugin_sidecar = Some(sc);

@@ -276,6 +276,27 @@ async function trigger(name, input, output) {
   return output;
 }
 
+/**
+ * v1 `config` hook (plugin/index.ts:244-251): every loaded plugin's
+ * `hooks.config(cfg)` is called once with the resolved config; each failure
+ * logged + ignored (Effect.ignore). Distinct from `trigger` (which passes an
+ * input+output pair) — here the single arg IS the config.
+ */
+async function dispatchConfig(cfg) {
+  let matched = 0;
+  for (const plugin of loaded) {
+    const fn = plugin.hooks["config"];
+    if (typeof fn !== "function") continue;
+    matched++;
+    try {
+      await fn(cfg);
+    } catch (e) {
+      process.stderr.write(`[plugin:${plugin.spec}] config hook failed: ${e?.stack ?? e}\n`);
+    }
+  }
+  return { matched };
+}
+
 // ---- protocol loop ---------------------------------------------------
 let buffer = "";
 process.stdin.setEncoding("utf8");
@@ -374,7 +395,7 @@ async function handle(line) {
           rpcs: Object.keys(v2State.rpcs),
         });
         break;
-      case "config": reply("ok"); break; // config() hooks: invoked at load-time parity, M4b
+      case "config": reply(await dispatchConfig(msg.params.config)); break;
       // v1 parity (plugin/index.ts:255-259): per-plugin hooks["event"]
       // called with {event:{id,type,properties}}; each failure logged and
       // skipped (upstream: void fire-and-forget, fail-open).

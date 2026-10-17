@@ -1007,6 +1007,42 @@ export default PluginModule.server;
         Ok(())
     }
 
+    /// The `config` hook is dispatched (v1 parity, plugin/index.ts:244-251).
+    /// Closes the registered-but-never-called class: a plugin whose `config`
+    /// is a real hook must see it run (host `config` used to hard-code "ok").
+    #[tokio::test]
+    async fn config_hook_is_dispatched() -> anyhow::Result<()> {
+        if !runtime_available() {
+            panic!(
+                "plugin-runtime binary ({}) required for plugin-host tests",
+                crate::plugin_runtime().program()
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("cfg.mjs"),
+            r#"export const PluginModule = {
+  id: "cfg",
+  server: async () => ({
+    config: async (cfg) => {
+      if (typeof cfg !== "object" || cfg === null) throw new Error("config not object");
+    },
+    "chat.message": async () => {},
+  }),
+};
+export default PluginModule.server;"#,
+        )
+        .unwrap();
+        let host = materialize_host(&dir.path().join("host"))?;
+        let mut sc = Sidecar::spawn(&host, "http://127.0.0.1:9", "/work").await?;
+        sc.load("cfg", &dir.path().join("cfg.mjs"), &json!({}), &Value::Null)
+            .await?;
+        let r = sc.config(json!({"model": "x"})).await?;
+        assert_eq!(r["matched"], 1, "config hook must be dispatched: {r}");
+        sc.shutdown().await;
+        Ok(())
+    }
+
     /// Test environment gate: the ACTUAL runtime (bun preferred) must exist.
     fn runtime_available() -> bool {
         crate::which(crate::plugin_runtime().program()).is_some()
