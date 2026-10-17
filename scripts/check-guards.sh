@@ -197,18 +197,22 @@ else
 fi
 
 echo "== guard: embedded UI version-skew (rule 17) =="
-# The pinned web UI must call only routes present in the frozen spec (same
-# tag); a mismatch means the extraction captured the wrong build. Replaces the
-# old Cloudflare-latest webui-routes.txt. Planted control: sabotaged spec → red.
-if [ -f crates/ocserve-http/assets/webui/1.18.31.pack.zst ] && [ -f crates/ocserve-core/assets/openapi/1.18.31.json ]; then
-  if out=$(python3 bench/webui/check-app-skew.py crates/ocserve-http/assets/webui/1.18.31.pack.zst crates/ocserve-core/assets/openapi/1.18.31.json 2>&1); then
-    echo "ok"
+# Each pinned web UI must call only routes present in its SAME-TAG frozen
+# spec (Phase E: v1 + v2 packs). A mismatch means the extraction captured the
+# wrong build. Planted control: sabotaged spec → red.
+for _tag in 1.18.31 2.0.28; do
+  _pack="crates/ocserve-http/assets/webui/$_tag.pack.zst"
+  _spec="crates/ocserve-core/assets/openapi/$_tag.json"
+  if [ -f "$_pack" ] && [ -f "$_spec" ]; then
+    if out=$(python3 bench/webui/check-app-skew.py "$_pack" "$_spec" 2>&1); then
+      echo "ok ($_tag)"
+    else
+      echo "$out"; echo "FAIL: $_tag embedded UI calls a route absent from its spec (rule 17)"; fail=1
+    fi
   else
-    echo "$out"; echo "FAIL: embedded UI calls a route absent from the frozen spec (rule 17)"; fail=1
+    echo "ok ($_tag: no embedded app pack)"
   fi
-else
-  echo "ok (no embedded app pack)"
-fi
+done
 
 echo "== guard: permission oracle vectors present + self-consistent (rule 18) =="
 # Behavioural layer: route-binding (16) and shape (P4) cannot see authorization

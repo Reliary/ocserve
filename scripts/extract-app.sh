@@ -70,8 +70,11 @@ def get(path):
 
 seen = {}
 queue = ["/"]
-# Root-referenced files + transitive /assets refs discovered in text bodies.
-asset_re = re.compile(rb'(?:src|href)="(/[^"]+)"|(/assets/[A-Za-z0-9_.-]+)')
+# Root-referenced files + transitive asset refs discovered in text bodies.
+# Both generations: v1 bundles reference /assets/*, v2 bundles /_assets/*
+# (plus /icons/* favicons in both). Miss either prefix and the pack ships a
+# broken shell (Phase E: the regex is load-bearing).
+asset_re = re.compile(rb'(?:src|href)="(/[^"]+)"|(/_?assets/[A-Za-z0-9_.\-/]+)|(/icons/[A-Za-z0-9_.\-/]+)')
 while queue:
     path = queue.pop(0)
     if path in seen or len(seen) > 400:
@@ -85,7 +88,7 @@ while queue:
     # Discover further local references from text-ish bodies.
     if path.endswith((".js", ".css", ".html", ".json", ".webmanifest", ".svg")) or path == "/":
         for m in asset_re.finditer(body):
-            ref = (m.group(1) or m.group(2) or b"").decode("latin1")
+            ref = (m.group(1) or m.group(2) or m.group(3) or b"").decode("latin1")
             if not ref or ref.startswith("//") or "://" in ref or ref.startswith("data:"):
                 continue
             if ref not in seen and ref not in queue:

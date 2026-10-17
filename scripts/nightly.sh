@@ -121,13 +121,17 @@ step "backup drill (VACUUM INTO + integrity + counts)" bash -c "$(declare -f dri
 #      1.18.31 app pack, zstd 5.08 MB, embedded via include_bytes! — upstream
 #      parity: upstream embeds its whole app/dist too; still ~6.5x smaller
 #      than upstream's 185 MB ELF) → ceiling 30,000,000 B
+#     Phase E second pack: 32,965,584 B measured 2026-10-17 (the pinned
+#      2.0.28 app pack, zstd 3.16 MB, same pipeline — both packs embedded,
+#      selected by OCSERVE_UI_PACK; still ~5.6x smaller than upstream's
+#      185 MB ELF) → ceiling 34,000,000 B
 size_gate() {
   local bin="target/release/ocserve"
   if [ ! -x "$bin" ]; then
     echo "release binary missing — building"
     cargo build --release || return 1
   fi
-  local sz ceiling=30000000
+  local sz ceiling=34000000
   sz="$(stat -c%s "$bin")"
   echo "size=${sz} ceiling=${ceiling}"
   [ "$sz" -le "$ceiling" ] || { echo "OVER SIZE CEILING"; return 1; }
