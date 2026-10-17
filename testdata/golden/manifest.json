@@ -23,6 +23,7 @@
    "$.data[].hidden",
    "$.data[].id",
    "$.data[].mode",
+   "$.data[].name",
    "$.data[].permissions",
    "$.data[].permissions[].action",
    "$.data[].permissions[].effect",
@@ -30,10 +31,12 @@
    "$.data[].request",
    "$.data[].request.body",
    "$.data[].request.headers",
+   "$.data[].request.settings",
    "$.data[].system",
    "$.location",
    "$.location.directory",
    "$.location.project",
+   "$.location.project.canonical",
    "$.location.project.directory",
    "$.location.project.id"
   ],
@@ -50,6 +53,7 @@
    "$.location",
    "$.location.directory",
    "$.location.project",
+   "$.location.project.canonical",
    "$.location.project.directory",
    "$.location.project.id"
   ],
@@ -81,6 +85,7 @@
   "keys": [
    "$.directory",
    "$.project",
+   "$.project.canonical",
    "$.project.directory",
    "$.project.id"
   ],
@@ -165,6 +170,7 @@
    "$.location",
    "$.location.directory",
    "$.location.project",
+   "$.location.project.canonical",
    "$.location.project.directory",
    "$.location.project.id"
   ],
@@ -333,6 +339,23 @@
   "path": "/experimental/resource",
   "status": 200
  },
+ "experimental_session": {
+  "keys": [
+   "$[].directory",
+   "$[].id",
+   "$[].slug",
+   "$[].time",
+   "$[].time.created",
+   "$[].time.updated",
+   "$[].title",
+   "$[].version"
+  ],
+  "mode": "keys_subset",
+  "ms": 50,
+  "note": "required = keys freeze emits for an unprompted seeded session; ocserve additionally emits agent/cost/model (documented D-PAIR-3; live A<->B equality asserted in pair mode)",
+  "path": "/experimental/session?search=OpenCode&roots=true&limit=50",
+  "status": 200
+ },
  "experimental_workspace": {
   "keys": [
    "$[]"
@@ -389,10 +412,12 @@
  },
  "project": {
   "keys": [
+   "$[].canonical",
    "$[].id",
    "$[].sandboxes",
    "$[].sandboxes[]",
    "$[].time",
+   "$[].time.active",
    "$[].time.created",
    "$[].time.initialized",
    "$[].time.updated",
@@ -405,10 +430,12 @@
  },
  "project_current": {
   "keys": [
+   "$.canonical",
    "$.id",
    "$.sandboxes",
    "$.sandboxes[]",
    "$.time",
+   "$.time.active",
    "$.time.created",
    "$.time.initialized",
    "$.time.updated",
@@ -491,6 +518,7 @@
   "truncated": true
  },
  "provider_auth": {
+  "defer": "divergence:K-ADMIN-api-key-only",
   "keys": [
    "$.azure",
    "$.azure[].label",
@@ -561,8 +589,7 @@
   ],
   "mode": "keys",
   "path": "/provider/auth",
-  "status": 200,
-  "defer": "divergence:K-ADMIN-api-key-only"
+  "status": 200
  },
  "session_list": {
   "keys": [
@@ -577,9 +604,9 @@
   ],
   "mode": "keys_subset",
   "ms": 53,
+  "note": "required = keys freeze emits for an unprompted seeded session; ocserve additionally emits agent/cost/model (documented D-PAIR-3; live A<->B equality asserted in pair mode)",
   "path": "/session",
-  "status": 200,
-  "note": "required = keys freeze emits for an unprompted seeded session; ocserve additionally emits agent/cost/model (documented D-PAIR-3; live A<->B equality asserted in pair mode)"
+  "status": 200
  },
  "session_status": {
   "len": 2,
@@ -595,22 +622,5 @@
   "mode": "keys",
   "path": "/vcs",
   "status": 200
- },
- "experimental_session": {
-  "mode": "keys_subset",
-  "path": "/experimental/session?search=OpenCode&roots=true&limit=50",
-  "status": 200,
-  "keys": [
-   "$[].directory",
-   "$[].id",
-   "$[].slug",
-   "$[].time",
-   "$[].time.created",
-   "$[].time.updated",
-   "$[].title",
-   "$[].version"
-  ],
-  "ms": 50,
-  "note": "required = keys freeze emits for an unprompted seeded session; ocserve additionally emits agent/cost/model (documented D-PAIR-3; live A<->B equality asserted in pair mode)"
  }
 }

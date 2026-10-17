@@ -1657,7 +1657,7 @@ pub(crate) fn project_list_body(st: &Arc<AppState>) -> Value {
     Value::Array(out)
 }
 
-/// GET /project/current — same shape, single object.
+/// GET /project/current — same union Project shape as the list, single object.
 async fn get_project_current(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1667,7 +1667,10 @@ async fn get_project_current(State(st): State<Arc<AppState>>) -> impl IntoRespon
     Json(json!({
         "id": "global",
         "worktree": worktree,
-        "time": {"created": now_ms, "updated": now_ms, "initialized": now_ms},
+        // UNION (D-V2-UNION): same additive keys as the list projector —
+        // one Project shape on every project route.
+        "canonical": worktree,
+        "time": {"created": now_ms, "updated": now_ms, "initialized": now_ms, "active": now_ms},
         "sandboxes": [],
     }))
 }
