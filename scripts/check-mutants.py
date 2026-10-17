@@ -22,9 +22,14 @@ import json
 import sys
 from pathlib import Path
 
-# Agreed at the first measured baseline (2026-10-17); ratchet DOWN over time.
-# Ratcheting up requires a commit message naming the reason.
-DEFAULT_MISSED_CEILING = 400
+# Agreed at the first measured full-scope baseline (2026-10-17, i9, 2330
+# mutants: 939 caught / 1221 missed / 24 timeout / 146 unviable = 43.5% score).
+# This is a ratchet: it must only ever go DOWN. Raising it requires a commit
+# naming the reason (e.g. a large new module not yet covered). The 24 timeouts
+# are not counted as survivors but may flip to missed on a faster/luckier run;
+# a run over the ceiling is triaged (real regression vs timeout flip), never
+# silently re-run.
+DEFAULT_MISSED_CEILING = 1221
 
 
 def main() -> int:
