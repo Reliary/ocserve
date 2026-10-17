@@ -48,6 +48,16 @@ pub fn per_id() -> String {
     format!("per_{}", encode(ms, &nonce[..8]))
 }
 
+/// Credential id (`cred_` + 22 chars, observed live on 2.0.28:
+/// `cred_14959efa2001dXqJruE0AGdF2q`). Same time-hexed construction,
+/// truncated to the observed width (full time prefix retained, hash tail
+/// shortened — collision space still dominated by ms + sha).
+pub fn cred_id() -> String {
+    let ms = now_ms();
+    let nonce: Vec<u8> = std::iter::repeat_with(rand_byte).take(8).collect();
+    format!("cred_{}", encode(ms, &nonce[..8])[..22].to_string())
+}
+
 /// Upstream `Identifier.ascending()` tail: 13 hex chars = ms*4096+counter
 /// encoded big-endian in 6 bytes; +12 random base62. Used for pty_ ids
 /// (schema/src/identifier.ts, procced live 2026-10-08).

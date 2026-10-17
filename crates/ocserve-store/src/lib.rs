@@ -2558,6 +2558,205 @@ pub fn session_directory(db: &std::path::Path, session_id: &str) -> anyhow::Resu
     Ok(d.filter(|s| !s.is_empty()))
 }
 
+// ---------------------------------------------------------------------------
+// Credentials (gap closure): upstream `credential` table semantics, verified
+// live against 2.0.28 — create returns the entry (label defaults "default",
+// active defaults true and single-actives same-integration siblings);
+// activate flips one active + siblings inactive (per-integration scope,
+// unknown id = 204 no-op); list echoes values in creation order (upstream
+// parity — authenticated clients only). Explicit columns (rule 25/33).
+// ---------------------------------------------------------------------------
+
+/// One credential row (mirrors Credential.Entry wire shape).
+pub struct Credential {
+    pub id: String,
+    pub integration_id: Option<String>,
+    pub label: String,
+    pub value: String,
+    pub active: bool,
+    pub time_created: i64,
+    pub time_updated: i64,
+}
+
+impl Credential {
+    pub fn to_wire(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "integrationID": self.integration_id,
+            "label": self.label,
+            "active": self.active,
+            "value": serde_json::from_str::<serde_json::Value>(&self.value).unwrap_or(serde_json::Value::Null),
+        })
+    }
+}
+
+fn credential_row(r: &rusqlite::Row) -> rusqlite::Result<Credential> {
+    Ok(Credential {
+        id: r.get(0)?,
+        integration_id: r.get(1)?,
+        label: r.get(2)?,
+        value: r.get(3)?,
+        active: r.get::<_, i64>(4)? != 0,
+        time_created: r.get(5)?,
+        time_updated: r.get(6)?,
+    })
+}
+
+/// List all credentials in creation order.
+pub fn credential_list(db: &std::path::Path) -> anyhow::Result<Vec<Credential>> {
+    let conn = pragma::open_reader(db)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, integration_id, label, value, active, time_created, time_updated \
+         FROM credential ORDER BY time_created, rowid",
+    )?;
+    let rows = stmt.query_map([], credential_row)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Insert a credential; when `active`, same-integration siblings deactivate
+/// (single-active per integration, verified live). Returns the entry.
+pub fn credential_create(
+    writer: &Writer,
+    id: &str,
+    integration_id: Option<&str>,
+    label: &str,
+    value: &str,
+    active: bool,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    let mut ops = vec![WriteOp::Sql {
+        sql: "INSERT INTO credential \
+              (id, integration_id, label, value, active, time_created, time_updated) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)"
+            .into(),
+        params: vec![
+            id.into(),
+            integration_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+            label.into(),
+            value.into(),
+            (if active { 1 } else { 0 }).into(),
+            now_ms.into(),
+        ],
+    }];
+    if active {
+        ops.push(WriteOp::Sql {
+            sql: "UPDATE credential SET active = 0, time_updated = ?2 \
+                  WHERE integration_id IS ?1 AND id != ?3"
+                .into(),
+            params: vec![
+                integration_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+                now_ms.into(),
+                id.into(),
+            ],
+        });
+    }
+    writer.write(ops)?;
+    Ok(())
+}
+
+/// Activate one credential (target active + siblings inactive); unknown id =
+/// no-op Ok (upstream 204s unknown ids — idempotent, never 404).
+pub fn credential_activate(writer: &Writer, db: &std::path::Path, id: &str, now_ms: i64) -> anyhow::Result<()> {
+    let conn = pragma::open_reader(db)?;
+    let row: Option<Option<String>> = conn
+        .query_row("SELECT integration_id FROM credential WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .ok();
+    let Some(integration) = row else {
+        return Ok(());
+    };
+    let flat: Option<String> = integration;
+    writer.write(vec![
+        WriteOp::Sql {
+            sql: "UPDATE credential SET active = 0, time_updated = ?2 \
+                  WHERE integration_id IS ?1 AND id != ?3"
+                .into(),
+            params: vec![
+                flat.clone().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+                now_ms.into(),
+                id.into(),
+            ],
+        },
+        WriteOp::Sql {
+            sql: "UPDATE credential SET active = 1, time_updated = ?2 WHERE id = ?1".into(),
+            params: vec![id.into(), now_ms.into()],
+        },
+    ])?;
+    Ok(())
+}
+
+/// The ACTIVE credential value for an integration (websearch key lookup).
+/// `None` when no active row exists.
+pub fn credential_active_value(
+    db: &std::path::Path,
+    integration_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let conn = pragma::open_reader(db)?;
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT value FROM credential \
+             WHERE integration_id = ?1 AND active != 0 \
+             ORDER BY time_updated DESC LIMIT 1",
+            [integration_id],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(v)
+}
+
+// ---------------------------------------------------------------------------
+// Session environment (gap closure, D-ENV): per-session string map, replaced
+// wholesale by PUT. Read once per turn; injected into tool subprocess env.
+// Never sent to the provider.
+// ---------------------------------------------------------------------------
+
+/// Replace the session's variables wholesale (REST replace semantics).
+pub fn environment_put(
+    writer: &Writer,
+    session_id: &str,
+    variables: &serde_json::Value,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    writer.write(vec![WriteOp::Sql {
+        sql: "INSERT INTO session_environment (session_id, variables, time_updated) \
+              VALUES (?1, ?2, ?3) \
+              ON CONFLICT(session_id) DO UPDATE SET variables = ?2, time_updated = ?3"
+            .into(),
+        params: vec![session_id.into(), variables.clone(), now_ms.into()],
+    }])?;
+    Ok(())
+}
+
+/// Load the session's variables (empty map when absent). Values are
+/// strings by contract; non-string JSON coerces via to_string.
+pub fn environment_get(
+    db: &std::path::Path,
+    session_id: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let conn = pragma::open_reader(db)?;
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT variables FROM session_environment WHERE session_id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .ok();
+    let mut out = Vec::new();
+    if let Some(raw) = raw
+        && let Ok(map) = serde_json::from_str::<serde_json::Value>(&raw)
+        && let Some(obj) = map.as_object()
+    {
+        for (k, v) in obj {
+            let s = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+            out.push((k.clone(), s));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
 /// Set a session's directory (v2 `session.move` execution). Explicit columns
 /// (rule 25/33); returns rows affected (0 = unknown session).
 pub fn set_session_directory(

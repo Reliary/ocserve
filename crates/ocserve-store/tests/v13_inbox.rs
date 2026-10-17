@@ -82,7 +82,7 @@ fn v13_migration_is_pure_create_no_data_movement() {
     let ver: i64 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(ver, 13);
+    assert_eq!(ver, 14);
     let sessions: i64 = conn
         .query_row("SELECT count(*) FROM session", [], |r| r.get(0))
         .unwrap();
@@ -94,6 +94,13 @@ fn v13_migration_is_pure_create_no_data_movement() {
         .query_row("SELECT type FROM event", [], |r| r.get(0))
         .unwrap();
     assert_eq!(ty, "session.created", "migration must not rewrite types");
+    // v13->v14 arms create the gap-closure tables empty (no backfill).
+    for tbl in ["credential", "session_environment"] {
+        let n: i64 = conn
+            .query_row(&format!("SELECT count(*) FROM {tbl}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "{tbl} must migrate empty");
+    }
     // CONTROL: any data touch in the 12->13 arm (e.g. a type rewrite) → red.
 }
 

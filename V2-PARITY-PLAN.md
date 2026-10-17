@@ -155,21 +155,35 @@ admit-only; the turn executor is unchanged). Binary 33,013,072 B ≤ 34M.
   foreground/background tool distinction in the inline loop).
 - D-VIEW-NOWATERMARK: view records + 204s (no read watermark tracked).
 - D-PLUGIN-INVENTORY: plugin list honestly empty (no inventory RPC yet).
-- D-ENV: `PUT environment` unbound until turn injection lands (persisting
-  unread vars = shape-without-mutation). Injection point: `run_v2_turn`
-  system rendering; store: `session_environment` table; oracle: capdiff
-  bytes-axis proving vars reach the provider.
+- D-ENV: CLOSED — `PUT /api/session/{id}/environment` bound (replace
+  semantics); `session_environment` table; read once per turn, injected
+  into bash subprocess env; never sent to the provider (e2e asserts tool
+  result carries the value + first provider body lacks it).
   `PUT /api/session/{sessionID}/environment` — same verdict, exact path.
-- D-RPC: `POST /api/rpc/*` explicitly 404 `RpcError` (plugin-RPC dispatch
-  has no oracle; no caller at boot/basic flows). Build trigger: a real
-  client call observed in the boot-capture harness.
-  `POST /api/rpc/{rpcID}/{method}` — same handler (wildcard route), same verdict.
-- D-WEBSEARCH: `POST /api/websearch` explicitly 503 (route exists, no
-  provider backend). Build trigger: client demand + provider plumbing.
-  `GET /api/websearch/provider` — same verdict (no backend, no list).
-- D-CREDENTIAL: credential stubs only (204/401 inventory shapes, no secret
-  store). No fake success: nothing claims a credential was stored. Build
-  trigger: OAuth/pairing flow requirement.
+- D-RPC: CLOSED as exact-error parity — no constructible state enables RPC
+  (fake + real builtin ids all → `rpc.unavailable`, verified live);
+  byte-exact 400 + type field; missing/invalid body → exact Payload error.
+  Routes to the sidecar the day a plugin registers RPC methods.
+  `POST /api/rpc/{rpcID}/{method}` — same handler (exact path), same verdict.
+- D-WEBSEARCH: CLOSED — provider list exact (verified bytes); validation
+  byte-exact (required/not-found); active credential key → direct backend
+  (Tavily/Exa); no key → `{results: []}` (observed keyless behavior);
+  backend failure → exact ServiceUnavailable envelope. Firecrawl/Parallel/
+  TinyFish → same failure envelope (D-WEBSEARCH-PARTIAL — the envelope
+  upstream emits when ITS backend fails, never fabricated results).
+  `GET /api/websearch/provider` — same verdict (exact list).
+- D-CREDENTIAL: CLOSED — `credential` table (upstream shape); CRUD with
+  single-active-per-integration (create default + activate, verified live);
+  unknown activate = 204 no-op; label defaults "default"; value union
+  validated with exact Payload wording; values echo on GET (upstream
+  parity); DB file 600 (pragma::open_writer restricts every open).
+- D-GENERATE-EPHEMERAL: CLOSED — `RunOpts.transient` threads the shared
+  executor (no session bail, no persist, no session-scoped emissions,
+  no compaction anchor, unsolicited tool_calls dropped); experimental
+  generate returns `{data:{text}}` with zero session/message/event rows
+  (verified live: upstream creates nothing either). Also fixed the same
+  latent empty-text bug in session generate (info has no text field —
+  extract from parts).
 
 ## 9. Phase D exit: G2-targeted perf (local single-VU, release binary)
 

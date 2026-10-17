@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -171,6 +171,35 @@ CREATE TABLE form (
 ) STRICT;
 
 CREATE INDEX idx_form_session ON form(session_id, time_created);
+
+-- v2 credentials (gap closure): upstream `credential` table shape
+-- (verified live against 2.0.28: id/integration_id/label/value/active +
+-- created/updated; connector_id/method_id ride along nullable for OAuth
+-- flows). Values echo on GET (upstream parity — authenticated loopback /
+-- tailnet clients only, same threat model). File-level protection is the
+-- 600 DB mode (pragma::open_writer restricts on every open).
+CREATE TABLE credential (
+    id             TEXT PRIMARY KEY,
+    integration_id TEXT,
+    label          TEXT NOT NULL,
+    value          TEXT NOT NULL,
+    connector_id   TEXT,
+    method_id      TEXT,
+    active         INTEGER,
+    time_created   INTEGER NOT NULL,
+    time_updated   INTEGER NOT NULL
+) STRICT;
+
+-- Session environment variables (gap closure, D-ENV): per-session string
+-- map replaced wholesale by PUT (REST replace semantics). Read once per
+-- turn and injected into tool subprocess env (bash). Never sent to the
+-- provider (no prompt-text contamination — the capdiff bytes axis stays
+-- clean by construction).
+CREATE TABLE session_environment (
+    session_id   TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+    variables    TEXT NOT NULL DEFAULT '{}',
+    time_updated INTEGER NOT NULL
+) STRICT;
 
 -- legacy-delta sync state (dev bridge: legacy -> ocserve additive pulls;
 -- dropped relevance once the final migration lands — PLAN §17)
@@ -732,6 +761,28 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                     ) STRICT;
                     CREATE INDEX IF NOT EXISTS idx_form_session
                         ON form(session_id, time_created);",
+                )?;
+            }
+            13 => {
+                // v13->v14: credentials + session environment (gap closure).
+                // Pure CREATE, no data movement (same fast-path rule as v12).
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS credential (
+                        id             TEXT PRIMARY KEY,
+                        integration_id TEXT,
+                        label          TEXT NOT NULL,
+                        value          TEXT NOT NULL,
+                        connector_id   TEXT,
+                        method_id      TEXT,
+                        active         INTEGER,
+                        time_created   INTEGER NOT NULL,
+                        time_updated   INTEGER NOT NULL
+                    ) STRICT;
+                    CREATE TABLE IF NOT EXISTS session_environment (
+                        session_id   TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+                        variables    TEXT NOT NULL DEFAULT '{}',
+                        time_updated INTEGER NOT NULL
+                    ) STRICT;",
                 )?;
             }
             other => {
