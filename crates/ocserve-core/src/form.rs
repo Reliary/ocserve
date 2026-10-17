@@ -90,22 +90,29 @@ impl FormGate {
 
     /// Reply: deliver the answer object. Unknown id → false.
     pub fn reply(&self, id: &str, answer: Value) -> bool {
-        let done = match self.pending.lock().remove(id) {
-            Some(p) => p.tx.send(FormOutcome::Answered(answer)).is_ok(),
+        // Entry-existence verdict (send best-effort — see attempt.rs).
+        let existed = match self.pending.lock().remove(id) {
+            Some(p) => {
+                let _ = p.tx.send(FormOutcome::Answered(answer));
+                true
+            }
             None => false,
         };
         self.guards.lock().remove(id);
-        done
+        existed
     }
 
     /// Cancel: settle as cancelled. Unknown id → false.
     pub fn cancel(&self, id: &str) -> bool {
-        let done = match self.pending.lock().remove(id) {
-            Some(p) => p.tx.send(FormOutcome::Cancelled).is_ok(),
+        let existed = match self.pending.lock().remove(id) {
+            Some(p) => {
+                let _ = p.tx.send(FormOutcome::Cancelled);
+                true
+            }
             None => false,
         };
         self.guards.lock().remove(id);
-        done
+        existed
     }
 
     /// Runner wait with the bounded cap; timeout → Cancelled + cleanup.

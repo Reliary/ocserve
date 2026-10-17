@@ -315,6 +315,10 @@ pub struct AppState {
     pub question_gate: std::sync::Arc<ocserve_core::question::QuestionGate>,
     /// Form rendezvous (v2 Form service): pending asks + reply/cancel.
     pub form_gate: std::sync::Arc<ocserve_core::form::FormGate>,
+    /// Connect-attempt rendezvous (integration command/external/oauth).
+    pub attempt_gate: std::sync::Arc<ocserve_core::attempt::AttemptGate>,
+    /// Background shell registry (Phase D bulkhead: 128 shells, 64KiB out).
+    pub shells: std::sync::Arc<ocserve_core::shell::ShellRegistry>,
     /// v2 runtime kill-switch (V2-PLAN.md D2): read from `OCSERVE_V2` ONCE at
     /// construction (never per-request env reads — env is process-global and
     /// per-request reads make parallel tests flaky by construction).
@@ -636,6 +640,8 @@ impl AppState {
             prompt_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             question_gate: ocserve_core::question::QuestionGate::new(),
             form_gate: ocserve_core::form::FormGate::new(),
+            attempt_gate: ocserve_core::attempt::AttemptGate::new(),
+            shells: ocserve_core::shell::ShellRegistry::new(),
             v2_enabled: v2,
             coordinators: std::sync::Arc::new(ocserve_core::coordinator::CoordinatorSet::new()),
             tui: crate::tui::TuiControl::default(),
@@ -5533,6 +5539,24 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/session/active", get(v2::active_sessions))
         .route("/api/session/{sessionID}", get(v2::get_session))
+        .route(
+            "/api/session/{sessionID}",
+            axum::routing::delete(v2::session_remove_api).patch(v2::session_update_api),
+        )
+        .route(
+            "/api/session/{sessionID}/revert",
+            axum::routing::delete(v2::session_revert_clear_api),
+        )
+        .route(
+            "/api/session/{sessionID}/agent",
+            axum::routing::post(v2::session_agent_api),
+        )
+        .route(
+            "/api/session/{sessionID}/model",
+            axum::routing::post(v2::session_model_api),
+        )
+        // NOTE: axum merges the two registrations for the same path
+        // (get + delete + patch on one path).
         .route("/api/session/{sessionID}/message", get(v2::list_messages))
         .route(
             "/api/session/{sessionID}/message/{messageID}",
@@ -5540,14 +5564,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/session/{sessionID}/context", get(v2::session_context))
         .route("/api/session/{sessionID}/history", get(v2::session_history))
-        .route(
-            "/api/session/{sessionID}/agent",
-            axum::routing::post(v2::switch_agent),
-        )
-        .route(
-            "/api/session/{sessionID}/model",
-            axum::routing::post(v2::switch_model),
-        )
         .route(
             "/api/session/{sessionID}/prompt",
             axum::routing::post(v2::prompt),
@@ -5585,11 +5601,25 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/config", get(v2::config_list))
         .route("/api/config/shell", get(v2::config_shells))
         .route("/api/model/default", get(v2::model_default))
-        .route("/api/debug/location", get(v2::debug_location_list).delete(v2::debug_location_evict))
-        .route("/api/experimental/migration/v1", get(v2::migration_v1_status))
+        .route(
+            "/api/debug/location",
+            get(v2::debug_location_list).delete(v2::debug_location_evict),
+        )
+        .route(
+            "/api/experimental/migration/v1",
+            get(v2::migration_v1_status),
+        )
         .route("/api/plugin", get(v2::plugin_list))
-        .route("/api/experimental/fs/write", axum::routing::post(v2::fs_write))
-        .route("/api/worktree", get(v2::worktree_list_api).post(v2::worktree_create_api).delete(v2::worktree_remove_api))
+        .route(
+            "/api/experimental/fs/write",
+            axum::routing::post(v2::fs_write),
+        )
+        .route(
+            "/api/worktree",
+            get(v2::worktree_list_api)
+                .post(v2::worktree_create_api)
+                .delete(v2::worktree_remove_api),
+        )
         .route(
             "/api/worktree/refresh",
             axum::routing::post(v2::worktree_refresh_api),
@@ -5598,6 +5628,132 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/session/{sessionID}/background",
             axum::routing::post(v2::session_background_api),
+        )
+        .route(
+            "/api/session/{sessionID}/command",
+            axum::routing::post(v2::session_command_api),
+        )
+        .route(
+            "/api/session/{sessionID}/shell",
+            axum::routing::post(v2::session_shell_api),
+        )
+        .route(
+            "/api/session/{sessionID}/move",
+            axum::routing::post(v2::session_move_api),
+        )
+        .route(
+            "/api/session/{sessionID}/synthetic",
+            axum::routing::post(v2::session_synthetic_api),
+        )
+        .route(
+            "/api/session/{sessionID}/view",
+            axum::routing::post(v2::session_view_api),
+        )
+        .route(
+            "/api/session/{sessionID}/generate",
+            axum::routing::post(v2::session_generate_api),
+        )
+        .route(
+            "/api/integration/{integrationID}/connect/command",
+            axum::routing::post(v2::integration_command_connect),
+        )
+        .route(
+            "/api/integration/{integrationID}/connect/external",
+            axum::routing::post(v2::integration_external_connect),
+        )
+        .route(
+            "/api/integration/{integrationID}/connect/command/{attemptID}",
+            get(v2::integration_attempt_poll).delete(v2::integration_attempt_abort),
+        )
+        .route(
+            "/api/integration/{integrationID}/connect/oauth/{attemptID}",
+            get(v2::integration_attempt_poll).delete(v2::integration_attempt_abort),
+        )
+        .route(
+            "/api/integration/{integrationID}/connect/oauth/{attemptID}/complete",
+            axum::routing::post(v2::integration_oauth_complete),
+        )
+        .route(
+            "/api/experimental/integration/wellknown",
+            axum::routing::post(v2::integration_wellknown),
+        )
+        .route(
+            "/api/experimental/mcp/{server}",
+            axum::routing::put(v2::mcp_exp_upsert).delete(v2::mcp_exp_remove),
+        )
+        .route(
+            "/api/experimental/mcp/{server}/connect",
+            axum::routing::post(v2::mcp_exp_connect),
+        )
+        .route(
+            "/api/experimental/mcp/{server}/disconnect",
+            axum::routing::post(v2::mcp_exp_disconnect),
+        )
+        .route("/api/pair", axum::routing::post(v2::pair_mint))
+        .route("/auth/connect/{code}", get(v2::pair_connect))
+        .route(
+            "/api/experimental/persistent-pty/{ptyID}",
+            get(v2::ppty_get)
+                .put(v2::ppty_update)
+                .delete(v2::ppty_remove),
+        )
+        .route(
+            "/api/experimental/persistent-pty/{ptyID}/connect",
+            get(v2::ppty_connect_info),
+        )
+        .route(
+            "/api/experimental/persistent-pty/{ptyID}/snapshot",
+            get(v2::ppty_snapshot),
+        )
+        .route(
+            "/api/experimental/persistent-pty/{ptyID}/connect-token",
+            axum::routing::post(v2::ppty_connect_token),
+        )
+        .route(
+            "/api/experimental/persistent-pty/handoff",
+            axum::routing::post(v2::ppty_handoff),
+        )
+        .route(
+            "/api/experimental/persistent-pty/shutdown",
+            axum::routing::post(v2::ppty_shutdown),
+        )
+        .route(
+            "/api/experimental/session/{sessionID}/terminal",
+            get(v2::ppty_session_list).post(v2::ppty_session_create),
+        )
+        .route(
+            "/api/experimental/session/{sessionID}/terminal/read",
+            get(v2::ppty_session_read),
+        )
+        .route("/api/shell", get(v2::shell_list).post(v2::shell_create))
+        .route(
+            "/api/shell/{id}",
+            get(v2::shell_get).delete(v2::shell_remove),
+        )
+        .route("/api/shell/{id}/output", get(v2::shell_output))
+        .route(
+            "/api/experimental/session/{sessionID}/skill",
+            axum::routing::post(v2::session_skill_api),
+        )
+        .route(
+            "/api/experimental/session/{sessionID}/instructions/entries",
+            get(v2::instruction_list),
+        )
+        .route(
+            "/api/experimental/session/stats",
+            get(v2::session_stats_api),
+        )
+        .route(
+            "/api/experimental/session/import",
+            axum::routing::post(v2::session_import_api),
+        )
+        .route(
+            "/api/experimental/session/{sessionID}/export",
+            get(v2::session_export_api),
+        )
+        .route(
+            "/api/experimental/session/{sessionID}/instructions/entries/{key}",
+            axum::routing::put(v2::instruction_put).delete(v2::instruction_remove),
         )
         .route(
             "/api/session/{sessionID}/fork",

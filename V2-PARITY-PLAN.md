@@ -142,3 +142,14 @@ measure per-turn cost in G2) · splice/memos/prepared-cache on their decode
 hot path (no ratios) · single-copy ring (per-subscriber MB math) · union
 serving (one port, cited) · **columnar stats aggregation** (new: their
 stats endpoint shreds JSON per request; ours is indexed SUM/COUNT).
+
+## 8. Named divergences added in parity phases
+
+- D-BACKGROUND-NOOP: background is an honest recorded 204 (no
+  foreground/background tool distinction in the inline loop).
+- D-VIEW-NOWATERMARK: view records + 204s (no read watermark tracked).
+- D-PLUGIN-INVENTORY: plugin list honestly empty (no inventory RPC yet).
+- D-ENV: `PUT environment` unbound until turn injection lands (persisting
+  unread vars = shape-without-mutation). Injection point: `run_v2_turn`
+  system rendering; store: `session_environment` table; oracle: capdiff
+  bytes-axis proving vars reach the provider.

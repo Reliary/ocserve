@@ -27,12 +27,21 @@ fn app() -> (axum::Router, Arc<AppState>) {
 async fn get(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
     let resp = app
         .clone()
-        .oneshot(Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 #[tokio::test]
@@ -52,8 +61,16 @@ async fn phase_a_boot_fanout_answers() {
     // mcp resource catalog: enveloped, both arrays present.
     let (s, v) = get(&app, "/api/mcp/resource").await;
     assert_eq!(s, StatusCode::OK);
-    assert!(v.pointer("/data/resources").and_then(|r| r.as_array()).is_some());
-    assert!(v.pointer("/data/templates").and_then(|t| t.as_array()).is_some());
+    assert!(
+        v.pointer("/data/resources")
+            .and_then(|r| r.as_array())
+            .is_some()
+    );
+    assert!(
+        v.pointer("/data/templates")
+            .and_then(|t| t.as_array())
+            .is_some()
+    );
     // session active: {data: {...}} map shape.
     let (s, v) = get(&app, "/api/session/active").await;
     assert_eq!(s, StatusCode::OK);
@@ -61,7 +78,10 @@ async fn phase_a_boot_fanout_answers() {
     // fs list serves the TUI's api.file.list call (query contract is the
     // v1 ListQuery shape — assert only that it answers JSON, not HTML).
     let (s, v) = get(&app, "/api/fs/list?path=/tmp").await;
-    assert!(s.is_success() || s == StatusCode::BAD_REQUEST, "fs/list status {s}, body {v}");
+    assert!(
+        s.is_success() || s == StatusCode::BAD_REQUEST,
+        "fs/list status {s}, body {v}"
+    );
     // CONTROL: enveloped project list (wrap in {data}) → bare-array assert reds.
 }
 
@@ -208,7 +228,10 @@ async fn phase_b_session_aliases() {
             .unwrap();
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     // diff: enveloped (empty without revert markers).
@@ -228,7 +251,12 @@ async fn phase_b_session_aliases() {
     assert_ne!(v["data"]["id"], "ses_pb");
 
     // fork unknown key → 400 (additionalProperties enforced).
-    let (s, _) = post(&app, "/api/session/ses_pb/fork", json!({"messageID": "msg_x"})).await;
+    let (s, _) = post(
+        &app,
+        "/api/session/ses_pb/fork",
+        json!({"messageID": "msg_x"}),
+    )
+    .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     // fork bad brand → 400.
     let (s, _) = post(&app, "/api/session/ses_pb/fork", json!({"before": "msgx"})).await;

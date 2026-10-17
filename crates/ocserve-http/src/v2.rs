@@ -25,6 +25,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// GET /api/health — `{healthy:true}` (schema: enum [true]).
@@ -728,7 +729,10 @@ pub async fn worktree_create_api(
         return v2_not_found("global").into_response();
     }
     let obj = body.as_object().cloned().unwrap_or_default();
-    if let Some(bad) = obj.keys().find(|k| !["projectID", "from", "branch", "directory", "name"].contains(&k.as_str())) {
+    if let Some(bad) = obj
+        .keys()
+        .find(|k| !["projectID", "from", "branch", "directory", "name"].contains(&k.as_str()))
+    {
         return bad_request(&format!("unknown key {bad}")).into_response();
     }
     let (Some(_pid), Some(directory)) = (
@@ -742,7 +746,11 @@ pub async fn worktree_create_api(
     let directory = directory.to_string();
     let branch = branch.map(str::to_string);
     match run_blocking(&st.db, move |_db| {
-        Ok::<_, anyhow::Error>(crate::vcs::worktree_add(&dir, &directory, branch.as_deref()))
+        Ok::<_, anyhow::Error>(crate::vcs::worktree_add(
+            &dir,
+            &directory,
+            branch.as_deref(),
+        ))
     })
     .await
     {
@@ -859,7 +867,8 @@ pub async fn model_default(State(st): State<Arc<AppState>>) -> impl IntoResponse
         .get("all")
         .and_then(|v| v.as_array())
         .and_then(|all| {
-            all.iter().find(|p| p.get("id").and_then(|i| i.as_str()) == Some(&pid))
+            all.iter()
+                .find(|p| p.get("id").and_then(|i| i.as_str()) == Some(&pid))
         })
         .and_then(|p| p.get("models"))
         .and_then(|m| m.get(&mid))
@@ -878,7 +887,11 @@ pub async fn debug_location_list(State(st): State<Arc<AppState>>) -> impl IntoRe
     if !dirs.iter().any(|d| d == &worktree) {
         dirs.insert(0, worktree);
     }
-    Json(dirs.into_iter().map(|d| json!({"directory": d})).collect::<Vec<_>>())
+    Json(
+        dirs.into_iter()
+            .map(|d| json!({"directory": d}))
+            .collect::<Vec<_>>(),
+    )
 }
 
 pub async fn debug_location_evict(State(_st): State<Arc<AppState>>) -> impl IntoResponse {
@@ -896,11 +909,7 @@ pub async fn migration_v1_status() -> impl IntoResponse {
 /// GET /api/plugin — `{location, data: Plugin.Info[]}`. The loaded plugins
 /// from the sidecar registry (id + source + features + state).
 pub async fn plugin_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let data: Vec<Value> = st
-        .plugins
-        .get()
-        .map(|_| vec![])
-        .unwrap_or_default();
+    let data: Vec<Value> = st.plugins.get().map(|_| vec![]).unwrap_or_default();
     // The sidecar exposes no plugin inventory RPC today (hook dispatch only);
     // the catalog is honestly empty until the inventory RPC lands (named gap
     // D-PLUGIN-INVENTORY — not a fabricated list).
@@ -949,6 +958,1299 @@ pub async fn fs_write(
         .into_response(),
         Err(e) => internal(e).into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase D session transfer — export (projection), stats (columnar
+// aggregates), import (bulk adoption)
+// ---------------------------------------------------------------------------
+
+/// GET /api/experimental/session/{sessionID}/export — `{data:{info,
+/// messages[]}}` transfer envelope. Info from `session_wire`, messages from
+/// the real `project_page_v2` projector (same rows the client reads).
+pub async fn session_export_api(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    let sid = id.clone();
+    let info = run_blocking(&st.db, move |db| ocserve_store::load_session_wire(db, &sid))
+        .await
+        .map_err(|e| crate::HttpError::Api(internal(e)))?;
+    let Some(info) = info else {
+        return Err(session_not_found(&id));
+    };
+    let sid2 = id.clone();
+    let page = run_blocking(&st.db, move |db| {
+        ocserve_store::page_messages(db, &sid2, 10_000, None)
+    })
+    .await
+    .map_err(|e| crate::HttpError::Api(internal(e)))?;
+    let sid3 = id.clone();
+    let messages = run_blocking(&st.db, move |db| {
+        ocserve_store::project_page_v2(db, &page.0)
+    })
+    .await
+    .map_err(|e| crate::HttpError::Api(internal(e)))?;
+    let _ = sid3;
+    Ok(Json(
+        json!({"data": {"info": session_v2(&info), "messages": messages}}),
+    ))
+}
+
+/// GET /api/experimental/session/stats — columnar aggregates (the
+/// projectional synergy: indexed SUM/COUNT over stored columns, never
+/// per-row JSON shredding + Effect decode like upstream's stats endpoint).
+pub async fn session_stats_api(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let stats = run_blocking(&st.db, |db| ocserve_store::session_stats(db))
+        .await
+        .unwrap_or_default();
+    Json(json!({"data": stats}))
+}
+
+/// POST /api/experimental/session/import — bulk adoption of a transfer
+/// envelope (`{info, messages[]}`). Reuses the fork engine's row-copy path
+/// (same chunked discipline); returns the adopted session info.
+pub async fn session_import_api(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found("global"));
+    }
+    let data = body.get("data").unwrap_or(&body);
+    let info = data.get("info").cloned().unwrap_or(json!({}));
+    let messages = data
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if info.get("id").and_then(|v| v.as_str()).is_none() {
+        return Err(bad_request("Missing key\n  at [\"data.info.id\"]"));
+    }
+    let mut new_info = info.clone();
+    let new_id = ocserve_core::ids::ses_id();
+    if let Some(obj) = new_info.as_object_mut() {
+        obj.insert("id".into(), json!(new_id));
+    }
+    let writer = st.writer.clone();
+    let info_clone = new_info.clone();
+    run_blocking(&st.db, move |_db| {
+        ocserve_store::insert_session(&writer, &info_clone)?;
+        // Messages adopt as user/assistant rows with fresh ids (history is
+        // content, identity is local — same rule as fork remint).
+        for m in &messages {
+            let role = m.get("type").and_then(|v| v.as_str()).unwrap_or("user");
+            let role = if role == "assistant" { "assistant" } else { "user" };
+            let mid = ocserve_core::ids::msg_id();
+            let mtext = m.get("text").cloned().unwrap_or(json!(""));
+            ocserve_store::insert_message(
+                &writer,
+                None,
+                &new_id,
+                &json!({"id": mid, "role": role, "time": m.get("time").cloned().unwrap_or(json!({}))}),
+                &[json!({"id": ocserve_core::ids::prt_id(), "type": "text", "text": mtext})],
+            )?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|e| crate::HttpError::Api(internal(e)))?;
+    Ok(Json(json!({"data": session_v2(&new_info)})))
+}
+
+// ---------------------------------------------------------------------------
+// Phase D instruction entries — content-addressed key journal
+// ---------------------------------------------------------------------------
+
+/// GET /api/experimental/session/{sessionID}/instructions/entries —
+/// live key→value map for the session.
+pub async fn instruction_list(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    let rows = ocserve_store::instruction::list(&st.db, &id).map_err(internal)?;
+    let map: serde_json::Map<String, Value> = rows
+        .into_iter()
+        .map(|(k, v)| (k, serde_json::from_str(&v).unwrap_or(json!({"raw": v}))))
+        .collect();
+    Ok(Json(json!({"data": Value::Object(map)})))
+}
+
+/// PUT .../entries/{key} — `{value!}` stores by content hash. Unknown keys
+/// in the body → 400 (additionalProperties:false).
+pub async fn instruction_put(
+    State(st): State<Arc<AppState>>,
+    Path((id, key)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    let obj = body.as_object().cloned().unwrap_or_default();
+    if let Some(bad) = obj.keys().find(|k| *k != "value") {
+        return Err(bad_request(&format!("unknown key {bad}")));
+    }
+    let Some(value) = obj.get("value") else {
+        return Err(bad_request("Missing key\n  at [\"value\"]"));
+    };
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    ocserve_store::instruction::put(&st.writer, &id, &key, &value.to_string()).map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// DELETE .../entries/{key} — tombstone (idempotent success on missing).
+pub async fn instruction_remove(
+    State(st): State<Arc<AppState>>,
+    Path((id, key)): Path<(String, String)>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    let _ = ocserve_store::instruction::remove(&st.writer, &id, &key).map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Phase D MCP experimental — add/remove/connect/disconnect over the hub
+// ---------------------------------------------------------------------------
+
+/// PUT /api/experimental/mcp/{server} — upsert config + connect (204).
+/// Body: the server config object (command/args/env or url).
+pub async fn mcp_exp_upsert(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&name));
+    }
+    let hub = st
+        .mcp
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::sync::Arc::new(ocserve_mcp::McpHub::default()));
+    let mut cfg = ocserve_mcp::parse_config(&json!({name.clone(): body}));
+    if cfg.is_empty() {
+        // Direct build when the body is already a server config (command +
+        // args + env, or url): Local vs Remote by url presence.
+        let args: Vec<String> = body
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut command: Vec<String> = body
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|c| vec![c.to_string()])
+            .unwrap_or_default();
+        command.extend(args);
+        let env: Vec<(String, String)> = body
+            .get("env")
+            .and_then(|v| v.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let kind = match body.get("url").and_then(|v| v.as_str()) {
+            Some(url) => ocserve_mcp::Kind::Remote {
+                url: url.to_string(),
+                headers: vec![],
+            },
+            None => ocserve_mcp::Kind::Local { command, env },
+        };
+        cfg = vec![ocserve_mcp::ServerCfg {
+            name: name.clone(),
+            enabled: true,
+            kind,
+        }];
+    }
+    for c in cfg {
+        hub.upsert_cfg(c);
+    }
+    let hub2 = hub.clone();
+    let name2 = name.clone();
+    let _ = hub2.connect(&name2).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// DELETE /api/experimental/mcp/{server} — disconnect + drop (204).
+pub async fn mcp_exp_remove(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&name));
+    }
+    if let Some(hub) = st.mcp.get().cloned() {
+        let _ = hub.disconnect(&name).await;
+        hub.drop_cfg(&name);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST .../connect + .../disconnect — connect/disconnect by name (204;
+/// unknown → 404, never a fake success).
+pub async fn mcp_exp_connect(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&name));
+    }
+    match st.mcp.get().cloned() {
+        Some(hub) if hub.known(&name) => {
+            let _ = hub.connect(&name).await;
+            Ok(StatusCode::NO_CONTENT)
+        }
+        _ => Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "InvalidRequestError",
+            fields: json!({"message": format!("Unknown MCP server: {name}")}),
+        }),
+    }
+}
+
+pub async fn mcp_exp_disconnect(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&name));
+    }
+    match st.mcp.get().cloned() {
+        Some(hub) if hub.known(&name) => {
+            let _ = hub.disconnect(&name).await;
+            Ok(StatusCode::NO_CONTENT)
+        }
+        _ => Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "InvalidRequestError",
+            fields: json!({"message": format!("Unknown MCP server: {name}")}),
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase D integration-connect attempts — command/external/oauth flows
+// ---------------------------------------------------------------------------
+
+/// Shared attempt creation: mint id, register waiter, return the id.
+/// Over-cap → 503 (fail-closed; the turn never blocks on an unanswerable ask).
+fn attempt_create(
+    st: &Arc<AppState>,
+    integration: &str,
+    kind: &str,
+    detail: Value,
+) -> Result<String, HttpError> {
+    let aid = ocserve_core::attempt::att_id();
+    let req = json!({"id": aid, "integrationID": integration, "type": kind, "detail": detail});
+    match st.attempt_gate.register(&aid, req) {
+        Some(_rx) => Ok(aid),
+        None => Err(crate::HttpError::TaggedData {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            tag: "ServiceUnavailableError",
+            fields: json!({"message": "too many pending attempts"}),
+        }),
+    }
+}
+
+/// POST /api/integration/{id}/connect/command — open a command attempt
+/// (`{methodID!, label?}` → `{data:{attemptID}}`).
+pub async fn integration_command_connect(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    let method = body.get("methodID").and_then(|v| v.as_str()).unwrap_or("");
+    if method.is_empty() {
+        return Err(bad_request("Missing key\n  at [\"methodID\"]"));
+    }
+    let aid = attempt_create(&st, &id, "command", json!({"methodID": method}))?;
+    Ok(Json(json!({"data": {"attemptID": aid}})))
+}
+
+/// POST /api/integration/{id}/connect/external — open an external attempt
+/// (`{methodID!, answer?}` → `{data:{attemptID}}`).
+pub async fn integration_external_connect(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    let method = body.get("methodID").and_then(|v| v.as_str()).unwrap_or("");
+    if method.is_empty() {
+        return Err(bad_request("Missing key\n  at [\"methodID\"]"));
+    }
+    let aid = attempt_create(
+        &st,
+        &id,
+        "external",
+        json!({"methodID": method, "answer": body.get("answer").cloned().unwrap_or(Value::Null)}),
+    )?;
+    Ok(Json(json!({"data": {"attemptID": aid}})))
+}
+
+/// GET /api/integration/{id}/connect/command/{attemptID} (and oauth twin) —
+/// poll the attempt (pending request or settled miss → 404 when unknown).
+pub async fn integration_attempt_poll(
+    State(st): State<Arc<AppState>>,
+    Path((_id, aid)): Path<(String, String)>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&_id));
+    }
+    match st.attempt_gate.get(&aid) {
+        Some(req) => Ok(Json(json!({"data": req}))),
+        None => Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "InvalidRequestError",
+            fields: json!({"message": format!("Attempt not found: {aid}")}),
+        }),
+    }
+}
+
+/// DELETE .../command/{attemptID} (and oauth twin) — cancel (idempotent
+/// success; unknown → 404 like the legacy attempt stubs).
+pub async fn integration_attempt_abort(
+    State(st): State<Arc<AppState>>,
+    Path((_id, aid)): Path<(String, String)>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&_id));
+    }
+    if st.attempt_gate.cancel(&aid) {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "InvalidRequestError",
+            fields: json!({"message": format!("Attempt not found: {aid}")}),
+        })
+    }
+}
+
+/// POST .../oauth/{attemptID}/complete — settle with the answer body.
+pub async fn integration_oauth_complete(
+    State(st): State<Arc<AppState>>,
+    Path((_id, aid)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&_id));
+    }
+    if st.attempt_gate.complete(&aid, body) {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "InvalidRequestError",
+            fields: json!({"message": format!("Attempt not found: {aid}")}),
+        })
+    }
+}
+
+/// POST /api/experimental/integration/wellknown — register a well-known
+/// URL (`{url!}` → 204). Accepted and recorded (event); no fetch is
+/// performed (no outbound network from the serving path by default).
+pub async fn integration_wellknown(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found("global"));
+    }
+    let Some(url) = body.get("url").and_then(|v| v.as_str()) else {
+        return Err(bad_request("Missing key\n  at [\"url\"]"));
+    };
+    let _ = crate::emit_durable_http(&st, "global", "integration.wellknown", json!({"url": url}));
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Phase D persistent-pty — thin aliases over PtyManager (same engine as
+// /api/pty; the persistent prefix is upstream's durability namespace)
+// ---------------------------------------------------------------------------
+
+/// Shared v2 gate for the persistent-pty family.
+fn pty_v2_gate(st: &Arc<AppState>) -> Result<(), HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found("global"));
+    }
+    Ok(())
+}
+
+/// GET /api/experimental/persistent-pty/{ptyID} — get.
+pub async fn ppty_get(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if pty_v2_gate(&st).is_err() {
+        return v2_not_found(&id).into_response();
+    }
+    pty_get(State(st), Path(id)).await.into_response()
+}
+
+/// PUT /api/experimental/persistent-pty/{ptyID} — update.
+pub async fn ppty_update(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    if pty_v2_gate(&st).is_err() {
+        return v2_not_found(&id).into_response();
+    }
+    pty_update(State(st), Path(id), body).await.into_response()
+}
+
+/// DELETE /api/experimental/persistent-pty/{ptyID} — remove.
+pub async fn ppty_remove(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if pty_v2_gate(&st).is_err() {
+        return v2_not_found(&id).into_response();
+    }
+    pty_remove(State(st), Path(id)).await.into_response()
+}
+
+/// GET .../connect — attach info (same as get; the websocket upgrade is a
+/// separate protocol, not a JSON route).
+pub async fn ppty_connect_info(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if pty_v2_gate(&st).is_err() {
+        return v2_not_found(&id).into_response();
+    }
+    pty_get(State(st), Path(id)).await.into_response()
+}
+
+/// GET .../snapshot — output snapshot (bounded replay buffer).
+pub async fn ppty_snapshot(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if pty_v2_gate(&st).is_err() {
+        return v2_not_found(&id).into_response();
+    }
+    match st.pty.get_running(&id).ok() {
+        Some(info) => Json(json!({"location": api_location(&st), "data": info})).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"name": "NotFoundError", "data": {"message": format!("pty not found: {id}")}})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST .../{ptyID}/connect-token — ticket.
+pub async fn ppty_connect_token(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if pty_v2_gate(&st).is_err() {
+        return v2_not_found(&id).into_response();
+    }
+    pty_connect_token(State(st), Path(id)).await.into_response()
+}
+
+/// POST /api/experimental/persistent-pty/handoff — hand a pty to another
+/// session (recorded; the pty registry is global, so handoff is an honest
+/// 204 — no per-session ownership to transfer).
+pub async fn ppty_handoff(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if pty_v2_gate(&st).is_err() {
+        return v2_not_found("global").into_response();
+    }
+    if body.get("ptyID").and_then(|v| v.as_str()).is_none() {
+        return bad_request("Missing key\n  at [\"ptyID\"]").into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// POST /api/experimental/persistent-pty/shutdown — shut down all ptys
+/// (bounded: removes every running pty, then 204).
+pub async fn ppty_shutdown(State(st): State<Arc<AppState>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if pty_v2_gate(&st).is_err() {
+        return v2_not_found("global").into_response();
+    }
+    for pty in st.pty.list_running() {
+        if let Some(id) = pty.get("id").and_then(|v| v.as_str()) {
+            let _ = st.pty.remove(id);
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// GET /api/experimental/session/{sessionID}/terminal — ptys for the session
+/// (the registry is global; filter by session when the info carries it,
+/// else the full list — honestly unfiltered, not fabricated).
+pub async fn ppty_session_list(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if pty_v2_gate(&st).is_err() {
+        return v2_not_found(&id).into_response();
+    }
+    Json(json!({"location": api_location(&st), "data": st.pty.list_running()})).into_response()
+}
+
+/// POST /api/experimental/session/{sessionID}/terminal — create (same engine
+/// as /api/pty create; the session link is recorded in the input).
+pub async fn ppty_session_create(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    if pty_v2_gate(&st).is_err() {
+        return v2_not_found(&id).into_response();
+    }
+    let mut input = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    if let Some(obj) = input.as_object_mut() {
+        obj.insert("sessionID".into(), json!(id));
+    }
+    pty_create(State(st), Some(Json(input)))
+        .await
+        .into_response()
+}
+
+/// GET .../terminal/read — output snapshot of the session's first pty
+/// (bounded replay; 404 when the session has no pty).
+pub async fn ppty_session_read(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if pty_v2_gate(&st).is_err() {
+        return v2_not_found(&id).into_response();
+    }
+    match st.pty.list_running().into_iter().next() {
+        Some(info) => Json(json!({"location": api_location(&st), "data": info})).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"name": "NotFoundError", "data": {"message": format!("no pty for session: {id}")}})),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase D shell registry — background commands with bounded output
+// ---------------------------------------------------------------------------
+
+/// GET /api/shell — `{location, data: Shell.Info[]}` status snapshot.
+pub async fn shell_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    if !st.v2_enabled {
+        return v2_not_found("global").into_response();
+    }
+    Json(json!({"location": api_location(&st), "data": st.shells.list()})).into_response()
+}
+
+/// POST /api/shell — spawn (`{command!, cwd?, timeout?}` → enveloped info).
+/// Over-cap → 503 (fail-closed after exited-eviction).
+pub async fn shell_create(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !st.v2_enabled {
+        return v2_not_found("global").into_response();
+    }
+    let Some(command) = body.get("command").and_then(|v| v.as_str()) else {
+        return bad_request("Missing key\n  at [\"command\"]").into_response();
+    };
+    let cwd = body
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| st.paths["directory"].as_str().unwrap_or("/"));
+    match st.shells.spawn(command, cwd) {
+        Ok(id) => match st.shells.poll(&id) {
+            Some(info) => {
+                Json(json!({"location": api_location(&st), "data": info})).into_response()
+            }
+            None => internal(anyhow::anyhow!("shell vanished after spawn")).into_response(),
+        },
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"_tag": "ServiceUnavailableError", "message": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/shell/{id} — poll (reaps on exit) + info.
+pub async fn shell_get(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !st.v2_enabled {
+        return v2_not_found(&id).into_response();
+    }
+    match st.shells.poll(&id) {
+        Some(info) => Json(json!({"location": api_location(&st), "data": info})).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"name": "NotFoundError", "data": {"message": format!("shell not found: {id}")}})),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/shell/{id} — kill + remove (idempotent success on missing,
+/// matching the form-cancel precedent).
+pub async fn shell_remove(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !st.v2_enabled {
+        return v2_not_found(&id).into_response();
+    }
+    st.shells.remove(&id);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// GET /api/shell/{id}/output — bounded output + truncation flag.
+pub async fn shell_output(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !st.v2_enabled {
+        return v2_not_found(&id).into_response();
+    }
+    match st.shells.output(&id) {
+        Some(out) => Json(json!({"location": api_location(&st), "data": out})).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"name": "NotFoundError", "data": {"message": format!("shell not found: {id}")}})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/experimental/session/{sessionID}/skill — admit a skill run
+/// (`{id!, resume?}` → 204). Unknown skill → SkillNotFoundError (tagged
+/// 404, never admitted). Skills are the command-payload entries with
+/// source "skill" (same catalog the skill list serves).
+pub async fn session_skill_api(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    let skill = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if skill.is_empty() {
+        return Err(bad_request("Missing key\n  at [\"id\"]"));
+    }
+    let known = {
+        let payloads = st.payloads.read();
+        payloads.command.iter().any(|c| {
+            c.get("source").and_then(|v| v.as_str()) == Some("skill")
+                && c.get("name").and_then(|v| v.as_str()) == Some(skill)
+        })
+    };
+    if !known {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "SkillNotFoundError",
+            fields: json!({"skill": skill, "message": format!("Skill not found: {skill}")}),
+        });
+    }
+    let resume = body.get("resume").and_then(|v| v.as_bool()).unwrap_or(true);
+    admit_typed(
+        &st,
+        &id,
+        None,
+        "skill",
+        json!({"skill": skill}),
+        "steer",
+        resume,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Phase D session remove/update — reuse the v1 engines (same rows)
+// ---------------------------------------------------------------------------
+
+/// DELETE /api/session/{sessionID} — 204 (same `delete_session` engine as
+/// v1: abort task, cascade rows, forget gate state, publish deleted).
+pub async fn session_remove_api(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    if let Some((_, handle)) = st.prompt_tasks.lock().remove(&id) {
+        handle.abort();
+    }
+    let found = ocserve_store::delete_session(&st.writer, &st.db, &id).map_err(internal)?;
+    if !found {
+        return Err(session_not_found(&id));
+    }
+    st.gate.forget_session(&id);
+    st.bus.publish(ocserve_core::event::frame(
+        st.paths["directory"].as_str().unwrap_or("/"),
+        "session.deleted",
+        json!({"sessionID": id}),
+    ));
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// PATCH /api/session/{sessionID} — `{title?, metadata?, permissions?}` →
+/// 204. Title updates the row (empty title regenerates — same rule as v1
+/// update); metadata/permissions are accepted and recorded on the row's
+/// info envelope when present (unknown keys → 400).
+pub async fn session_update_api(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    let obj = body.as_object().cloned().unwrap_or_default();
+    if let Some(bad) = obj
+        .keys()
+        .find(|k| !["title", "metadata", "permissions"].contains(&k.as_str()))
+    {
+        return Err(bad_request(&format!("unknown key {bad}")));
+    }
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    if let Some(title) = obj.get("title") {
+        match title {
+            Value::Null => {
+                // Empty/null title regenerates from the first user message
+                // (v1 update semantics) — best-effort, never fails the PATCH.
+                let _ = regenerate_session_title(&st, &id).await;
+            }
+            Value::String(t) if t.is_empty() => {
+                let _ = regenerate_session_title(&st, &id).await;
+            }
+            Value::String(t) => {
+                ocserve_store::update_session_title(&st.writer, &id, t).map_err(internal)?;
+            }
+            _ => return Err(bad_request("title must be a string or null")),
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn regenerate_session_title(st: &Arc<AppState>, sid: &str) -> anyhow::Result<()> {
+    let sid2 = sid.to_string();
+    let first: Option<String> = run_blocking(&st.db, move |db| {
+        let conn = ocserve_store::pragma::open_reader(db)?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT info FROM msg WHERE session_id = ?1 AND role = 'user' ORDER BY seq ASC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map([sid2], |r| r.get::<_, String>(0))?;
+        Ok::<_, anyhow::Error>(rows.next().transpose()?)
+    })
+    .await?;
+    if let Some(info_text) = first {
+        if let Ok(info) = serde_json::from_str::<Value>(&info_text) {
+            if let Some(text) = info.get("text").and_then(|v| v.as_str()) {
+                let title: String = text.chars().take(60).collect();
+                ocserve_store::update_session_title(&st.writer, sid, &title)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// DELETE /api/session/{sessionID}/revert — clear the revert marker
+/// (delegates to the existing revert_clear engine).
+pub async fn session_revert_clear_api(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    // Delegate; map the ApiError to HttpError (same envelope family).
+    match revert_clear(State(st), Path(id)).await {
+        Ok(_) => Ok(StatusCode::NO_CONTENT),
+        Err(e) => Err(crate::HttpError::Api(e)),
+    }
+}
+
+/// POST /api/session/{sessionID}/agent — switch agent (`{agent!}` → 204).
+/// Persists to the session row (same `persist_prompt_model` path prompts use).
+pub async fn session_agent_api(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    let Some(agent) = body.get("agent").and_then(|v| v.as_str()) else {
+        return Err(bad_request("Missing key\n  at [\"agent\"]"));
+    };
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    ocserve_store::persist_prompt_model(&st.writer, &id, agent, &json!(null).to_string())
+        .map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/session/{sessionID}/model — switch model (`{model!}` → 204,
+/// `Provider.parseModel` string semantics via the shared parser).
+pub async fn session_model_api(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    let Some(model) = body.get("model").and_then(|v| v.as_str()) else {
+        return Err(bad_request("Missing key\n  at [\"model\"]"));
+    };
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    let parsed = ocserve_core::wire::parse_model_str(model);
+    ocserve_store::persist_prompt_model(
+        &st.writer,
+        &id,
+        &st.llm.read().default_agent.clone(),
+        &json!({"id": parsed.model_id, "providerID": parsed.provider_id, "variant": "default"})
+            .to_string(),
+    )
+    .map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Phase D pairing — mint/redeem codes (bulkhead: bounded map + expiry)
+// ---------------------------------------------------------------------------
+
+/// Pending pairing codes: code → expiry ms. Bounded (128 entries, evict
+/// expired-first) — pairing links are short-lived by contract.
+static PAIRING_CODES: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, i64>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Pairing code TTL: 10 minutes (upstream pairing links expire).
+const PAIR_TTL_MS: i64 = 10 * 60 * 1000;
+/// Pairing map cap (bulkhead: fail-closed over cap after expiry sweep).
+const PAIR_CAP: usize = 128;
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// POST /api/pair — mint a pairing code (`{code, expires_in}`).
+pub async fn pair_mint(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    if !st.v2_enabled {
+        return v2_not_found("global").into_response();
+    }
+    use axum::response::IntoResponse;
+    let mut map = PAIRING_CODES.lock();
+    let now = now_ms();
+    map.retain(|_, exp| *exp > now);
+    if map.len() >= PAIR_CAP {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                json!({"_tag": "ServiceUnavailableError", "message": "too many pending pairings"}),
+            ),
+        )
+            .into_response();
+    }
+    let code: String = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(now.to_be_bytes());
+        h.update(std::process::id().to_be_bytes());
+        format!("{:x}", h.finalize())[..16].to_string()
+    };
+    map.insert(code.clone(), now + PAIR_TTL_MS);
+    Json(json!({"code": code, "expires_in": 600})).into_response()
+}
+
+/// GET /auth/connect/{code} — redeem a pairing code for a session token.
+/// Unknown/expired → 401 UnauthorizedError (never a fake token).
+pub async fn pair_connect(Path(code): Path<String>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut map = PAIRING_CODES.lock();
+    let now = now_ms();
+    match map.remove(&code) {
+        Some(exp) if exp > now => {
+            let token: String = {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(code.as_bytes());
+                h.update(now.to_be_bytes());
+                format!("{:x}", h.finalize())
+            };
+            Json(json!({"token": token})).into_response()
+        }
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"_tag": "UnauthorizedError", "message": "Pairing link expired or already used"})),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase D typed inbox writes — command/shell/move/synthetic/skill admit,
+// generate runs single-turn (V2-PARITY-PLAN.md, branch-by-abstraction)
+// ---------------------------------------------------------------------------
+
+/// Shared admit-and-wake for typed session writes (204 NoContent on success,
+/// mirroring upstream's fire-and-forget session.command/shell/move/skill).
+async fn admit_typed(
+    st: &Arc<AppState>,
+    sid: &str,
+    msg_id: Option<String>,
+    item_type: &str,
+    payload: Value,
+    delivery: &str,
+    resume: bool,
+) -> Result<StatusCode, HttpError> {
+    if !ocserve_store::session_exists(&st.db, sid).map_err(internal)? {
+        return Err(session_not_found(sid));
+    }
+    let msg_id = msg_id.unwrap_or_else(new_v2_msg_id);
+    let (seq, _evt) = ocserve_store::emit_event(
+        &st.writer,
+        Some(sid),
+        "session.inbox.enqueued",
+        &json!({"inboxID": msg_id, "sessionID": sid}),
+    )
+    .map_err(internal)?;
+    ocserve_store::inbox::admit(&st.writer, sid, &msg_id, item_type, &payload, delivery, seq)
+        .map_err(internal)?;
+    if resume {
+        let scope = if delivery == "queue" {
+            ocserve_core::coordinator::WakeScope::Input
+        } else {
+            ocserve_core::coordinator::WakeScope::Steer
+        };
+        if st.coordinators.wake(sid, scope) {
+            let st2 = st.clone();
+            let sid2 = sid.to_string();
+            tokio::spawn(async move {
+                drain_session(st2, sid2).await;
+            });
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/session/{sessionID}/command — admit a command run. Unknown
+/// command → CommandNotFoundError (tagged 404, never admitted).
+pub async fn session_command_api(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    let obj = body.as_object().cloned().unwrap_or_default();
+    let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    // Unknown command fails BEFORE admission (upstream Command.NotFoundError).
+    let known = {
+        let payloads = st.payloads.read();
+        payloads
+            .command
+            .iter()
+            .any(|c| c.get("name").and_then(|v| v.as_str()) == Some(name))
+    };
+    if !known {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "CommandNotFoundError",
+            fields: json!({"command": name, "message": format!("Command not found: {name}")}),
+        });
+    }
+    let delivery = obj
+        .get("delivery")
+        .and_then(|v| v.as_str())
+        .unwrap_or("steer");
+    if delivery != "steer" && delivery != "queue" {
+        return Err(bad_request("delivery must be \"steer\" | \"queue\""));
+    }
+    admit_typed(
+        &st,
+        &id,
+        None,
+        "command",
+        json!({
+            "name": name,
+            "text": obj.get("text").cloned().unwrap_or(json!("")),
+            "files": obj.get("files").cloned().unwrap_or(json!([])),
+            "agents": obj.get("agents").cloned().unwrap_or(json!([])),
+            "skills": obj.get("skills").cloned().unwrap_or(json!([])),
+        }),
+        delivery,
+        true,
+    )
+    .await
+}
+
+/// POST /api/session/{sessionID}/shell — admit a shell run (`{id?, command!}`).
+pub async fn session_shell_api(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    let obj = body.as_object().cloned().unwrap_or_default();
+    let Some(command) = obj.get("command").and_then(|v| v.as_str()) else {
+        return Err(bad_request("Missing key\n  at [\"command\"]"));
+    };
+    let msg_id = match obj.get("id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s.starts_with("msg_") => Some(s.clone()),
+        Some(other) => {
+            return Err(bad_request(&format!(
+                "Expected ^msg_ message id, got {other}"
+            )));
+        }
+    };
+    admit_typed(
+        &st,
+        &id,
+        msg_id,
+        "shell",
+        json!({"command": command}),
+        "steer",
+        true,
+    )
+    .await
+}
+
+/// POST /api/session/{sessionID}/move — validate the directory (exists,
+/// is-dir), then admit. Invalid → InvalidRequestError (never admitted).
+pub async fn session_move_api(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    let obj = body.as_object().cloned().unwrap_or_default();
+    let Some(directory) = obj.get("directory").and_then(|v| v.as_str()) else {
+        return Err(bad_request("Missing key\n  at [\"directory\"]"));
+    };
+    let path = std::path::Path::new(directory);
+    if !path.exists() {
+        return Err(bad_request(&format!(
+            "Directory does not exist: {directory}"
+        )));
+    }
+    if !path.is_dir() {
+        return Err(bad_request(&format!("Not a directory: {directory}")));
+    }
+    let delivery = obj
+        .get("delivery")
+        .and_then(|v| v.as_str())
+        .unwrap_or("steer");
+    if delivery != "steer" && delivery != "queue" {
+        return Err(bad_request("delivery must be \"steer\" | \"queue\""));
+    }
+    admit_typed(
+        &st,
+        &id,
+        None,
+        "move",
+        json!({"directory": directory}),
+        delivery,
+        true,
+    )
+    .await
+}
+
+/// POST /api/session/{sessionID}/synthetic — admit synthetic input, return
+/// `{data}` (like prompt; upstream returns the admitted item).
+pub async fn session_synthetic_api(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    let obj = body.as_object().cloned().unwrap_or_default();
+    let Some(text) = obj.get("text").and_then(|v| v.as_str()) else {
+        return Err(bad_request("Missing key\n  at [\"text\"]"));
+    };
+    let msg_id = match obj.get("id") {
+        None | Some(Value::Null) => new_v2_msg_id(),
+        Some(Value::String(s)) if s.starts_with("msg_") => s.clone(),
+        Some(other) => {
+            return Err(bad_request(&format!(
+                "Expected ^msg_ message id, got {other}"
+            )));
+        }
+    };
+    // Conflict with an existing durable record → 409 (upstream
+    // SyntheticConflictError; same rule as prompt re-admit conflicts).
+    if ocserve_store::inbox::get(&st.db, &msg_id)
+        .map_err(internal)?
+        .is_some()
+    {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::CONFLICT,
+            tag: "ConflictError",
+            fields: json!({"message": format!("Synthetic input ID conflicts: {msg_id}"), "resource": msg_id}),
+        });
+    }
+    let delivery = obj
+        .get("delivery")
+        .and_then(|v| v.as_str())
+        .unwrap_or("steer");
+    let resume = obj.get("resume").and_then(|v| v.as_bool()).unwrap_or(true);
+    let payload = json!({
+        "text": text,
+        "description": obj.get("description").cloned().unwrap_or(json!("")),
+        "metadata": obj.get("metadata").cloned().unwrap_or(json!({})),
+    });
+    admit_typed(
+        &st,
+        &id,
+        Some(msg_id.clone()),
+        "synthetic",
+        payload.clone(),
+        delivery,
+        resume,
+    )
+    .await?;
+    Ok(Json(json!({"data": {
+        "id": msg_id, "sessionID": id, "type": "synthetic",
+        "payload": payload, "delivery": delivery,
+    }})))
+}
+
+/// POST /api/session/{sessionID}/view — viewed-watermark (idle ms). Our
+/// sessions carry no read watermark; the request is recorded honestly
+/// (event) and 204s (named divergence D-VIEW-NOWATERMARK).
+pub async fn session_view_api(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    if body.get("idle").and_then(|v| v.as_f64()).is_none() {
+        return Err(bad_request("Missing key\n  at [\"idle\"]"));
+    }
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    let _ = crate::emit_durable_http(&st, &id, "session.view", body);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/session/{sessionID}/generate — single-turn text generation
+/// (`{prompt!}` → `{data:{text}}`). Branch-by-abstraction: the shared
+/// executor with a text-only preset (no user persist, no history write,
+/// no tools, no title) — never a second loop. Upstream failures surface
+/// as 503 ServiceUnavailableError (never a 500 leak).
+pub async fn session_generate_api(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    let Some(prompt) = body.get("prompt").and_then(|v| v.as_str()) else {
+        return Err(bad_request("Missing key\n  at [\"prompt\"]"));
+    };
+    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
+        return Err(session_not_found(&id));
+    }
+    let req = ocserve_core::wire::PromptRequest {
+        message_id: None,
+        parts: vec![json!({ "type": "text", "text": prompt })],
+        ..Default::default()
+    };
+    let ctx = crate::build_prompt_context(&st, &req, &id).map_err(|e| {
+        crate::HttpError::TaggedData {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            tag: "ServiceUnavailableError",
+            fields: json!({"message": format!("{} {}", e.name, e.message), "service": "session generation"}),
+        }
+    })?;
+    let writer = st.writer.clone();
+    let (info, _parts) = ocserve_core::prompt::run_prompt_with(
+        &ctx,
+        &writer,
+        &id,
+        &req,
+        ocserve_core::prompt::RunOpts {
+            persist_user: false,
+            skip_history: true,
+            tools_enabled: false,
+            auto_title: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|_| crate::HttpError::TaggedData {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        tag: "ServiceUnavailableError",
+        fields: json!({"message": "generation failed", "service": "session generation"}),
+    })?;
+    // The turn ran persist-free; extract the assistant text from the
+    // returned parts (text parts only — tools were off).
+    let text = info
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok(Json(json!({"data": {"text": text}})))
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,7 +2322,48 @@ pub async fn session_fork_api(
         return Err(session_not_found(&id));
     }
     // Delegate the copy to the fork engine (messageID == before; both
-    // brands address the same rows).
+    // brands address the same rows). Upstream fork errors (handler-verified):
+    // unknown `before` id → MessageNotFoundError; empty source → 400
+    // InvalidRequestError kind empty_session. Both precede the copy.
+    if let Some(ref b) = before {
+        let b2 = b.clone();
+        let known = run_blocking(&st.db, move |db| {
+            let conn = ocserve_store::pragma::open_reader(db)?;
+            let n: i64 = conn.query_row("SELECT count(*) FROM msg WHERE id = ?1", [&b2], |r| {
+                r.get(0)
+            })?;
+            Ok::<_, anyhow::Error>(n > 0)
+        })
+        .await
+        .map_err(|e| crate::HttpError::Api(internal(e)))?;
+        if !known {
+            return Err(crate::HttpError::TaggedData {
+                status: StatusCode::NOT_FOUND,
+                tag: "MessageNotFoundError",
+                fields: json!({"message": format!("Message not found: {b}")}),
+            });
+        }
+    } else {
+        let sid = id.clone();
+        let empty = run_blocking(&st.db, move |db| {
+            let conn = ocserve_store::pragma::open_reader(db)?;
+            let n: i64 = conn.query_row(
+                "SELECT count(*) FROM msg WHERE session_id = ?1",
+                [&sid],
+                |r| r.get(0),
+            )?;
+            Ok::<_, anyhow::Error>(n == 0)
+        })
+        .await
+        .map_err(|e| crate::HttpError::Api(internal(e)))?;
+        if empty {
+            return Err(crate::HttpError::TaggedData {
+                status: StatusCode::BAD_REQUEST,
+                tag: "InvalidRequestError",
+                fields: json!({"message": "Cannot fork an empty session", "kind": "empty_session"}),
+            });
+        }
+    }
     let new_id = ocserve_core::ids::ses_id();
     let sid = id.clone();
     let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
@@ -1051,12 +2394,16 @@ pub async fn session_fork_api(
     .await
     .map_err(|e| crate::HttpError::Api(internal(e)))?;
     let sid2 = new_id.clone();
-    let s = run_blocking(&st.db, move |db| ocserve_store::load_session_wire(db, &sid2))
-        .await
-        .map_err(|e| crate::HttpError::Api(internal(e)))?;
+    let s = run_blocking(&st.db, move |db| {
+        ocserve_store::load_session_wire(db, &sid2)
+    })
+    .await
+    .map_err(|e| crate::HttpError::Api(internal(e)))?;
     match s {
         Some(info) => Ok(Json(json!({"data": session_v2(&info)}))),
-        None => Err(crate::HttpError::Api(internal(anyhow::anyhow!("fork copy lost")))),
+        None => Err(crate::HttpError::Api(internal(anyhow::anyhow!(
+            "fork copy lost"
+        )))),
     }
 }
 
@@ -1362,7 +2709,9 @@ pub async fn session_context(
     // here, so strip it rather than allowlist it (exact on both).
     let Json(v) =
         list_messages(State(st), Path(id), Query(std::collections::HashMap::new())).await?;
-    Ok(Json(json!({"data": v.get("data").cloned().unwrap_or(json!([]))})))
+    Ok(Json(
+        json!({"data": v.get("data").cloned().unwrap_or(json!([]))}),
+    ))
 }
 
 /// GET /api/session/{sessionID}/history — `{data:[DurableEvent], hasMore}`.
@@ -1425,32 +2774,10 @@ pub async fn session_question(
 // writes: session lifecycle (shared executor for prompt)
 // ---------------------------------------------------------------------------
 
-/// POST /api/session/{sessionID}/agent — switch agent (NoContent).
-pub async fn switch_agent(
-    State(st): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<Value>,
-) -> Result<StatusCode, crate::HttpError> {
-    let agent = body.get("agent").and_then(|v| v.as_str()).unwrap_or("");
-    set_session_field(&st, &id, "agent", json!(agent)).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// POST /api/session/{sessionID}/model — switch model (NoContent).
-pub async fn switch_model(
-    State(st): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<Value>,
-) -> Result<StatusCode, crate::HttpError> {
-    set_session_field(
-        &st,
-        &id,
-        "model",
-        body.get("model").cloned().unwrap_or(json!({})),
-    )
-    .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
+// NOTE: the agent/model switch routes are served by `session_agent_api` /
+// `session_model_api` (Phase D: v2 gate, missing-key 400, unknown-session
+// 404, prompt-consistent persist). The older `switch_agent`/`switch_model`
+// pair was removed (single owner per route).
 
 async fn set_session_field(
     st: &AppState,
@@ -1720,37 +3047,237 @@ async fn run_v2_turn(st: &Arc<AppState>, sid: &str, item_id: &str) -> anyhow::Re
     else {
         return Ok(()); // cancelled between promote and run — not an error
     };
-    if itype != "user" && itype != "synthetic" {
-        // compaction/move items: P4 delivers them; for now deliver-delete so
-        // the queue cannot wedge on an unhandled kind.
-        st.writer
-            .write(vec![ocserve_store::inbox::deliver_ops(item_id)])?;
-        let _ = delivery;
-        return Ok(());
-    }
     let payload: Value = serde_json::from_str(&payload_text).unwrap_or(json!({"text": ""}));
-    // Deliver-delete + message insert happen in the turn body
-    // (`insert_message`); the delete joins that same writer flow by running
-    // first here (single-writer serialization makes the pair atomic enough:
-    // no reader observes a half-delivered item — the message insert follows
-    // in the same task before any other promotable runs).
+    match itype.as_str() {
+        "command" => run_v2_command_turn(st, sid, item_id, &payload).await,
+        "skill" => run_v2_skill_turn(st, sid, item_id, &payload).await,
+        "shell" => run_v2_shell_turn(st, sid, item_id, &payload).await,
+        "move" => run_v2_move_turn(st, sid, item_id, &payload).await,
+        "user" | "synthetic" => run_v2_prompt_turn(st, sid, item_id, &payload).await,
+        _ => {
+            // compaction + unknown kinds: deliver-delete so the queue cannot
+            // wedge on an unhandled kind (Phase D covers compaction items).
+            st.writer
+                .write(vec![ocserve_store::inbox::deliver_ops(item_id)])?;
+            let _ = delivery;
+            Ok(())
+        }
+    }
+}
+
+/// Shared deliver-then-run skeleton: delete the inbox row, build the v1
+/// request, run the shared executor. The delete runs first (single-writer
+/// serialization makes the pair atomic enough: no reader observes a
+/// half-delivered item — the message insert follows in the same task before
+/// any other promotable runs).
+async fn run_v2_delivered_turn(
+    st: &Arc<AppState>,
+    sid: &str,
+    item_id: &str,
+    req: ocserve_core::wire::PromptRequest,
+    opts: ocserve_core::prompt::RunOpts,
+) -> anyhow::Result<()> {
     st.writer
         .write(vec![ocserve_store::inbox::deliver_ops(item_id)])?;
-    let req = ocserve_core::wire::PromptRequest {
-        message_id: Some(item_id.to_string()),
-        parts: v2_payload_parts(&payload),
-        ..Default::default()
-    };
     let ctx = crate::build_prompt_context(st, &req, sid)
         .map_err(|e| anyhow::anyhow!("{} {}", e.name, e.message))?;
     let writer = st.writer.clone();
-    ocserve_core::prompt::run_prompt(&ctx, &writer, sid, &req)
+    ocserve_core::prompt::run_prompt_with(&ctx, &writer, sid, &req, opts)
         .await
         .map_err(|e| anyhow::anyhow!("{e:#}"))?;
-    let _ = itype;
     Ok(())
 }
 
+async fn run_v2_prompt_turn(
+    st: &Arc<AppState>,
+    sid: &str,
+    item_id: &str,
+    payload: &Value,
+) -> anyhow::Result<()> {
+    let req = ocserve_core::wire::PromptRequest {
+        message_id: Some(item_id.to_string()),
+        parts: v2_payload_parts(payload),
+        ..Default::default()
+    };
+    run_v2_delivered_turn(
+        st,
+        sid,
+        item_id,
+        req,
+        ocserve_core::prompt::RunOpts::default(),
+    )
+    .await
+}
+
+/// Command items: template expansion (same `expand_command` as v1) +
+/// `command.execute.before` hook + shared executor with auto_title off
+/// (a command must never name the session after itself — K-TITLE).
+async fn run_v2_command_turn(
+    st: &Arc<AppState>,
+    sid: &str,
+    item_id: &str,
+    payload: &Value,
+) -> anyhow::Result<()> {
+    let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    let template = {
+        let payloads = st.payloads.read();
+        payloads
+            .command
+            .iter()
+            .find(|c| c.get("name").and_then(|v| v.as_str()) == Some(name))
+            .and_then(|c| c.get("template").and_then(|v| v.as_str()))
+            .map(str::to_string)
+    };
+    let Some(template) = template else {
+        // Command vanished between admit and run: deliver + loud error part.
+        st.writer
+            .write(vec![ocserve_store::inbox::deliver_ops(item_id)])?;
+        anyhow::bail!("command disappeared between admit and run: {name}");
+    };
+    let expanded = crate::expand_command(&template, text);
+    let mut cmd_parts = vec![json!({ "type": "text", "text": expanded })];
+    let parts_out = ocserve_core::prompt::hook_mutate(
+        st.plugins.get(),
+        "command.execute.before",
+        json!({"command": name, "sessionID": sid, "arguments": text}),
+        json!({"parts": cmd_parts.clone()}),
+    )
+    .await;
+    if let Some(p) = parts_out.get("parts").and_then(|p| p.as_array()) {
+        cmd_parts = p.clone().into_iter().collect();
+    }
+    // File/agent attachments ride as parts (same mapping as prompt items).
+    for arr_key in ["files", "agents"] {
+        if let Some(arr) = payload.get(arr_key).and_then(|v| v.as_array()) {
+            for el in arr {
+                cmd_parts.push(json!({"type": arr_key.trim_end_matches('s'), arr_key: el}));
+            }
+        }
+    }
+    let req = ocserve_core::wire::PromptRequest {
+        message_id: Some(item_id.to_string()),
+        parts: cmd_parts.into_iter().collect(),
+        ..Default::default()
+    };
+    run_v2_delivered_turn(
+        st,
+        sid,
+        item_id,
+        req,
+        ocserve_core::prompt::RunOpts {
+            auto_title: false,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Skill items: same as command turns (the skill catalog IS the command
+/// payload subset with source "skill" — template expansion + hook + shared
+/// executor, auto_title off).
+async fn run_v2_skill_turn(
+    st: &Arc<AppState>,
+    sid: &str,
+    item_id: &str,
+    payload: &Value,
+) -> anyhow::Result<()> {
+    let skill = payload.get("skill").and_then(|v| v.as_str()).unwrap_or("");
+    let template = {
+        let payloads = st.payloads.read();
+        payloads
+            .command
+            .iter()
+            .find(|c| {
+                c.get("source").and_then(|v| v.as_str()) == Some("skill")
+                    && c.get("name").and_then(|v| v.as_str()) == Some(skill)
+            })
+            .and_then(|c| c.get("template").and_then(|v| v.as_str()))
+            .map(str::to_string)
+    };
+    let Some(template) = template else {
+        st.writer
+            .write(vec![ocserve_store::inbox::deliver_ops(item_id)])?;
+        anyhow::bail!("skill disappeared between admit and run: {skill}");
+    };
+    let req = ocserve_core::wire::PromptRequest {
+        message_id: Some(item_id.to_string()),
+        parts: vec![json!({ "type": "text", "text": template })],
+        ..Default::default()
+    };
+    run_v2_delivered_turn(
+        st,
+        sid,
+        item_id,
+        req,
+        ocserve_core::prompt::RunOpts {
+            auto_title: false,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Shell items: run the command directly (bash), like v1 `post_shell` —
+/// synthetic-user + assistant/tool messages via the shared executor with
+/// model-less shell semantics. Minimal faithful shape: a user turn whose
+/// text is the command output request (the full v1 shell message graph is
+/// v1-path behavior; the v2 turn records the run, not the graph).
+async fn run_v2_shell_turn(
+    st: &Arc<AppState>,
+    sid: &str,
+    item_id: &str,
+    payload: &Value,
+) -> anyhow::Result<()> {
+    let command = payload
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let req = ocserve_core::wire::PromptRequest {
+        message_id: Some(item_id.to_string()),
+        parts: vec![json!({ "type": "text", "text": command })],
+        ..Default::default()
+    };
+    run_v2_delivered_turn(
+        st,
+        sid,
+        item_id,
+        req,
+        ocserve_core::prompt::RunOpts {
+            auto_title: false,
+            tools_enabled: false,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Move items: update the session directory (validated at admit; re-check
+/// at run — the directory may have vanished between admit and drain).
+async fn run_v2_move_turn(
+    st: &Arc<AppState>,
+    sid: &str,
+    item_id: &str,
+    payload: &Value,
+) -> anyhow::Result<()> {
+    let directory = payload
+        .get("directory")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    st.writer
+        .write(vec![ocserve_store::inbox::deliver_ops(item_id)])?;
+    if !std::path::Path::new(directory).is_dir() {
+        anyhow::bail!("move target vanished between admit and run: {directory}");
+    }
+    ocserve_store::set_session_directory(&st.writer, sid, directory)?;
+    let _ = crate::emit_durable_http(
+        st,
+        sid,
+        "session.updated",
+        json!({"id": sid, "directory": directory}),
+    );
+    Ok(())
+}
 /// Inbox payload → v1 parts array.
 fn v2_payload_parts(payload: &Value) -> Vec<Value> {
     let mut parts = vec![json!({
@@ -1810,7 +3337,10 @@ pub async fn list_mcp(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         .map(|m| {
             m.iter()
                 .map(|(name, v)| {
-                    let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("pending");
+                    let status = v
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("pending");
                     // v2 status union is a fixed literal set; pass through
                     // known literals, coerce anything else to pending.
                     let status = match status {
@@ -2153,7 +3683,9 @@ pub async fn form_list_global(State(st): State<Arc<AppState>>) -> Result<Json<Va
         return Err(v2_not_found("global"));
     }
     // v2 `form.list` is a Location.response — envelope required.
-    Ok(Json(json!({"location": api_location(&st), "data": st.form_gate.list()})))
+    Ok(Json(
+        json!({"location": api_location(&st), "data": st.form_gate.list()}),
+    ))
 }
 
 /// Project one inbox row to `Session.Inbox.Info`

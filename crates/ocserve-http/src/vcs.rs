@@ -237,18 +237,21 @@ pub fn branches(dir: &str) -> Value {
     if !is_git(dir) {
         return Value::Array(vec![]);
     }
-    run_git(dir, &["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
-        .filter(|(t, c)| *c == 0)
-        .map(|(t, _)| {
-            Value::Array(
-                t.lines()
-                    .map(|l| l.trim())
-                    .filter(|l| !l.is_empty())
-                    .map(|l| json!(l))
-                    .collect(),
-            )
-        })
-        .unwrap_or_else(|| Value::Array(vec![]))
+    run_git(
+        dir,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+    )
+    .filter(|(t, c)| *c == 0)
+    .map(|(t, _)| {
+        Value::Array(
+            t.lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .map(|l| json!(l))
+                .collect(),
+        )
+    })
+    .unwrap_or_else(|| Value::Array(vec![]))
 }
 
 /// Worktree list (`Worktree.List`): `git worktree list --porcelain` parsed

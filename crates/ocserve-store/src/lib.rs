@@ -2011,6 +2011,132 @@ pub fn prune_events(
     Ok(aged + capped)
 }
 
+/// Columnar session stats (Phase D projectional synergy): indexed
+/// SUM/COUNT over stored columns — never per-row JSON shredding. Explicit
+/// columns (rule 25/33). Shape mirrors `SessionStats.Info` envelopes
+/// (range/sessions/prompts/steps/tokens) with subagents=0 (no subagent
+/// launcher — named gap, not a fabricated count).
+pub fn session_stats(db: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+    let conn = pragma::open_reader(db)?;
+    let (sessions, prompts, steps, tin, tout, treason, tcr, tcw, tmin, tmax): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+    ) = conn.query_row(
+        "SELECT (SELECT count(*) FROM session), \
+                (SELECT count(*) FROM msg WHERE role = 'user'), \
+                (SELECT count(*) FROM msg WHERE role = 'assistant'), \
+                (SELECT COALESCE(SUM(tokens_input),0) FROM session), \
+                (SELECT COALESCE(SUM(tokens_output),0) FROM session), \
+                (SELECT COALESCE(SUM(tokens_reasoning),0) FROM session), \
+                (SELECT COALESCE(SUM(tokens_cache_read),0) FROM session), \
+                (SELECT COALESCE(SUM(tokens_cache_write),0) FROM session), \
+                (SELECT MIN(time_created) FROM session), \
+                (SELECT MAX(time_updated) FROM session)",
+        [],
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+            ))
+        },
+    )?;
+    Ok(serde_json::json!({
+        "range": {"from": tmin.unwrap_or(0), "to": tmax.unwrap_or(0)},
+        "sessions": sessions,
+        "subagents": 0,
+        "prompts": prompts,
+        "steps": steps,
+        "tokens": {
+            "input": tin, "output": tout, "reasoning": treason,
+            "cache": {"read": tcr, "write": tcw},
+        },
+    }))
+}
+
+/// v2 instruction entries (Phase D): content-addressed key journal over the
+/// P2 `instruction_*` tables. Values store by sha256 in `instruction_blob`
+/// (dedupe by construction); `instruction_entry` carries the key→hash link.
+/// Explicit columns (rule 25/33).
+pub mod instruction {
+    use super::{WriteOp, Writer};
+    use anyhow::Result;
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    fn hash(value: &str) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(value.as_bytes()))
+    }
+
+    /// Put a key (insert-or-replace the link + the blob). Value is caller JSON.
+    pub fn put(writer: &Writer, session_id: &str, key: &str, value: &str) -> Result<()> {
+        let h = hash(value);
+        let now = now_ms();
+        writer.write(vec![
+            WriteOp::Sql {
+                sql: "INSERT OR IGNORE INTO instruction_blob (hash, value) VALUES (?1, ?2)".into(),
+                params: vec![h.clone().into(), value.into()],
+            },
+            WriteOp::Sql {
+                sql: "INSERT INTO instruction_entry (session_id, key, value, removed, time_created, time_updated) \
+                      VALUES (?1, ?2, ?3, 0, ?4, ?4) \
+                      ON CONFLICT (session_id, key) DO UPDATE SET value = ?3, removed = 0, time_updated = ?4"
+                    .into(),
+                params: vec![session_id.into(), key.into(), h.into(), now.into()],
+            },
+        ])?;
+        Ok(())
+    }
+
+    /// Remove a key (tombstone, not delete — the journal is append-biased;
+    /// reset clears). Returns true when a live key transitioned.
+    pub fn remove(writer: &Writer, session_id: &str, key: &str) -> Result<bool> {
+        let n = writer.write(vec![WriteOp::Sql {
+            sql: "UPDATE instruction_entry SET removed = 1, time_updated = ?3 \
+                  WHERE session_id = ?1 AND key = ?2 AND removed = 0"
+                .into(),
+            params: vec![session_id.into(), key.into(), now_ms().into()],
+        }])?;
+        Ok(n == 1)
+    }
+
+    /// Live entries for a session (key → value JSON), oldest first.
+    pub fn list(db: &std::path::Path, session_id: &str) -> Result<Vec<(String, String)>> {
+        let conn = crate::pragma::open_reader(db)?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT e.key, b.value FROM instruction_entry e \
+             JOIN instruction_blob b ON b.hash = e.value \
+             WHERE e.session_id = ?1 AND e.removed = 0 ORDER BY e.time_created ASC",
+        )?;
+        let rows = stmt.query_map([session_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+}
+
 /// v2 forms (V2-PLAN.md P4, L3-lite): persistent ask rendezvous state.
 /// The waiters live in `core::form::FormGate`; this module is the durable
 /// state (create/settle/get/list). Explicit columns (rule 25/33).
@@ -2276,6 +2402,19 @@ pub fn session_directory(db: &std::path::Path, session_id: &str) -> anyhow::Resu
         .ok()
         .flatten();
     Ok(d.filter(|s| !s.is_empty()))
+}
+
+/// Set a session's directory (v2 `session.move` execution). Explicit columns
+/// (rule 25/33); returns rows affected (0 = unknown session).
+pub fn set_session_directory(
+    writer: &Writer,
+    session_id: &str,
+    directory: &str,
+) -> anyhow::Result<usize> {
+    writer.write(vec![WriteOp::Sql {
+        sql: "UPDATE session SET directory = ?2 WHERE id = ?1".into(),
+        params: vec![session_id.into(), directory.into()],
+    }])
 }
 
 /// All non-global, non-empty project `directory` values across sessions,
