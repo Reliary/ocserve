@@ -13,7 +13,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VENDOR="bench/parity/vendor/opencode"
-WANT="${OCSERVE_FREEZE_VERSION:-1.18.31}"
+# Positional version wins (bump.sh v1 passes it), then env, then the pinned
+# default. Before this, a positional arg was silently IGNORED and the pinned
+# default staged regardless — `acquire-freeze.sh 1.19.3` fetched 1.18.31.
+WANT="${1:-${OCSERVE_FREEZE_VERSION:-1.18.31}}"
 
 if [ -x "$VENDOR" ] && [ "$("$VENDOR" --version 2>/dev/null | head -1)" = "$WANT" ]; then
   echo "acquire-freeze: $VENDOR already at $WANT"

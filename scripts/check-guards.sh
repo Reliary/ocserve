@@ -768,4 +768,44 @@ else
   echo "FAIL: upstream v2 hooks missing from the capability matrix (rule 36)"; fail=1
 fi
 
+echo "== guard: bump pipeline actually runs its mechanical steps (rule 37) =="
+# bump.sh claimed "runs steps 1-4" but only ran step 1 (npm pack) and PRINTED
+# 2-4 (2026-10-18). The mechanical steps must be INVOKED, and the script must
+# expose --dry-run. Static check so the defect cannot silently return.
+# Planted control: the SAME predicate run on a sabotaged copy must return false
+# (proves the check bites, not just that grep works).
+bump_ok() { # $1 = bump.sh path → 0 when the pipeline invokes its steps
+  grep -q 'run scripts/extract-spec.sh' "$1" \
+    && grep -q 'run scripts/extract-app.sh' "$1" \
+    && grep -q 'run python3 scripts/contract-diff.py' "$1" \
+    && grep -q -- '--dry-run' "$1" \
+    && grep -q -- '--delta' "$1"
+}
+_bump="scripts/bump.sh"
+if [ ! -f "$_bump" ]; then
+  echo "FAIL: $_bump missing (rule 37)"; fail=1
+else
+  if bump_ok "$_bump"; then
+    echo "ok (bump.sh invokes steps 2-4 + --dry-run + delta)"
+  else
+    echo "FAIL: bump.sh does not invoke its mechanical steps (rule 37)"; fail=1
+  fi
+  _plant="$(mktemp)"
+  grep -v 'run scripts/extract-spec.sh' "$_bump" > "$_plant"
+  if bump_ok "$_plant"; then
+    echo "FAIL: rule 37 planted control not detected (check is vacuous)"; fail=1
+  else
+    echo "ok (planted removed step → predicate false)"
+  fi
+  rm -f "$_plant"
+fi
+# contract-diff must accept --v2/--delta (the bump needs same-line delta).
+if python3 scripts/contract-diff.py --selftest >/dev/null 2>&1 \
+   && grep -q -- '"--delta"' scripts/contract-diff.py \
+   && grep -q -- '"--v2"' scripts/contract-diff.py; then
+  echo "ok (contract-diff supports --v2 + --delta)"
+else
+  echo "FAIL: contract-diff missing --v2/--delta (rule 37)"; fail=1
+fi
+
 exit $fail

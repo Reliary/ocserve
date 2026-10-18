@@ -272,8 +272,11 @@ LATEST="$(npm view opencode-ai version 2>/dev/null)" || { echo "harness failure:
 # registry output is untrusted: reject anything that is not a plain version
 # before it reaches docker build-arg / image tag / report (review L1)
 [[ "$LATEST" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]+)?$ ]] || { echo "harness failure: npm version has unexpected format: '$LATEST'"; exit 1; }
-V2="$(npm view 'opencode-ai@>=2.0.0' version 2>/dev/null || true)"
-if [ -n "$V2" ]; then V2NOTE="**PUBLISHED: ${V2}** — PLAN §8 adoption trigger review"; else V2NOTE="not on npm (pre-release tags only)"; fi
+V2="$(npm view '@opencode/cli' version 2>/dev/null || true)"
+# registry output is untrusted (review L1): validate before it reaches the
+# report; a malformed value is dropped, never interpolated.
+[[ "$V2" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]+)?$ ]] || V2=""
+if [ -n "$V2" ]; then V2NOTE="**PUBLISHED: ${V2}** — v2 line on npm (@opencode/cli); monthly-pin review"; else V2NOTE="not on npm (pre-release tags only)"; fi
 V2NOTE="${V2NOTE//$'\n'/ }"; V2NOTE="${V2NOTE//|/\\|}"
 echo "latest=${LATEST}  freeze=${FROZEN}  v2=${V2NOTE}"
 

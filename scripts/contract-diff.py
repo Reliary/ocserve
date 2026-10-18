@@ -39,8 +39,14 @@ If this script disagrees, the script is wrong until proven otherwise.
 
 Usage:
   contract-diff.py [--selftest]
+  contract-diff.py --v2 <tag>              # cross-line: v1 vs assets/openapi/<tag>.json
+  contract-diff.py --delta <prev> <next>   # same-line: <prev> v2 vs <next> v2
   --selftest plants a fake new-v2 op (must go red) and a fake conflict
   (must go red), proving both detectors non-vacuous.
+
+--v2/--delta exist so the bump pipeline can classify a NEW upstream release
+without editing the hardcoded V2 constant: cross-line answers "does the new v2
+still cover ocserve", same-line answers "what did upstream change 2.0.28→2.0.32".
 """
 import copy
 import json
@@ -204,8 +210,38 @@ def classify(v1doc, v2doc):
 
 
 def main():
-    selftest = "--selftest" in sys.argv
-    v1doc, v2doc = load(V1), load(V2)
+    args = sys.argv[1:]
+    selftest = "--selftest" in args
+
+    # --delta <prev> <next>: same-line v2 comparison (bump triage). Shows what
+    # upstream changed between two v2 releases (new ops / removed / type changes).
+    if "--delta" in args:
+        i = args.index("--delta")
+        prev, nxt = args[i + 1], args[i + 2]
+        a = load(f"crates/ocserve-core/assets/openapi/{prev}.json")
+        b = load(f"crates/ocserve-core/assets/openapi/{nxt}.json")
+        rows = classify(a, b)
+        cats = {}
+        for k, v in rows:
+            cats.setdefault(v.split(":")[0], []).append(k)
+        print(f"delta {prev} → {nxt}: ops {len(ops_of(a))} → {len(ops_of(b))}")
+        for cat in ("identical", "additive-superset", "renamed-ref",
+                    "new-v2", "v1-only", "removed", "conflict"):
+            n = len(cats.get(cat, []))
+            if n:
+                print(f"  {cat}: {n}")
+        for cat in ("new-v2", "removed", "conflict"):
+            for k in cats.get(cat, []):
+                print(f"  {cat.upper():9} {k[0]} {k[1]}")
+        # same-line: nothing is "v1-only"; a conflict is still load-bearing.
+        return 1 if cats.get("conflict") else 0
+
+    # --v2 <tag>: cross-line classification against a non-default v2 asset.
+    v2path = V2
+    if "--v2" in args:
+        v2path = f"crates/ocserve-core/assets/openapi/{args[args.index('--v2') + 1]}.json"
+
+    v1doc, v2doc = load(V1), load(v2path)
     if selftest:
         # Plant a fake new-v2 op: must classify new-v2 (detector non-vacuous).
         v2doc = copy.deepcopy(v2doc)
