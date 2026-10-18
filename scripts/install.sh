@@ -10,19 +10,24 @@
 #   --bin-only   place/report the binary only; do not touch systemd
 #   --dry-run    print exactly what would change; touch nothing
 #   --bin PATH   binary to run in place (default: target/release/ocserve)
+#   --release    use the CI-built release artifact instead of a local build
+#                (scripts/fetch-release.sh; no Rust toolchain needed)
+#   --tag TAG    with --release, the version to fetch (default: latest)
 # Non-systemd hosts fall back to bin-only with a note.
 # Never sudo, never touches non-ocserve units (check-guards rule 6).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO=$PWD
 
-BIN_ONLY=0 DRY=0 SRC=""
+BIN_ONLY=0 DRY=0 SRC="" RELEASE=0 TAG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --bin-only) BIN_ONLY=1 ;;
     --dry-run)  DRY=1 ;;
     --bin)      SRC=$2; shift ;;
-    -h|--help)  sed -n '2,16p' "$0"; exit 0 ;;
+    --release)  RELEASE=1 ;;
+    --tag)      TAG=$2; shift ;;
+    -h|--help)  sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown flag: $1" >&2; exit 2 ;;
   esac
   shift
@@ -40,6 +45,23 @@ if [ "$SD" = 0 ]; then
 fi
 
 # --- resolve binary (used in place; no copying) -----------------------------
+# The systemd unit executes the binary at an absolute path, so a --release
+# download must be moved OFF $TMPDIR into a stable per-user bin dir; otherwise
+# the service dies at the next reboot when the temp file is reaped.
+BIN_HOME="$HOME/.local/bin"
+if [ "$RELEASE" = 1 ]; then
+  if [ "$DRY" = 1 ]; then
+    say "[dry-run] would fetch the CI release artifact${TAG:+ ($TAG)} via scripts/fetch-release.sh"
+    say "[dry-run] would place it at $BIN_HOME/ocserve"
+    SRC=$REPO/target/release/ocserve   # report-only below
+  else
+    fetched=$(./scripts/fetch-release.sh ${TAG:+"$TAG"}) || exit 1
+    mkdir -p "$BIN_HOME"
+    install -m 0755 "$fetched" "$BIN_HOME/ocserve"
+    SRC=$BIN_HOME/ocserve
+    say "placed release binary at $SRC"
+  fi
+fi
 SRC=${SRC:-$REPO/target/release/ocserve}
 if [ ! -x "$SRC" ]; then
   if [ "$DRY" = 1 ]; then

@@ -28,9 +28,11 @@ your own box rather than trusting them.
 ## Install
 
 ```sh
-cargo install ocserve          # Rust toolchain
-# or grab a release binary:
+cargo install ocserve          # Rust toolchain (crates.io: 0.3.1 until the
+                               # ocserve-http upload limit is raised)
+# or use a CI-built release binary — no toolchain, checksum-verified:
 #   https://github.com/Reliary/ocserve/releases
+#   scripts/fetch-release.sh            # from a clone: verifies SHA256SUMS
 ```
 
 ## Run
@@ -58,6 +60,7 @@ Optional systemd user service (never installed implicitly):
 
 ```sh
 ./scripts/install.sh          # --dry-run first if you prefer
+./scripts/install.sh --release  # fetch the CI-built artifact, no local build
 ./scripts/uninstall.sh        # keeps history by default; --purge for full wipe
 ```
 
