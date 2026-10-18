@@ -21,7 +21,8 @@
 #      the 2026-10-05 incident class; only ocserve* units are mutable, TESTING §1.6) [suite]
 #   7. exact assertions on process-global counters inside src/ (parallel in-crate
 #      tests race — the reader_opens flake; such tests belong in tests/) [suite]
-#   8. (retired — folded into 7)
+#   8. normalized plugin outputs written atomically (a torn `.normalized.mjs`
+#      after a crash loads as a syntax error at boot; D1) [suite]
 #   9. unit template keeps OOMPolicy=continue (child OOM must not bounce the
 #      service — the 2026-10-06 stop-policy bounce; A3's completion) [suite]
 #  10. A3 child wrapper stays byte-identical in ocserve-mcp + ocserve-plugin
@@ -57,6 +58,16 @@
 #  34. serving path is Rust-native (no non-Rust runtime in the request path;
 #      same-sidecar-protocol extensions allowed, new runtimes forbidden) [plant]
 #  35. no absolute-path silent redirect in writers (resolve_within class) [plant]
+#  36. every upstream v2 plugin hook is accounted for in the capability matrix
+#      (an undocumented hook is a silent gap) [plant: fake hook injected]
+#  37. upgrade machinery actually RUNS its mechanical steps (bump.sh printed
+#      them once; contract-diff needs --v2/--delta; spec-validate is
+#      version-agnostic) [plant: removed step → predicate false]
+#  38. no crate payload crosses the registry upload ceiling (the `.crate` is
+#      the published artifact; `cargo package --list` only checks layout)
+#      [plant: delegated selftest]
+#  39. every script with a `--selftest` is invoked by a gate (a selftest that
+#      nothing runs is the registered-but-never-called class) [plant: orphan]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -833,6 +844,26 @@ if grep -q "CRATE_PAYLOAD_LIMIT_BYTES:" .github/workflows/publish.yml; then
   echo "ok (ceiling declared in publish.yml)"
 else
   echo "FAIL: publish.yml does not declare CRATE_PAYLOAD_LIMIT_BYTES (rule 38)"; fail=1
+fi
+
+echo "== guard: every --selftest has a gate that runs it (rule 39) =="
+# A selftest nothing invokes is the registered-but-never-called class: the v1
+# `config` hook returned a hard-coded "ok" and was never dispatched, and
+# fetch-release.sh shipped a real selftest that no gate called. The checker
+# accepts a name (file or stem) co-occurring with --selftest in a gate file,
+# and plants a fresh orphan to prove it is not vacuous.
+if python3 scripts/check-selftests.py >/dev/null 2>&1 \
+   && python3 scripts/check-selftests.py --selftest >/dev/null 2>&1; then
+  echo "ok (every selftest acceptor is wired; planted orphan detected)"
+else
+  echo "FAIL: a script offers --selftest that no gate runs, or the check is vacuous (rule 39)"; fail=1
+fi
+# The release fetcher's checksum gate is load-bearing (it decides what binary a
+# host installs), so it runs here rather than only in nightly.
+if ./scripts/fetch-release.sh --selftest >/dev/null 2>&1; then
+  echo "ok (fetch-release checksum gate rejects a corrupted tarball)"
+else
+  echo "FAIL: fetch-release --selftest (checksum gate vacuous)"; fail=1
 fi
 
 exit $fail

@@ -77,6 +77,45 @@ def gitignored_dirs() -> tuple[str, ...]:
 IGNORED = gitignored_dirs()
 
 
+# A doc path may carry a `<placeholder>` leaf (a generated artifact named by the
+# build, e.g. the tag in `assets/webui/<tag>.pack.zst`). The exact token is not
+# a real file, but the DIRECTORY must still exist: otherwise moving the assets
+# turns the doc into a lie and the token regex (which needs a file extension)
+# quietly skips it. This is the 2026-10-18 THIRD-PARTY.md finding.
+PLACEHOLDER = re.compile(r'`([A-Za-z0-9_][A-Za-z0-9_./-]*)<[A-Za-z0-9_-]+>([A-Za-z0-9_./-]*)`')
+
+
+def check_dead_placeholder_dirs() -> list[str]:
+    bad: list[str] = []
+    for name in DOCS:
+        path = os.path.join(ROOT, name)
+        for i, line in enumerate(open(path, encoding="utf-8", errors="ignore"), 1):
+            for m in PLACEHOLDER.finditer(line):
+                p = m.group(1) + "PLACEHOLDER" + m.group(2)
+                if not p.startswith(PREFIXES):
+                    continue
+                if any(p.startswith(d) for d in IGNORED):
+                    continue
+                # the directory that must exist is everything before the
+                # placeholder segment
+                head = m.group(1)
+                d = os.path.dirname(head.rstrip("/"))
+                while d and not os.path.isdir(os.path.join(ROOT, d)):
+                    nd = os.path.dirname(d)
+                    if nd == d:
+                        break
+                    d = nd
+                # require the deepest existing prefix to be the dir we expect,
+                # i.e. the placeholder's own directory must exist
+                want = head.rstrip("/")
+                if want and not os.path.isdir(os.path.join(ROOT, want)):
+                    bad.append(
+                        f"{name}:{i}: placeholder path `{p}` names directory "
+                        f"`{want}` that does not exist"
+                    )
+    return bad
+
+
 def check_dead_paths() -> list[str]:
     bad: list[str] = []
     for name in DOCS:
@@ -90,6 +129,7 @@ def check_dead_paths() -> list[str]:
                     continue  # gitignored runtime artifact (bench/drift/, …)
                 if not os.path.exists(os.path.join(ROOT, p)):
                     bad.append(f"{name}:{i}: dead repo path `{p}`")
+    bad.extend(check_dead_placeholder_dirs())
     return bad
 
 
@@ -242,13 +282,27 @@ def selftest() -> int:
         shutil.move(b1, decl_victim)
         shutil.move(b2, list_victim)
 
-    if caught_path and caught_rule and caught_closed:
+    # plant a placeholder whose directory does not exist (the THIRD-PARTY shape)
+    ph_victim = os.path.join(ROOT, DOCS[0])
+    ph_backup = ph_victim + ".lintbak"
+    shutil.copy2(ph_victim, ph_backup)
+    caught_placeholder = False
+    try:
+        with open(ph_victim, "a", encoding="utf-8") as f:
+            f.write("\n(selftest) `bench/__rule31_missing_dir/<tag>.pack.zst`\n")
+        caught_placeholder = any("__rule31_missing_dir" in x for x in run_all())
+    finally:
+        shutil.move(ph_backup, ph_victim)
+
+    if caught_path and caught_rule and caught_closed and caught_placeholder:
         print(
-            "selftest: PASS (dead path + bogus rule ref + reopened closed divergence all detected)"
+            "selftest: PASS (dead path + bogus rule ref + reopened closed "
+            "divergence + dead placeholder dir all detected)"
         )
         return 0
     print(
-        f"selftest: FAIL (path={caught_path} rule={caught_rule} closed={caught_closed}) — guard is vacuous",
+        f"selftest: FAIL (path={caught_path} rule={caught_rule} closed={caught_closed} "
+        f"placeholder={caught_placeholder}) — guard is vacuous",
         file=sys.stderr,
     )
     return 1

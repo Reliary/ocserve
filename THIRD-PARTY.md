@@ -46,7 +46,7 @@ byte-equivalently to the frozen upstream.
 
 ## Embedded web UI
 
-`bench/webui/app/<tag>.pack.zst` is the built `packages/app` web client,
+`crates/ocserve-http/assets/webui/<tag>.pack.zst` is the built `packages/app` web client,
 captured from the pinned upstream build through its public HTTP interface
 (`scripts/extract-app.sh`) and embedded via `include_bytes!` so ocserve serves
 the fully version-matched UI offline (upstream parity: the upstream binary
