@@ -740,6 +740,8 @@ fn task_exec<'a>(
                 "Background subagents are not supported (D-TASK-BACKGROUND); run the task in the foreground."
             );
         }
+        // M6: make subagent spawns observable (depth guard + failures).
+        ocserve_metrics::labeled_counter("ocserve_task_total", "result=\"spawn\"", 1);
 
         // Depth guard (upstream subagent_depth, default 1): the PARENT's depth
         // from its own ancestors must be < limit, so the child sits at

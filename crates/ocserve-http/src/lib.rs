@@ -6062,6 +6062,9 @@ async fn api_method_fallback(
 /// The byte-exact upstream 401 (probed live on 2.0.28). Shared by the auth
 /// gate and the method fallback so the two can never drift apart.
 fn unauthorized_response() -> Response {
+    // M6 (reliability review): make auth denials observable (a spike = a client
+    // misconfigured or a probe; without a counter it is invisible).
+    ocserve_metrics::counter("ocserve_auth_denied_total", 1);
     let body =
         serde_json::json!({"_tag": "UnauthorizedError", "message": "Authentication required"})
             .to_string();

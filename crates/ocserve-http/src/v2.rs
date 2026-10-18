@@ -2259,6 +2259,7 @@ pub async fn rpc_unimplemented(
     // Phase 3: dispatch to a v2 plugin that registered {rpcID, method}. When a
     // plugin serves the id this is a real call; otherwise the exact
     // `rpc.unavailable` error (same behavior for the same state — parity).
+    ocserve_metrics::labeled_counter("ocserve_rpc_calls_total", "result=\"dispatch\"", 1);
     if let Some(plug) = st.plugins.get() {
         let reg = {
             let mut guard = plug.lock().await;
