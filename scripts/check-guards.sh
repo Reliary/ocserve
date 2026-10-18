@@ -816,4 +816,23 @@ else
   echo "ok (spec-validate v2 detection is version-agnostic)"
 fi
 
+echo "== guard: no crate payload exceeds the registry upload ceiling (rule 38) =="
+# crates.io rejects an over-limit `.crate`, and the ordered publish chain
+# aborts there (2026-10-18: ocserve-http carries two embedded web-UI packs,
+# ~35 MB). `cargo package --list` — the only other payload gate — validates
+# LAYOUT, never bytes, so this is the sole byte-level check.
+if python3 scripts/check-crate-payload.py >/dev/null 2>&1 \
+   && python3 scripts/check-crate-payload.py --selftest >/dev/null 2>&1; then
+  echo "ok (every member under the declared ceiling)"
+else
+  echo "FAIL: a crate payload exceeds the declared ceiling, or its selftest is vacuous (rule 38)"; fail=1
+fi
+# The ceiling must be DECLARED (publish.yml env), not defaulted silently —
+# a raised limit is a deliberate, dated decision, not a missing constant.
+if grep -q "CRATE_PAYLOAD_LIMIT_BYTES:" .github/workflows/publish.yml; then
+  echo "ok (ceiling declared in publish.yml)"
+else
+  echo "FAIL: publish.yml does not declare CRATE_PAYLOAD_LIMIT_BYTES (rule 38)"; fail=1
+fi
+
 exit $fail

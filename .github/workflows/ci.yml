@@ -85,6 +85,13 @@ jobs:
       - name: publish order guard
         run: python3 scripts/check-publish-order.py && python3 scripts/check-publish-order.py --selftest
 
+      # Byte payload vs the registry's upload ceiling. `cargo package --list`
+      # below validates LAYOUT only, so nothing else catches a crate that grew
+      # past the limit (the 2026-10-18 finding: two embedded web-UI packs push
+      # ocserve-http to ~35 MB). The cap is declared once, in publish.yml.
+      - name: crate payload size guard
+        run: python3 scripts/check-crate-payload.py && python3 scripts/check-crate-payload.py --selftest
+
       # release build + artifact: the release artifact is the product; build it
       # on every push so a broken release build is caught by CI (not tag day).
       - name: build release
