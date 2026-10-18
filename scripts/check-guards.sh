@@ -261,7 +261,15 @@ fi
 echo "== guard: embedded UI version-skew (rule 17) =="
 # Each pinned web UI must call only routes present in its SAME-TAG frozen
 # spec (Phase E: v1 + v2 packs). A mismatch means the extraction captured the
-# wrong build. Planted control: sabotaged spec → red.
+# wrong build. Planted control: sabotaged spec → red. ALSO: the pack and its
+# manifest must have the SAME entry count and a known format — a manifest
+# regenerated without its pack (or vice-versa) shipped once (2026-10-18) and
+# only the browser caught it; this makes that class a commit-time failure.
+if python3 scripts/check-pack-manifest.py; then
+  echo "ok (pack/manifest entry counts + format)"
+else
+  echo "FAIL: embedded UI pack/manifest inconsistent (rule 17)"; fail=1
+fi
 for _tag in 1.18.31 2.0.28; do
   _pack="crates/ocserve-http/assets/webui/$_tag.pack.zst"
   _spec="crates/ocserve-core/assets/openapi/$_tag.json"
