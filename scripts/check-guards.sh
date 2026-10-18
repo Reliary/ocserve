@@ -519,10 +519,13 @@ fi
 # every non-comment allow line must be preceded (within the comment block) by
 # a D- token somewhere in the file's comments
 if [ -f bench/capdiff/allow.txt ]; then
+  # `while read` exits non-zero at EOF; under `set -o pipefail` that would kill
+  # the script when the allowlist has zero non-comment lines (the state after
+  # D-TOOLS-TASK closed). `|| true` keeps the empty-list case a no-op.
   bad=$(grep -vE '^\s*(#|$)' bench/capdiff/allow.txt | while read -r line; do
     pref="${line%% *}"
     if ! grep -qE "D-[A-Z0-9-]+" bench/capdiff/allow.txt; then echo "$pref"; fi
-  done)
+  done || true)
   if [ -n "$bad" ]; then
     echo "FAIL: allowlist entry without a D-row citation: $bad (rule 27)"; fail=1
   fi

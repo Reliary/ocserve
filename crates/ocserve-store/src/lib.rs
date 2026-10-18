@@ -2553,6 +2553,27 @@ pub fn session_directory(db: &std::path::Path, session_id: &str) -> anyhow::Resu
     Ok(d.filter(|s| !s.is_empty()))
 }
 
+/// A session's derived permission ruleset (JSON array; v1 `{permission,
+/// pattern, action}`), or None when the session carries none. Used by the
+/// `task` tool's child-permission derivation (K-TASK).
+pub fn session_permission(
+    db: &std::path::Path,
+    session_id: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let conn = pragma::open_reader(db)?;
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT permission FROM session WHERE id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(raw
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str(&s).ok()))
+}
+
 // ---------------------------------------------------------------------------
 // Credentials (gap closure): upstream `credential` table semantics, verified
 // live against 2.0.28 — create returns the entry (label defaults "default",
@@ -2817,6 +2838,68 @@ pub fn insert_session(writer: &Writer, info: &serde_json::Value) -> anyhow::Resu
         ],
     }])?;
     Ok(())
+}
+
+/// Insert a SUBAGENT (task-tool) child session: parent_id, agent, and the
+/// derived permission ruleset (JSON array, v1 `{permission,pattern,action}`).
+/// `permission` is stored as TEXT so `agent_rules`-style readers can parse it.
+/// Used only by the `task` tool launcher (K-TASK).
+pub fn insert_child_session(
+    writer: &Writer,
+    info: &serde_json::Value,
+    parent_id: &str,
+    agent: &str,
+    permission: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let id = info["id"].as_str().unwrap_or_default().to_string();
+    writer.write(vec![WriteOp::Sql {
+        sql: "INSERT OR REPLACE INTO session (id, project_id, slug, directory, path, title, version, \
+              time_created, time_updated, parent_id, agent, permission) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+            .into(),
+        params: vec![
+            id.into(),
+            info["projectID"].as_str().unwrap_or("global").into(),
+            info["slug"].as_str().unwrap_or("").into(),
+            info["directory"].as_str().unwrap_or("").into(),
+            info["path"].as_str().unwrap_or("").into(),
+            info["title"].as_str().unwrap_or("").into(),
+            info["version"].as_str().unwrap_or("").into(),
+            info["time"]["created"].as_i64().unwrap_or(0).into(),
+            info["time"]["updated"].as_i64().unwrap_or(0).into(),
+            parent_id.into(),
+            agent.into(),
+            permission.to_string().into(),
+        ],
+    }])?;
+    Ok(())
+}
+
+/// Walk the `parent_id` chain from `session_id`; returns the number of
+/// ancestors (depth). A root session → 0. Missing session → None. Used by the
+/// `task` tool's `subagent_depth` guard (K-TASK).
+pub fn session_depth(db: &std::path::Path, session_id: &str) -> anyhow::Result<Option<u32>> {
+    let conn = pragma::open_reader(db)?;
+    let mut depth = 0u32;
+    let mut cur = session_id.to_string();
+    loop {
+        let next: Option<Option<String>> = conn
+            .query_row("SELECT parent_id FROM session WHERE id = ?1", [&cur], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()?;
+        match next {
+            None => return Ok(None), // session id unknown
+            Some(None) => return Ok(Some(depth)),
+            Some(Some(p)) => {
+                depth += 1;
+                if depth > 64 {
+                    return Ok(Some(depth)); // cycle guard (should never happen)
+                }
+                cur = p;
+            }
+        }
+    }
 }
 
 /// Full session wire object merged with `overrides` (upstream `patch()`:

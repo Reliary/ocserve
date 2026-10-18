@@ -17,7 +17,7 @@
 //! loop evaluates each like upstream.
 
 use crate::bash_patterns;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 /// One `ctx.ask()` request: `permission` names the rule family; `patterns`
@@ -77,6 +77,17 @@ pub fn asks_for(tool: &str, args: &Value, cwd: &Path) -> Vec<Ask> {
         }],
         "websearch" => single_always("websearch", args),
         "todowrite" => single_always("todowrite", args),
+        // v1 task tool: ctx.ask({permission:"task", patterns:[subagent_type],
+        // always:["*"]}) — pattern is the subagent type, not "*".
+        "task" => vec![Ask {
+            permission: "task".to_string(),
+            patterns: vec![str_arg(args, "subagent_type")],
+            always: vec!["*".to_string()],
+            metadata: json!({
+                "description": args.get("description").cloned().unwrap_or(Value::Null),
+                "subagent_type": args.get("subagent_type").cloned().unwrap_or(Value::Null),
+            }),
+        }],
         // Unknown/other tools: a wildcard ask (upstream default = ask).
         _ => vec![Ask {
             permission: tool.to_string(),

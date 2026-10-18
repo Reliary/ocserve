@@ -3489,6 +3489,15 @@ pub(crate) fn build_prompt_context(
         // SNAPSHOT (SNAPSHOT.md): config `snapshot != false` + env kill-switch;
         // the engine resolves the worktree lazily and no-ops when non-git.
         snapshots,
+        // K-TASK: subagent launcher config (depth + resolvable agents).
+        subagent_depth: st
+            .payloads
+            .read()
+            .config
+            .get("subagent_depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32,
+        agent_catalog: st.payloads.read().api_agent.clone(),
     };
     Ok(ctx)
 }

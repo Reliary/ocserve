@@ -118,19 +118,26 @@ byte-identical to freeze, echo assertions green on both arms, 0 divergences.**
   **SUPERSEDED: noReply/system/tools/format implemented as above; residual
   named gaps live in field-probes.md §Out of scope.**
 
-## D-TOOLS-TASK — provider advertises `task`, ocserve does not execute it
+## D-TOOLS-TASK — `task` subagent launcher (CLOSED 2026-10-17, K-TASK)
 
-`bench/capdiff` (K-CAPDIFF) compared the two arms' real provider requests and
-found freeze advertises 11 tools; ocserve executes 10 (missing `task`, a
-subagent launcher). The vendored `default.txt` system prompt tells the model to
-use `Task`, so this is a REAL functional gap, not a cosmetic one:
+> **CLOSED.** `task` is now implemented: `ocserve-core::prompt::task_exec`
+> spawns a child session (`parent_id = ctx.sessionID`, title
+> `"{description} (@{agent} subagent)"`), derives the child's permission
+> ruleset (upstream `subagent-permissions.ts`), and runs the SHARED
+> `run_prompt_with` executor on it (no second loop). Depth is bounded by
+> `subagent_depth` (default 1); background mode is a named divergence
+> (`D-TASK-BACKGROUND`). The provider tool sets now match, so the capdiff
+> allowlist line `$.tools.task` was removed. Tests: `tests/task_e2e.rs`.
+
+Historical record (pre-closure): `bench/capdiff` (K-CAPDIFF) compared the two
+arms' real provider requests and found freeze advertises 11 tools; ocserve
+executed 10 (missing `task`, a subagent launcher). The vendored `default.txt`
+system prompt tells the model to use `Task`, so it was a real functional gap.
 
 - Freeze: `task` launches a subagent (separate session, its own model loop) and
   returns its output to the parent.
-- ocserve: no subagent execution path yet → the tool is NOT advertised, so the
-  model cannot call a tool that would fail.
+- ocserve (pre-K-TASK): no subagent execution path → the tool was NOT
+  advertised, so the model could not call a tool that would fail.
 
-Allowlisted in `bench/capdiff/allow.txt` as `$.tools.task` (one line, name-keyed
-diff). Implementing `task` needs a subagent executor reusing `run_prompt_with`
-against a child session — tracked, not yet built. The other 10 tools are now
-byte-identical (schemas + descriptions).
+The launcher reuses `run_prompt_with` against a child session. The other 10
+tools are byte-identical (schemas + descriptions).

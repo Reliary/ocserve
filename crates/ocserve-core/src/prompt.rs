@@ -67,6 +67,13 @@ pub struct PromptContext {
     /// worktree before a turn, records tool changes as `patch` parts, and
     /// restores files on revert.
     pub snapshots: Option<crate::snapshot::Snapshots>,
+    /// K-TASK: max subagent nesting depth (config `subagent_depth`, default 1).
+    /// The `task` tool refuses to spawn a child when the parent's ancestor
+    /// count already equals this.
+    pub subagent_depth: u32,
+    /// K-TASK: configured agents (v1 `Agent.Info` shape) — the `task` tool
+    /// resolves `subagent_type` against `mode == "subagent"` entries here.
+    pub agent_catalog: Vec<serde_json::Value>,
 }
 
 /// `track()` off the tokio workers (git shells out — the F1 convoy rule).
@@ -699,6 +706,240 @@ fn skill_exec(
         error: false,
         metadata: None,
     })
+}
+
+/// v1 `task` tool (tool/task.ts) — subagent launcher (K-TASK). Spawns a child
+/// session (`parent_id = ctx.sessionID`), derives the child's permission
+/// ruleset (parent deny + external_directory rules, plus todowrite/task denies
+/// unless the subagent permits — `subagent-permissions.ts`), and runs the
+/// SHARED executor on it (branch-by-abstraction: one loop). Foreground only;
+/// background subagents are upstream-experimental (`D-TASK-BACKGROUND`).
+///
+/// Boxed future: `task_exec` → `run_prompt_with` → (tool loop) → `task_exec` is
+/// a recursive async cycle (nested subagents), which rustc requires boxing.
+fn task_exec<'a>(
+    ctx: &'a PromptContext,
+    writer: &'a ocserve_store::Writer,
+    session_id: &'a str,
+    input: &'a Value,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<ocserve_tools::ToolResult>> + Send + 'a>,
+> {
+    Box::pin(async move {
+        let subagent_type = input["subagent_type"]
+            .as_str()
+            .context("task.subagent_type")?
+            .to_string();
+        let description = input["description"].as_str().unwrap_or("").to_string();
+        let prompt = input["prompt"]
+            .as_str()
+            .context("task.prompt (the task for the agent to perform)")?
+            .to_string();
+        if input.get("background").and_then(|b| b.as_bool()) == Some(true) {
+            anyhow::bail!(
+                "Background subagents are not supported (D-TASK-BACKGROUND); run the task in the foreground."
+            );
+        }
+
+        // Depth guard (upstream subagent_depth, default 1): the PARENT's depth
+        // from its own ancestors must be < limit, so the child sits at
+        // parent_depth+1.
+        let limit = ctx.subagent_depth;
+        let parent_chain = ocserve_store::session_depth(&ctx.db, session_id)?.unwrap_or(0);
+        if parent_chain >= limit {
+            anyhow::bail!(
+                "Subagent depth limit reached ({limit}). Increase \"subagent_depth\" to allow nested subagents."
+            );
+        }
+
+        // Resolve the subagent: a configured agent with mode == "subagent".
+        let sub = ctx
+            .agent_catalog
+            .iter()
+            .find(|a| {
+                a.get("name").and_then(|n| n.as_str()) == Some(subagent_type.as_str())
+                    && a.get("mode").and_then(|m| m.as_str()) == Some("subagent")
+            })
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("Unknown agent type: {subagent_type} is not a valid agent type")
+            })?;
+
+        // Child session: reuse an existing child (task_id) or create one.
+        let child_id = match input.get("task_id").and_then(|t| t.as_str()) {
+            Some(tid) if ocserve_store::session_exists(&ctx.db, tid).unwrap_or(false) => {
+                tid.to_string()
+            }
+            _ => new_child_session(ctx, writer, session_id, &description, &subagent_type, &sub)?,
+        };
+
+        // Run the shared executor on the child (fresh PromptContext, child's
+        // directory/agent/model). The child's history is its own; the tool
+        // result is its final assistant text.
+        let child = child_context(ctx, &child_id, &subagent_type, &sub)?;
+        let req = crate::wire::PromptRequest {
+            parts: vec![json!({"type": "text", "text": prompt})],
+            ..Default::default()
+        };
+        let (_info, parts) = run_prompt_with(
+            &child,
+            writer,
+            &child_id,
+            &req,
+            RunOpts {
+                auto_title: false,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let text = final_text(&parts).unwrap_or_default();
+        let block = format!(
+            "<task id=\"{child_id}\" state=\"completed\">\n<summary>{description}</summary>\n\
+             <task_result>\n{text}\n</task_result>\n</task>"
+        );
+        Ok(ocserve_tools::ToolResult {
+            output: block,
+            truncated: false,
+            exit: None,
+            title: description,
+            error: false,
+            metadata: Some(json!({
+                "parentSessionId": session_id,
+                "sessionId": child_id,
+            })),
+        })
+    })
+}
+
+/// Create the child (`task`) session row: parent_id + agent + derived
+/// permission JSON. Title mirrors upstream `"{description} (@{agent} subagent)"`.
+fn new_child_session(
+    ctx: &PromptContext,
+    writer: &ocserve_store::Writer,
+    parent_id: &str,
+    description: &str,
+    subagent_type: &str,
+    sub: &Value,
+) -> Result<String> {
+    let id = crate::ids::ses_id();
+    let now = now_ms();
+    let title = if description.trim().is_empty() {
+        format!("(@{subagent_type} subagent)")
+    } else {
+        format!("{description} (@{subagent_type} subagent)")
+    };
+    let parent_perms = ocserve_store::session_permission(&ctx.db, parent_id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| json!([]));
+    let permission = derive_subagent_permission(&parent_perms, sub);
+    let info = json!({
+        "id": id,
+        "projectID": "global",
+        "directory": ctx.directory,
+        "path": "",
+        "slug": id.trim_start_matches("ses_").chars().take(12).collect::<String>(),
+        "title": title,
+        "version": "1",
+        "time": {"created": now, "updated": now},
+    });
+    ocserve_store::insert_child_session(writer, &info, parent_id, subagent_type, &permission)?;
+    let mut seq = 0i64;
+    let _ = emit_durable(
+        ctx,
+        writer,
+        parent_id,
+        "session.created",
+        json!({"sessionID": id, "info": info}),
+        &mut seq,
+    );
+    Ok(id)
+}
+
+/// Upstream `deriveSubagentSessionPermission` (subagent-permissions.ts):
+/// parent `deny` + `external_directory` rules, plus `todowrite`/`task` denies
+/// unless the subagent's own rules already name that permission. RCM framing
+/// (arXiv 2610.21243): the child keeps the parent's hard constraints.
+fn derive_subagent_permission(parent: &Value, sub: &Value) -> Value {
+    let mut out: Vec<Value> = Vec::new();
+    if let Some(rules) = parent.as_array() {
+        for r in rules {
+            let perm = r.get("permission").and_then(|p| p.as_str()).unwrap_or("");
+            let action = r.get("action").and_then(|a| a.as_str()).unwrap_or("");
+            if perm == "external_directory" || action == "deny" {
+                out.push(r.clone());
+            }
+        }
+    }
+    let sub_rules = sub.get("permission").and_then(|p| p.as_array());
+    let names = |p: &str| -> bool {
+        sub_rules
+            .map(|rs| {
+                rs.iter()
+                    .any(|r| r.get("permission").and_then(|x| x.as_str()) == Some(p))
+            })
+            .unwrap_or(false)
+    };
+    for p in ["todowrite", "task"] {
+        if !names(p) {
+            out.push(json!({"permission": p, "pattern": "*", "action": "deny"}));
+        }
+    }
+    Value::Array(out)
+}
+
+/// Fresh PromptContext for the child session: the child's directory/agent/
+/// model and its derived rules, but the parent's infra (bus/gate/skills/mcp/…).
+fn child_context(
+    parent: &PromptContext,
+    child_id: &str,
+    subagent_type: &str,
+    sub: &Value,
+) -> Result<PromptContext> {
+    let mut child = parent.clone();
+    child.agent = subagent_type.to_string();
+    if let Some(p) = sub.get("prompt").and_then(|p| p.as_str()) {
+        child.system = p.to_string();
+    }
+    if let Some(dir) = ocserve_store::session_directory(&parent.db, child_id)
+        .ok()
+        .flatten()
+        && !dir.is_empty()
+    {
+        child.directory = dir;
+    }
+    let perms = ocserve_store::session_permission(&parent.db, child_id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| json!([]));
+    child.rules = perms
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    Some(ocserve_tools::Rule {
+                        permission: r.get("permission")?.as_str()?.to_string(),
+                        pattern: r.get("pattern")?.as_str()?.to_string(),
+                        action: r.get("action")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(child)
+}
+
+/// Concatenate the text parts of a persisted assistant message.
+fn final_text(parts: &[Value]) -> Option<String> {
+    let mut s = String::new();
+    for p in parts {
+        if p.get("type").and_then(|t| t.as_str()) == Some("text")
+            && let Some(t) = p.get("text").and_then(|t| t.as_str())
+        {
+            s.push_str(t);
+        }
+    }
+    (!s.is_empty()).then_some(s)
 }
 
 async fn spawn_tool(
@@ -2021,6 +2262,13 @@ pub async fn run_prompt_with(
                             // by name, emit the <skill_content> block. Missing
                             // name → error (upstream Effect.die).
                             skill_exec(&ctx.skills, &input)
+                        } else if call.name == "task" {
+                            // K-TASK: spawn a subagent on its OWN child session
+                            // and run the SHARED executor on it (no second
+                            // loop). Depth-bounded by `subagent_depth` (default
+                            // 1); child permission derived like upstream
+                            // (subagent-permissions.ts, RCM framing).
+                            task_exec(ctx, writer, session_id, &input).await
                         } else if builtin {
                             spawn_tool(&call.name, input, &ctx.directory, &session_env).await
                         } else if let Some(hub) = &ctx.mcp {

@@ -164,9 +164,10 @@ fn todowrite(input: &Value) -> Result<ToolResult> {
 }
 
 /// Tools ocserve executes. Advertised tool list = the intersection of these
-/// names and the frozen provider-tools.json (D-TOOLS-TASK: `task` is advertised
-/// upstream but not yet executed here, so it is excluded until implemented —
-/// see bench/openapi/FIELD-CONTRACT.md).
+/// names and the frozen provider-tools.json. `task` is a subagent launcher
+/// implemented in `ocserve-core::prompt::task_exec` (K-TASK): the launcher is
+/// not a subprocess tool, so it is advertised here but dispatched by the
+/// prompt loop (like `question`).
 pub const IMPLEMENTED: &[&str] = &[
     "bash",
     "edit",
@@ -175,6 +176,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "question",
     "read",
     "skill",
+    "task",
     "todowrite",
     "webfetch",
     "write",
