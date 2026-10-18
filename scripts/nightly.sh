@@ -216,6 +216,10 @@ step "v2 contract-differ selftest + classify" \
   bash -c 'python3 scripts/contract-diff.py --selftest && python3 scripts/contract-diff.py'
 step "v2 shapes vs 2.0.28 contract" ./scripts/spec-validate-v2.sh
 step "v2 drift detection (npm latest vs vendored)" ./scripts/v2-drift.sh
+# 6g. live v2 CLIENT acceptance (GAPS-PLAN Tier 1.2): drives the REAL 2.0.28 CLI
+#     as a client against ocserve and asserts no reachable route serves HTML.
+#     Local-nightly only (needs the 2.0.28 CLI binary).
+step "v2 client acceptance (2.0.28 CLI vs ocserve)" ./scripts/v2cli-check.sh
 
 # 7. mutants (opt-in): survivor report is triaged like a defect (TESTING §9)
 if [ "$WITH_MUTANTS" = "1" ]; then
