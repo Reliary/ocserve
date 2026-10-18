@@ -1,17 +1,19 @@
 # Gap-closure plan: absolute compatibility (v1 + v2), low maintenance, high performance
 
-Status: **Tier 1 + Tier 3 complete** (2026-10-18); **Tier 2 scoped** to
-`command`/`skill` transforms. Scope agreed 2026-10-17 (all tiers;
-foreground-only `task`; v2 acceptance pinned to the vendored **2.0.28**;
-service-bound divergences kept).
+Status: **Tiers 1–3 complete** (2026-10-18). Tier 2 shipped as the
+`command`/`skill` transform pair (`K-V2-TRANSFORM`, PR #13); the remaining
+domains stay named divergences with their reasons recorded below. Scope
+agreed 2026-10-17 (all tiers; foreground-only `task`; v2 acceptance pinned to
+the vendored **2.0.28**; service-bound divergences kept).
 
 ## Findings this plan closes
 
 - **v1: 188 implemented / 0 cited / 0 gaps**; v2: **142 / 0 / 0** (both spec-driven,
   guard rules 16/16b).
-- **The one genuine functional hole: `task`.** The frozen `provider-tools.json`
-  advertises `task`; `ocserve-tools::IMPLEMENTED` excludes it; the default system
-  prompt tells the model to use Task → a dead tool step. `D-TOOLS-TASK`.
+- **`task` was the one genuine functional hole — now closed** (`K-TASK`). The
+  frozen `provider-tools.json` advertises `task` and the default system prompt
+  tells the model to use it; the tool now recurses the single shared executor on
+  a child session, with a `parentID` depth guard and derived permissions.
 - **The one unbacked claim: no live v2 client ever booted against ocserve.**
   v2 is proven by `pair-v2-check` driving the real 2.0.28 CLI **as a server**;
   Phase A's own exit ("real v2 TUI reaches session list") was never met. The v1
@@ -55,24 +57,45 @@ explicit `subagent_type`, so candidate-context scaling is a non-problem.
 
 ### 1.3 Live v2 web-UI browser run with `OCSERVE_UI_PACK=2.0.28` (mirror v1 acceptance).
 
-## Tier 2 — v2 behaviour depth (mutating domains only)
+## Tier 2 — v2 behaviour depth (mutating domains only) — COMPLETE, scoped
 
-- bridge transform domains `agent`/`model`/`provider`/`command`/`skill`/`reference`/
-  `worktree`/`websearch` over the derived payloads, applied at reload, with `reload()`.
-- disk-backed `ctx.storage` (drops `D-V2-STORAGE-MEM`); `rpc.events.emit` (drops
-  `D-V2-RPC-EVENTS`).
-- keep named divergences: `integration` (OAuth), `mcp`, `vcs` actions, `aisdk`,
-  `experimental`, `session.hook(lifecycle)`, `shell.create.before`, `tool.transform`.
+Shipped (`K-V2-TRANSFORM`): `command.transform` + `skill.transform`. Upstream's
+`CommandEditor` exposes only `add`, and `State.create` re-runs transforms from a
+pristine list, so the mechanism is a PULL on config reload (a push would serve a
+stale list after a reconcile). Because `Payloads.command` feeds both `GET
+/command` and the `<available_skills>` system-prompt block, the transform changes
+what the model reads. Applied at boot as well as on reload. A throwing transform
+is reported and skipped; an empty result is rejected.
 
-## Tier 3 — hygiene
+Still deliberately unbridged, with the reason:
 
-- fix stale `D-PLUGIN-INVENTORY` row (closed, still listed).
-- extend rule 31: cross-check `D-*` CLOSED-vs-current across **all** docs.
+- `agent`/`model`/`provider` — registry-level. `build_agents` output feeds four
+  consumers (the v1 route, `/api/agent`, per-agent system prompts, and
+  `agent_rules`), and models/providers feed the `LlmRegistry`; editing only the
+  served list would be shape-without-mutation (the A1 rule).
+- `reference`/`worktree`/`websearch`, `integration` (OAuth), `mcp`, `vcs`
+  actions, `aisdk`, `experimental`, `session.hook(lifecycle)`,
+  `shell.create.before`, `tool.transform` — named divergences.
+- disk-backed `ctx.storage` (`D-V2-STORAGE-MEM`) — needs a persistent sidecar
+  data dir first; the host dir is throwaway today.
+- `rpc.events.emit` (`D-V2-RPC-EVENTS`) — needs an RPC event SSE surface that
+  does not exist.
 
-## Then — upgrade-machinery exercise
+## Tier 3 — hygiene — COMPLETE
 
-- run `bump.sh v2 <npm-latest>` (2.0.32 at time of writing) against the current
-  shipped binary: the mechanical pipeline's first real use.
+- Fixed the stale `D-PLUGIN-INVENTORY` row (it was closed but still listed).
+- Extended rule 31 to cross-check `D-*` CLOSED-vs-current across **all** docs;
+  it immediately found a second stale claim (`/api/rpc/*` documented as a 404
+  when it returns a byte-exact 400).
+- Fixed three "executing" status banners and added the missing plan/report
+  files to the AGENTS doc-map.
+
+## Then — upgrade-machinery exercise — COMPLETE
+
+- Exercised `bump.sh` against the real latest releases (v2 `2.0.32`, v1
+  `1.19.3`) and verified the shipped binary against both (`K-BUMP`,
+  `bench/BUMP-MACHINERY-TEST.md`). Pins stayed frozen: this tested the
+  machinery, it did not adopt the upgrades.
 
 ## Guardrails (every tier)
 

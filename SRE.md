@@ -239,6 +239,18 @@ other than the async worker (thread identity recorded by a test-only seam).
   hint); `--dry-run` (diff, touch nothing), `--bin-only`; non-systemd host
   auto-falls to bin-only. Writes `install-receipt` (BIN=) so uninstall can
   attribute the binary. Never sudo, never non-ocserve units (rule 6).
+- **Install from CI (no toolchain):** `scripts/install.sh --release [--tag vX.Y.Z]`
+  fetches the tagged artifact with `scripts/fetch-release.sh`, verifies it
+  against `SHA256SUMS`, and places it at `~/.local/bin/ocserve` before
+  rendering the unit. Placement is deliberately outside `$TMPDIR`: the unit
+  runs an absolute path, so a temp-file binary would vanish at the next reboot
+  and take the service with it. The fetcher's `--selftest` (run by guard rule
+  39) proves a corrupted tarball is rejected.
+- **Release is a tag, not a local build.** `release.yml` fires on `v*` and
+  publishes linux x86_64 + aarch64 tarballs + `SHA256SUMS` to the GitHub
+  Release. macOS/Windows are best-effort (the PTY shim is Linux/glibc). The
+  crates.io publish is a separate manual workflow and is not on the release
+  path.
 - **Uninstall (application-clean; history sacred):** `scripts/uninstall.sh`
   — default removes ocserve\* units/timers/drop-ins (glob), the
   receipt/ExecStart binary (dev `target/` builds KEPT with a note), and

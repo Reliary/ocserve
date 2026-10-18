@@ -212,7 +212,7 @@ recovery. **No savings percentages are claimed until the benchmark harness measu
   published 2026-10-13; ten 2.0.x releases in the preceding month) — while
   `opencode-ai@latest` stays the v1 line (1.19.0). The adoption trigger
   ("a v2 stable tag exists on npm") has therefore FIRED, and the v2 backend
-  build is tracked in `V2-PLAN.md` (`feat/v2-engine`). What remains true from the
+  shipped (tracked in `V2-PLAN.md`, merged on `main`). What remains true from the
   original posture: v2 intentionally breaks v1 plugins/server/TUI contracts, so
   the v1 freeze stays the v1 contract and v2 is a second, additive surface —
   never a rewrite of the v1 routes. The original gated text is preserved below

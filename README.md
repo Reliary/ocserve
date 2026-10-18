@@ -72,19 +72,23 @@ SSE event stream, prompts and the agent loop, tools, permissions, questions,
 commands, shells, todos, search, files, MCP, plugins, the `/tui/*` controller
 group, auto-compaction, config hot-reload, the terminal PTY group (`/pty/*`,
 used by the web UI's embedded shell), git diff browsing (`/vcs/*`), and the
-full TUI/web-UI v2 `/api/*` surface.
+v2 `/api/*` routes the current TUI and web UI call.
 
-**opencode2 surface** (`V2-PLAN.md`, branch `feat/v2-engine` — behind
-`OCSERVE_V2=1`, dark by default): inbox admission + run coordinator with
-write-ahead execution claims, real `content[]` message projection, v2-grammar
-dual event emission, durable log replay (`log?after&follow` + `log.synced`),
-form service, `/api/info` version probe. Proven 11/11 against the real
-`@opencode/cli@2.0.28` binary (`scripts/pair-v2-check.sh`) with the v2 shape
-oracle at 22 checked / 0 violations (oracle calibrated fair: the real binary
-validates 44/0). Named divergences: `D-V2-UNION` (single-port union shapes —
-no discriminator exists), `D-PROV-SECRETS` (settings never carry apiKey
-values), `D-REVERT-NODELETE` (mark-only revert kept), `D-EVENT-ALWAYSON`
-(log always on where upstream defaults off).
+**opencode2 surface** (`V2-PLAN.md`, merged on `main`): every v2
+`/api/*` operation is bound (142/142, guard rule 16b). The v2 run engine —
+inbox admission, write-ahead execution claims, real `content[]` projection,
+dual-grammar events, `log?after&follow` replay, form service — is behind
+`OCSERVE_V2=1` and stays dark by default, so `/api/info` answers a JSON 404
+until you enable it. Verified live against the real `@opencode/cli@2.0.28`
+binary: `scripts/pair-v2-check.sh` **28/28 vectors, 0 divergences**, and
+`scripts/spec-validate-v2.sh` **44 checked / 0 violations** (calibrated fair:
+the real binary also validates 44/0). v2 plugin transforms are live:
+`command.transform` and `skill.transform` change both the served list and the
+`<available_skills>` block in the system prompt. Named divergences:
+`D-V2-UNION` (single-port union shapes — no discriminator exists),
+`D-PROV-SECRETS` (settings never carry apiKey values), `D-REVERT-NODELETE`
+(mark-only revert kept), `D-EVENT-ALWAYSON` (log always on where upstream
+defaults off).
 
 **API coverage is spec-driven and complete.** The frozen server ships its own
 OpenAPI 3.1.0 contract (162 paths / 188 operations); ocserve serves it at

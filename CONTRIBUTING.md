@@ -34,6 +34,23 @@ Differential gates (need the vendored freeze binary; see `bench/pair/`):
 4. Open a PR against `main`. CI runs exactly the gates you ran plus the
    differential suite in `capdiff`/`pair`.
 
+## Release
+
+Releases are tag-triggered; nothing is built by hand.
+
+1. Bump `[workspace.package] version` in `Cargo.toml` (all `workspace.dependencies`
+   entries in the same file follow it) and commit as `release: vX.Y.Z`.
+2. Push the commit, then tag: `git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z`.
+3. `.github/workflows/release.yml` builds linux x86_64 + aarch64, packages
+   tarballs with `SHA256SUMS`, and attaches them to the GitHub Release.
+   macOS/Windows are best-effort (the PTY shim is Linux/glibc).
+4. Deploy a host with `./scripts/install.sh --release` (fetches and verifies the
+   artifact; no Rust toolchain needed).
+
+crates.io is separate and manual (`publish.yml`, `workflow_dispatch`, requires
+`CARGO_REGISTRY_TOKEN`). It is not on the release path; `check-crate-payload.py`
+(rule 38) fails the build if any crate would exceed the registry's upload limit.
+
 ## Docs are the spec
 
 The core documents below are normative and disagreements are fixed as doc

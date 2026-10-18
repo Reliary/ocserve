@@ -1,6 +1,6 @@
 # V2-PARITY-PLAN.md — full v2 feature parity on `feat/v2-engine`
 
-Status: Phases A→F complete (2026-10-16); superseded for gap closure by
+Status: Phases A→F complete (2026-10-16); merged to `main` 2026-10-18. Superseded for gap closure by
 `GAPS-PLAN.md`. Companion to `V2-PLAN.md` (engine P0–P6, all green).
 Precedence: TESTING.md gates > PLAN.md > this document for parity-domain
 decisions.
