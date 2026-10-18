@@ -139,13 +139,24 @@ step "backup drill (VACUUM INTO + integrity + counts)" bash -c "$(declare -f dri
 #      2.0.28 app pack, zstd 3.16 MB, same pipeline — both packs embedded,
 #      selected by OCSERVE_UI_PACK; still ~5.6x smaller than upstream's
 #      185 MB ELF) → ceiling 34,000,000 B
+#     K-SECREV web-UI completeness: 61,479,024 B measured 2026-10-18. The
+#      browser acceptance (scripts/webui-v2-check.py) proved the first pack
+#      missed ~52 lazily code-split chunks AND the root assets (sw.js/favicon);
+#      the complete closure is v1 944 files/36 MB raw + v2 1678 files/87 MB raw
+#      (36 MB of it lazily-loaded office-preview WASM). Packs switched to
+#      OCAP2 (per-file zstd frames) so the loader decompresses ONE file at a
+#      time into a 16 MiB bounded LRU — resident memory is O(16 MiB), not the
+#      87 MB closure (MEMORY.md bounded-by-construction). Size re-baselined
+#      from measurement (provenance rule); still ~3x smaller than upstream's
+#      185 MB ELF. NOTE: 36 MB of this is office-document-preview WASM — a
+#      candidate to drop if a leaner default is wanted (documented tradeoff).
 size_gate() {
   local bin="target/release/ocserve"
   if [ ! -x "$bin" ]; then
     echo "release binary missing — building"
     cargo build --release || return 1
   fi
-  local sz ceiling=34000000
+  local sz ceiling=62000000
   sz="$(stat -c%s "$bin")"
   echo "size=${sz} ceiling=${ceiling}"
   [ "$sz" -le "$ceiling" ] || { echo "OVER SIZE CEILING"; return 1; }

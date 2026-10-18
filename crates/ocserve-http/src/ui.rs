@@ -590,7 +590,7 @@ fn embedded_response(path: &str) -> Response {
         )
             .into_response();
     };
-    let ct = crate::embedded_ui::mime_for(resolved);
+    let ct = crate::embedded_ui::mime_for(&resolved);
     let mut out = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, ct);
@@ -598,17 +598,17 @@ fn embedded_response(path: &str) -> Response {
         // Perf dive 2026-10-11: the pre-fix path did `String::from_utf8_lossy`
         // (a full copy of index.html) + sha256 on EVERY navigation, and
         // `body.to_vec()` copied the entry JS (multi-MB) per request. The
-        // pack is 'static and immutable, so Bytes::from_static is a refcount
-        // and the CSP string is computed once (the pack is one pinned build).
+        // pack decompresses each file once into a bounded cache; the CSP string
+        // is computed once (the pack is one pinned build).
         static CSP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         let csp_value = CSP
-            .get_or_init(|| csp_for_html(&String::from_utf8_lossy(body)))
+            .get_or_init(|| csp_for_html(&String::from_utf8_lossy(&body)))
             .clone();
         out = out.header("content-security-policy", csp_value);
     } else {
         out = out.header("content-security-policy", csp(""));
     }
-    out.body(Body::from(bytes::Bytes::from_static(body)))
+    out.body(Body::from(bytes::Bytes::from(body.to_vec())))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
