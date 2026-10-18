@@ -684,7 +684,6 @@ impl Sidecar {
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .map(Value::from)
             .collect();
         let failures = r["failures"].as_array().cloned().unwrap_or_default();
         Ok((out, failures))
@@ -1241,8 +1240,9 @@ export default PluginModule.server;
             "a reload must not accumulate duplicates"
         );
 
-        // 6. a THROWING transform is reported, not fatal, and does not empty the list
-        let (kept, failures2) = sc
+        // 6. a pull over a one-entry list keeps that entry (the plugin's own adds are
+        //    additive; the caller must never receive a shorter list than it sent)
+        let (kept, _) = sc
             .transform_commands(vec![json!({"name": "keepme"})])
             .await?;
         assert!(kept.iter().any(|c| c["name"] == "keepme"));

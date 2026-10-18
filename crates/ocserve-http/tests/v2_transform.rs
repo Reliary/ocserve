@@ -24,14 +24,15 @@ use tower::ServiceExt;
 /// A payload set with ONE skill (the vector `skill_entries` filters on
 /// `source=="skill"`) and one config command.
 fn payloads() -> Payloads {
-    let mut p = Payloads::default();
-    p.command = vec![
-        json!({"name": "demo-skill", "description": "ORIGINAL-DESCRIPTION", "source": "skill",
-               "location": "/skills/demo", "template": "body"}),
-        json!({"name": "review", "description": "config command", "source": "config",
-               "template": "review $ARGUMENTS"}),
-    ];
-    p
+    Payloads {
+        command: vec![
+            json!({"name": "demo-skill", "description": "ORIGINAL-DESCRIPTION", "source": "skill",
+                   "location": "/skills/demo", "template": "body"}),
+            json!({"name": "review", "description": "config command", "source": "config",
+                   "template": "review $ARGUMENTS"}),
+        ],
+        ..Default::default()
+    }
 }
 
 fn registry() -> LlmRegistry {
