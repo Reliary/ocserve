@@ -1,6 +1,9 @@
 # ocserve — Rust drop-in server for opencode v1
 
-Status (2026-10-13): **shipped and published** (v0.3.1). This document originated as the
+Status (2026-10-18): **v0.4.0** is a tag-triggered CI release (binaries +
+SHA256SUMS from `release.yml`); crates.io publish is pending a per-crate
+upload-limit increase for `ocserve-http` (two embedded web-UI packs), so the
+0.3.1 crates remain the latest on the registry. This document originated as the
 build plan; the milestone record, parity ledger (§17), and standards below are current.
 Every claim is sourced from local trees/service/DB measurements, direct empirical tests, or a
 verified reference (§12). Nothing is aspirational.
