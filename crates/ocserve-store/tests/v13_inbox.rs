@@ -82,7 +82,7 @@ fn v13_migration_is_pure_create_no_data_movement() {
     let ver: i64 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(ver, 14);
+    assert_eq!(ver, schema::SCHEMA_VERSION);
     let sessions: i64 = conn
         .query_row("SELECT count(*) FROM session", [], |r| r.get(0))
         .unwrap();

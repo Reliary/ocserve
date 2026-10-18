@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -34,6 +34,7 @@ CREATE TABLE session (
     time_updated  INTEGER NOT NULL,
     version_dirt  INTEGER NOT NULL DEFAULT 0,
     permission    TEXT,
+    subagent_rules TEXT,
     revert        TEXT
 ) STRICT;
 
@@ -784,6 +785,28 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                         time_updated INTEGER NOT NULL
                     ) STRICT;",
                 )?;
+            }
+            14 => {
+                // v14→v15 (security review F3): the `permission` column was
+                // OVERLOADED — `session_grant_always` stores its always-keys
+                // there as a `["perm\tpat"]` string array, while the `task`
+                // tool stored a derived ruleset there as `[{permission,...}]`
+                // objects. Each writer read the other's shape as "empty" and
+                // OVERWROTE it, so a subagent's "always" reply wiped its
+                // derived deny rules (privilege regression). Split: the
+                // `permission` column stays the always-grants; a new
+                // `subagent_rules` column holds the derived child ruleset.
+                // SQLite has no `ADD COLUMN IF NOT EXISTS`, and a fresh v15 DB
+                // already carries the column — guard on the column set so the
+                // arm is idempotent (migration-order tests rewind user_version).
+                let has_col: bool = conn
+                    .prepare("PRAGMA table_info(session)")?
+                    .query_map([], |r| r.get::<_, String>(1))?
+                    .filter_map(|r| r.ok())
+                    .any(|name| name == "subagent_rules");
+                if !has_col {
+                    conn.execute_batch("ALTER TABLE session ADD COLUMN subagent_rules TEXT;")?;
+                }
             }
             other => {
                 bail!(

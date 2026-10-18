@@ -766,8 +766,26 @@ fn task_exec<'a>(
             })?;
 
         // Child session: reuse an existing child (task_id) or create one.
+        // C1/F2 (security review): a `task_id` is only honoured when it names a
+        // DIRECT CHILD of this session AND its agent matches `subagent_type`.
+        // Otherwise a model could hijack an arbitrary session (isolation break)
+        // or point at its own session (target==parent → the depth guard never
+        // advances → unbounded recursion). Anything else → fresh child.
         let child_id = match input.get("task_id").and_then(|t| t.as_str()) {
-            Some(tid) if ocserve_store::session_exists(&ctx.db, tid).unwrap_or(false) => {
+            Some(tid)
+                if tid != session_id
+                    && ocserve_store::session_exists(&ctx.db, tid).unwrap_or(false)
+                    && ocserve_store::session_parent(&ctx.db, tid)
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        == Some(session_id)
+                    && ocserve_store::session_agent(&ctx.db, tid)
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        == Some(subagent_type.as_str()) =>
+            {
                 tid.to_string()
             }
             _ => new_child_session(ctx, writer, session_id, &description, &subagent_type, &sub)?,
@@ -775,13 +793,18 @@ fn task_exec<'a>(
 
         // Run the shared executor on the child (fresh PromptContext, child's
         // directory/agent/model). The child's history is its own; the tool
-        // result is its final assistant text.
+        // result is its final assistant text. H1 (reliability review): the
+        // child MUST surface its own failure (durable session.error +
+        // [turn stopped] + finalize + idle) exactly like `run_prompt`, or a
+        // child that dies mid-turn is seen as busy forever. We call the
+        // surfacing wrapper here rather than `run_prompt` so we keep the
+        // child's RunOpts (auto_title=false).
         let child = child_context(ctx, &child_id, &subagent_type, &sub)?;
         let req = crate::wire::PromptRequest {
             parts: vec![json!({"type": "text", "text": prompt})],
             ..Default::default()
         };
-        let (_info, parts) = run_prompt_with(
+        let res = run_prompt_with(
             &child,
             writer,
             &child_id,
@@ -791,7 +814,14 @@ fn task_exec<'a>(
                 ..Default::default()
             },
         )
-        .await?;
+        .await;
+        let (_info, parts) = match res {
+            Ok(v) => v,
+            Err(e) => {
+                surface_run_failure(&child, writer, &child_id, &e).await;
+                return Err(e);
+            }
+        };
         let text = final_text(&parts).unwrap_or_default();
         let block = format!(
             "<task id=\"{child_id}\" state=\"completed\">\n<summary>{description}</summary>\n\
@@ -828,11 +858,11 @@ fn new_child_session(
     } else {
         format!("{description} (@{subagent_type} subagent)")
     };
-    let parent_perms = ocserve_store::session_permission(&ctx.db, parent_id)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| json!([]));
-    let permission = derive_subagent_permission(&parent_perms, sub);
+    // The PARENT's effective ruleset is the running context's `rules` (the
+    // parent's agent config, or — for a nested subagent — its own derived
+    // rules); that is the source of the deny + external_directory constraints
+    // the child must inherit (F1). Read from ctx, not the DB.
+    let permission = derive_subagent_permission(&ctx.rules, sub);
     let info = json!({
         "id": id,
         "projectID": "global",
@@ -857,18 +887,19 @@ fn new_child_session(
 }
 
 /// Upstream `deriveSubagentSessionPermission` (subagent-permissions.ts):
-/// parent `deny` + `external_directory` rules, plus `todowrite`/`task` denies
-/// unless the subagent's own rules already name that permission. RCM framing
-/// (arXiv 2610.21243): the child keeps the parent's hard constraints.
-fn derive_subagent_permission(parent: &Value, sub: &Value) -> Value {
+/// the parent's `deny` + `external_directory` rules, plus `todowrite`/`task`
+/// denies unless the subagent's own rules already name that permission. RCM
+/// framing (arXiv 2610.21243): the child keeps the parent's hard constraints.
+/// The parent ruleset is the running context's `Rule` list.
+fn derive_subagent_permission(parent: &[ocserve_tools::Rule], sub: &Value) -> Value {
     let mut out: Vec<Value> = Vec::new();
-    if let Some(rules) = parent.as_array() {
-        for r in rules {
-            let perm = r.get("permission").and_then(|p| p.as_str()).unwrap_or("");
-            let action = r.get("action").and_then(|a| a.as_str()).unwrap_or("");
-            if perm == "external_directory" || action == "deny" {
-                out.push(r.clone());
-            }
+    for r in parent {
+        if r.permission == "external_directory" || r.action == "deny" {
+            out.push(json!({
+                "permission": r.permission,
+                "pattern": r.pattern,
+                "action": r.action,
+            }));
         }
     }
     let sub_rules = sub.get("permission").and_then(|p| p.as_array());
@@ -889,7 +920,15 @@ fn derive_subagent_permission(parent: &Value, sub: &Value) -> Value {
 }
 
 /// Fresh PromptContext for the child session: the child's directory/agent/
-/// model and its derived rules, but the parent's infra (bus/gate/skills/mcp/…).
+/// model and its rules, but the parent's infra (bus/gate/skills/mcp/…).
+///
+/// F1 (security review): the child's rules MUST include the SUBAGENT's own
+/// configured permission rules (`sub.permission`) — the child runs *as* that
+/// agent, so its allow/deny rules apply. Only installing the derived parent
+/// constraints let a model use a locked-down agent (`edit:deny`) to edit files.
+/// Order (last-match-wins, `evaluate`): subagent rules first, then the derived
+/// session constraints (parent deny + external_directory + todowrite/task
+/// denies) so a broad subagent allow can never override a hard parent deny.
 fn child_context(
     parent: &PromptContext,
     child_id: &str,
@@ -908,12 +947,21 @@ fn child_context(
     {
         child.directory = dir;
     }
-    let perms = ocserve_store::session_permission(&parent.db, child_id)
+    // 1) the subagent's own configured rules, 2) the derived constraints.
+    let mut rules = rules_from_array(sub.get("permission"));
+    let derived = ocserve_store::session_permission(&parent.db, child_id)
         .ok()
         .flatten()
         .unwrap_or_else(|| json!([]));
-    child.rules = perms
-        .as_array()
+    rules.extend(rules_from_array(Some(&derived)));
+    child.rules = rules;
+    Ok(child)
+}
+
+/// Parse a v1 permission ruleset (`[{permission,pattern,action}]`) into the
+/// evaluator's `Rule` list. Missing/non-array → empty.
+fn rules_from_array(v: Option<&Value>) -> Vec<ocserve_tools::Rule> {
+    v.and_then(|x| x.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|r| {
@@ -925,8 +973,75 @@ fn child_context(
                 })
                 .collect()
         })
-        .unwrap_or_default();
-    Ok(child)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod task_perm_tests {
+    use super::*;
+
+    fn sub_with(perms: Value) -> Value {
+        json!({"name": "explore", "mode": "subagent", "permission": perms})
+    }
+
+    // F1 (security review): the child rule list MUST include the subagent's own
+    // configured rules. A locked-down subagent (`edit:deny`) must deny edit in
+    // the child even though the derived parent set carries no edit rule.
+    #[test]
+    fn child_context_installs_subagent_rules() {
+        let sub = sub_with(json!([
+            {"permission": "edit", "pattern": "*", "action": "deny"},
+            {"permission": "read", "pattern": "*", "action": "allow"},
+        ]));
+        let parent_rules = vec![ocserve_tools::Rule {
+            permission: "bash".into(),
+            pattern: "*".into(),
+            action: "deny".into(),
+        }];
+        let derived = derive_subagent_permission(&parent_rules, &sub);
+        let mut rules = rules_from_array(sub.get("permission"));
+        rules.extend(rules_from_array(Some(&derived)));
+        // subagent's deny survives → evaluate(edit) == deny
+        assert_eq!(ocserve_tools::evaluate("edit", "src/x.rs", &rules), "deny");
+        // parent's derived deny survives → evaluate(bash) == deny
+        assert_eq!(ocserve_tools::evaluate("bash", "ls", &rules), "deny");
+        // subagent's allow → read allowed
+        assert_eq!(ocserve_tools::evaluate("read", "src/x.rs", &rules), "allow");
+    }
+
+    // The derived set keeps parent deny + external_directory, and adds the
+    // todowrite/task denies the subagent did not name.
+    #[test]
+    fn derive_keeps_parent_constraints_and_default_denies() {
+        let sub = sub_with(json!([]));
+        let parent_rules = vec![
+            ocserve_tools::Rule {
+                permission: "*.write".into(),
+                pattern: "*".into(),
+                action: "deny".into(),
+            },
+            ocserve_tools::Rule {
+                permission: "external_directory".into(),
+                pattern: "/etc/*".into(),
+                action: "ask".into(),
+            },
+            ocserve_tools::Rule {
+                permission: "grep".into(),
+                pattern: "*".into(),
+                action: "allow".into(),
+            },
+        ];
+        let d = derive_subagent_permission(&parent_rules, &sub);
+        let arr = d.as_array().unwrap();
+        let has = |p: &str| arr.iter().any(|r| r["permission"] == p);
+        assert!(has("*.write"), "parent deny kept");
+        assert!(has("external_directory"), "external_directory kept");
+        assert!(
+            !has("grep"),
+            "parent allow NOT propagated (only deny/extdir)"
+        );
+        assert!(has("todowrite") && has("task"), "default denies added");
+    }
 }
 
 /// Concatenate the text parts of a persisted assistant message.

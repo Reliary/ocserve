@@ -113,7 +113,7 @@ async fn phase_a_vcs_aliases_answer() {
 
 #[tokio::test]
 async fn phase_c_projections_answer() {
-    let (app, _st) = app();
+    let (app, st) = app();
     // config entries: document + directory sources.
     let (s, v) = get(&app, "/api/config").await;
     assert_eq!(s, StatusCode::OK);
@@ -173,6 +173,40 @@ async fn phase_c_projections_answer() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // F6 (security review): a SYMLINK inside the worktree pointing out of it
+    // must not become a write escape via the not-found lexical branch. Create
+    // `<worktree>/loot -> <outside>` then write through `loot/evil`.
+    {
+        let wt: String = st.paths["directory"].as_str().unwrap_or(".").to_string();
+        let outside = std::env::temp_dir().join(format!("ocserve-f6-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        let _ = std::fs::remove_file(std::path::Path::new(&wt).join("loot"));
+        let _ = std::os::unix::fs::symlink(&outside, std::path::Path::new(&wt).join("loot"));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/experimental/fs/write?path=loot/evil.txt")
+                    .body(Body::from("escaped"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "symlink escape must 403, got {}",
+            resp.status()
+        );
+        assert!(
+            !outside.join("evil.txt").exists(),
+            "symlink escape wrote outside the worktree"
+        );
+        let _ = std::fs::remove_file(std::path::Path::new(&wt).join("loot"));
+        let _ = std::fs::remove_dir_all(&outside);
+    }
     // worktree list: array (empty outside git is honest, not an error).
     let (s, v) = get(&app, "/api/worktree").await;
     assert_eq!(s, StatusCode::OK);

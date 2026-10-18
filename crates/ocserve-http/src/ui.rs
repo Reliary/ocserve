@@ -350,6 +350,17 @@ pub async fn ui_fallback(
     State(st): State<Arc<crate::AppState>>,
     req: axum::extract::Request,
 ) -> Response {
+    // F7 (security/reliability review): an unmatched `/api/*` path must be a
+    // JSON 404, never the SPA index HTML. Serving HTML 200 to an API client is
+    // a crash/info-leak class (the SDK parses as text, callers choke on shape).
+    // The web UI never requests unbound API paths; real API clients do.
+    if req.uri().path() == "/api" || req.uri().path().starts_with("/api/") {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"_tag": "NotFoundError", "message": "Not Found"})),
+        )
+            .into_response();
+    }
     let ui = &st.ui;
     if !ui.enabled {
         return (

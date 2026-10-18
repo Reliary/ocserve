@@ -282,7 +282,7 @@ async fn task_child_inherits_parent_deny_and_agent_title() {
     let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
     let perm: String = conn
         .query_row(
-            "SELECT permission FROM session WHERE parent_id = ?1",
+            "SELECT subagent_rules FROM session WHERE parent_id = ?1",
             [sid],
             |r| r.get(0),
         )

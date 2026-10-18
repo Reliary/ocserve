@@ -645,16 +645,35 @@ fn resolve_within(base: &std::path::Path, rel: &str) -> std::io::Result<std::pat
                 ))
             }
         }
-        // not found: fall back to a lexical containment check on the joined path
+        // Not found: the target does not exist yet. A lexical check alone is
+        // NOT enough for writers (F6, security review): if any existing path
+        // component is a symlink (`<base>/link -> /etc`), `<base>/link/evil`
+        // passes the lexical test but `create_dir_all`+write follow the link
+        // out of the tree. Canonicalize the deepest EXISTING ancestor and
+        // require it to stay within base; the non-existent tail is then safe
+        // to create (it can only be created under that verified ancestor).
         Err(_) => {
             let lex = lexically_normalize(&joined);
-            if lex.starts_with(&base_canon) {
-                Ok(joined)
-            } else {
+            let mut probe = lex.clone();
+            while probe.symlink_metadata().is_err() {
+                match probe.parent() {
+                    Some(p) if p != probe => probe = p.to_path_buf(),
+                    _ => break,
+                }
+            }
+            let ancestor_real = probe.canonicalize().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "path escapes the project directory",
+                )
+            })?;
+            if !ancestor_real.starts_with(&base_canon) || !lex.starts_with(&base_canon) {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "path escapes the project directory",
                 ))
+            } else {
+                Ok(joined)
             }
         }
     }

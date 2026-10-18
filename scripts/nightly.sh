@@ -210,16 +210,31 @@ step "provider-boundary differential (freeze vs ocserve)" \
 #     2.0.28 binary (11 vectors: info/inbox/form/log/messages/admission) +
 #     v2 contract selftest + v2 shape validation + v2 drift detection.
 #     Local-nightly only (needs the 2.0.28 binary + password harness; hosted
-#     runners 500 on freeze probes — same reason as pair/capdiff).
-step "v2 live differential (2.0.28 vs ocserve)" ./scripts/pair-v2-check.sh
+#     runners 500 on freeze probes — same reason as pair/capdiff). The live
+#     arms are SKIPPED-with-a-note when the 2.0.28 artifacts are absent (a
+#     missing dev tool is not a product defect — the established nightly rule,
+#     same as the fuzz step); the offline contract-differ still runs.
+V2CLI="${V2_CLI:-/var/tmp/ocserve-scratch/ocli/node_modules/@opencode/cli-linux-x64/bin/opencode}"
+if [ -x "$V2CLI" ]; then
+  step "v2 live differential (2.0.28 vs ocserve)" ./scripts/pair-v2-check.sh
+  step "v2 shapes vs 2.0.28 contract" ./scripts/spec-validate-v2.sh
+  step "v2 client acceptance (2.0.28 CLI vs ocserve)" ./scripts/v2cli-check.sh
+  if python3 -c 'import playwright' >/dev/null 2>&1; then
+    step "v2 web UI browser acceptance (2.0.28 pack)" \
+      bash -c 'D=$(mktemp -d); cp -r testdata/fixture "$D/fh"; \
+        setsid env HOME="$D/fh" OCSERVE_DATA_DIR="$D" OCSERVE_V2=1 OCSERVE_UI_PACK=2.0.28 \
+        OPENCODE_DISABLE_MODELS_FETCH=1 ./target/release/ocserve serve --port 5151 >"$D/s.log" 2>&1 & \
+        P=$!; sleep 4; python3 scripts/webui-v2-check.py http://127.0.0.1:5151; rc=$?; \
+        kill $P 2>/dev/null; rm -rf "$D"; exit $rc'
+  else
+    echo "== v2 web UI browser acceptance: SKIPPED (python playwright absent) ==" | tee -a "$LOG"
+  fi
+else
+  echo "== v2 live column: SKIPPED (2.0.28 CLI absent at $V2CLI) ==" | tee -a "$LOG"
+fi
 step "v2 contract-differ selftest + classify" \
   bash -c 'python3 scripts/contract-diff.py --selftest && python3 scripts/contract-diff.py'
-step "v2 shapes vs 2.0.28 contract" ./scripts/spec-validate-v2.sh
 step "v2 drift detection (npm latest vs vendored)" ./scripts/v2-drift.sh
-# 6g. live v2 CLIENT acceptance (GAPS-PLAN Tier 1.2): drives the REAL 2.0.28 CLI
-#     as a client against ocserve and asserts no reachable route serves HTML.
-#     Local-nightly only (needs the 2.0.28 CLI binary).
-step "v2 client acceptance (2.0.28 CLI vs ocserve)" ./scripts/v2cli-check.sh
 
 # 7. mutants (opt-in): survivor report is triaged like a defect (TESTING §9)
 if [ "$WITH_MUTANTS" = "1" ]; then

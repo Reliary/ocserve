@@ -275,6 +275,20 @@ async fn serve(
 
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create data dir {}", data_dir.display()))?;
+    // F4 (security review): the data dir holds the DB (provider API keys in
+    // the `credential` table) and its `-wal`/`-shm` siblings, which SQLite
+    // re-creates on checkpoint/WAL-reset with the process umask. A one-time
+    // file chmod is defeated the moment they are recreated, so lock the
+    // DIRECTORY to owner-only (0o700): a recreated WAL/SHM inherits nothing
+    // readable by other users because they cannot traverse the dir at all.
+    // The store's `restrict_file_mode` chmod stays as belt-and-braces for a
+    // pre-existing 0644 DB. Unix only; documented no-op elsewhere.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 700 data dir {}", data_dir.display()))?;
+    }
 
     // fail-fast boot checks (SRE.md §1) — before binding
     ocserve::boot_checks(&data_dir)?;
@@ -399,16 +413,22 @@ async fn serve(
             );
         }
     }
+    // Password mode (SECURITY.md): off = freeze parity (passwordless
+    // loopback); basic = upstream-exact 401 on every route. Resolved
+    // flag > env > ocserve.toml > off; fail-fast on bad mode or missing
+    // password (an open server by typo is the failure to avoid).
+    let auth_off = server_config::resolve_auth_mode(auth_mode, file_cfg.auth_mode.as_deref())?;
+    // F5 (security review): fail-fast when binding to a NON-loopback address
+    // with auth OFF — the credential store echoes provider API keys on GET, so
+    // an open non-loopback bind exposes them to the network.
+    server_config::reject_open_nonloopback(&hostname, &auth_off)?;
+    let auth = server_config::resolve_password(
+        &auth_off,
+        auth_password_file,
+        file_cfg.auth_password_file.clone(),
+    )?;
     let state = AppState::with_wiring(
-        // Password mode (SECURITY.md): off = freeze parity (passwordless
-        // loopback); basic = upstream-exact 401 on every route. Resolved
-        // flag > env > ocserve.toml > off; fail-fast on bad mode or missing
-        // password (an open server by typo is the failure to avoid).
-        server_config::resolve_password(
-            &server_config::resolve_auth_mode(auth_mode, file_cfg.auth_mode.as_deref())?,
-            auth_password_file,
-            file_cfg.auth_password_file.clone(),
-        )?,
+        auth,
         payloads,
         ocserve_http::Wires {
             db: db_path,

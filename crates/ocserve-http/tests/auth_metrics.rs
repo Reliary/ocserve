@@ -196,6 +196,34 @@ async fn auth_wrong_method_matches_v2() {
     // CONTROL: SPA fallback on /api wrong-method → 200 here, red.
 }
 
+/// F7 (security/reliability review): an UNBOUND `/api/*` GET must be a JSON
+/// 404, never the SPA index HTML (serving HTML 200 to an API client crashes the
+/// SDK's shape parse). Non-API unknown paths stay public UI (upstream parity).
+#[tokio::test]
+async fn unbound_api_path_is_json_404_not_html() {
+    let resp = app_off()
+        .oneshot(
+            Request::builder()
+                .uri("/api/definitely-not-a-bound-route")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let ct = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ct.contains("application/json"),
+        "unbound /api/* must be JSON, got content-type {ct}"
+    );
+    // CONTROL: removing the /api guard in ui_fallback → text/html, red.
+}
+
 /// CORS preflight through the PRODUCTION stack (perimeter layer outside the
 /// router, as serve() wires it): 204 on both routes, off and basic. The
 /// perimeter exists because fallback + MNF responses bypass router middleware

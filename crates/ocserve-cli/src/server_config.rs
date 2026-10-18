@@ -73,6 +73,39 @@ pub fn resolve_auth_mode(flag: Option<String>, file: Option<&str>) -> Result<Str
     Ok("off".to_string())
 }
 
+/// F5 (security review): refuse to bind a NON-loopback address with auth off.
+/// The credential store intentionally echoes provider API keys on GET
+/// (upstream parity), so an open, network-reachable bind would expose them.
+/// Loopback literals (`127.0.0.0/8`, `::1`, `localhost`) are always allowed
+/// (the freeze-parity default); any other host with `auth_mode=off` is a
+/// misconfiguration and fails fast at boot.
+pub fn reject_open_nonloopback(hostname: &str, auth_mode: &str) -> Result<()> {
+    if auth_mode != "off" {
+        return Ok(());
+    }
+    let h = hostname
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let loopback = h == "localhost"
+        || h == "::1"
+        || h.parse::<std::net::Ipv4Addr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+        || h.parse::<std::net::Ipv6Addr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+    if loopback {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to bind {hostname} with auth_mode=off: the credential store \
+         echoes API keys and the server would be reachable off-host. Set \
+         auth_mode=\"basic\" (with a password file) or bind a loopback address \
+         (the tailnet forwarder pattern keeps the bind loopback)."
+    )
+}
+
 fn check_mode(m: &str) -> Result<String> {
     if m == "off" || m == "basic" {
         Ok(m.to_string())
@@ -177,6 +210,34 @@ mod tests {
     #[test]
     fn off_needs_no_password() {
         assert!(resolve_password("off", None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn reject_open_nonloopback_refuses_off_on_public_binds() {
+        // loopback literals are fine with auth off
+        for h in ["127.0.0.1", "localhost", "::1", "[::1]"] {
+            assert!(
+                reject_open_nonloopback(h, "off").is_ok(),
+                "{h} loopback must be allowed with auth off"
+            );
+        }
+        // any non-loopback host with auth off is a misconfiguration
+        for h in [
+            "0.0.0.0",
+            "::",
+            "192.168.1.5",
+            "example.com",
+            "100.68.229.86",
+        ] {
+            assert!(
+                reject_open_nonloopback(h, "off").is_err(),
+                "{h} non-loopback with auth off must fail fast"
+            );
+        }
+        // basic mode allows any bind
+        assert!(reject_open_nonloopback("0.0.0.0", "basic").is_ok());
+        // CONTROL: a permissive impl (always Ok) would green-light an open
+        // public bind — the 0.0.0.0/off case above is the red guard.
     }
 
     #[test]

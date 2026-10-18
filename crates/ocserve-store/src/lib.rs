@@ -2553,9 +2553,10 @@ pub fn session_directory(db: &std::path::Path, session_id: &str) -> anyhow::Resu
     Ok(d.filter(|s| !s.is_empty()))
 }
 
-/// A session's derived permission ruleset (JSON array; v1 `{permission,
-/// pattern, action}`), or None when the session carries none. Used by the
-/// `task` tool's child-permission derivation (K-TASK).
+/// A session's derived subagent ruleset (JSON array; v1 `{permission,
+/// pattern, action}`) from the dedicated `subagent_rules` column, or None
+/// when the session has none (F3: this is separate from `permission`, which
+/// holds always-grants). Used by the `task` tool's child-context build.
 pub fn session_permission(
     db: &std::path::Path,
     session_id: &str,
@@ -2563,7 +2564,7 @@ pub fn session_permission(
     let conn = pragma::open_reader(db)?;
     let raw: Option<Option<String>> = conn
         .query_row(
-            "SELECT permission FROM session WHERE id = ?1",
+            "SELECT subagent_rules FROM session WHERE id = ?1",
             [session_id],
             |r| r.get(0),
         )
@@ -2572,6 +2573,34 @@ pub fn session_permission(
         .flatten()
         .filter(|s| !s.is_empty())
         .and_then(|s| serde_json::from_str(&s).ok()))
+}
+
+/// The `parent_id` of a session, or None when it is a root (or unknown). Used
+/// by the `task` tool's `task_id` lineage validation (K-TASK).
+pub fn session_parent(db: &std::path::Path, session_id: &str) -> anyhow::Result<Option<String>> {
+    let conn = pragma::open_reader(db)?;
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT parent_id FROM session WHERE id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(raw.flatten().filter(|s| !s.is_empty()))
+}
+
+/// The `agent` of a session, or None when unset (or unknown). Used by the
+/// `task` tool's `task_id` validation (K-TASK).
+pub fn session_agent(db: &std::path::Path, session_id: &str) -> anyhow::Result<Option<String>> {
+    let conn = pragma::open_reader(db)?;
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT agent FROM session WHERE id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(raw.flatten().filter(|s| !s.is_empty()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2841,9 +2870,10 @@ pub fn insert_session(writer: &Writer, info: &serde_json::Value) -> anyhow::Resu
 }
 
 /// Insert a SUBAGENT (task-tool) child session: parent_id, agent, and the
-/// derived permission ruleset (JSON array, v1 `{permission,pattern,action}`).
-/// `permission` is stored as TEXT so `agent_rules`-style readers can parse it.
-/// Used only by the `task` tool launcher (K-TASK).
+/// derived permission ruleset (JSON array, v1 `{permission,pattern,action}`)
+/// stored in the dedicated `subagent_rules` column (F3: the `permission`
+/// column is reserved for always-grants and must not be overwritten). Used
+/// only by the `task` tool launcher (K-TASK).
 pub fn insert_child_session(
     writer: &Writer,
     info: &serde_json::Value,
@@ -2854,7 +2884,7 @@ pub fn insert_child_session(
     let id = info["id"].as_str().unwrap_or_default().to_string();
     writer.write(vec![WriteOp::Sql {
         sql: "INSERT OR REPLACE INTO session (id, project_id, slug, directory, path, title, version, \
-              time_created, time_updated, parent_id, agent, permission) \
+              time_created, time_updated, parent_id, agent, subagent_rules) \
               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
             .into(),
         params: vec![
