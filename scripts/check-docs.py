@@ -132,8 +132,78 @@ def check_removed_divergence() -> list[str]:
     return bad
 
 
+def check_closed_divergence_reopened() -> list[str]:
+    """A `D-*` token DECLARED closed must not be re-listed as a CURRENT
+    divergence anywhere else.
+
+    The 2026-10-18 finding: `V2-PARITY-PLAN.md` still described
+    `D-PLUGIN-INVENTORY` as "plugin list honestly empty" months after the
+    divergence was closed in code. The pre-existing check only cross-read
+    SECURITY.md and only against "removed" tokens, so the contradiction passed.
+
+    A CLOSURE is `D-X: CLOSED` or `D-X … CLOSED` where CLOSED attaches to
+    X — NOT the word "closed" anywhere on the line. Two shapes that produced
+    false positives when this was coarse (do not re-introduce):
+      * `... (closes D-TOOLS-TASK)` — English verb describing the work, the
+        token is the divergence the row is ABOUT, not a closure marker;
+      * `- D-RPC: CLOSED ... (see D-WEBSEARCH)` — D-RPC is closed, D-WEBSEARCH
+        is a separate token that happens to share the line.
+    So: the marker must follow its own token, and only the FIRST token on a
+    declaring line counts.
+    """
+    closed: dict[str, str] = {}
+    decl = re.compile(r"\b(D-[A-Z0-9-]+)\b[^|]{0,80}?\bCLOSED\b")
+    for name in DOCS:
+        path = os.path.join(ROOT, name)
+        if not os.path.isfile(path):
+            continue
+        for lineno, line in enumerate(
+            open(path, encoding="utf-8", errors="ignore"), start=1
+        ):
+            m = decl.search(line)
+            if m:
+                closed.setdefault(m.group(1), f"{name}:{lineno}")
+
+    if not closed:
+        return []
+
+    # Whole-token membership: `D-WEBSEARCH` must NOT match `D-WEBSEARCH-PARTIAL`
+    # (the base divergence closed; the -PARTIAL residual is current — the 2026-10-18
+    # false positive). A token appears in a line only as its own bracketed word.
+    def mentions(line: str, tok: str) -> bool:
+        return re.search(r"(?<![A-Z0-9-])" + re.escape(tok) + r"(?![A-Z0-9-])", line) is not None
+
+    bad: list[str] = []
+    for name in DOCS:
+        path = os.path.join(ROOT, name)
+        if not os.path.isfile(path):
+            continue
+        for lineno, line in enumerate(
+            open(path, encoding="utf-8", errors="ignore"), start=1
+        ):
+            for tok, where in closed.items():
+                if f"{name}:{lineno}" == where:
+                    continue
+                if not mentions(line, tok):
+                    continue
+                low = line.lower()
+                if "closed" in low or "removed" in low or "superseded" in low:
+                    continue
+                bad.append(
+                    f"{name}:{lineno}: lists {tok} as current, but it is declared "
+                    f"CLOSED at {where} (rule 31)"
+                )
+                break
+    return bad
+
+
 def run_all() -> list[str]:
-    return check_dead_paths() + check_rule_refs() + check_removed_divergence()
+    return (
+        check_dead_paths()
+        + check_rule_refs()
+        + check_removed_divergence()
+        + check_closed_divergence_reopened()
+    )
 
 
 def selftest() -> int:
@@ -152,11 +222,33 @@ def selftest() -> int:
         caught_rule = any("rule 991" in x for x in findings)
     finally:
         shutil.move(backup, victim)
-    if caught_path and caught_rule:
-        print("selftest: PASS (dead path + bogus rule ref both detected)")
+
+    # plant a contradiction: declare a divergence CLOSED, then re-list it
+    # elsewhere as current (the 2026-10-18 D-PLUGIN-INVENTORY shape).
+    decl_victim = os.path.join(ROOT, "PLAN.md")
+    list_victim = os.path.join(ROOT, "README.md")
+    b1, b2 = decl_victim + ".lintbak", list_victim + ".lintbak"
+    shutil.copy2(decl_victim, b1)
+    shutil.copy2(list_victim, b2)
+    caught_closed = False
+    try:
+        divergence = "D-RULE31-SELFTEST"
+        with open(decl_victim, "a", encoding="utf-8") as f:
+            f.write(f"\n- {divergence}: CLOSED — selftest fixture.\n")
+        with open(list_victim, "a", encoding="utf-8") as f:
+            f.write(f"\n(selftest) {divergence} is a current known limitation.\n")
+        caught_closed = any(divergence in x for x in run_all())
+    finally:
+        shutil.move(b1, decl_victim)
+        shutil.move(b2, list_victim)
+
+    if caught_path and caught_rule and caught_closed:
+        print(
+            "selftest: PASS (dead path + bogus rule ref + reopened closed divergence all detected)"
+        )
         return 0
     print(
-        f"selftest: FAIL (path={caught_path} rule={caught_rule}) — guard is vacuous",
+        f"selftest: FAIL (path={caught_path} rule={caught_rule} closed={caught_closed}) — guard is vacuous",
         file=sys.stderr,
     )
     return 1
@@ -171,7 +263,7 @@ def main() -> int:
             print(f"FAIL: {x}")
         print(f"\n{len(findings)} doc staleness finding(s) — fix or correct the doc (rule 31).")
         return 1
-    print("ok (no dead doc paths, no dangling guard-rule refs, no stale divergences)")
+    print("ok (no dead doc paths, no dangling guard-rule refs, no stale/reopened divergences)")
     return 0
 
 

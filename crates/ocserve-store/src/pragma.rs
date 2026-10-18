@@ -118,8 +118,38 @@ pub fn open_writer(path: &std::path::Path) -> Result<Connection> {
     };
     conn.pragma_update(None, "cache_size", WRITER_CACHE_KB)
         .context("writer cache_size")?;
+    // Credential store prerequisite (gap closure): the DB holds API keys
+    // (upstream echoes values on GET), so the file is owner-only. Applied
+    // on EVERY open (idempotent) so pre-existing 644 DBs lock down on next
+    // boot — including the live one. Non-fatal: a chmod failure warns, it
+    // must never take the server down (same rule as post_maintenance).
+    restrict_file_mode(path);
     Ok(conn)
 }
+
+/// chmod 600 the DB file (+ best-effort WAL/SHM siblings). Unix only; on
+/// other platforms this is a documented no-op (upstream runs unix-first).
+#[cfg(unix)]
+fn restrict_file_mode(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    // DB + WAL/SHM siblings (`<db>-wal`, `<db>-shm` — plain suffixes).
+    let mut targets = vec![path.to_path_buf()];
+    for suffix in ["-wal", "-shm"] {
+        let mut s = path.as_os_str().to_owned();
+        s.push(suffix);
+        targets.push(std::path::PathBuf::from(s));
+    }
+    for p in targets {
+        if p.exists()
+            && let Err(e) = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))
+        {
+            tracing::warn!("restrict_file_mode {}: {e:#}", p.display());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_file_mode(_path: &std::path::Path) {}
 
 /// Open a read-only reader connection (STORAGE.md §2): ro URI + query_only + small cache.
 /// K-EFFICIENCY: reader-open accounting (core snapshots this per prompt).

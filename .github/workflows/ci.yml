@@ -85,6 +85,13 @@ jobs:
       - name: publish order guard
         run: python3 scripts/check-publish-order.py && python3 scripts/check-publish-order.py --selftest
 
+      # Byte payload vs the registry's upload ceiling. `cargo package --list`
+      # below validates LAYOUT only, so nothing else catches a crate that grew
+      # past the limit (the 2026-10-18 finding: two embedded web-UI packs push
+      # ocserve-http to ~35 MB). The cap is declared once, in publish.yml.
+      - name: crate payload size guard
+        run: python3 scripts/check-crate-payload.py && python3 scripts/check-crate-payload.py --selftest
+
       # release build + artifact: the release artifact is the product; build it
       # on every push so a broken release build is caught by CI (not tag day).
       - name: build release
@@ -111,9 +118,12 @@ jobs:
           echo "binary size: $SIZE bytes"
           # Ceiling re-baselined from measurement, never bypassed (SRE §5 / the
           # provenance rule): 9,279,528 (2026-10-03) -> 30,000,000 (web-UI
-          # embedded bundle, v2 surface). Headroom is intentional: rolldown +
-          # embedded UI are the large static contributors.
-          MAX=30000000
+          # embedded bundle, v2 surface) -> 34,000,000 (second embedded web
+          # pack, Phase E) -> 62,000,000 (K-SECREV full web-UI closure: both
+          # packs complete + OCAP2 per-file frames; see scripts/nightly.sh).
+          # Headroom is intentional: rolldown + embedded UI are the large
+          # static contributors.
+          MAX=62000000
           if [ "$SIZE" -gt "$MAX" ]; then
             echo "FAIL: binary $SIZE exceeds ceiling $MAX — re-baseline with provenance";
             exit 1

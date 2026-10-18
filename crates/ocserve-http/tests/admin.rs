@@ -243,7 +243,7 @@ async fn global_dispose_emits_event_and_returns_true() {
     let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
     let n: i64 = conn
         .query_row(
-            "SELECT count(*) FROM event WHERE type='server.instance.disposed'",
+            "SELECT count(*) FROM event WHERE type IN ('server.instance.disposed', 'server.instance.disposed@v1')",
             [],
             |r| r.get(0),
         )

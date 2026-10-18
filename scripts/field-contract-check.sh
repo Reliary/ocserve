@@ -16,6 +16,15 @@
 # id/role), not byte-wise — user-info key sets differ between arms by
 # pre-existing named rows (summary) and ids/times are per-arm generated.
 #
+# VERSION SPLIT (V2-PLAN.md P3, 2026-10-16): the `v2-*` vectors below pin the
+# 1.18.31 nested prompt body (`prompt:{text}`) and are correct ONLY against
+# the 1.18.31 freeze arm. ocserve's decoder targets the 2.0.28 FLAT body, so
+# the v2 vectors now DIVERGE BY DESIGN on this differential — they are kept
+# (not deleted) as the 1.18.31 arm's self-check, and skipped for the ocserve
+# arm until the P5 differential runs flat vectors against the real 2.0.28
+# binary. See field-probes.md scope note. V2_VECTORS=only runs just them.
+V2_ONLY="${V2_VECTORS:-}"
+#
 # Usage: scripts/field-contract-check.sh [--self-test]
 # Exit 0 = ocserve matches freeze on every vector; 1 = divergence; 2 = setup.
 set -uo pipefail
@@ -196,6 +205,17 @@ vectors = [
 
 fail = 0
 for name, tmpl, body in vectors:
+    # VERSION SPLIT: v2-prompt vectors diverge by design on the ocserve arm
+    # (flat 2.0.28 body vs nested 1.18.31 freeze body). Compare freeze-vs-
+    # freeze as the arm's self-check; skip the ocserve comparison (P5 runs
+    # flat vectors against the real 2.0.28 binary).
+    if name.startswith("v2-") and tmpl == V2P:
+        st_f, b_f = post(port_f, tmpl.replace("{S}", sid_f), body)
+        st_f2, b_f2 = post(port_f, tmpl.replace("{S}", sid_f), body)
+        if st_f != st_f2 or b_f != b_f2:
+            fail += 1
+            print(f"DIVERGE {name}: freeze not self-consistent")
+        continue
     st_f, b_f = post(port_f, tmpl.replace("{S}", sid_f), body)
     st_r, b_r = post(port_r, tmpl.replace("{S}", sid_r), body)
     if st_f != st_r or b_f != b_r:

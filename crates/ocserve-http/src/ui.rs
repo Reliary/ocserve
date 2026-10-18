@@ -75,7 +75,61 @@ fn is_opencode_ai_origin(origin: &str) -> bool {
     })
 }
 
-/// Hand-rolled CORS middleware with exact freeze parity (probed live):
+/// Build a 204 preflight response for an allowed origin (shared constructor:
+/// the perimeter layer and the in-router gate must never drift apart).
+pub fn preflight_response(origin: &str, req_headers: &axum::http::HeaderMap) -> Response {
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        "access-control-allow-origin",
+        HeaderValue::from_str(origin).unwrap_or(HeaderValue::from_static("*")),
+    );
+    h.insert(
+        "vary",
+        HeaderValue::from_static("Access-Control-Request-Headers, Origin"),
+    );
+    h.insert(
+        "access-control-allow-methods",
+        HeaderValue::from_static("GET, HEAD, PUT, PATCH, POST, DELETE"),
+    );
+    // echo the requested headers (freeze behavior; empty when absent)
+    if let Some(reqh) = req_headers.get("access-control-request-headers").cloned() {
+        h.insert("access-control-allow-headers", reqh);
+    } else {
+        h.insert("access-control-allow-headers", HeaderValue::from_static(""));
+    }
+    h.insert("access-control-max-age", HeaderValue::from_static("86400"));
+    resp
+}
+
+/// Perimeter CORS layer (serve-time, OUTSIDE the router): answers preflights
+/// before routing/auth/fallbacks ever see them. This exists because fallback
+/// and method-not-allowed responses bypass router middleware in our builder
+/// order (proven empirically: preflights resolved to ui_fallback/MNF with no
+/// 204 and no ACAO, while routed responses carry ACAO). Passes everything
+/// else through untouched (the in-router gate still decorates routed
+/// responses; no double headers — this layer only short-circuits).
+pub async fn perimeter_cors(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    use axum::http::Method;
+    let is_preflight = req.method() == Method::OPTIONS
+        && req.headers().contains_key("access-control-request-method");
+    if is_preflight {
+        let origin = req
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        // Same predicate as the in-router gate, including OCSERVE_CORS extras
+        // (one source of truth; the two must never disagree on an origin).
+        let extra = crate::read_cors_env();
+        if let Some(o) = origin
+            && is_allowed_cors_origin(&o, &extra)
+        {
+            return preflight_response(&o, req.headers());
+        }
+    }
+    next.run(req).await
+}
 /// preflight → 204 with ACAO + echoed ACAH + ACM 4 methods... actually the
 /// freeze method list is GET, HEAD, PUT, PATCH, POST, DELETE, ACAH echoes the
 /// requested list, max-age 86400, `Vary: Access-Control-Request-Headers,
@@ -103,28 +157,8 @@ pub async fn cors_gate(
         let Some(origin) = origin else {
             return next.run(req).await;
         };
-        let mut resp = StatusCode::NO_CONTENT.into_response();
-        let h = resp.headers_mut();
-        h.insert(
-            "access-control-allow-origin",
-            HeaderValue::from_str(&origin).unwrap_or(HeaderValue::from_static("*")),
-        );
-        h.insert(
-            "vary",
-            HeaderValue::from_static("Access-Control-Request-Headers, Origin"),
-        );
-        h.insert(
-            "access-control-allow-methods",
-            HeaderValue::from_static("GET, HEAD, PUT, PATCH, POST, DELETE"),
-        );
-        // echo the requested headers (freeze behavior; empty when absent)
-        if let Some(reqh) = req.headers().get("access-control-request-headers").cloned() {
-            h.insert("access-control-allow-headers", reqh);
-        } else {
-            h.insert("access-control-allow-headers", HeaderValue::from_static(""));
-        }
-        h.insert("access-control-max-age", HeaderValue::from_static("86400"));
-        return resp;
+        // Shared constructor (perimeter layer uses the same one).
+        return preflight_response(&origin, req.headers());
     }
 
     let mut resp = next.run(req).await;
@@ -316,6 +350,17 @@ pub async fn ui_fallback(
     State(st): State<Arc<crate::AppState>>,
     req: axum::extract::Request,
 ) -> Response {
+    // F7 (security/reliability review): an unmatched `/api/*` path must be a
+    // JSON 404, never the SPA index HTML. Serving HTML 200 to an API client is
+    // a crash/info-leak class (the SDK parses as text, callers choke on shape).
+    // The web UI never requests unbound API paths; real API clients do.
+    if req.uri().path() == "/api" || req.uri().path().starts_with("/api/") {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"_tag": "NotFoundError", "message": "Not Found"})),
+        )
+            .into_response();
+    }
     let ui = &st.ui;
     if !ui.enabled {
         return (
@@ -545,7 +590,7 @@ fn embedded_response(path: &str) -> Response {
         )
             .into_response();
     };
-    let ct = crate::embedded_ui::mime_for(resolved);
+    let ct = crate::embedded_ui::mime_for(&resolved);
     let mut out = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, ct);
@@ -553,17 +598,17 @@ fn embedded_response(path: &str) -> Response {
         // Perf dive 2026-10-11: the pre-fix path did `String::from_utf8_lossy`
         // (a full copy of index.html) + sha256 on EVERY navigation, and
         // `body.to_vec()` copied the entry JS (multi-MB) per request. The
-        // pack is 'static and immutable, so Bytes::from_static is a refcount
-        // and the CSP string is computed once (the pack is one pinned build).
+        // pack decompresses each file once into a bounded cache; the CSP string
+        // is computed once (the pack is one pinned build).
         static CSP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         let csp_value = CSP
-            .get_or_init(|| csp_for_html(&String::from_utf8_lossy(body)))
+            .get_or_init(|| csp_for_html(&String::from_utf8_lossy(&body)))
             .clone();
         out = out.header("content-security-policy", csp_value);
     } else {
         out = out.header("content-security-policy", csp(""));
     }
-    out.body(Body::from(bytes::Bytes::from_static(body)))
+    out.body(Body::from(bytes::Bytes::from(body.to_vec())))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 

@@ -456,9 +456,9 @@ async fn round_cap_fails_loud_session_error_stopped_part_metric_and_persisted_gr
                 .prepare(
                     "SELECT json_extract(payload,'$.id'), json_extract(payload,'$.permission'), \
                      (SELECT count(*) FROM event e2 WHERE e2.session_id=event.session_id \
-                      AND e2.type='permission.replied' \
+                      AND e2.type IN ('permission.replied', 'permission.replied@v1') \
                       AND json_extract(e2.payload,'$.requestID') = json_extract(event.payload,'$.id')) \
-                     FROM event WHERE session_id='ses_cap000000000001' AND type='permission.asked'",
+                     FROM event WHERE session_id='ses_cap000000000001' AND type IN ('permission.asked', 'permission.asked@v1')",
                 )
                 .unwrap()
                 .query_map([], |r| {
@@ -482,7 +482,7 @@ async fn round_cap_fails_loud_session_error_stopped_part_metric_and_persisted_gr
             if conn
                 .query_row(
                     "SELECT count(*) FROM event WHERE session_id='ses_cap000000000001' \
-                     AND type='session.error' AND payload LIKE '%OCSERVE_PROMPT_MAX_ROUNDS%'",
+                     AND type IN ('session.error', 'session.error@v1') AND payload LIKE '%OCSERVE_PROMPT_MAX_ROUNDS%'",
                     [],
                     |r| r.get::<_, i64>(0),
                 )

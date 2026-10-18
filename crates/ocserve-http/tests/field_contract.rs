@@ -22,6 +22,16 @@ fn app() -> axum::Router {
     ocserve_http::router(ocserve_http::AppState::new())
 }
 
+/// v2-enabled app (hermetic per-state gate — the v2 contract tests must not
+/// depend on process env; parallel tests sharing env flake by construction).
+fn app_v2() -> axum::Router {
+    ocserve_http::router(ocserve_http::AppState::with_payloads_and_v2(
+        None,
+        ocserve_http::Payloads::default(),
+        true,
+    ))
+}
+
 /// Same router but with a dead endpoint wired for `fake/m` (golden's
 /// prompt_async pattern) — `build_prompt_context` resolves BEFORE the
 /// session check / noReply return, so endpoint-less states 400 first.
@@ -238,7 +248,7 @@ async fn shell_missing_agent_exact_envelope() {
 
 #[tokio::test]
 async fn v2_prompt_missing_prompt_exact_envelope() {
-    let app = app();
+    let app = app_v2();
     let sid = new_session(&app).await;
     let (st, v) = post(&app, &format!("/api/session/{sid}/prompt"), json!({})).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
@@ -246,7 +256,7 @@ async fn v2_prompt_missing_prompt_exact_envelope() {
         v,
         json!({
             "_tag": "InvalidRequestError",
-            "message": "Missing key\n  at [\"prompt\"]",
+            "message": "Missing key\n  at [\"text\"]",
             "kind": "Payload"
         })
     );
@@ -254,12 +264,12 @@ async fn v2_prompt_missing_prompt_exact_envelope() {
 
 #[tokio::test]
 async fn v2_prompt_bad_id_uses_msg_underscore() {
-    let app = app();
+    let app = app_v2();
     let sid = new_session(&app).await;
     let (st, v) = post(
         &app,
         &format!("/api/session/{sid}/prompt"),
-        json!({"id": "msgx", "prompt": {"text": "x"}}),
+        json!({"id": "msgx", "text": "x"}),
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
@@ -465,7 +475,9 @@ async fn command_and_shell_and_prompt_family_decode_before_busy() {
 #[tokio::test]
 async fn every_prompt_family_route_decodes() {
     let app = app();
+    let app2 = app_v2();
     let sid = new_session(&app).await;
+    let sid2 = new_session(&app2).await;
     for (uri, expect) in [
         (format!("/session/{sid}/message"), "parts"),
         (format!("/session/{sid}/prompt_async"), "parts"),
@@ -483,7 +495,12 @@ async fn every_prompt_family_route_decodes() {
         );
         assert_eq!(v["data"]["kind"], "Payload", "{uri} envelope kind");
     }
-    let (st, v) = post(&app, &format!("/api/session/{sid}/prompt"), json!({})).await;
+    // Flat 2.0.28 body: `{}` misses top-level `text` (not nested `prompt`).
+    let (st, v) = post(&app2, &format!("/api/session/{sid2}/prompt"), json!({})).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert_eq!(v["_tag"], "InvalidRequestError");
+    assert!(
+        v["message"].as_str().unwrap_or("").contains("[\"text\"]"),
+        "flat-body missing key, got {v}"
+    );
 }

@@ -19,6 +19,9 @@ ExecStart=%h/src/ocserve/target/release/ocserve serve --port 4912
 WorkingDirectory=%h/src/ocserve
 Environment=OCSERVE_DATA_DIR=%h/.local/share/ocserve
 Environment=RUST_LOG=ocserve=info
+# F4 (security review): owner-only umask for every file this unit creates
+# (DB/WAL/SHM hold credential rows; SQLite recreates WAL/SHM under this umask).
+UMask=0077
 # MIMALLOC_* env removed 2026-10-04: no allocator is linked (dead config).
 # Re-add with real allocator wiring if/when profiling justifies it.
 Restart=on-failure

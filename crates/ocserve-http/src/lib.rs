@@ -104,6 +104,7 @@ pub mod tui;
 pub mod ui;
 pub mod v2;
 pub mod vcs;
+pub mod websearch;
 
 /// Upstream error envelope: {"name":"NotFoundError","data":{"message":"..."}} (captured live).
 pub struct ApiError {
@@ -313,6 +314,21 @@ pub struct AppState {
     pub prompt_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Question rendezvous (v1 Question service): pending asks + reply/reject.
     pub question_gate: std::sync::Arc<ocserve_core::question::QuestionGate>,
+    /// Form rendezvous (v2 Form service): pending asks + reply/cancel.
+    pub form_gate: std::sync::Arc<ocserve_core::form::FormGate>,
+    /// Connect-attempt rendezvous (integration command/external/oauth).
+    pub attempt_gate: std::sync::Arc<ocserve_core::attempt::AttemptGate>,
+    /// Background shell registry (Phase D bulkhead: 128 shells, 64KiB out).
+    pub shells: std::sync::Arc<ocserve_core::shell::ShellRegistry>,
+    /// v2 runtime kill-switch (V2-PLAN.md D2): read from `OCSERVE_V2` ONCE at
+    /// construction (never per-request env reads — env is process-global and
+    /// per-request reads make parallel tests flaky by construction).
+    pub v2_enabled: bool,
+    /// v2 run coordinators (V2-PLAN.md P3): one entry per session with live
+    /// work, dropped on idle drain-end. Gated by OCSERVE_V2=1 (D2: the whole
+    /// v2 runtime stays dark until acceptance; the set exists so construction
+    /// is uniform, but no v2 route touches it while disabled).
+    pub coordinators: ocserve_core::coordinator::SharedCoordinators,
     /// /tui/control rendezvous queues (v1 shared/tui-control.ts)
     pub tui: crate::tui::TuiControl,
     /// Web-UI reverse proxy (Phase 7; upstream serveUIEffect parity)
@@ -500,6 +516,21 @@ impl AppState {
     /// Build from pre-assembled route payloads with a temp-backed store
     /// (tests / simple construction — real pieces, no placeholders).
     pub fn with_payloads(auth: Option<(String, String)>, p: Payloads) -> Arc<Self> {
+        Self::with_payloads_and_v2(
+            auth,
+            p,
+            std::env::var("OCSERVE_V2").unwrap_or_default() == "1",
+        )
+    }
+
+    /// `with_payloads` with an explicit v2 flag (contract tests: hermetic
+    /// per-state gate — env is process-global and parallel tests sharing it
+    /// flake by construction).
+    pub fn with_payloads_and_v2(
+        auth: Option<(String, String)>,
+        p: Payloads,
+        v2: bool,
+    ) -> Arc<Self> {
         // pid + nanos + counter: parallel tests calling this on the same clock
         // tick must not share a temp data dir (writer/db contention → flaky).
         static NEW_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -519,7 +550,7 @@ impl AppState {
         let blobs = std::sync::Arc::new(
             ocserve_store::BlobStore::new(dir.join("blobs")).expect("temp blobs"),
         );
-        Self::with_wiring(
+        Self::with_wiring_and_v2(
             auth,
             p,
             Wires {
@@ -528,11 +559,29 @@ impl AppState {
                 writer,
                 llm: LlmRegistry::default(),
             },
+            v2,
         )
     }
 
     /// One-shot construction with real runtime wiring (CLI path).
     pub fn with_wiring(auth: Option<(String, String)>, p: Payloads, w: Wires) -> Arc<Self> {
+        Self::with_wiring_and_v2(
+            auth,
+            p,
+            w,
+            std::env::var("OCSERVE_V2").unwrap_or_default() == "1",
+        )
+    }
+
+    /// Construction with an explicit v2 flag (tests: hermetic per-state gate,
+    /// never process env — env is process-global and per-request reads make
+    /// parallel tests flaky by construction).
+    pub fn with_wiring_and_v2(
+        auth: Option<(String, String)>,
+        p: Payloads,
+        w: Wires,
+        v2: bool,
+    ) -> Arc<Self> {
         let home = std::env::var("HOME").unwrap_or_default();
         let worktree = std::env::current_dir()
             .map(|p| p.display().to_string())
@@ -541,9 +590,13 @@ impl AppState {
             .map(|v| v == "0")
             .unwrap_or(false);
         // v2 envelope location (static per process — same value every request).
+        // UNION shape (D-V2-UNION): v1 clients read `.project`; v2's
+        // Location.PublicRef wants `{directory}`-only, and v2's PublicInfo
+        // wants `project.canonical`. Both decoders strip extras; the v2
+        // spec-validate allowlists the envelope paths (named, not silent).
         let location = json!({
             "directory": worktree,
-            "project": {"id": "global", "directory": "/"},
+            "project": {"id": "global", "directory": "/", "canonical": "/"},
         });
         let wire_map = rebuild_wire(&p, wire_off, &location);
         let bus = ocserve_core::EventBus::new();
@@ -587,6 +640,11 @@ impl AppState {
             )),
             prompt_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             question_gate: ocserve_core::question::QuestionGate::new(),
+            form_gate: ocserve_core::form::FormGate::new(),
+            attempt_gate: ocserve_core::attempt::AttemptGate::new(),
+            shells: ocserve_core::shell::ShellRegistry::new(),
+            v2_enabled: v2,
+            coordinators: std::sync::Arc::new(ocserve_core::coordinator::CoordinatorSet::new()),
             tui: crate::tui::TuiControl::default(),
             ui: crate::ui::UiProxy::from_env(),
             pty,
@@ -808,7 +866,7 @@ pub(crate) fn api_location(st: &AppState) -> Value {
     let dir = st.paths["directory"].as_str().unwrap_or("/");
     json!({
         "directory": dir,
-        "project": {"id": "global", "directory": "/"},
+        "project": {"id": "global", "directory": "/", "canonical": dir},
     })
 }
 
@@ -836,45 +894,56 @@ pub(crate) fn api_agent_body(payloads: &Payloads, location: &Value) -> Value {
 }
 
 fn api_agent_data(payloads: &Payloads) -> Vec<Value> {
-    let data: Vec<Value> = payloads
-        .api_agent
-        .iter()
-        .map(|a| {
-            let perms: Vec<Value> = a["permission"]
-                .as_array()
-                .map(|rules| {
-                    rules
-                        .iter()
-                        .map(|r| {
-                            json!({
-                                "action": r["permission"],
-                                "resource": r["pattern"],
-                                "effect": r["action"],
-                            })
-                        })
-                        .collect()
+    payloads.api_agent.iter().map(api_agent_item).collect()
+}
+
+/// Single-agent union projection (shared by the list and the detail route —
+/// one projector, never two shapes for the same item).
+pub(crate) fn api_agent_item(a: &Value) -> Value {
+    let perms: Vec<Value> = a["permission"]
+        .as_array()
+        .map(|rules| {
+            rules
+                .iter()
+                .map(|r| {
+                    json!({
+                        "action": r["permission"],
+                        "resource": r["pattern"],
+                        "effect": r["action"],
+                    })
                 })
-                .unwrap_or_default();
-            let mut out = json!({
-                "id": a["name"],
-                "hidden": a.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false),
-                "mode": a["mode"],
-                "permissions": perms,
-                "request": {"headers": {}, "body": {}},
-            });
-            if let Some(d) = a.get("description") {
-                out["description"] = d.clone();
-            }
-            // system: explicit prompt, else the captured build default
-            if let Some(p) = a.get("prompt") {
-                out["system"] = p.clone();
-            } else if a["name"] == "build" {
-                out["system"] = json!(BUILD_SYSTEM_BLURB);
-            }
-            out
+                .collect()
         })
-        .collect();
-    data
+        .unwrap_or_default();
+    let mut out = json!({
+        "id": a["name"],
+        // UNION (D-V2-UNION): v2 `Agent.Info` requires `name`
+        // (display name; freeze: id "build", name "Build") and
+        // `request.settings`. Title-case the id when no display
+        // name is configured. Both decoders strip extras.
+        "name": a.get("display_name").and_then(|v| v.as_str()).map(String::from).unwrap_or_else(|| {
+            let id = a["name"].as_str().unwrap_or("");
+            let mut c = id.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        }),
+        "hidden": a.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false),
+        "mode": a["mode"],
+        "permissions": perms,
+        "request": {"headers": {}, "body": {}, "settings": {}},
+    });
+    if let Some(d) = a.get("description") {
+        out["description"] = d.clone();
+    }
+    // system: explicit prompt, else the captured build default
+    if let Some(p) = a.get("prompt") {
+        out["system"] = p.clone();
+    } else if a["name"] == "build" {
+        out["system"] = json!(BUILD_SYSTEM_BLURB);
+    }
+    out
 }
 
 /// Captured from live /api/agent (build has no prompt; upstream serves this blurb).
@@ -1555,6 +1624,12 @@ async fn get_path(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 /// `global`+`current`, sessions under other directories were dropped from the
 /// sidebar ("Nothing here yet").
 async fn get_projects(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(project_list_body(&st))
+}
+
+/// Shared project-list projector (v1 `/project` and v2 `/api/project` serve
+/// the same union body — one projection, no drift).
+pub(crate) fn project_list_body(st: &Arc<AppState>) -> Value {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -1569,7 +1644,10 @@ async fn get_projects(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         json!({
             "id": id,
             "worktree": wt,
-            "time": {"created": now_ms, "updated": now_ms, "initialized": now_ms},
+            // UNION (D-V2-UNION): v2 `Project` requires `canonical` (=
+            // worktree) and `time.active`. Both decoders strip extras.
+            "canonical": wt,
+            "time": {"created": now_ms, "updated": now_ms, "initialized": now_ms, "active": now_ms},
             "sandboxes": [],
         })
     };
@@ -1577,10 +1655,10 @@ async fn get_projects(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     for d in dirs {
         out.push(project(&d, &d));
     }
-    Json(Value::Array(out))
+    Value::Array(out)
 }
 
-/// GET /project/current — same shape, single object.
+/// GET /project/current — same union Project shape as the list, single object.
 async fn get_project_current(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1590,7 +1668,10 @@ async fn get_project_current(State(st): State<Arc<AppState>>) -> impl IntoRespon
     Json(json!({
         "id": "global",
         "worktree": worktree,
-        "time": {"created": now_ms, "updated": now_ms, "initialized": now_ms},
+        // UNION (D-V2-UNION): same additive keys as the list projector —
+        // one Project shape on every project route.
+        "canonical": worktree,
+        "time": {"created": now_ms, "updated": now_ms, "initialized": now_ms, "active": now_ms},
         "sandboxes": [],
     }))
 }
@@ -2233,7 +2314,7 @@ async fn get_messages(
 /// swaps derived payloads so the next GET serves fresh config. Divergence:
 /// ocserve treats global==user config (single file); runtime endpoint
 /// registries refresh on restart (TESTING §1.6).
-async fn patch_config(
+pub(crate) async fn patch_config(
     State(st): State<Arc<AppState>>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
@@ -2635,13 +2716,16 @@ async fn global_dispose(State(st): State<Arc<AppState>>) -> Result<Json<Value>, 
     // spec Event.server.instance.disposed.properties: {directory} (required).
     let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
     let props = json!({"directory": dir});
-    ocserve_store::append_event(&st.writer, None, "server.instance.disposed", &props).map_err(
-        |e| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            name: "InternalError",
-            message: format!("{e:#}"),
-        },
-    )?;
+    // Global (session-less) emission through the single choke: versioned
+    // durable type + stable id, no session sync twin (V2-PLAN.md P2).
+    let (_seq, _id) =
+        ocserve_store::emit_event(&st.writer, None, "server.instance.disposed", &props).map_err(
+            |e| ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                name: "InternalError",
+                message: format!("{e:#}"),
+            },
+        )?;
     st.bus.publish(ocserve_core::event::frame(
         &dir,
         "server.instance.disposed",
@@ -3405,6 +3489,15 @@ pub(crate) fn build_prompt_context(
         // SNAPSHOT (SNAPSHOT.md): config `snapshot != false` + env kill-switch;
         // the engine resolves the worktree lazily and no-ops when non-git.
         snapshots,
+        // K-TASK: subagent launcher config (depth + resolvable agents).
+        subagent_depth: st
+            .payloads
+            .read()
+            .config
+            .get("subagent_depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32,
+        agent_catalog: st.payloads.read().api_agent.clone(),
     };
     Ok(ctx)
 }
@@ -4594,23 +4687,9 @@ fn emit_session_error_event(st: &Arc<AppState>, sid: &str, message: &str) {
         "sessionID": sid,
         "error": {"name": "UnknownError", "data": {"message": message}},
     });
-    if let Err(e) = ocserve_store::append_event(&st.writer, Some(sid), "session.error", &props) {
-        tracing::warn!("session.error persist failed: {e:#}");
+    if let Err(e) = emit_durable_http(st, sid, "session.error", props.clone()) {
+        tracing::warn!("session.error emit failed: {} {}", e.name, e.message);
     }
-    let seq = ocserve_store::next_event_seq(&st.db, sid).unwrap_or(0);
-    let dir = st.paths["directory"].as_str().unwrap_or("/");
-    st.bus.publish(ocserve_core::event::frame(
-        dir,
-        "session.error",
-        props.clone(),
-    ));
-    st.bus.publish(ocserve_core::event::sync_frame(
-        dir,
-        "session.error",
-        props,
-        seq as u64,
-        sid,
-    ));
 }
 
 /// Busy rejection (v1 mapBusy → SessionBusyError): command/shell never queue
@@ -4882,7 +4961,8 @@ async fn post_shell(
         let cmd = json!({"command": command});
         let d = dir.clone();
         tokio::task::spawn_blocking(move || {
-            ocserve_tools::execute("bash", &cmd, std::path::Path::new(&d))
+            // v1 shell route: no session scope, so no session env (empty).
+            ocserve_tools::execute("bash", &cmd, std::path::Path::new(&d), &[])
         })
         .await
         .map_err(|e| ApiError {
@@ -4971,14 +5051,16 @@ pub(crate) fn emit_durable_http(
     props: Value,
 ) -> Result<(), ApiError> {
     let props = ocserve_core::event::normalize_props(event_type, props);
-    ocserve_store::append_event(&st.writer, Some(sid), event_type, &props).map_err(|e| {
-        ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            name: "InternalError",
-            message: format!("{e:#}"),
-        }
-    })?;
-    let seq = ocserve_store::next_event_seq(&st.db, sid).unwrap_or(0);
+    // Single choke (V2-PLAN.md P2): versioned durable type + stable id from
+    // the allocated seq — the same path the prompt loop uses (D5).
+    let (seq, _id) =
+        ocserve_store::emit_event(&st.writer, Some(sid), event_type, &props).map_err(|e| {
+            ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                name: "InternalError",
+                message: format!("{e:#}"),
+            }
+        })?;
     let dir = st.paths["directory"].as_str().unwrap_or("/");
     st.bus
         .publish(ocserve_core::event::frame(dir, event_type, props.clone()));
@@ -5047,6 +5129,15 @@ fn encode_event_frame(stored: &str, fmt: EventFormat) -> Option<String> {
         return Some(stored.to_string());
     }
     let v: Value = serde_json::from_str(stored).ok()?;
+    // Already-v2 frames (frame_v2 twins: {id,type,data}, no payload key)
+    // pass through untouched on the V2 stream; other formats drop them (the
+    // v1 clients never subscribed to v2 grammar — same ignore rule).
+    if v.get("payload").is_none() {
+        if matches!(fmt, EventFormat::V2) && v.get("type").and_then(Value::as_str).is_some() {
+            return Some(stored.to_string());
+        }
+        return None;
+    }
     let payload = v.get("payload")?;
     if payload.get("type").and_then(Value::as_str) == Some("sync") {
         return None;
@@ -5181,6 +5272,15 @@ fn req_log() -> bool {
     })
 }
 
+/// Constant-time byte equality (no `subtle` dep for one call site).
+/// Length must be checked by the caller first (lengths differ → false).
+fn subtle_compare(a: &[u8], b: &[u8]) -> bool {
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
 async fn auth_gate(
     State(st): State<Arc<AppState>>,
     req: axum::extract::Request,
@@ -5211,6 +5311,8 @@ async fn auth_gate(
         tracing::info!("req {} {}", req.method(), req.uri().path());
     }
     if let Some((user, pass)) = &st.auth {
+        // Constant-time credential compare (timing oracle on a secret
+        // check is a real class; the tuple is short so cost is trivial).
         let authorized = req
             .headers()
             .get(axum::http::header::AUTHORIZATION)
@@ -5221,17 +5323,16 @@ async fn auth_gate(
                 base64::engine::general_purpose::STANDARD.decode(b64).ok()
             })
             .map(|raw| {
-                let text = String::from_utf8_lossy(&raw);
-                text == format!("{user}:{pass}")
+                let expect = format!("{user}:{pass}");
+                raw.len() == expect.len() && subtle_compare(&raw, expect.as_bytes())
             })
             .unwrap_or(false);
         if !authorized {
             record(metric_t0);
-            return Err(ApiError {
-                status: StatusCode::UNAUTHORIZED,
-                name: "UnauthorizedError",
-                message: "unauthorized".into(),
-            });
+            // Byte-exact upstream challenge (probed live on 2.0.28) — shared
+            // constructor with the method fallback (single source, no drift).
+            // Absent and wrong credentials are indistinguishable (no oracle).
+            return Ok(unauthorized_response());
         }
     }
     let resp = next.run(req).await;
@@ -5461,6 +5562,24 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/session/active", get(v2::active_sessions))
         .route("/api/session/{sessionID}", get(v2::get_session))
+        .route(
+            "/api/session/{sessionID}",
+            axum::routing::delete(v2::session_remove_api).patch(v2::session_update_api),
+        )
+        .route(
+            "/api/session/{sessionID}/revert",
+            axum::routing::delete(v2::session_revert_clear_api),
+        )
+        .route(
+            "/api/session/{sessionID}/agent",
+            axum::routing::post(v2::session_agent_api),
+        )
+        .route(
+            "/api/session/{sessionID}/model",
+            axum::routing::post(v2::session_model_api),
+        )
+        // NOTE: axum merges the two registrations for the same path
+        // (get + delete + patch on one path).
         .route("/api/session/{sessionID}/message", get(v2::list_messages))
         .route(
             "/api/session/{sessionID}/message/{messageID}",
@@ -5469,17 +5588,249 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/session/{sessionID}/context", get(v2::session_context))
         .route("/api/session/{sessionID}/history", get(v2::session_history))
         .route(
-            "/api/session/{sessionID}/agent",
-            axum::routing::post(v2::switch_agent),
-        )
-        .route(
-            "/api/session/{sessionID}/model",
-            axum::routing::post(v2::switch_model),
-        )
-        .route(
             "/api/session/{sessionID}/prompt",
             axum::routing::post(v2::prompt),
         )
+        .route("/api/session/{sessionID}/inbox", get(v2::inbox_list))
+        .route(
+            "/api/session/{sessionID}/inbox/{inboxID}",
+            axum::routing::delete(v2::inbox_cancel).patch(v2::inbox_update),
+        )
+        .route(
+            "/api/experimental/session/{sessionID}/log",
+            get(v2::session_log),
+        )
+        .route(
+            "/api/session/{sessionID}/form",
+            get(v2::form_list).post(v2::form_create),
+        )
+        .route(
+            "/api/session/{sessionID}/form/{formID}",
+            get(v2::form_get).delete(v2::form_cancel),
+        )
+        .route(
+            "/api/session/{sessionID}/form/{formID}/reply",
+            axum::routing::post(v2::form_reply),
+        )
+        .route("/api/form", get(v2::form_list_global))
+        .route("/api/project", get(v2::list_projects))
+        .route("/api/mcp", get(v2::list_mcp))
+        .route("/api/mcp/resource", get(v2::mcp_resource))
+        .route("/api/vcs", get(v2::vcs_get))
+        .route("/api/vcs/status", get(v2::vcs_status))
+        .route("/api/vcs/diff", get(v2::vcs_diff))
+        .route("/api/vcs/base", get(v2::vcs_base))
+        .route("/api/vcs/branch", get(v2::vcs_branch))
+        .route("/api/config", get(v2::config_list))
+        .route("/api/config/shell", get(v2::config_shells))
+        .route("/api/model/default", get(v2::model_default))
+        .route(
+            "/api/debug/location",
+            get(v2::debug_location_list).delete(v2::debug_location_evict),
+        )
+        .route(
+            "/api/experimental/migration/v1",
+            get(v2::migration_v1_status),
+        )
+        .route("/api/plugin", get(v2::plugin_list))
+        .route(
+            "/api/experimental/fs/write",
+            axum::routing::post(v2::fs_write),
+        )
+        .route(
+            "/api/worktree",
+            get(v2::worktree_list_api)
+                .post(v2::worktree_create_api)
+                .delete(v2::worktree_remove_api),
+        )
+        .route(
+            "/api/worktree/refresh",
+            axum::routing::post(v2::worktree_refresh_api),
+        )
+        .route("/api/session/{sessionID}/diff", get(v2::session_diff_api))
+        .route(
+            "/api/session/{sessionID}/background",
+            axum::routing::post(v2::session_background_api),
+        )
+        .route(
+            "/api/session/{sessionID}/command",
+            axum::routing::post(v2::session_command_api),
+        )
+        .route(
+            "/api/session/{sessionID}/shell",
+            axum::routing::post(v2::session_shell_api),
+        )
+        .route(
+            "/api/session/{sessionID}/move",
+            axum::routing::post(v2::session_move_api),
+        )
+        .route(
+            "/api/session/{sessionID}/synthetic",
+            axum::routing::post(v2::session_synthetic_api),
+        )
+        .route(
+            "/api/session/{sessionID}/view",
+            axum::routing::post(v2::session_view_api),
+        )
+        .route(
+            "/api/session/{sessionID}/generate",
+            axum::routing::post(v2::session_generate_api),
+        )
+        .route(
+            "/api/integration/{integrationID}/connect/command",
+            axum::routing::post(v2::integration_command_connect),
+        )
+        .route(
+            "/api/integration/{integrationID}/connect/external",
+            axum::routing::post(v2::integration_external_connect),
+        )
+        .route(
+            "/api/integration/{integrationID}/connect/command/{attemptID}",
+            get(v2::integration_attempt_poll).delete(v2::integration_attempt_abort),
+        )
+        .route(
+            "/api/integration/{integrationID}/connect/oauth/{attemptID}",
+            get(v2::integration_attempt_poll).delete(v2::integration_attempt_abort),
+        )
+        .route(
+            "/api/integration/{integrationID}/connect/oauth/{attemptID}/complete",
+            axum::routing::post(v2::integration_oauth_complete),
+        )
+        .route(
+            "/api/experimental/integration/wellknown",
+            axum::routing::post(v2::integration_wellknown),
+        )
+        .route(
+            "/api/experimental/mcp/{server}",
+            axum::routing::put(v2::mcp_exp_upsert).delete(v2::mcp_exp_remove),
+        )
+        .route(
+            "/api/experimental/mcp/{server}/connect",
+            axum::routing::post(v2::mcp_exp_connect),
+        )
+        .route(
+            "/api/experimental/mcp/{server}/disconnect",
+            axum::routing::post(v2::mcp_exp_disconnect),
+        )
+        .route("/api/pair", axum::routing::post(v2::pair_mint))
+        .route("/auth/connect/{code}", get(v2::pair_connect))
+        .route(
+            "/api/experimental/persistent-pty/{ptyID}",
+            get(v2::ppty_get)
+                .put(v2::ppty_update)
+                .delete(v2::ppty_remove),
+        )
+        .route(
+            "/api/experimental/persistent-pty/{ptyID}/connect",
+            get(v2::ppty_connect_info),
+        )
+        .route(
+            "/api/experimental/persistent-pty/{ptyID}/snapshot",
+            get(v2::ppty_snapshot),
+        )
+        .route(
+            "/api/experimental/persistent-pty/{ptyID}/connect-token",
+            axum::routing::post(v2::ppty_connect_token),
+        )
+        .route(
+            "/api/experimental/persistent-pty/handoff",
+            axum::routing::post(v2::ppty_handoff),
+        )
+        .route(
+            "/api/experimental/persistent-pty/shutdown",
+            axum::routing::post(v2::ppty_shutdown),
+        )
+        .route(
+            "/api/experimental/session/{sessionID}/terminal",
+            get(v2::ppty_session_list).post(v2::ppty_session_create),
+        )
+        .route(
+            "/api/experimental/session/{sessionID}/terminal/read",
+            get(v2::ppty_session_read),
+        )
+        .route("/api/shell", get(v2::shell_list).post(v2::shell_create))
+        .route(
+            "/api/shell/{id}",
+            get(v2::shell_get).delete(v2::shell_remove),
+        )
+        .route("/api/shell/{id}/output", get(v2::shell_output))
+        .route(
+            "/api/experimental/session/{sessionID}/skill",
+            axum::routing::post(v2::session_skill_api),
+        )
+        .route(
+            "/api/rpc/{rpcID}/{method}",
+            axum::routing::post(v2::rpc_unimplemented),
+        )
+        .route("/api/websearch", axum::routing::post(v2::websearch_api))
+        .route("/api/websearch/provider", get(v2::websearch_providers_api))
+        .route(
+            "/api/session/{sessionID}/environment",
+            axum::routing::put(v2::session_environment_api),
+        )
+        .route("/api/agent/{agentID}", get(v2::agent_detail_api))
+        .route(
+            "/api/credential",
+            get(v2::credential_list_api).post(v2::credential_create_api),
+        )
+        .route(
+            "/api/credential/{credentialID}/activate",
+            axum::routing::post(v2::credential_activate_api),
+        )
+        .route(
+            "/api/experimental/config",
+            axum::routing::patch(v2::experimental_config_patch),
+        )
+        .route(
+            "/api/experimental/generate",
+            axum::routing::post(v2::experimental_generate_api),
+        )
+        .route(
+            "/api/location/reload",
+            axum::routing::post(v2::location_reload_api),
+        )
+        .route(
+            "/api/plugin/check",
+            axum::routing::post(v2::plugin_check_api),
+        )
+        .route(
+            "/api/plugin/update",
+            axum::routing::post(v2::plugin_update_api),
+        )
+        .route("/api/vcs/init", axum::routing::post(v2::vcs_init_api))
+        .route(
+            "/api/experimental/session/{sessionID}/instructions/entries",
+            get(v2::instruction_list),
+        )
+        .route(
+            "/api/experimental/session/stats",
+            get(v2::session_stats_api),
+        )
+        .route(
+            "/api/experimental/session/import",
+            axum::routing::post(v2::session_import_api),
+        )
+        .route(
+            "/api/experimental/session/{sessionID}/export",
+            get(v2::session_export_api),
+        )
+        .route(
+            "/api/experimental/session/{sessionID}/instructions/entries/{key}",
+            axum::routing::put(v2::instruction_put).delete(v2::instruction_remove),
+        )
+        .route(
+            "/api/session/{sessionID}/fork",
+            axum::routing::post(v2::session_fork_api),
+        )
+        .route(
+            "/api/project/{projectID}",
+            axum::routing::patch(v2::update_project),
+        )
+        // Version probe (V2-PLAN.md D2): bound EXPLICITLY so it never falls
+        // through to the SPA catch-all (freeze serves HTML 200 for unknown
+        // paths — v1-faithful, but a v2 client probing /api/info must get a
+        // version signal, not HTML). Dark (JSON 404) until P5 acceptance.
+        .route("/api/info", get(v2::server_info))
         .route(
             "/api/session/{sessionID}/interrupt",
             axum::routing::post(v2::interrupt),
@@ -5490,6 +5841,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/session/{sessionID}/wait",
+            axum::routing::post(v2::wait),
+        )
+        .route(
+            "/api/experimental/session/{sessionID}/wait",
             axum::routing::post(v2::wait),
         )
         .route(
@@ -5640,31 +5995,97 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/experimental/workspace/{id}",
             axum::routing::delete(v2::workspace_delete),
         )
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth_gate,
-        ))
         // CORS (upstream cors.ts parity) sits OUTSIDE auth: preflights must
-        // answer without credentials, exactly like upstream.
+        // answer without credentials, exactly like upstream. Layer order
+        // matters: in axum/Tower the FIRST .layer() is outermost (runs
+        // first) — so cors is registered BEFORE auth. (The previous order
+        // had auth outer, which 401'd preflights; browsers send no
+        // credentials on preflight, so every browser client broke under
+        // password mode. Probed upstream: preflight → 204, no auth.)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::ui::cors_gate,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_gate,
         ))
         // Catch-all: unmatched paths serve the web UI (embedded upstream-side
         // or proxied to app.opencode.ai), matching v1 serveUIEffect. Disabled
         // via OCSERVE_UI=0 → JSON 404.
         .fallback(crate::ui::ui_fallback)
-        // Upstream's catch-all is a *route*, not a fallback: a known path with
-        // an unknown method (e.g. PATCH /pty/{id}) also gets the SPA, not a
-        // 405. Probed against freeze 2026-10-08.
-        .method_not_allowed_fallback(crate::ui::ui_fallback)
+        // Wrong-method on a bound path: version-split (probed live).
+        // v1 freeze (2026-10-08) serves the SPA; v2 2.0.28 answers 401
+        // unauthenticated / 404 authenticated (probed 2026-10-17) — so
+        // `/api/*` (the v2 surface) must never SPA here. Anything else
+        // keeps the v1 UI fallback.
+        .method_not_allowed_fallback(api_method_fallback)
         .with_state(state)
+}
+
+/// Wrong-method fallback: `/api/*` challenges (unauth) or 404s (authed),
+/// matching v2 exactly; all other paths keep the v1 SPA fallback.
+async fn api_method_fallback(
+    State(st): State<Arc<AppState>>,
+    req: axum::extract::Request,
+) -> Response {
+    if !req.uri().path().starts_with("/api/") {
+        return crate::ui::ui_fallback(State(st), req).await;
+    }
+    if st.auth.is_some() {
+        let authorized = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Basic "))
+            .and_then(|b64| {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.decode(b64).ok()
+            })
+            .map(|raw| {
+                let (user, pass) = st.auth.as_ref().expect("checked is_some");
+                let expect = format!("{user}:{pass}");
+                raw.len() == expect.len() && subtle_compare(&raw, expect.as_bytes())
+            })
+            .unwrap_or(false);
+        if !authorized {
+            return unauthorized_response();
+        }
+    }
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"_tag": "NotFoundError", "message": "Not Found"})),
+    )
+        .into_response()
+}
+
+/// The byte-exact upstream 401 (probed live on 2.0.28). Shared by the auth
+/// gate and the method fallback so the two can never drift apart.
+fn unauthorized_response() -> Response {
+    // M6 (reliability review): make auth denials observable (a spike = a client
+    // misconfigured or a probe; without a counter it is invisible).
+    ocserve_metrics::counter("ocserve_auth_denied_total", 1);
+    let body =
+        serde_json::json!({"_tag": "UnauthorizedError", "message": "Authentication required"})
+            .to_string();
+    (
+        StatusCode::UNAUTHORIZED,
+        [
+            (
+                axum::http::header::WWW_AUTHENTICATE,
+                "Basic realm=\"Secure Area\"",
+            ),
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// CORS extras: OCSERVE_CORS (comma-separated) — the `--cors` equivalent.
 /// Config-file `server.cors` support arrives with the config passthrough;
 /// env is the runtime-tunable equivalent until then.
-fn read_cors_env() -> Vec<String> {
+pub(crate) fn read_cors_env() -> Vec<String> {
     std::env::var("OCSERVE_CORS")
         .ok()
         .map(|v| {

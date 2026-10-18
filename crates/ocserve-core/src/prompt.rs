@@ -67,6 +67,13 @@ pub struct PromptContext {
     /// worktree before a turn, records tool changes as `patch` parts, and
     /// restores files on revert.
     pub snapshots: Option<crate::snapshot::Snapshots>,
+    /// K-TASK: max subagent nesting depth (config `subagent_depth`, default 1).
+    /// The `task` tool refuses to spawn a child when the parent's ancestor
+    /// count already equals this.
+    pub subagent_depth: u32,
+    /// K-TASK: configured agents (v1 `Agent.Info` shape) — the `task` tool
+    /// resolves `subagent_type` against `mode == "subagent"` entries here.
+    pub agent_catalog: Vec<serde_json::Value>,
 }
 
 /// `track()` off the tokio workers (git shells out — the F1 convoy rule).
@@ -146,6 +153,11 @@ pub(crate) fn message_tokens(u: &Usage) -> Value {
 
 /// Emit a durable event: persist to ring, publish plain frame + sync twin.
 /// `seq` is a session-local counter seeded once (avoids re-opening readers).
+///
+/// V2-PLAN.md P2: this is the single emission choke alongside
+/// `emit_durable_http` — both flow through `ocserve_store::emit_event`, which
+/// stamps the versioned durable type (`type@v1`) and mints the stable id from
+/// the allocated seq. One write, two grammars (D5).
 pub(crate) fn emit_durable(
     ctx: &PromptContext,
     writer: &ocserve_store::Writer,
@@ -157,7 +169,10 @@ pub(crate) fn emit_durable(
     // normalize ONCE so the persisted payload and every published frame agree
     // (the event-log validator reads the persisted copy).
     let properties = crate::event::normalize_props(event_type, properties);
-    ocserve_store::append_event(writer, Some(session_id), event_type, &properties)?;
+    // Hot path: versioned append WITHOUT the seq read-back (the MAX query
+    // per emission is pure overhead here — the prompt-local counter is
+    // authoritative for sync twins; see NOTE above).
+    ocserve_store::append_versioned(writer, Some(session_id), event_type, &properties)?;
     ocserve_metrics::labeled_counter(
         "ocserve_events_emitted_total",
         &format!("type=\"{event_type}\""),
@@ -165,6 +180,14 @@ pub(crate) fn emit_durable(
     );
     let this_seq = *seq;
     *seq += 1;
+    // NOTE: no assert linking the stored seq to this_seq. The prompt-local
+    // counter is seeded once at turn start (preflight) while the stored seq
+    // is the live per-session MAX — they diverge whenever the writer queue
+    // hasn't flushed seed rows yet or another writer interleaves (proven by
+    // the autonomy title test: stored 9 vs local 1 on a first-turn emit).
+    // The sync twin keeps the local counter (wire-identical to pre-choke);
+    // the durable seq is authoritative for inbox ordering. Conflating them
+    // would be the bug, not the fix.
     ctx.bus
         .publish(frame(&ctx.directory, event_type, properties.clone()));
     ctx.bus.publish(sync_frame(
@@ -304,6 +327,42 @@ pub async fn hook_mutate(
     }
 }
 
+/// v2 domain-hook dispatch (Phase 3): the v2 shim normalizes both plugin
+/// dialects onto one table; a hook that no v2 plugin installed returns the
+/// input unchanged (no observable difference). Fail-open like `hook_mutate` —
+/// a plugin error never breaks the turn.
+pub async fn hook_v2(
+    plugins: Option<&Arc<tokio::sync::Mutex<ocserve_plugin::Sidecar>>>,
+    domain: &str,
+    name: &str,
+    input: Value,
+) -> Value {
+    let Some(plug) = plugins else {
+        return input;
+    };
+    let mut guard = plug.lock().await;
+    let t0 = std::time::Instant::now();
+    match guard.trigger_v2(domain, name, input.clone()).await {
+        Ok(v) => {
+            ocserve_metrics::observe(
+                "ocserve_plugin_hook_duration_seconds",
+                &format!("hook=\"v2.{domain}.{name}\",result=\"ok\""),
+                t0.elapsed().as_micros() as u64,
+            );
+            v.get("output").cloned().unwrap_or(input)
+        }
+        Err(e) => {
+            ocserve_metrics::labeled_counter(
+                "ocserve_plugin_hook_errors_total",
+                &format!("hook=\"v2.{domain}.{name}\""),
+                1,
+            );
+            tracing::warn!("plugin v2 {domain}.{name}: {e:#}");
+            input
+        }
+    }
+}
+
 /// Emit a non-durable live event (delta/status/idle/diff — no sync twin, per capture).
 pub(crate) fn emit_live(ctx: &PromptContext, event_type: &str, properties: Value) {
     ocserve_metrics::labeled_counter(
@@ -312,7 +371,14 @@ pub(crate) fn emit_live(ctx: &PromptContext, event_type: &str, properties: Value
         1,
     );
     ctx.bus
-        .publish(frame(&ctx.directory, event_type, properties));
+        .publish(frame(&ctx.directory, event_type, properties.clone()));
+    // v2-grammar twin (V2-PLAN.md P4): the v2 client dispatches on type
+    // strings and ignores unknowns, so without the twin a v2 UI never
+    // updates. Ephemeral deltas publish live-only (never persisted —
+    // matches upstream's ephemeral Delta defs).
+    if let Some((v2type, v2data, _durable)) = crate::event::v2_twin(event_type, &properties) {
+        ctx.bus.publish(crate::event::frame_v2(&v2type, v2data));
+    }
 }
 
 /// Build the assistant message skeleton emitted at the START of a provider turn
@@ -642,16 +708,371 @@ fn skill_exec(
     })
 }
 
+/// v1 `task` tool (tool/task.ts) — subagent launcher (K-TASK). Spawns a child
+/// session (`parent_id = ctx.sessionID`), derives the child's permission
+/// ruleset (parent deny + external_directory rules, plus todowrite/task denies
+/// unless the subagent permits — `subagent-permissions.ts`), and runs the
+/// SHARED executor on it (branch-by-abstraction: one loop). Foreground only;
+/// background subagents are upstream-experimental (`D-TASK-BACKGROUND`).
+///
+/// Boxed future: `task_exec` → `run_prompt_with` → (tool loop) → `task_exec` is
+/// a recursive async cycle (nested subagents), which rustc requires boxing.
+fn task_exec<'a>(
+    ctx: &'a PromptContext,
+    writer: &'a ocserve_store::Writer,
+    session_id: &'a str,
+    input: &'a Value,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<ocserve_tools::ToolResult>> + Send + 'a>,
+> {
+    Box::pin(async move {
+        let subagent_type = input["subagent_type"]
+            .as_str()
+            .context("task.subagent_type")?
+            .to_string();
+        let description = input["description"].as_str().unwrap_or("").to_string();
+        let prompt = input["prompt"]
+            .as_str()
+            .context("task.prompt (the task for the agent to perform)")?
+            .to_string();
+        if input.get("background").and_then(|b| b.as_bool()) == Some(true) {
+            anyhow::bail!(
+                "Background subagents are not supported (D-TASK-BACKGROUND); run the task in the foreground."
+            );
+        }
+        // M6: make subagent spawns observable (depth guard + failures).
+        ocserve_metrics::labeled_counter("ocserve_task_total", "result=\"spawn\"", 1);
+
+        // Depth guard (upstream subagent_depth, default 1): the PARENT's depth
+        // from its own ancestors must be < limit, so the child sits at
+        // parent_depth+1.
+        let limit = ctx.subagent_depth;
+        let parent_chain = ocserve_store::session_depth(&ctx.db, session_id)?.unwrap_or(0);
+        if parent_chain >= limit {
+            anyhow::bail!(
+                "Subagent depth limit reached ({limit}). Increase \"subagent_depth\" to allow nested subagents."
+            );
+        }
+
+        // Resolve the subagent: a configured agent with mode == "subagent".
+        let sub = ctx
+            .agent_catalog
+            .iter()
+            .find(|a| {
+                a.get("name").and_then(|n| n.as_str()) == Some(subagent_type.as_str())
+                    && a.get("mode").and_then(|m| m.as_str()) == Some("subagent")
+            })
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("Unknown agent type: {subagent_type} is not a valid agent type")
+            })?;
+
+        // Child session: reuse an existing child (task_id) or create one.
+        // C1/F2 (security review): a `task_id` is only honoured when it names a
+        // DIRECT CHILD of this session AND its agent matches `subagent_type`.
+        // Otherwise a model could hijack an arbitrary session (isolation break)
+        // or point at its own session (target==parent → the depth guard never
+        // advances → unbounded recursion). Anything else → fresh child.
+        let child_id = match input.get("task_id").and_then(|t| t.as_str()) {
+            Some(tid)
+                if tid != session_id
+                    && ocserve_store::session_exists(&ctx.db, tid).unwrap_or(false)
+                    && ocserve_store::session_parent(&ctx.db, tid)
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        == Some(session_id)
+                    && ocserve_store::session_agent(&ctx.db, tid)
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        == Some(subagent_type.as_str()) =>
+            {
+                tid.to_string()
+            }
+            _ => new_child_session(ctx, writer, session_id, &description, &subagent_type, &sub)?,
+        };
+
+        // Run the shared executor on the child (fresh PromptContext, child's
+        // directory/agent/model). The child's history is its own; the tool
+        // result is its final assistant text. H1 (reliability review): the
+        // child MUST surface its own failure (durable session.error +
+        // [turn stopped] + finalize + idle) exactly like `run_prompt`, or a
+        // child that dies mid-turn is seen as busy forever. We call the
+        // surfacing wrapper here rather than `run_prompt` so we keep the
+        // child's RunOpts (auto_title=false).
+        let child = child_context(ctx, &child_id, &subagent_type, &sub)?;
+        let req = crate::wire::PromptRequest {
+            parts: vec![json!({"type": "text", "text": prompt})],
+            ..Default::default()
+        };
+        let res = run_prompt_with(
+            &child,
+            writer,
+            &child_id,
+            &req,
+            RunOpts {
+                auto_title: false,
+                ..Default::default()
+            },
+        )
+        .await;
+        let (_info, parts) = match res {
+            Ok(v) => v,
+            Err(e) => {
+                surface_run_failure(&child, writer, &child_id, &e).await;
+                return Err(e);
+            }
+        };
+        let text = final_text(&parts).unwrap_or_default();
+        let block = format!(
+            "<task id=\"{child_id}\" state=\"completed\">\n<summary>{description}</summary>\n\
+             <task_result>\n{text}\n</task_result>\n</task>"
+        );
+        Ok(ocserve_tools::ToolResult {
+            output: block,
+            truncated: false,
+            exit: None,
+            title: description,
+            error: false,
+            metadata: Some(json!({
+                "parentSessionId": session_id,
+                "sessionId": child_id,
+            })),
+        })
+    })
+}
+
+/// Create the child (`task`) session row: parent_id + agent + derived
+/// permission JSON. Title mirrors upstream `"{description} (@{agent} subagent)"`.
+fn new_child_session(
+    ctx: &PromptContext,
+    writer: &ocserve_store::Writer,
+    parent_id: &str,
+    description: &str,
+    subagent_type: &str,
+    sub: &Value,
+) -> Result<String> {
+    let id = crate::ids::ses_id();
+    let now = now_ms();
+    let title = if description.trim().is_empty() {
+        format!("(@{subagent_type} subagent)")
+    } else {
+        format!("{description} (@{subagent_type} subagent)")
+    };
+    // The PARENT's effective ruleset is the running context's `rules` (the
+    // parent's agent config, or — for a nested subagent — its own derived
+    // rules); that is the source of the deny + external_directory constraints
+    // the child must inherit (F1). Read from ctx, not the DB.
+    let permission = derive_subagent_permission(&ctx.rules, sub);
+    let info = json!({
+        "id": id,
+        "projectID": "global",
+        "directory": ctx.directory,
+        "path": "",
+        "slug": id.trim_start_matches("ses_").chars().take(12).collect::<String>(),
+        "title": title,
+        "version": "1",
+        "time": {"created": now, "updated": now},
+    });
+    ocserve_store::insert_child_session(writer, &info, parent_id, subagent_type, &permission)?;
+    let mut seq = 0i64;
+    let _ = emit_durable(
+        ctx,
+        writer,
+        parent_id,
+        "session.created",
+        json!({"sessionID": id, "info": info}),
+        &mut seq,
+    );
+    Ok(id)
+}
+
+/// Upstream `deriveSubagentSessionPermission` (subagent-permissions.ts):
+/// the parent's `deny` + `external_directory` rules, plus `todowrite`/`task`
+/// denies unless the subagent's own rules already name that permission. RCM
+/// framing (arXiv 2610.21243): the child keeps the parent's hard constraints.
+/// The parent ruleset is the running context's `Rule` list.
+fn derive_subagent_permission(parent: &[ocserve_tools::Rule], sub: &Value) -> Value {
+    let mut out: Vec<Value> = Vec::new();
+    for r in parent {
+        if r.permission == "external_directory" || r.action == "deny" {
+            out.push(json!({
+                "permission": r.permission,
+                "pattern": r.pattern,
+                "action": r.action,
+            }));
+        }
+    }
+    let sub_rules = sub.get("permission").and_then(|p| p.as_array());
+    let names = |p: &str| -> bool {
+        sub_rules
+            .map(|rs| {
+                rs.iter()
+                    .any(|r| r.get("permission").and_then(|x| x.as_str()) == Some(p))
+            })
+            .unwrap_or(false)
+    };
+    for p in ["todowrite", "task"] {
+        if !names(p) {
+            out.push(json!({"permission": p, "pattern": "*", "action": "deny"}));
+        }
+    }
+    Value::Array(out)
+}
+
+/// Fresh PromptContext for the child session: the child's directory/agent/
+/// model and its rules, but the parent's infra (bus/gate/skills/mcp/…).
+///
+/// F1 (security review): the child's rules MUST include the SUBAGENT's own
+/// configured permission rules (`sub.permission`) — the child runs *as* that
+/// agent, so its allow/deny rules apply. Only installing the derived parent
+/// constraints let a model use a locked-down agent (`edit:deny`) to edit files.
+/// Order (last-match-wins, `evaluate`): subagent rules first, then the derived
+/// session constraints (parent deny + external_directory + todowrite/task
+/// denies) so a broad subagent allow can never override a hard parent deny.
+fn child_context(
+    parent: &PromptContext,
+    child_id: &str,
+    subagent_type: &str,
+    sub: &Value,
+) -> Result<PromptContext> {
+    let mut child = parent.clone();
+    child.agent = subagent_type.to_string();
+    if let Some(p) = sub.get("prompt").and_then(|p| p.as_str()) {
+        child.system = p.to_string();
+    }
+    if let Some(dir) = ocserve_store::session_directory(&parent.db, child_id)
+        .ok()
+        .flatten()
+        && !dir.is_empty()
+    {
+        child.directory = dir;
+    }
+    // 1) the subagent's own configured rules, 2) the derived constraints.
+    let mut rules = rules_from_array(sub.get("permission"));
+    let derived = ocserve_store::session_permission(&parent.db, child_id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| json!([]));
+    rules.extend(rules_from_array(Some(&derived)));
+    child.rules = rules;
+    Ok(child)
+}
+
+/// Parse a v1 permission ruleset (`[{permission,pattern,action}]`) into the
+/// evaluator's `Rule` list. Missing/non-array → empty.
+fn rules_from_array(v: Option<&Value>) -> Vec<ocserve_tools::Rule> {
+    v.and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    Some(ocserve_tools::Rule {
+                        permission: r.get("permission")?.as_str()?.to_string(),
+                        pattern: r.get("pattern")?.as_str()?.to_string(),
+                        action: r.get("action")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod task_perm_tests {
+    use super::*;
+
+    fn sub_with(perms: Value) -> Value {
+        json!({"name": "explore", "mode": "subagent", "permission": perms})
+    }
+
+    // F1 (security review): the child rule list MUST include the subagent's own
+    // configured rules. A locked-down subagent (`edit:deny`) must deny edit in
+    // the child even though the derived parent set carries no edit rule.
+    #[test]
+    fn child_context_installs_subagent_rules() {
+        let sub = sub_with(json!([
+            {"permission": "edit", "pattern": "*", "action": "deny"},
+            {"permission": "read", "pattern": "*", "action": "allow"},
+        ]));
+        let parent_rules = vec![ocserve_tools::Rule {
+            permission: "bash".into(),
+            pattern: "*".into(),
+            action: "deny".into(),
+        }];
+        let derived = derive_subagent_permission(&parent_rules, &sub);
+        let mut rules = rules_from_array(sub.get("permission"));
+        rules.extend(rules_from_array(Some(&derived)));
+        // subagent's deny survives → evaluate(edit) == deny
+        assert_eq!(ocserve_tools::evaluate("edit", "src/x.rs", &rules), "deny");
+        // parent's derived deny survives → evaluate(bash) == deny
+        assert_eq!(ocserve_tools::evaluate("bash", "ls", &rules), "deny");
+        // subagent's allow → read allowed
+        assert_eq!(ocserve_tools::evaluate("read", "src/x.rs", &rules), "allow");
+    }
+
+    // The derived set keeps parent deny + external_directory, and adds the
+    // todowrite/task denies the subagent did not name.
+    #[test]
+    fn derive_keeps_parent_constraints_and_default_denies() {
+        let sub = sub_with(json!([]));
+        let parent_rules = vec![
+            ocserve_tools::Rule {
+                permission: "*.write".into(),
+                pattern: "*".into(),
+                action: "deny".into(),
+            },
+            ocserve_tools::Rule {
+                permission: "external_directory".into(),
+                pattern: "/etc/*".into(),
+                action: "ask".into(),
+            },
+            ocserve_tools::Rule {
+                permission: "grep".into(),
+                pattern: "*".into(),
+                action: "allow".into(),
+            },
+        ];
+        let d = derive_subagent_permission(&parent_rules, &sub);
+        let arr = d.as_array().unwrap();
+        let has = |p: &str| arr.iter().any(|r| r["permission"] == p);
+        assert!(has("*.write"), "parent deny kept");
+        assert!(has("external_directory"), "external_directory kept");
+        assert!(
+            !has("grep"),
+            "parent allow NOT propagated (only deny/extdir)"
+        );
+        assert!(has("todowrite") && has("task"), "default denies added");
+    }
+}
+
+/// Concatenate the text parts of a persisted assistant message.
+fn final_text(parts: &[Value]) -> Option<String> {
+    let mut s = String::new();
+    for p in parts {
+        if p.get("type").and_then(|t| t.as_str()) == Some("text")
+            && let Some(t) = p.get("text").and_then(|t| t.as_str())
+        {
+            s.push_str(t);
+        }
+    }
+    (!s.is_empty()).then_some(s)
+}
+
 async fn spawn_tool(
     name: &str,
     input: Value,
     directory: &str,
+    env: &[(String, String)],
 ) -> Result<ocserve_tools::ToolResult> {
     let name = name.to_string();
     let dir = directory.to_string();
-    tokio::task::spawn_blocking(move || ocserve_tools::execute(&name, &input, Path::new(&dir)))
-        .await
-        .map_err(|e| anyhow::anyhow!("tool join: {e}"))?
+    let env = env.to_vec();
+    tokio::task::spawn_blocking(move || {
+        ocserve_tools::execute(&name, &input, Path::new(&dir), &env)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("tool join: {e}"))?
 }
 
 /// Execution knobs for `run_prompt_with`. Defaults = every existing caller's
@@ -677,6 +1098,15 @@ pub struct RunOpts {
     /// auto-title default-titled sessions from the first user message
     /// (false: command/shell flows must not name sessions after a command)
     pub auto_title: bool,
+    /// transient run against a session id that does not exist (experimental
+    /// generate): skips the session-exists bail, model/agent persistence,
+    /// ALL session-scoped emissions (session.updated, message.updated,
+    /// part deltas), assistant/user persistence, usage accumulation, and
+    /// finalize. The provider turn itself is identical (same system prompt,
+    /// same text-only preset) — only the session side effects are cut.
+    /// Upstream emits nothing session-scoped for sessionless generate
+    /// (verified live: zero sessions/messages rows after the call).
+    pub transient: bool,
 }
 
 impl Default for RunOpts {
@@ -692,6 +1122,7 @@ impl Default for RunOpts {
             max_rounds: None,
             cost_ceiling: None,
             auto_title: true,
+            transient: false,
         }
     }
 }
@@ -722,7 +1153,7 @@ pub async fn run_prompt_with(
     req: &crate::wire::PromptRequest,
     opts: RunOpts,
 ) -> Result<(Value, Vec<Value>)> {
-    if !ocserve_store::session_exists(&ctx.db, session_id)? {
+    if !opts.transient && !ocserve_store::session_exists(&ctx.db, session_id)? {
         anyhow::bail!("Session not found: {session_id}");
     }
     // K-ALWAYS: one DB read pulls this session's persisted always-grants
@@ -738,13 +1169,16 @@ pub async fn run_prompt_with(
     // K-MODEL-STATE: resolved model+agent land at START (not finalize) —
     // cap/OOM/abort deaths keep the selection sticky for the next
     // payload-less send. Churn-free UPDATE (0 rows when unchanged).
-    ocserve_store::persist_prompt_model(
-        writer,
-        session_id,
-        &ctx.agent,
-        &json!({"id": ctx.model_id, "providerID": ctx.provider_id, "variant": "default"})
-            .to_string(),
-    )?;
+    // Transient runs have no session row — nothing to persist to.
+    if !opts.transient {
+        ocserve_store::persist_prompt_model(
+            writer,
+            session_id,
+            &ctx.agent,
+            &json!({"id": ctx.model_id, "providerID": ctx.provider_id, "variant": "default"})
+                .to_string(),
+        )?;
+    }
     // K-EFFICIENCY: RSS + reader-open probe — Drop-based so BAIL exits
     // (cap/provider errors) emit too (tail-only emission missed them:
     // proven by the cap e2e going red the first time).
@@ -755,6 +1189,15 @@ pub async fn run_prompt_with(
     let mut pre = ocserve_store::compaction_preflight(&ctx.db, session_id)?;
     let mut seq = pre.seq;
     let mut pre_dirty = false;
+    // Session environment (D-ENV closure): read ONCE per turn (not per tool
+    // call — vars change via PUT between turns, never mid-turn), injected
+    // into tool subprocess env. Empty for transient runs (no session row).
+    // Never sent to the provider — subprocess env only.
+    let session_env: Vec<(String, String)> = if opts.transient {
+        Vec::new()
+    } else {
+        ocserve_store::environment_get(&ctx.db, session_id).unwrap_or_default()
+    };
     // Session-lifetime usage accumulator, seeded ONCE from the preflight row.
     // Mirrors upstream applyUsage (core/session/projector.ts:89-108): every
     // step-finish ADDS its usage to the session row; the running copy here lets
@@ -780,11 +1223,17 @@ pub async fn run_prompt_with(
         .filter(|a| !a.is_empty())
         .unwrap_or_else(|| ctx.agent.clone());
 
-    // ---- persist user message (text parts; file parts land with M3) ----
+    // ---- persist user message (text + file/agent attachment parts) ----
     // Boundary decode (wire.rs) validated `messageID` against `^msg` — the
     // upstream rule (isStartsWith only; probe: bare "msg" and 5000-char ids
     // pass, no length/charset cap). Internal constructors pass None →
     // generate (upstream `input.messageID ?? MessageID.ascending()`).
+    //
+    // File/agent parts persist alongside text (V2-PLAN.md P4): upstream's
+    // `Session.Message.User` carries `files[]`/`agents[]`, and the v2
+    // projector reads them from parts. v1 readers splice parts generically
+    // (no per-type filter), so the new part types are inert on the v1 path.
+    // Bounded: attachment objects are small request JSON (uri/name).
     let user_msg_id = req.message_id.clone().unwrap_or_else(msg_id);
     let mut user_parts = Vec::new();
     for p in &req.parts {
@@ -796,6 +1245,15 @@ pub async fn run_prompt_with(
                 "messageID": user_msg_id,
                 "type": "text",
                 "text": text,
+            }));
+        } else if p["type"] == "file" || p["type"] == "agent" {
+            let ptype = p["type"].as_str().unwrap_or("file").to_string();
+            user_parts.push(json!({
+                "id": prt_id(),
+                "sessionID": session_id,
+                "messageID": user_msg_id,
+                "type": ptype,
+                ptype.clone(): p.get(&ptype).cloned().unwrap_or(json!({})),
             }));
         }
     }
@@ -862,16 +1320,21 @@ pub async fn run_prompt_with(
         .context("persist user message")?;
     }
 
-    emit_session_updated(
-        ctx,
-        writer,
-        session_id,
-        json!({
-            "model": {"id": model, "providerID": ctx.provider_id, "variant": "default"},
-            "agent": agent,
-        }),
-        &mut seq,
-    )?;
+    // Transient runs emit nothing session-scoped (no session.updated for a
+    // session that does not exist — clients key stores by sessionId and a
+    // phantom id would plant ghost entries).
+    if !opts.transient {
+        emit_session_updated(
+            ctx,
+            writer,
+            session_id,
+            json!({
+                "model": {"id": model, "providerID": ctx.provider_id, "variant": "default"},
+                "agent": agent,
+            }),
+            &mut seq,
+        )?;
+    }
     if opts.persist_user {
         emit_durable(
             ctx,
@@ -903,11 +1366,14 @@ pub async fn run_prompt_with(
     if req.no_reply {
         return Ok((user_info, user_parts));
     }
-    emit_live(
-        ctx,
-        "session.status",
-        json!({"sessionID": session_id, "status": {"type": "busy"}}),
-    );
+    // No busy frame for transient runs (same ghost-entry rule as above).
+    if !opts.transient {
+        emit_live(
+            ctx,
+            "session.status",
+            json!({"sessionID": session_id, "status": {"type": "busy"}}),
+        );
+    }
 
     // ── M6 outer compaction loop (upstream runLoop, prompt.ts:1083+) ──
     // Rounds re-filter history, run the pending engine step, then rebuild
@@ -1111,6 +1577,42 @@ pub async fn run_prompt_with(
             // array is the messages PREFIX: splice replaces it each iteration
             // (upstream rebuilds system per request).
             let mut sys_vec = vec![ctx.system.clone()];
+            // v2 Phase 3: session.context — the v2 client mutates
+            // {system[], messages[], tools, model, options} immediately before
+            // provider dispatch (promise/session.ts). Map its system array onto
+            // the same sys_vec the v1 transform feeds (one prefix, two dialects).
+            let v2_ctx = hook_v2(
+                ctx.plugins.as_ref(),
+                "session",
+                "context",
+                json!({
+                    "sessionID": session_id,
+                    "agent": agent,
+                    "model": model,
+                    "system": sys_vec,
+                    "messages": [],
+                    "tools": {},
+                    "options": {},
+                }),
+            )
+            .await;
+            if let Some(arr) = v2_ctx.get("system").and_then(|a| a.as_array())
+                && !arr.is_empty()
+            {
+                // v2 SystemPart is a union (string | {type,text,…}); accept the
+                // string form and the text field — anything else is skipped.
+                let v: Vec<String> = arr
+                    .iter()
+                    .filter_map(|x| {
+                        x.as_str()
+                            .map(String::from)
+                            .or_else(|| x.get("text").and_then(|t| t.as_str()).map(String::from))
+                    })
+                    .collect();
+                if !v.is_empty() {
+                    sys_vec = v;
+                }
+            }
             let sys_out = hook_mutate(
                 ctx.plugins.as_ref(),
                 "experimental.chat.system.transform",
@@ -1233,20 +1735,27 @@ pub async fn run_prompt_with(
             // exactly once per part (upstream processor.ts:280-291/500-511 order).
             macro_rules! announce_part {
                 ($part_id:expr, $part_type:expr) => {{
-                    if !assistant_announced {
-                        emit_live(
-                            ctx,
-                            "message.updated",
-                            json!({"sessionID": session_id, "info": assistant_message_start(
-                                ctx, session_id, &turn_msg_id, &assistant_id, &agent, &model,
-                                turn_started,
-                            )}),
-                        );
+                    // Transient runs stream silently (no skeleton/parts for a
+                    // phantom session id — same ghost-entry rule; the text
+                    // still accumulates into the response).
+                    if opts.transient {
                         assistant_announced = true;
+                    } else {
+                        if !assistant_announced {
+                            emit_live(
+                                ctx,
+                                "message.updated",
+                                json!({"sessionID": session_id, "info": assistant_message_start(
+                                    ctx, session_id, &turn_msg_id, &assistant_id, &agent, &model,
+                                    turn_started,
+                                )}),
+                            );
+                            assistant_announced = true;
+                        }
+                        emit_part_start(
+                            ctx, session_id, &assistant_id, $part_id, $part_type, turn_started,
+                        );
                     }
-                    emit_part_start(
-                        ctx, session_id, &assistant_id, $part_id, $part_type, turn_started,
-                    );
                 }};
             }
 
@@ -1281,6 +1790,11 @@ pub async fn run_prompt_with(
                     // with overflow=true, then the outer loop re-filters.
                     let emsg = format!("{e:#}");
                     if ocserve_llm::looks_like_context_overflow(&emsg) {
+                        // Transient runs never compact (no session to anchor)
+                        // — the rejection surfaces as the run error directly.
+                        if opts.transient {
+                            anyhow::bail!("provider stream open: {emsg}");
+                        }
                         emit_live(
                             ctx,
                             "session.error",
@@ -1339,14 +1853,16 @@ pub async fn run_prompt_with(
                             // publish the text part before its first delta
                             announce_part!(&text_part_id, "text");
                         }
-                        emit_live(
-                            ctx,
-                            "message.part.delta",
-                            json!({
-                                "sessionID": session_id, "messageID": assistant_id,
-                                "partID": text_part_id, "field": "text", "delta": t,
-                            }),
-                        );
+                        if !opts.transient {
+                            emit_live(
+                                ctx,
+                                "message.part.delta",
+                                json!({
+                                    "sessionID": session_id, "messageID": assistant_id,
+                                    "partID": text_part_id, "field": "text", "delta": t,
+                                }),
+                            );
+                        }
                         text.push_str(&t);
                     }
                     StreamEvent::ReasoningDelta(r) => {
@@ -1358,15 +1874,17 @@ pub async fn run_prompt_with(
                             announce_part!(&rid, "reasoning");
                             live_reasoning_id = Some(rid);
                         }
-                        emit_live(
-                            ctx,
-                            "message.part.delta",
-                            json!({
-                                "sessionID": session_id, "messageID": assistant_id,
-                                "partID": live_reasoning_id.clone().unwrap_or_default(),
-                                "field": "reasoning", "delta": r,
-                            }),
-                        );
+                        if !opts.transient {
+                            emit_live(
+                                ctx,
+                                "message.part.delta",
+                                json!({
+                                    "sessionID": session_id, "messageID": assistant_id,
+                                    "partID": live_reasoning_id.clone().unwrap_or_default(),
+                                    "field": "reasoning", "delta": r,
+                                }),
+                            );
+                        }
                         reasoning.push_str(&r);
                     }
                     StreamEvent::ToolCallDelta {
@@ -1424,7 +1942,17 @@ pub async fn run_prompt_with(
             // in-memory copy in step with the queued DB op (writer.write is
             // ack-synchronous, so op + copy are always consistent).
             let step_tokens = message_tokens(&u);
-            ocserve_store::accumulate_session_usage(writer, session_id, &step_tokens, step_cost)?;
+            // No session row for transient runs (UPDATE would be a 0-row
+            // noop, but skipping keeps the writer queue clean); the
+            // in-memory aggregate below still feeds the response path.
+            if !opts.transient {
+                ocserve_store::accumulate_session_usage(
+                    writer,
+                    session_id,
+                    &step_tokens,
+                    step_cost,
+                )?;
+            }
             {
                 let bump = |agg: &mut Value, key: &str, v: i64| {
                     agg[key] = (agg[key].as_i64().unwrap_or(0) + v).into();
@@ -1463,7 +1991,11 @@ pub async fn run_prompt_with(
             // here so the streamed part and the persisted part share ONE id.
 
             // ---- tool-call turn ----
-            if finish_reason == "tool_calls" && !tool_calls.is_empty() {
+            // Transient runs never execute tools (text-only contract — no
+            // tools were sent, so tool_calls here are unsolicited; drop them
+            // and keep the text rather than running side effects for a
+            // phantom session).
+            if finish_reason == "tool_calls" && !tool_calls.is_empty() && !opts.transient {
                 let mut parts = vec![step_start_part(
                     round_base.as_deref(),
                     session_id,
@@ -1774,6 +2306,29 @@ pub async fn run_prompt_with(
                         {
                             input = a.clone();
                         }
+                        // v2 Phase 3: tool.execute.before — v2 mutates `input`
+                        // (promise/tool.ts), same contract as v1's args. Runs
+                        // before the widened-args guard so a v2 mutation gets the
+                        // same re-evaluation as a v1 one.
+                        let v2_before = hook_v2(
+                            ctx.plugins.as_ref(),
+                            "tool",
+                            "execute.before",
+                            json!({
+                                "tool": call.name,
+                                "sessionID": session_id,
+                                "agent": agent,
+                                "messageID": assistant_id,
+                                "id": call.id,
+                                "input": input,
+                            }),
+                        )
+                        .await;
+                        if let Some(a) = v2_before.get("input")
+                            && a.is_object()
+                        {
+                            input = a.clone();
+                        }
                         // G1 soundness: `tool.execute.before` runs AFTER the
                         // permission gate, so a plugin (compromised via poisoned
                         // tool output) could widen the approved args (e.g. `rm x`
@@ -1824,8 +2379,15 @@ pub async fn run_prompt_with(
                             // by name, emit the <skill_content> block. Missing
                             // name → error (upstream Effect.die).
                             skill_exec(&ctx.skills, &input)
+                        } else if call.name == "task" {
+                            // K-TASK: spawn a subagent on its OWN child session
+                            // and run the SHARED executor on it (no second
+                            // loop). Depth-bounded by `subagent_depth` (default
+                            // 1); child permission derived like upstream
+                            // (subagent-permissions.ts, RCM framing).
+                            task_exec(ctx, writer, session_id, &input).await
                         } else if builtin {
-                            spawn_tool(&call.name, input, &ctx.directory).await
+                            spawn_tool(&call.name, input, &ctx.directory, &session_env).await
                         } else if let Some(hub) = &ctx.mcp {
                             match hub.call(&call.name, input.clone()).await {
                                 Some(Ok(text)) => Ok(ocserve_tools::ToolResult {
@@ -1837,10 +2399,13 @@ pub async fn run_prompt_with(
                                     metadata: None,
                                 }),
                                 Some(Err(e)) => Err(e),
-                                None => spawn_tool(&call.name, input, &ctx.directory).await,
+                                None => {
+                                    spawn_tool(&call.name, input, &ctx.directory, &session_env)
+                                        .await
+                                }
                             }
                         } else {
-                            spawn_tool(&call.name, input, &ctx.directory).await
+                            spawn_tool(&call.name, input, &ctx.directory, &session_env).await
                         };
                         match exec {
                             Ok(r) => {
@@ -1960,6 +2525,32 @@ pub async fn run_prompt_with(
                                 1,
                             );
                             tracing::warn!("plugin tool.execute.after: {e:#}");
+                        }
+                    }
+                    // v2 Phase 3: tool.execute.after — the v2 tool-result shape
+                    // is a status union (promise/tool.ts): completed {result} or
+                    // error {error}. Map onto the same output string; a v2 hook
+                    // that replaces `result`/`error` mutates the tool output.
+                    {
+                        let v2_out = hook_v2(
+                            ctx.plugins.as_ref(),
+                            "tool",
+                            "execute.after",
+                            json!({
+                                "tool": call.name,
+                                "sessionID": session_id,
+                                "agent": agent,
+                                "messageID": assistant_id,
+                                "id": call.id,
+                                "input": serde_json::from_str::<Value>(&call.arguments)
+                                    .unwrap_or_else(|_| json!({})),
+                                "status": "completed",
+                                "result": output,
+                            }),
+                        )
+                        .await;
+                        if let Some(r) = v2_out.get("result").and_then(|v| v.as_str()) {
+                            output = r.to_string();
                         }
                     }
                     emit_durable(
@@ -2204,48 +2795,52 @@ pub async fn run_prompt_with(
                     "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
                 }));
             }
-            insert_message(
-                writer,
-                Some(&*ctx.blobs),
-                session_id,
-                &assistant_info,
-                &parts,
-            )
-            .context("persist assistant message")?;
+            // Transient runs persist nothing (no assistant row, no part
+            // events, no session.updated — the response carries the text).
+            if !opts.transient {
+                insert_message(
+                    writer,
+                    Some(&*ctx.blobs),
+                    session_id,
+                    &assistant_info,
+                    &parts,
+                )
+                .context("persist assistant message")?;
 
-            for part in &parts {
+                for part in &parts {
+                    emit_durable(
+                        ctx,
+                        writer,
+                        session_id,
+                        "message.part.updated",
+                        json!({"sessionID": session_id, "part": part}),
+                        &mut seq,
+                    )?;
+                }
                 emit_durable(
                     ctx,
                     writer,
                     session_id,
-                    "message.part.updated",
-                    json!({"sessionID": session_id, "part": part}),
+                    "message.updated",
+                    json!({"sessionID": session_id, "info": assistant_info}),
+                    &mut seq,
+                )?;
+                emit_session_updated(
+                    ctx,
+                    writer,
+                    session_id,
+                    json!({
+                        "cost": session_cost,
+                        // Session-lifetime aggregate (upstream applyUsage), NOT the
+                        // assistant message's step tokens. Session.tokens has no
+                        // `total` (additionalProperties:false) — `session_usage` is
+                        // already in that shape.
+                        "tokens": session_usage.clone(),
+                        "time": {"updated": t_done},
+                    }),
                     &mut seq,
                 )?;
             }
-            emit_durable(
-                ctx,
-                writer,
-                session_id,
-                "message.updated",
-                json!({"sessionID": session_id, "info": assistant_info}),
-                &mut seq,
-            )?;
-            emit_session_updated(
-                ctx,
-                writer,
-                session_id,
-                json!({
-                    "cost": session_cost,
-                    // Session-lifetime aggregate (upstream applyUsage), NOT the
-                    // assistant message's step tokens. Session.tokens has no
-                    // `total` (additionalProperties:false) — `session_usage` is
-                    // already in that shape.
-                    "tokens": session_usage.clone(),
-                    "time": {"updated": t_done},
-                }),
-                &mut seq,
-            )?;
             // ── M6 post-turn trigger (upstream prompt.ts:1160-1167 + overflow.ts
             // isOverflow): the count is the STEP's tokens — `total` when the
             // provider reports it, else the component sum (upstream's sum omits
@@ -2264,7 +2859,12 @@ pub async fn run_prompt_with(
                 ctx.model_limit["context"].as_i64().unwrap_or(0),
                 ctx.model_limit["output"].as_i64().unwrap_or(0),
             );
-            if ctx.compaction.auto && crate::compact::is_overflow(a_total, usable_t) {
+            // Transient runs never auto-compact (single prompt, no history
+            // to relieve — and no session to anchor). The answer stands.
+            if !opts.transient
+                && ctx.compaction.auto
+                && crate::compact::is_overflow(a_total, usable_t)
+            {
                 if auto_doom.over() {
                     emit_live(
                         ctx,
@@ -2291,33 +2891,36 @@ pub async fn run_prompt_with(
     record_rounds(if final_out.is_some() { "done" } else { "error" }, step);
 
     // ---- finalize ONCE after any outer exit (idle trio + session row) ----
+    // Transient runs skip both (no session to idle, no row to finalize).
     let t_end = now_ms();
-    emit_live(
-        ctx,
-        "session.status",
-        json!({"sessionID": session_id, "status": {"type": "idle"}}),
-    );
-    emit_live(
-        ctx,
-        "session.diff",
-        json!({"sessionID": session_id, "diff": []}),
-    );
-    emit_live(ctx, "session.idle", json!({"sessionID": session_id}));
-    ocserve_store::finalize_session_prompt(
-        writer,
-        session_id,
-        &ocserve_store::PromptStats {
-            agent: &agent,
-            model_json: &json!({
-                "id": model,
-                "providerID": ctx.provider_id,
-                "variant": "default"
-            })
-            .to_string(),
-            time_updated: t_end,
-        },
-    )
-    .context("finalize session prompt row")?;
+    if !opts.transient {
+        emit_live(
+            ctx,
+            "session.status",
+            json!({"sessionID": session_id, "status": {"type": "idle"}}),
+        );
+        emit_live(
+            ctx,
+            "session.diff",
+            json!({"sessionID": session_id, "diff": []}),
+        );
+        emit_live(ctx, "session.idle", json!({"sessionID": session_id}));
+        ocserve_store::finalize_session_prompt(
+            writer,
+            session_id,
+            &ocserve_store::PromptStats {
+                agent: &agent,
+                model_json: &json!({
+                    "id": model,
+                    "providerID": ctx.provider_id,
+                    "variant": "default"
+                })
+                .to_string(),
+                time_updated: t_end,
+            },
+        )
+        .context("finalize session prompt row")?;
+    }
     // (rss/opens gauges emit from PhaseProbe::Drop — every exit path.)
     // K-TITLE: auto-title only reached on success, and only for sessions
     // STILL carrying a default title (preflight rides title — named

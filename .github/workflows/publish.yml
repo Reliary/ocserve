@@ -30,6 +30,21 @@ jobs:
   publish:
     name: crates.io publish (ordered)
     runs-on: ubuntu-latest
+    # crates.io's per-crate upload ceiling, declared here so the registry's
+    # real limit has exactly ONE declaration (check-crate-payload.py reads it).
+    #
+    # ocserve-http is intentionally large: it embeds BOTH web-UI packs
+    # (1.18.31 = 9.7 MB, 2.0.28 = 24.4 MB zstd) so the server is air-gapped and
+    # serves the version-matched app with no network dependency. That puts its
+    # packed payload at ~35 MB, over the 10 MiB default — crates.io grants
+    # per-crate increases on request (a support request sets the
+    # `max_upload_size` row for that crate), raised for ocserve-http on
+    # 2026-10-18.
+    #
+    # Lowering this back to the default without shrinking the packs would make
+    # the publish chain abort at ocserve-http (rule 38 catches it in CI).
+    env:
+      CRATE_PAYLOAD_LIMIT_BYTES: 67108864 # 64 MiB
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - uses: actions-rust-lang/setup-rust-toolchain@46a9d261ee2ace4b93b3bd6e867168ac38627b38  # v1.12.0
@@ -43,6 +58,12 @@ jobs:
       # guard derives both from Cargo.toml, so a new crate cannot be forgotten.
       - name: publish order guard
         run: python3 scripts/check-publish-order.py
+
+      # Byte payload vs the registry's upload ceiling. `cargo package --list`
+      # above validates LAYOUT only — it never looks at sizes — so without this
+      # a fat crate only fails on publish day, when the ordered chain aborts.
+      - name: crate payload size guard
+        run: python3 scripts/check-crate-payload.py
 
       - name: crates are packageable
         run: |

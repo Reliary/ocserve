@@ -169,7 +169,7 @@ async fn third_identical_call_asks_doom_loop_then_completes_on_approve() {
             let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
             let asked = conn
                 .prepare(
-                    "SELECT payload FROM event WHERE session_id='ses_lg' AND type='permission.asked'",
+                    "SELECT payload FROM event WHERE session_id='ses_lg' AND type IN ('permission.asked', 'permission.asked@v1')",
                 )
                 .unwrap()
                 .query_map([], |r| r.get::<_, String>(0))
@@ -178,7 +178,7 @@ async fn third_identical_call_asks_doom_loop_then_completes_on_approve() {
                 .collect();
             let replied = conn
                 .prepare(
-                    "SELECT json_extract(payload,'$.requestID') FROM event WHERE session_id='ses_lg' AND type='permission.replied'",
+                    "SELECT json_extract(payload,'$.requestID') FROM event WHERE session_id='ses_lg' AND type IN ('permission.replied', 'permission.replied@v1')",
                 )
                 .unwrap()
                 .query_map([], |r| r.get::<_, String>(0))

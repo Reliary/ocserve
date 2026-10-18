@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 15;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -34,6 +34,7 @@ CREATE TABLE session (
     time_updated  INTEGER NOT NULL,
     version_dirt  INTEGER NOT NULL DEFAULT 0,
     permission    TEXT,
+    subagent_rules TEXT,
     revert        TEXT
 ) STRICT;
 
@@ -105,6 +106,102 @@ CREATE TABLE todo (
 CREATE INDEX idx_todo_session ON todo(session_id);
 
 -- FTS5 external-content projection, MAIN DB only (STORAGE.md §1 — ATTACH impossible)
+-- v2 inbox + instruction state (V2-PLAN.md P2, schema v13). Additive tables
+-- only — the hot-path tables above are byte-stable. `session_inbox` holds
+-- ONLY unconsumed work (deliver deletes the row in the same txn that inserts
+-- the visible message, so the table is small by construction — no prune loop).
+-- `instruction_*` mirrors upstream's content-addressed delta store.
+CREATE TABLE session_inbox (
+    id           TEXT PRIMARY KEY,
+    session_id   TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+    type         TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    delivery     TEXT NOT NULL DEFAULT 'steer',
+    enqueued_seq INTEGER NOT NULL,
+    time_created INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX idx_inbox_session ON session_inbox(session_id, delivery, enqueued_seq);
+CREATE UNIQUE INDEX idx_inbox_seq ON session_inbox(session_id, enqueued_seq);
+
+CREATE TABLE instruction_blob (
+    hash  TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE instruction_state (
+    session_id     TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+    epoch_start    INTEGER NOT NULL DEFAULT 0,
+    through_seq    INTEGER NOT NULL DEFAULT 0,
+    initial_values TEXT NOT NULL DEFAULT '{}',
+    current_values TEXT NOT NULL DEFAULT '{}'
+) STRICT;
+
+CREATE TABLE instruction_entry (
+    session_id   TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+    key          TEXT NOT NULL,
+    value        TEXT NOT NULL,
+    removed      INTEGER NOT NULL DEFAULT 0,
+    time_created INTEGER NOT NULL,
+    time_updated INTEGER NOT NULL,
+    PRIMARY KEY (session_id, key)
+) STRICT;
+
+-- v2 execution claims (V2-PLAN.md P3): restart-recovery markers, own table
+-- (never the instruction journal). Pending-only by release discipline.
+CREATE TABLE execution_claim (
+    session_id      TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+    claimed_ms      INTEGER NOT NULL,
+    resume_attempts INTEGER NOT NULL DEFAULT 0
+) STRICT;
+
+-- v2 forms (V2-PLAN.md P4, L3-lite): persistent ask rendezvous. State is
+-- pending/answered/cancelled; the answer JSON rides the row so reconnect
+-- (`log?after` replay) sees settled forms. Waiters live in the gate
+-- (ocserve-core::form), not here — the table is state, not a queue.
+CREATE TABLE form (
+    id           TEXT PRIMARY KEY,
+    session_id   TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+    title        TEXT NOT NULL DEFAULT '',
+    metadata     TEXT NOT NULL DEFAULT '{}',
+    fields       TEXT NOT NULL DEFAULT '[]',
+    state        TEXT NOT NULL DEFAULT 'pending',
+    answer       TEXT,
+    time_created INTEGER NOT NULL,
+    time_updated INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX idx_form_session ON form(session_id, time_created);
+
+-- v2 credentials (gap closure): upstream `credential` table shape
+-- (verified live against 2.0.28: id/integration_id/label/value/active +
+-- created/updated; connector_id/method_id ride along nullable for OAuth
+-- flows). Values echo on GET (upstream parity — authenticated loopback /
+-- tailnet clients only, same threat model). File-level protection is the
+-- 600 DB mode (pragma::open_writer restricts on every open).
+CREATE TABLE credential (
+    id             TEXT PRIMARY KEY,
+    integration_id TEXT,
+    label          TEXT NOT NULL,
+    value          TEXT NOT NULL,
+    connector_id   TEXT,
+    method_id      TEXT,
+    active         INTEGER,
+    time_created   INTEGER NOT NULL,
+    time_updated   INTEGER NOT NULL
+) STRICT;
+
+-- Session environment variables (gap closure, D-ENV): per-session string
+-- map replaced wholesale by PUT (REST replace semantics). Read once per
+-- turn and injected into tool subprocess env (bash). Never sent to the
+-- provider (no prompt-text contamination — the capdiff bytes axis stays
+-- clean by construction).
+CREATE TABLE session_environment (
+    session_id   TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+    variables    TEXT NOT NULL DEFAULT '{}',
+    time_updated INTEGER NOT NULL
+) STRICT;
+
 -- legacy-delta sync state (dev bridge: legacy -> ocserve additive pulls;
 -- dropped relevance once the final migration lands — PLAN §17)
 CREATE TABLE import_sync (
@@ -604,6 +701,111 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                     conn.execute_batch(
                         "CREATE INDEX IF NOT EXISTS idx_event_time ON event(time_created);",
                     )?;
+                }
+            }
+            12 => {
+                // v12->v13: v2 inbox + instruction state (V2-PLAN.md P2).
+                // Additive tables only (see DDL above); the migration is a
+                // pure CREATE — no data movement, no index rebuild, fast on
+                // any DB size. Guard: rewind-based test arms may re-run this
+                // step without dropping the tables (same composability rule
+                // as v10->v11 / v11->v12).
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS session_inbox (
+                        id           TEXT PRIMARY KEY,
+                        session_id   TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+                        type         TEXT NOT NULL,
+                        payload      TEXT NOT NULL,
+                        delivery     TEXT NOT NULL DEFAULT 'steer',
+                        enqueued_seq INTEGER NOT NULL,
+                        time_created INTEGER NOT NULL
+                    ) STRICT;
+                    CREATE INDEX IF NOT EXISTS idx_inbox_session
+                        ON session_inbox(session_id, delivery, enqueued_seq);
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_seq
+                        ON session_inbox(session_id, enqueued_seq);
+                    CREATE TABLE IF NOT EXISTS instruction_blob (
+                        hash  TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    ) STRICT;
+                    CREATE TABLE IF NOT EXISTS instruction_state (
+                        session_id     TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+                        epoch_start    INTEGER NOT NULL DEFAULT 0,
+                        through_seq    INTEGER NOT NULL DEFAULT 0,
+                        initial_values TEXT NOT NULL DEFAULT '{}',
+                        current_values TEXT NOT NULL DEFAULT '{}'
+                    ) STRICT;
+                    CREATE TABLE IF NOT EXISTS instruction_entry (
+                        session_id   TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+                        key          TEXT NOT NULL,
+                        value        TEXT NOT NULL,
+                        removed      INTEGER NOT NULL DEFAULT 0,
+                        time_created INTEGER NOT NULL,
+                        time_updated INTEGER NOT NULL,
+                        PRIMARY KEY (session_id, key)
+                    ) STRICT;
+                    CREATE TABLE IF NOT EXISTS execution_claim (
+                        session_id      TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+                        claimed_ms      INTEGER NOT NULL,
+                        resume_attempts INTEGER NOT NULL DEFAULT 0
+                    ) STRICT;
+                    CREATE TABLE IF NOT EXISTS form (
+                        id           TEXT PRIMARY KEY,
+                        session_id   TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+                        title        TEXT NOT NULL DEFAULT '',
+                        metadata     TEXT NOT NULL DEFAULT '{}',
+                        fields       TEXT NOT NULL DEFAULT '[]',
+                        state        TEXT NOT NULL DEFAULT 'pending',
+                        answer       TEXT,
+                        time_created INTEGER NOT NULL,
+                        time_updated INTEGER NOT NULL
+                    ) STRICT;
+                    CREATE INDEX IF NOT EXISTS idx_form_session
+                        ON form(session_id, time_created);",
+                )?;
+            }
+            13 => {
+                // v13->v14: credentials + session environment (gap closure).
+                // Pure CREATE, no data movement (same fast-path rule as v12).
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS credential (
+                        id             TEXT PRIMARY KEY,
+                        integration_id TEXT,
+                        label          TEXT NOT NULL,
+                        value          TEXT NOT NULL,
+                        connector_id   TEXT,
+                        method_id      TEXT,
+                        active         INTEGER,
+                        time_created   INTEGER NOT NULL,
+                        time_updated   INTEGER NOT NULL
+                    ) STRICT;
+                    CREATE TABLE IF NOT EXISTS session_environment (
+                        session_id   TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+                        variables    TEXT NOT NULL DEFAULT '{}',
+                        time_updated INTEGER NOT NULL
+                    ) STRICT;",
+                )?;
+            }
+            14 => {
+                // v14→v15 (security review F3): the `permission` column was
+                // OVERLOADED — `session_grant_always` stores its always-keys
+                // there as a `["perm\tpat"]` string array, while the `task`
+                // tool stored a derived ruleset there as `[{permission,...}]`
+                // objects. Each writer read the other's shape as "empty" and
+                // OVERWROTE it, so a subagent's "always" reply wiped its
+                // derived deny rules (privilege regression). Split: the
+                // `permission` column stays the always-grants; a new
+                // `subagent_rules` column holds the derived child ruleset.
+                // SQLite has no `ADD COLUMN IF NOT EXISTS`, and a fresh v15 DB
+                // already carries the column — guard on the column set so the
+                // arm is idempotent (migration-order tests rewind user_version).
+                let has_col: bool = conn
+                    .prepare("PRAGMA table_info(session)")?
+                    .query_map([], |r| r.get::<_, String>(1))?
+                    .filter_map(|r| r.ok())
+                    .any(|name| name == "subagent_rules");
+                if !has_col {
+                    conn.execute_batch("ALTER TABLE session ADD COLUMN subagent_rules TEXT;")?;
                 }
             }
             other => {

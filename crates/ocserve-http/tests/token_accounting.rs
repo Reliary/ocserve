@@ -274,9 +274,9 @@ async fn per_step_message_tokens_and_accumulated_session_row() {
                 .prepare(
                     "SELECT json_extract(payload,'$.id'), \
                      (SELECT count(*) FROM event e2 WHERE e2.session_id=event.session_id \
-                      AND e2.type='permission.replied' \
+                      AND e2.type IN ('permission.replied', 'permission.replied@v1') \
                       AND json_extract(e2.payload,'$.requestID') = json_extract(event.payload,'$.id')) \
-                     FROM event WHERE session_id=?1 AND type='permission.asked'",
+                     FROM event WHERE session_id=?1 AND type IN ('permission.asked', 'permission.asked@v1')",
                 )
                 .unwrap()
                 .query_map([sid], |r| Ok((r.get(0)?, r.get(1)?)))

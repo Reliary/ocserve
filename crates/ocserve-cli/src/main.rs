@@ -30,6 +30,25 @@ enum Cmd {
         /// 127.0.0.1 default (loopback-only unless overridden).
         #[arg(long)]
         hostname: Option<String>,
+        /// Auth mode. Precedence: --auth-mode flag > OCSERVE_AUTH_MODE env >
+        /// ocserve.toml [server].auth_mode > "off" default (v1 freeze parity:
+        /// passwordless loopback). "basic" challenges EVERY route (incl. SSE,
+        /// /metrics, fallback/405s) with upstream's exact 401
+        /// (`UnauthorizedError`/`Authentication required` +
+        /// `WWW-Authenticate: Basic realm="Secure Area"`).
+        #[arg(long)]
+        auth_mode: Option<String>,
+        /// File containing the basic-auth password (mode 600 enforced at
+        /// read; the path itself is never logged). Precedence:
+        /// --auth-password-file flag > OCSERVE_AUTH_PASSWORD_FILE env >
+        /// ocserve.toml [server].auth_password_file >
+        /// OCSERVE_SERVER_PASSWORD env. Required when mode is "basic"
+        /// (fail-fast otherwise). Deliberate deviation from upstream v2 UX:
+        /// no generated-password-to-stdout (rule 8 absolute — secrets never
+        /// in logs; upstream's `server password` line is read from THEIR log
+        /// by pair-v2, never emitted by us).
+        #[arg(long)]
+        auth_password_file: Option<std::path::PathBuf>,
         #[arg(long)]
         data_dir: Option<std::path::PathBuf>,
     },
@@ -84,10 +103,10 @@ enum ModelsCmd {
     Refresh,
 }
 
-/// Port precedence: explicit `--port` > `OCSERVE_PORT` > 4096 default.
-/// A malformed env value is a fail-fast boot error (SRE §1) — a typo'd port
-/// silently serving elsewhere is worse than refusing to start.
-fn resolve_port(flag: Option<u16>) -> u16 {
+/// Port precedence: explicit `--port` > `OCSERVE_PORT` > ocserve.toml >
+/// 4096 default. A malformed env value is a fail-fast boot error (SRE §1) —
+/// a typo'd port silently serving elsewhere is worse than refusing to start.
+fn resolve_port_with_file(flag: Option<u16>, file: Option<u16>) -> u16 {
     if let Some(p) = flag {
         return p;
     }
@@ -95,11 +114,11 @@ fn resolve_port(flag: Option<u16>) -> u16 {
         Ok(v) if !v.is_empty() => v
             .parse::<u16>()
             .unwrap_or_else(|_| panic!("OCSERVE_PORT is not a valid port number: {v:?}")),
-        _ => 4096,
+        _ => file.unwrap_or(4096),
     }
 }
 
-/// Hostname precedence: explicit flag > env > default. Empty env = unset.
+/// Hostname precedence: explicit flag > env > default. Empty env = unset. Empty env = unset.
 fn resolve_net(flag: Option<String>, env_key: &str, default: &str) -> String {
     if let Some(h) = flag {
         return h;
@@ -126,6 +145,7 @@ mod partition;
 mod replay;
 mod resilience;
 mod runtime;
+mod server_config;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -140,12 +160,27 @@ fn main() -> Result<()> {
         Cmd::Serve {
             port,
             hostname,
+            auth_mode,
+            auth_password_file,
             data_dir,
-        } => rt::block_on(serve(
-            resolve_net(hostname, "OCSERVE_HOSTNAME", "127.0.0.1"),
-            resolve_port(port),
-            data_dir.unwrap_or_else(default_data_dir),
-        )),
+        } => {
+            let data_dir = data_dir.unwrap_or_else(default_data_dir);
+            // ocserve.toml is read AFTER the data dir resolves (it lives
+            // inside it); missing file = defaults (bare-machine invariant).
+            let file_cfg = server_config::load(&data_dir)?;
+            rt::block_on(serve(
+                resolve_net(
+                    hostname,
+                    "OCSERVE_HOSTNAME",
+                    file_cfg.hostname.as_deref().unwrap_or("127.0.0.1"),
+                ),
+                resolve_port_with_file(port, file_cfg.port),
+                auth_mode,
+                auth_password_file,
+                &file_cfg,
+                data_dir,
+            ))
+        }
         Cmd::Doctor { data_dir } => doctor(data_dir.unwrap_or_else(default_data_dir)),
         Cmd::Backup { dest, data_dir } => {
             let dir = data_dir.unwrap_or_else(default_data_dir);
@@ -228,11 +263,32 @@ mod rt {
     }
 }
 
-async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Result<()> {
+async fn serve(
+    hostname: String,
+    port: u16,
+    auth_mode: Option<String>,
+    auth_password_file: Option<std::path::PathBuf>,
+    file_cfg: &server_config::ServerCfg,
+    data_dir: std::path::PathBuf,
+) -> Result<()> {
     use ocserve_http::{AppState, FREEZE_VERSION};
 
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create data dir {}", data_dir.display()))?;
+    // F4 (security review): the data dir holds the DB (provider API keys in
+    // the `credential` table) and its `-wal`/`-shm` siblings, which SQLite
+    // re-creates on checkpoint/WAL-reset with the process umask. A one-time
+    // file chmod is defeated the moment they are recreated, so lock the
+    // DIRECTORY to owner-only (0o700): a recreated WAL/SHM inherits nothing
+    // readable by other users because they cannot traverse the dir at all.
+    // The store's `restrict_file_mode` chmod stays as belt-and-braces for a
+    // pre-existing 0644 DB. Unix only; documented no-op elsewhere.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 700 data dir {}", data_dir.display()))?;
+    }
 
     // fail-fast boot checks (SRE.md §1) — before binding
     ocserve::boot_checks(&data_dir)?;
@@ -249,13 +305,25 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     // M4a: probe MCP servers before serving (statuses captured, never fatal)
     let mcp_cfgs =
         ocserve_mcp::parse_config(rt.config.get("mcp").unwrap_or(&serde_json::Value::Null));
-    let plugin_specs: Vec<String> = rt
+    // v1 config.plugin is `(string | [string, options])[]` (ConfigPluginV1.Spec).
+    // The tuple form carries per-plugin options delivered to the server
+    // factory; the plain-string form is options=Null. Non-string non-tuple
+    // entries are dropped (upstream schema rejects them upstream of here).
+    let plugin_specs: Vec<(String, serde_json::Value)> = rt
         .config
         .get("plugin")
         .and_then(|v| v.as_array())
         .map(|a| {
             a.iter()
-                .filter_map(|s| s.as_str().map(String::from))
+                .filter_map(|e| match e {
+                    serde_json::Value::String(s) => Some((s.clone(), serde_json::Value::Null)),
+                    serde_json::Value::Array(t) if !t.is_empty() => {
+                        let spec = t.first().and_then(|v| v.as_str())?.to_string();
+                        let opts = t.get(1).cloned().unwrap_or(serde_json::Value::Null);
+                        Some((spec, opts))
+                    }
+                    _ => None,
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -294,6 +362,9 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
             );
         }
     }
+    // The plugin `config` hook (v1 parity) needs the resolved config; capture
+    // it before `into_payloads` consumes rt.
+    let plugin_config = rt.config.clone();
     let payloads = rt.into_payloads(); // consumed after llm/mcp/plugins took their pieces
     let db_path = ocserve_store::writer::db_path(&data_dir);
     let writer = std::sync::Arc::new(
@@ -342,8 +413,22 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
             );
         }
     }
+    // Password mode (SECURITY.md): off = freeze parity (passwordless
+    // loopback); basic = upstream-exact 401 on every route. Resolved
+    // flag > env > ocserve.toml > off; fail-fast on bad mode or missing
+    // password (an open server by typo is the failure to avoid).
+    let auth_off = server_config::resolve_auth_mode(auth_mode, file_cfg.auth_mode.as_deref())?;
+    // F5 (security review): fail-fast when binding to a NON-loopback address
+    // with auth OFF — the credential store echoes provider API keys on GET, so
+    // an open non-loopback bind exposes them to the network.
+    server_config::reject_open_nonloopback(&hostname, &auth_off)?;
+    let auth = server_config::resolve_password(
+        &auth_off,
+        auth_password_file,
+        file_cfg.auth_password_file.clone(),
+    )?;
     let state = AppState::with_wiring(
-        None,
+        auth,
         payloads,
         ocserve_http::Wires {
             db: db_path,
@@ -666,14 +751,22 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
                     "worktree": "/",
                     "serverUrl": server_url,
                 });
-                for spec in &plugin_specs {
+                for (spec, options) in &plugin_specs {
                     match ocserve_plugin::resolve_entry(spec, &home) {
-                        Ok(entry) => match sc.load(spec, &entry, &input).await {
+                        Ok(entry) => match sc.load(spec, &entry, &input, options).await {
                             Ok(hooks) => tracing::info!("plugin {spec} loaded: {hooks:?}"),
                             Err(e) => tracing::warn!("plugin {spec} load failed: {e:#}"),
                         },
                         Err(e) => tracing::warn!("plugin {spec} resolve failed: {e:#}"),
                     }
+                }
+                // v1 parity (plugin/index.ts:244-251): notify every loaded
+                // plugin of the resolved config via its `config` hook (called
+                // once, errors logged + ignored). Previously never dispatched —
+                // a registered-but-never-called hook (TESTING §1.6 class).
+                match sc.config(plugin_config.clone()).await {
+                    Ok(v) => tracing::info!("plugin config hook: {v}"),
+                    Err(e) => tracing::warn!("plugin config dispatch failed: {e:#}"),
                 }
                 tracing::info!("plugin statuses: {}", sc.statuses());
                 plugin_sidecar = Some(sc);
@@ -714,6 +807,12 @@ async fn serve(hostname: String, port: u16, data_dir: std::path::PathBuf) -> Res
     tracing::info!("  TUI:     opencode attach http://{addr}");
     tracing::info!("  web UI:  open http://{addr}");
 
+    // Perimeter CORS (Phase 1 auth work): preflights must 204 before
+    // routing/auth/fallbacks see them (fallback + MNF responses bypass router
+    // middleware when layers are registered before .fallback() — proven
+    // empirically). Router::layer wraps the fully-built router including its
+    // fallbacks; only short-circuits preflights, passes everything else.
+    let app = app.layer(axum::middleware::from_fn(ocserve_http::ui::perimeter_cors));
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;

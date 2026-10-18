@@ -615,20 +615,26 @@ impl ShellRequest {
 // V2PromptInput — POST /api/session/{sessionID}/prompt
 // ---------------------------------------------------------------------------
 
-/// Frozen v2 body: required `[prompt]`; `id` is `^msg_` (UNDERSCORE — differs
-/// from v1 `^msg`, probe-pinned); delivery enum; resume boolean.
+/// Frozen v2 body (2.0.28, flat): required `[text]`; `id` is `^msg_`; plus
+/// `files`/`agents`/`skills`/`metadata` passthrough, `delivery` enum, `resume`
+/// boolean. (The old nested `prompt:{text}` shape was the stale 2.0.21-era
+/// decoder — corrected 2026-10-16 against the regenerated 2.0.28 contract.)
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct V2PromptInput {
     pub id: Option<String>,
     pub prompt_text: String,
     pub prompt_files: Vec<Value>,
     pub prompt_agents: Vec<Value>,
+    pub prompt_skills: Vec<Value>,
+    pub metadata: Option<Value>,
     pub delivery: Option<String>,
     pub resume: Option<bool>,
 }
 
 impl V2PromptInput {
-    pub const WIRE_KEYS: [&'static str; 4] = ["id", "prompt", "delivery", "resume"];
+    pub const WIRE_KEYS: [&'static str; 8] = [
+        "id", "text", "files", "agents", "skills", "metadata", "delivery", "resume",
+    ];
 
     pub fn decode(v: &Value) -> Result<Self, WireError> {
         let Value::Object(map) = v else {
@@ -638,26 +644,23 @@ impl V2PromptInput {
         let mut req = V2PromptInput::default();
         if let Some(x) = map.get("id") {
             path.push(Seg::Key("id"));
-            req.id = str_prefix(x, "msg_", &path)?;
+            match x {
+                Value::Null => {}
+                _ => {
+                    req.id = str_prefix(x, "msg_", &path)?;
+                }
+            }
             path.pop();
         }
-        path.push(Seg::Key("prompt"));
-        let pobj = match map.get("prompt") {
-            None => return Err(WireError::new("Missing key", None, &path)),
-            Some(Value::Object(pm)) => pm,
-            Some(other) => {
-                return Err(type_err("PromptInput", false, other, &path));
-            }
-        };
         path.push(Seg::Key("text"));
-        match pobj.get("text") {
+        match map.get("text") {
             None => return Err(WireError::new("Missing key", None, &path)),
             Some(x) => {
                 req.prompt_text = str_req(x, &path)?;
             }
         }
         path.pop();
-        if let Some(x) = pobj.get("files") {
+        if let Some(x) = map.get("files") {
             path.push(Seg::Key("files"));
             match x {
                 Value::Array(arr) => {
@@ -686,7 +689,7 @@ impl V2PromptInput {
             }
             path.pop();
         }
-        if let Some(x) = pobj.get("agents") {
+        if let Some(x) = map.get("agents") {
             path.push(Seg::Key("agents"));
             match x {
                 Value::Array(arr) => {
@@ -711,7 +714,19 @@ impl V2PromptInput {
             }
             path.pop();
         }
-        path.pop(); // prompt
+        // skills + metadata ride through opaquely (instruction/skill routing
+        // consumes them in P3/P4; the decoder only pins presence + shape).
+        if let Some(x) = map.get("skills") {
+            path.push(Seg::Key("skills"));
+            match x {
+                Value::Array(arr) => req.prompt_skills = arr.clone(),
+                other => return Err(type_err("array", true, other, &path)),
+            }
+            path.pop();
+        }
+        if let Some(x) = map.get("metadata") {
+            req.metadata = Some(x.clone());
+        }
         if let Some(x) = map.get("delivery") {
             path.push(Seg::Key("delivery"));
             match x {
@@ -1100,57 +1115,56 @@ mod wire_tests {
     #[test]
     fn probe_v2_decode() {
         let v2err = |v: &Value| V2PromptInput::decode(v).unwrap_err().message;
-        assert_eq!(v2err(&json!({})), "Missing key\n  at [\"prompt\"]");
+        // Flat 2.0.28 body: text required at top level.
+        assert_eq!(v2err(&json!({})), "Missing key\n  at [\"text\"]");
         assert_eq!(
-            v2err(&json!({"prompt": "x"})),
-            r#"Expected PromptInput, got "x""#.to_string() + "\n  at [\"prompt\"]"
+            v2err(&json!({"text": 123})),
+            "Expected string, got 123\n  at [\"text\"]"
         );
         assert_eq!(
-            v2err(&json!({"prompt": {"files": []}})),
-            "Missing key\n  at [\"prompt\"][\"text\"]"
+            v2err(&json!({"text": "x", "files": [{}]})),
+            "Missing key\n  at [\"files\"][0][\"uri\"]"
         );
         assert_eq!(
-            v2err(&json!({"prompt": {"text": 123}})),
-            "Expected string, got 123\n  at [\"prompt\"][\"text\"]"
+            v2err(&json!({"text": "x", "files": [123]})),
+            r#"Expected PromptInput.FileAttachment, got 123"#.to_string() + "\n  at [\"files\"][0]"
         );
         assert_eq!(
-            v2err(&json!({"prompt": {"text": "x", "files": [{}]}})),
-            "Missing key\n  at [\"prompt\"][\"files\"][0][\"uri\"]"
+            v2err(&json!({"text": "x", "agents": [123]})),
+            r#"Expected Prompt.AgentAttachment, got 123"#.to_string() + "\n  at [\"agents\"][0]"
         );
         assert_eq!(
-            v2err(&json!({"prompt": {"text": "x", "files": [123]}})),
-            r#"Expected PromptInput.FileAttachment, got 123"#.to_string()
-                + "\n  at [\"prompt\"][\"files\"][0]"
-        );
-        assert_eq!(
-            v2err(&json!({"prompt": {"text": "x", "agents": [123]}})),
-            r#"Expected Prompt.AgentAttachment, got 123"#.to_string()
-                + "\n  at [\"prompt\"][\"agents\"][0]"
-        );
-        assert_eq!(
-            v2err(&json!({"prompt": {"text": "x", "agents": [{}]}})),
-            "Missing key\n  at [\"prompt\"][\"agents\"][0][\"name\"]"
+            v2err(&json!({"text": "x", "agents": [{}]})),
+            "Missing key\n  at [\"agents\"][0][\"name\"]"
         );
         // v2 id needs the UNDERSCORE prefix
         for bad in ["bad", "msgx"] {
             assert_eq!(
-                v2err(&json!({"id": bad, "prompt": {"text": "x"}})),
+                v2err(&json!({"id": bad, "text": "x"})),
                 format!(r#"Expected a string starting with "msg_", got "{bad}""#)
                     + "\n  at [\"id\"]"
             );
         }
         assert_eq!(
-            v2err(&json!({"prompt": {"text": "x"}, "delivery": "bogus"})),
+            v2err(&json!({"text": "x", "delivery": "bogus"})),
             r#"Expected "steer" | "queue", got "bogus""#.to_string() + "\n  at [\"delivery\"]"
         );
         assert_eq!(
-            v2err(&json!({"prompt": {"text": "x"}, "resume": "bad"})),
+            v2err(&json!({"text": "x", "resume": "bad"})),
             r#"Expected boolean | null, got "bad""#.to_string() + "\n  at [\"resume\"]"
         );
-        // valid: id, delivery null, files+agents
+        assert_eq!(
+            v2err(&json!({"text": "x", "skills": {}})),
+            r#"Expected array | null, got {}"#.to_string() + "\n  at [\"skills\"]"
+        );
+        // valid: id, delivery null, files+agents+skills+metadata
         let ok = V2PromptInput::decode(&json!({
             "id": null,
-            "prompt": {"text": "x", "files": [{"uri": "file:///a"}], "agents": [{"name": "sub"}]},
+            "text": "x",
+            "files": [{"uri": "file:///a"}],
+            "agents": [{"name": "sub"}],
+            "skills": ["s1"],
+            "metadata": {"k": 1},
             "delivery": null,
         }))
         .unwrap();
@@ -1158,23 +1172,26 @@ mod wire_tests {
         assert_eq!(ok.prompt_text, "x");
         assert_eq!(ok.prompt_files.len(), 1);
         assert_eq!(ok.prompt_agents.len(), 1);
-        let q =
-            V2PromptInput::decode(&json!({"prompt": {"text": "x"}, "delivery": "queue"})).unwrap();
+        assert_eq!(ok.prompt_skills.len(), 1);
+        let q = V2PromptInput::decode(&json!({"text": "x", "delivery": "queue"})).unwrap();
         assert_eq!(q.delivery.as_deref(), Some("queue"));
     }
 
     /// B4: wire key sets are pinned to the frozen spec. Generated from
     /// `assets/openapi/1.18.31.json` — upstream adds/renames a field → spec
-    /// refresh → red here → struct updated in lockstep.
+    /// refresh → red here → struct updated in lockstep. The v2 prompt pin
+    /// reads the REGENERATED 2.0.28 contract (SPEC_V2_JSON), not the v1 doc.
     #[test]
     fn wire_keys_match_frozen_spec() {
         let raw = crate::spec::SPEC_JSON;
+        let raw_v2 = crate::spec::SPEC_V2_JSON;
         let spec: Value = serde_json::from_str(raw).expect("spec parses");
-        let props = |path: &str, method: &str| -> Vec<String> {
+        let spec_v2: Value = serde_json::from_str(raw_v2).expect("v2 spec parses");
+        let props_in = |doc: &Value, path: &str, method: &str| -> Vec<String> {
             // Direct indexing only: serde_json::pointer tokenizes on `/`, and
             // both the spec path keys and the `application/json` content-type
             // key contain literal slashes.
-            spec.get("paths")
+            doc.get("paths")
                 .and_then(|p| p.get(format!("/{path}")))
                 .and_then(|op| op.get(method))
                 .and_then(|m| m.get("requestBody"))
@@ -1186,6 +1203,7 @@ mod wire_tests {
                 .map(|m| m.keys().cloned().collect())
                 .unwrap_or_else(|| panic!("no properties for {path} {method}"))
         };
+        let props = |path: &str, method: &str| props_in(&spec, path, method);
         let mut msg = props("session/{sessionID}/message", "post");
         msg.retain(|k| k != "sessionID"); // sessionID is path-bound, not body
         assert_eq!(
@@ -1211,13 +1229,56 @@ mod wire_tests {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
         );
-        let v2 = props("api/session/{sessionID}/prompt", "post");
+        let v2 = props_in(&spec_v2, "api/session/{sessionID}/prompt", "post");
         assert_eq!(
             v2,
             V2PromptInput::WIRE_KEYS
                 .iter()
                 .map(|s| s.to_string())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
+            "V2 prompt keys pinned to the REGENERATED 2.0.28 contract"
+        );
+    }
+
+    /// The v2 key pin above reads SPEC_V2_JSON (2.0.28), not the frozen v1
+    /// doc: the two contracts define different prompt bodies (flat vs the
+    /// legacy nested shape). A single-doc pin would pass vacuously on the
+    /// wrong keys.
+    #[test]
+    fn v2_prompt_keys_come_from_the_v2_contract() {
+        let v1: Value = serde_json::from_str(crate::spec::SPEC_JSON).expect("v1 parses");
+        let v2: Value = serde_json::from_str(crate::spec::SPEC_V2_JSON).expect("v2 parses");
+        let keys = |doc: &Value| {
+            doc.get("paths")
+                .and_then(|p| p.get("/api/session/{sessionID}/prompt"))
+                .and_then(|op| op.get("post"))
+                .and_then(|m| m.get("requestBody"))
+                .and_then(|rb| rb.get("content"))
+                .and_then(|c| c.get("application/json"))
+                .and_then(|ct| ct.get("schema"))
+                .and_then(|s| s.get("properties"))
+                .and_then(|p| p.as_object())
+                .map(|m| {
+                    let mut k: Vec<String> = m.keys().cloned().collect();
+                    k.sort();
+                    k
+                })
+                .expect("prompt properties present")
+        };
+        let mut want: Vec<String> = V2PromptInput::WIRE_KEYS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        want.sort();
+        assert_eq!(keys(&v2), want);
+        // The v1 doc does not define this route — the pin cannot pass
+        // vacuously against the wrong contract.
+        assert!(
+            keys(&v1) != want
+                || v1
+                    .get("paths")
+                    .and_then(|p| p.get("/api/session/{sessionID}/prompt"))
+                    .is_none()
         );
     }
 }

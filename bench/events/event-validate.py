@@ -12,7 +12,8 @@ model and no server.
 
 Suffix handling: ocserve stores both the plain type (`session.updated`) and
 the sync twin (`session.updated.1`, the durability envelope's `.version`
-append). The `.N` suffix is stripped before the spec lookup.
+append). The `.N` suffix is stripped before the spec lookup. Durable rows
+also carry the v2 version suffix (`type@v1`, V2-PLAN.md P2) — stripped too.
 
 Calibration (same discipline as spec-validate.py): the spec types optional
 fields but ocserve legitimately emits `null` (e.g. `model: null`), so
@@ -42,6 +43,10 @@ SPEC = os.path.join(
 ALLOW_TYPES = set()
 
 SUFFIX = re.compile(r"\.\d+$")
+# Durable version suffix (V2-PLAN.md P2): stored types carry `@vN`
+# (`session.updated@v1`); strip before the spec lookup — the envelope version
+# is orthogonal to the payload shape.
+VERSION = re.compile(r"@v\d+$")
 
 
 def inline(node, root, stack=()):
@@ -99,7 +104,7 @@ def event_type_index(spec):
 
 def validate_payload(props, etype, idx, spec):
     """Return an error string, or None when valid."""
-    base = SUFFIX.sub("", etype)
+    base = VERSION.sub("", SUFFIX.sub("", etype))
     if base in ALLOW_TYPES:
         return None
     if base not in idx:

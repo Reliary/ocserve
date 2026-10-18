@@ -25,22 +25,60 @@ import tempfile
 
 
 def read_pack(path):
-    raw = subprocess.run(["zstd", "-d", "-c", path], capture_output=True, check=True).stdout
-    if raw[:6] != b"OCAP1\n":
-        sys.exit(f"{path}: bad magic")
-    i = 6
-    (count,) = struct.unpack_from("<I", raw, i)
-    i += 4
+    raw = open(path, "rb").read()
+    # OCAP2 is stored raw (per-file zstd frames; no outer frame). Legacy OCAP1
+    # is an outer zstd of an eager table. Detect by magic, decompress only
+    # OCAP1. (An outer-decompress of an OCAP2 blob fails — and the old code
+    # exited 0 on that crash, a vacuous pass; now a bad pack is exit 2.)
+    if raw[:6] == b"OCAP2\n":
+        blob = raw
+        return _read_ocap2(blob)
+    if raw[:6] == b"OCAP1\n":
+        blob = raw
+    else:
+        # maybe an outer-zstd OCAP1 (the pre-OCAP2 on-disk form)
+        try:
+            blob = subprocess.run(
+                ["zstd", "-d", "-c", path], capture_output=True, check=True
+            ).stdout
+        except subprocess.CalledProcessError:
+            sys.exit(f"{path}: not a known pack format")
+    if blob[:6] != b"OCAP1\n":
+        sys.exit(f"{path}: not a known pack format")
+    i = 10
+    (count,) = struct.unpack_from("<I", blob, 6)
     files = {}
     for _ in range(count):
-        (plen,) = struct.unpack_from("<H", raw, i)
+        (plen,) = struct.unpack_from("<H", blob, i)
         i += 2
-        name = raw[i : i + plen].decode()
+        name = blob[i : i + plen].decode()
         i += plen
-        (dlen,) = struct.unpack_from("<Q", raw, i)
+        (dlen,) = struct.unpack_from("<Q", blob, i)
         i += 8
-        files[name] = raw[i : i + dlen]
+        files[name] = blob[i : i + dlen]
         i += dlen
+    return files
+
+
+def _read_ocap2(blob):
+    (count,) = struct.unpack_from("<I", blob, 6)
+    i = 10
+    entries = []
+    for _ in range(count):
+        (plen,) = struct.unpack_from("<H", blob, i)
+        i += 2
+        name = blob[i : i + plen].decode()
+        i += plen
+        off, raw_len, comp_len = struct.unpack_from("<QII", blob, i)
+        i += 16
+        entries.append((name, off, raw_len, comp_len))
+    data_base = i
+    files = {}
+    for name, off, _raw_len, comp_len in entries:
+        frame = blob[data_base + off : data_base + off + comp_len]
+        files[name] = subprocess.run(
+            ["zstd", "-d", "-c"], input=frame, capture_output=True, check=True
+        ).stdout
     return files
 
 

@@ -25,6 +25,7 @@ use tokio::sync::oneshot;
 /// Host files (written next to the data dir once; content-addressed by embed).
 pub const HOST_FILES: &[(&str, &str)] = &[
     ("host.mjs", include_str!("host/host.mjs")),
+    ("v2.mjs", include_str!("host/v2.mjs")),
     (
         "bun-sqlite-loader.mjs",
         include_str!("host/bun-sqlite-loader.mjs"),
@@ -176,9 +177,11 @@ pub struct Sidecar {
     server: (String, String),
     /// spawn identity for respawn-after-death
     args: SpawnArgs,
-    /// successful loads (spec, entry, input) — replayed on respawn
-    /// (entries stored RAW; load_raw re-normalizes on replay — D1-PLAN)
-    loads: Vec<(String, PathBuf, Value)>,
+    /// successful loads (spec, entry, input, options) — replayed on respawn
+    /// (entries stored RAW; load_raw re-normalizes on replay — D1-PLAN).
+    /// `options` is the v1 `[spec, options]` tuple's second element (Null when
+    /// the plain-string form was used) — passed to the server factory.
+    loads: Vec<(String, PathBuf, Value, Value)>,
     /// normalization output root (`data/normalized`); None = skip (tests,
     /// any sidecar without it — existing behavior untouched, D1-PLAN)
     normalize_root: Option<PathBuf>,
@@ -463,8 +466,8 @@ impl Sidecar {
         // D1-PLAN: replay must normalize too (warm no-op; rebuilds if outputs
         // were wiped mid-run — A1 stores raw, rebuilds here AND at next boot).
         fresh.normalize_root = self.normalize_root.clone();
-        for (spec, entry, input) in &loads {
-            if let Err(e) = fresh.load_raw(spec, entry, input).await {
+        for (spec, entry, input, options) in &loads {
+            if let Err(e) = fresh.load_raw(spec, entry, input, options).await {
                 tracing::warn!("plugin {spec} reload after respawn failed: {e:#}");
             }
         }
@@ -514,13 +517,27 @@ impl Sidecar {
     }
 
     /// Load one plugin (v1 server-factory extraction happens host-side).
-    pub async fn load(&mut self, spec: &str, entry: &Path, input: &Value) -> Result<Vec<String>> {
+    /// `options` is the v1 `[spec, options]` tuple's second element (pass
+    /// `Value::Null` for the plain-string form) — delivered to the factory.
+    pub async fn load(
+        &mut self,
+        spec: &str,
+        entry: &Path,
+        input: &Value,
+        options: &Value,
+    ) -> Result<Vec<String>> {
         self.ensure_alive().await?;
-        self.load_raw(spec, entry, input).await
+        self.load_raw(spec, entry, input, options).await
     }
 
     /// Unguarded load (respawn replay only — fresh child is alive).
-    async fn load_raw(&mut self, spec: &str, entry: &Path, input: &Value) -> Result<Vec<String>> {
+    async fn load_raw(
+        &mut self,
+        spec: &str,
+        entry: &Path,
+        input: &Value,
+        options: &Value,
+    ) -> Result<Vec<String>> {
         // D1: normalize for the RPC (CPU on spawn_blocking — A2 class); the
         // RAW entry is what gets recorded for respawn replay (A1).
         let root = self.normalize_root.clone();
@@ -574,7 +591,7 @@ impl Sidecar {
             "spec": spec,
             "entry": load_path.to_string_lossy(),
             "input": input,
-            "options": Value::Null,
+            "options": options,
         });
         let res = self.request_raw("load", params).await?;
         let hooks: Vec<String> = res["hooks"]
@@ -589,8 +606,12 @@ impl Sidecar {
             spec.to_string(),
             json!({"ok": true, "hooks": hooks, "id": res["id"]}),
         );
-        self.loads
-            .push((spec.to_string(), entry.to_path_buf(), input));
+        self.loads.push((
+            spec.to_string(),
+            entry.to_path_buf(),
+            input,
+            options.clone(),
+        ));
         Ok(hooks)
     }
 
@@ -608,6 +629,34 @@ impl Sidecar {
     /// `hooks["event"]({event})`. Returns host delivery count.
     pub async fn emit_event(&mut self, event: Value) -> Result<Value> {
         self.request("event", json!({"event": event})).await
+    }
+
+    /// v2 domain-hook dispatch (Phase 3): v2 hooks mutate the event object in
+    /// place (like v1's output), so this returns `{output, matched}`. `matched`
+    /// = 0 means no v2 plugin installed this hook (caller skips mutation).
+    pub async fn trigger_v2(&mut self, domain: &str, name: &str, input: Value) -> Result<Value> {
+        self.request(
+            "trigger_v2",
+            json!({"domain": domain, "name": name, "input": input}),
+        )
+        .await
+    }
+
+    /// v2 RPC dispatch (Phase 3): `{rpcID, method, input}` →
+    /// `{output}` (success) or `{error:{type,message}}` (unavailable /
+    /// method_not_found / handler_error).
+    pub async fn rpc_call(&mut self, rpc_id: &str, method: &str, input: Value) -> Result<Value> {
+        self.request(
+            "rpc_call",
+            json!({"rpcID": rpc_id, "method": method, "input": input}),
+        )
+        .await
+    }
+
+    /// v2 plugin inventory (real — id/dialect per loaded v2 plugin + the
+    /// registered RPC ids). Powers `/api/plugin` without fabricating a list.
+    pub async fn v2_inventory(&mut self) -> Result<Value> {
+        self.request("v2_inventory", json!({})).await
     }
 
     pub async fn config(&mut self, cfg: Value) -> Result<Value> {
@@ -711,7 +760,12 @@ export default PluginModule.server;
         let input =
             json!({"directory": "/work", "projectID": "global", "serverUrl": "http://127.0.0.1:9"});
         let hooks = sc
-            .load("synthetic", &dir.path().join("plug.mjs"), &input)
+            .load(
+                "synthetic",
+                &dir.path().join("plug.mjs"),
+                &input,
+                &Value::Null,
+            )
             .await
             .expect("load");
         assert_eq!(
@@ -791,9 +845,14 @@ export default PluginModule.server;
         .unwrap();
         let host = materialize_host(&dir.path().join("host"))?;
         let mut sc = Sidecar::spawn(&host, "http://127.0.0.1:9", "/work").await?;
-        sc.load("reaper", &dir.path().join("plug.mjs"), &json!({}))
-            .await
-            .expect("load");
+        sc.load(
+            "reaper",
+            &dir.path().join("plug.mjs"),
+            &json!({}),
+            &Value::Null,
+        )
+        .await
+        .expect("load");
         let pid = sc.child_pid();
         // force-kill the child (the live OOM class: sidecar dies, hooks
         // silently broken-piped until a respawn guard exists)
@@ -820,9 +879,406 @@ export default PluginModule.server;
         Ok(())
     }
 
+    /// v2 plugin battery (Phase 3): both dialects through the real sidecar.
+    /// A promise-flavor plugin registers a session hook + an RPC; an
+    /// effect-flavor plugin (with its own `effect` runtime vendored beside it)
+    /// registers a tool hook. Asserts detection, dispatch, RPC round-trip, the
+    /// real inventory, and that unregistered/missing RPCs keep exact errors.
+    #[tokio::test]
+    async fn v2_battery_promise_and_effect_dialects() -> anyhow::Result<()> {
+        if !runtime_available() {
+            panic!(
+                "plugin-runtime binary ({}) required for plugin-host tests",
+                crate::plugin_runtime().program()
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("p_v2_promise.mjs"),
+            r#"export default {
+  id: "v2promise",
+  setup: async (ctx) => {
+    await ctx.session.hook("context", (ev) => { ev.promiseTouched = true; });
+    await ctx.tool.hook("execute.after", (ev) => { ev.result = "mutated-by-promise"; });
+    await ctx.rpc.register({ id: "sample" }, {
+      hello: async (input) => ({ echoed: input, from: "promise" }),
+    });
+    await ctx.storage.set("k", 41);
+    if ((await ctx.storage.get("k")) !== 41) throw new Error("storage broke");
+  },
+};"#,
+        )
+        .unwrap();
+        let eff = dir
+            .path()
+            .join("p_v2_effect")
+            .join("node_modules")
+            .join("effect");
+        std::fs::create_dir_all(eff.join("lib")).unwrap();
+        std::fs::write(
+            eff.join("package.json"),
+            r#"{"name":"effect","version":"3.0.0","type":"module","exports":{".":"./lib/index.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            eff.join("lib/index.js"),
+            "export const Effect = { scoped: (p) => p, runPromise: async (p) => { await p; } };\nexport const Scope = {};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("p_v2_effect").join("plug.mjs"),
+            r#"export default {
+  id: "v2effect",
+  effect: (ctx) => (async () => {
+    await ctx.tool.hook("execute.before", (ev) => { ev.input.before = "effect"; });
+  })(),
+};"#,
+        )
+        .unwrap();
+
+        let host = materialize_host(&dir.path().join("host"))?;
+        let mut sc = Sidecar::spawn(&host, "http://127.0.0.1:9", "/work").await?;
+        let input = json!({"directory": "/work", "serverUrl": "http://127.0.0.1:9"});
+
+        let h1 = sc
+            .load(
+                "v2promise",
+                &dir.path().join("p_v2_promise.mjs"),
+                &input,
+                &Value::Null,
+            )
+            .await?;
+        assert!(
+            h1.contains(&"session.context".to_string()),
+            "promise hooks: {h1:?}"
+        );
+        assert!(h1.contains(&"tool.execute.after".to_string()));
+        let h2 = sc
+            .load(
+                "v2effect",
+                &dir.path().join("p_v2_effect").join("plug.mjs"),
+                &input,
+                &Value::Null,
+            )
+            .await?;
+        assert!(
+            h2.contains(&"tool.execute.before".to_string()),
+            "effect hooks: {h2:?}"
+        );
+
+        let out = sc.trigger_v2("session", "context", json!({})).await?;
+        assert_eq!(out["matched"], 1);
+        assert_eq!(out["output"]["promiseTouched"], true);
+        let after = sc
+            .trigger_v2(
+                "tool",
+                "execute.after",
+                json!({"tool": "read", "result": "orig"}),
+            )
+            .await?;
+        assert_eq!(after["output"]["result"], "mutated-by-promise");
+        let before = sc
+            .trigger_v2(
+                "tool",
+                "execute.before",
+                json!({"tool": "read", "input": {}}),
+            )
+            .await?;
+        assert_eq!(before["output"]["input"]["before"], "effect");
+
+        let rpc = sc.rpc_call("sample", "hello", json!({"n": 7})).await?;
+        assert_eq!(rpc["output"]["echoed"]["n"], 7);
+        let miss = sc.rpc_call("sample", "nope", json!({})).await?;
+        assert_eq!(miss["error"]["type"], "rpc.method_not_found");
+        let unreg = sc.rpc_call("ghost", "hello", json!({})).await?;
+        assert_eq!(unreg["error"]["type"], "rpc.unavailable");
+
+        let inv = sc.v2_inventory().await?;
+        assert_eq!(inv["plugins"].as_array().unwrap().len(), 2, "{inv}");
+        assert!(
+            inv["rpcs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r == "sample")
+        );
+
+        sc.shutdown().await;
+        Ok(())
+    }
+
+    /// The v2 REST half of a domain is bound to the route that actually exists —
+    /// and an UNBOUND verb keeps the named divergence instead of a bare TypeError.
+    ///
+    /// The 2026-10-18 finding: `session: { ...registrar("session") }` gave
+    /// `ctx.session` only `hook`, so `ctx.session.get(id)` was
+    /// `TypeError: ... is not a function` — a crash, not the honest throw the rest
+    /// of the shim uses. `ctx.plugin.list()` likewise returned `[]` while
+    /// `/api/plugin` serves the real inventory (D-PLUGIN-INVENTORY was closed).
+    #[tokio::test]
+    async fn v2_domain_rest_methods_bind_real_routes() -> anyhow::Result<()> {
+        if !runtime_available() {
+            panic!(
+                "plugin-runtime binary ({}) required for plugin-host tests",
+                crate::plugin_runtime().program()
+            );
+        }
+        // A real HTTP responder so ctx.session.get() exercises an actual route
+        // (stdlib thread; the shim fetches it like any other client would).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let body = br#"{"id":"ses_bound","title":"bound-route"}"#;
+                let _ = s.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+                let _ = s.write_all(body);
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        // The fixture reports each probe's outcome back over RPC so the test can
+        // read real results (not shim internals).
+        std::fs::write(
+            dir.path().join("rest.mjs"),
+            r#"export default {
+  id: "restprobe",
+  setup: async (ctx) => {
+    const results = {};
+    // plugin.list must return the REAL inventory, not [].
+    results.pluginList = await ctx.plugin.list();
+    // session.get must reach the bound route.
+    try {
+      const s = await ctx.session.get("ses_bound");
+      results.sessionGet = { ok: true, id: s && s.id };
+    } catch (e) { results.sessionGet = { ok: false, err: String(e && e.message || e) }; }
+    // An UNBOUND verb must throw the NAMED divergence, not a TypeError.
+    try { await ctx.session.notARealVerb("x"); results.unbound = { threw: false }; }
+    catch (e) { results.unbound = { threw: true, msg: String(e && e.message || e) }; }
+    await ctx.rpc.register({ id: "probe" }, { results: async () => results });
+  },
+};"#,
+        )
+        .unwrap();
+
+        let host = materialize_host(&dir.path().join("host"))?;
+        let mut sc = Sidecar::spawn(&host, &format!("http://127.0.0.1:{port}"), "/work").await?;
+        let input = json!({"directory": "/work", "serverUrl": format!("http://127.0.0.1:{port}")});
+        sc.load(
+            "restprobe",
+            &dir.path().join("rest.mjs"),
+            &input,
+            &Value::Null,
+        )
+        .await?;
+
+        let r = sc.rpc_call("probe", "results", json!({})).await?;
+        let out = &r["output"];
+
+        // 1. plugin.list is real (contains our own id), not empty.
+        let listed = out["pluginList"].as_array().cloned().unwrap_or_default();
+        assert!(
+            listed.iter().any(|p| p["id"] == "restprobe"),
+            "ctx.plugin.list() must report the loaded plugin: {out}"
+        );
+
+        // 2. session.get hit the bound route (the stub answered ses_bound).
+        assert_eq!(
+            out["sessionGet"]["ok"], true,
+            "ctx.session.get must reach /api/session/{{id}}: {out}"
+        );
+        assert_eq!(out["sessionGet"]["id"], "ses_bound");
+
+        // 3. an unbound verb throws the NAMED divergence (D-V2-DOMAIN), not a
+        //    TypeError and not silently succeeding.
+        assert_eq!(
+            out["unbound"]["threw"], true,
+            "unbound verb must throw: {out}"
+        );
+        let msg = out["unbound"]["msg"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("D-V2-DOMAIN"),
+            "unbound verb must name the divergence (D-V2-DOMAIN), got: {msg}"
+        );
+
+        sc.shutdown().await;
+        Ok(())
+    }
+
+    /// The `config` hook is dispatched (v1 parity, plugin/index.ts:244-251).
+    /// Closes the registered-but-never-called class: a plugin whose `config`
+    /// is a real hook must see it run (host `config` used to hard-code "ok").
+    #[tokio::test]
+    async fn config_hook_is_dispatched() -> anyhow::Result<()> {
+        if !runtime_available() {
+            panic!(
+                "plugin-runtime binary ({}) required for plugin-host tests",
+                crate::plugin_runtime().program()
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("cfg.mjs"),
+            r#"export const PluginModule = {
+  id: "cfg",
+  server: async () => ({
+    config: async (cfg) => {
+      if (typeof cfg !== "object" || cfg === null) throw new Error("config not object");
+    },
+    "chat.message": async () => {},
+  }),
+};
+export default PluginModule.server;"#,
+        )
+        .unwrap();
+        let host = materialize_host(&dir.path().join("host"))?;
+        let mut sc = Sidecar::spawn(&host, "http://127.0.0.1:9", "/work").await?;
+        sc.load("cfg", &dir.path().join("cfg.mjs"), &json!({}), &Value::Null)
+            .await?;
+        let r = sc.config(json!({"model": "x"})).await?;
+        assert_eq!(r["matched"], 1, "config hook must be dispatched: {r}");
+        sc.shutdown().await;
+        Ok(())
+    }
+
     /// Test environment gate: the ACTUAL runtime (bun preferred) must exist.
     fn runtime_available() -> bool {
         crate::which(crate::plugin_runtime().program()).is_some()
+    }
+
+    /// Real-plugin battery (V2-EXECUTION-PLAN Phase 2): every v1 authoring
+    /// form the frozen client supports (plugin/index.ts readV1Plugin +
+    /// getLegacyPlugins) plus the `[spec, options]` tuple. Loads all forms
+    /// through ONE sidecar (as production does) and asserts each registered
+    /// the expected hook AND that options actually reach the factory (the
+    /// silently-dropped-tuple bug this battery exists to pin).
+    #[tokio::test]
+    async fn battery_all_authoring_forms_and_options() -> anyhow::Result<()> {
+        if !runtime_available() {
+            panic!(
+                "plugin-runtime binary ({}) required for plugin-host tests",
+                crate::plugin_runtime().program()
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // 1. PluginModule.server (v1 canonical)
+        std::fs::write(
+            dir.path().join("p_module.mjs"),
+            r#"export const PluginModule = {
+  id: "m",
+  server: async () => ({ "chat.message": async (_i, o) => { o.module = true; } }),
+};"#,
+        )
+        .unwrap();
+        // 2. default object with .server
+        std::fs::write(
+            dir.path().join("p_default_obj.mjs"),
+            r#"export default { server: async () => ({ "chat.params": async (_i, o) => { o.defaultobj = true; } }) };"#,
+        )
+        .unwrap();
+        // 3. default function (legacy)
+        std::fs::write(
+            dir.path().join("p_default_fn.mjs"),
+            r#"export default async () => ({ "tool.execute.after": async (_i, o) => { o.defaultfn = true; } });"#,
+        )
+        .unwrap();
+        // 4. named plain-function export (each IS a server factory)
+        std::fs::write(
+            dir.path().join("p_named.mjs"),
+            r#"export async function MyPlugin() { return { "event": async () => {} }; }"#,
+        )
+        .unwrap();
+        // 5. options tuple: the factory must SEE the second tuple element.
+        std::fs::write(
+            dir.path().join("p_options.mjs"),
+            r#"export const PluginModule = {
+  id: "opts",
+  server: async (_input, options) => ({
+    "chat.message": async (_i, o) => { o.sawOptions = options; },
+  }),
+};"#,
+        )
+        .unwrap();
+
+        let host = materialize_host(&dir.path().join("host"))?;
+        let mut sc = Sidecar::spawn(&host, "http://127.0.0.1:9", "/work").await?;
+        let input =
+            json!({"directory": "/work", "projectID": "global", "serverUrl": "http://127.0.0.1:9"});
+
+        let h1 = sc
+            .load("m", &dir.path().join("p_module.mjs"), &input, &Value::Null)
+            .await?;
+        assert_eq!(h1, vec!["chat.message"], "PluginModule.server form");
+        let h2 = sc
+            .load(
+                "dobj",
+                &dir.path().join("p_default_obj.mjs"),
+                &input,
+                &Value::Null,
+            )
+            .await?;
+        assert_eq!(h2, vec!["chat.params"], "default object with .server form");
+        let h3 = sc
+            .load(
+                "dfn",
+                &dir.path().join("p_default_fn.mjs"),
+                &input,
+                &Value::Null,
+            )
+            .await?;
+        assert_eq!(
+            h3,
+            vec!["tool.execute.after"],
+            "default function (legacy) form"
+        );
+        let h4 = sc
+            .load(
+                "named",
+                &dir.path().join("p_named.mjs"),
+                &input,
+                &Value::Null,
+            )
+            .await?;
+        assert_eq!(h4, vec!["event"], "named function export form");
+
+        let opts = json!({"token": "abc", "n": 3});
+        let h5 = sc
+            .load("opts", &dir.path().join("p_options.mjs"), &input, &opts)
+            .await?;
+        assert_eq!(
+            h5,
+            vec!["chat.message"],
+            "options-tuple form registers same hook"
+        );
+
+        // Dispatch across ALL loaded plugins: each form's hook fires.
+        let out = sc.trigger("chat.message", json!({}), json!({})).await?;
+        assert_eq!(out["module"], true, "form 1 hook fired");
+        // options reached the factory (the tuple was NOT dropped)
+        assert_eq!(out["sawOptions"], opts, "factory saw the tuple options");
+        let out2 = sc.trigger("chat.params", json!({}), json!({})).await?;
+        assert_eq!(out2["defaultobj"], true, "form 2 hook fired");
+        let out3 = sc
+            .trigger("tool.execute.after", json!({}), json!({}))
+            .await?;
+        assert_eq!(out3["defaultfn"], true, "form 3 hook fired");
+
+        // statuses carry all five loads (real inventory, not empty).
+        let st = sc.statuses();
+        for spec in ["m", "dobj", "dfn", "named", "opts"] {
+            assert_eq!(st[spec]["ok"], true, "status for {spec}");
+        }
+        sc.shutdown().await;
+        Ok(())
     }
 }
 

@@ -143,12 +143,20 @@ def main() -> int:
         # selftest against a minimal inline spec
         spec = {"components": {"schemas": {"X": {"properties": {"ok": {}}}}}}
         return selftest(spec, {"ok"} | ALLOW)
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 4):
         print(__doc__)
         return 2
     spec = json.loads(Path(sys.argv[1]).read_text())
     allowed = spec_keys(spec) | ALLOW
-    src = Path(sys.argv[2])
+    # Second contract (V2-PLAN.md P4): a key valid in EITHER contract passes —
+    # the version split is enforced by the wire.rs key pins + differentials,
+    # not this lexical scan (which cannot see which route a handler serves).
+    if len(sys.argv) == 4:
+        spec2 = json.loads(Path(sys.argv[2]).read_text())
+        allowed |= spec_keys(spec2)
+        src = Path(sys.argv[3])
+    else:
+        src = Path(sys.argv[2])
     files = sorted(src.glob("*.rs"))
     viol = []
     for f in files:

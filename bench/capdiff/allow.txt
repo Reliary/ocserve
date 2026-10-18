@@ -2,9 +2,5 @@
 # row (same discipline as pair-check). Read by capdiff.py; a divergence not
 # listed here fails the gate.
 #
-# D-TOOLS-TASK: freeze advertises the `task` tool (a subagent launcher);
-# ocserve does not implement subagents, so it is not advertised. The default
-# system prompt tells the model to use Task, so this is a REAL functional gap
-# (queued), not a permanent divergence. Keying the tool diff by name keeps
-# this to a single line. JSON-Pointer prefix form.
-$.tools.task
+# (D-TOOLS-TASK closed 2026-10-17: `task` is now implemented — K-TASK — so the
+# freeze/ocserve provider tool sets match and no allowlist line is needed.)

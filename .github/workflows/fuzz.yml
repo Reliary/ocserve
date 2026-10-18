@@ -1,8 +1,10 @@
 name: fuzz
 
 # Weekly + on-demand fuzzing of the parsers (SSE line parser, splice JSON
-# passthrough, typed wire decode). Targets live in fuzz/ (own workspace,
-# excluded from the main build graph).
+# passthrough, typed wire decode, event decoder, provider stream assembler,
+# config TOML, substr window math, MCP JSON-RPC). Targets live in fuzz/ (own
+# workspace, excluded from the main build graph). Every TESTING §6 target is
+# present; a new parser ships with its target or a named justification.
 #
 # Run locally: `cargo +nightly fuzz run sse_parser`
 
@@ -16,19 +18,26 @@ permissions:
 
 jobs:
   fuzz:
-    name: cargo-fuzz
+    name: cargo-fuzz ${{ matrix.target }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - sse_parser
+          - splice_parser
+          - wire_decode
+          - event_decoder
+          - stream_assembler
+          - config_toml
+          - substr_window
+          - mcp_jsonrpc
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - name: install nightly + cargo-fuzz
         run: |
           rustup toolchain install nightly --profile minimal
           cargo +nightly install cargo-fuzz --locked
-      - name: build targets
-        run: cargo +nightly fuzz build
-      - name: run sse_parser (60s)
-        run: cargo +nightly fuzz run sse_parser -- -max_total_time=60 -timeout=30
-      - name: run splice_parser (60s)
-        run: cargo +nightly fuzz run splice_parser -- -max_total_time=60 -timeout=30
-      - name: run wire_decode (60s)
-        run: cargo +nightly fuzz run wire_decode -- -max_total_time=60 -timeout=30
+      - name: run ${{ matrix.target }} (60s)
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60 -timeout=30
+

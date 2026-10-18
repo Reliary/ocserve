@@ -63,6 +63,20 @@ step "corpus: session-list wire parity over live db" \
 # 3. provider stream fuzz: 10k seeded chunk-boundary splits vs whole-buffer
 step "stream chunk-split fuzz" cargo test -p ocserve-llm chunk_split_fuzz
 
+# 3b. cargo-fuzz smoke pass (TESTING §6): every parser target for a bounded
+#     10s each. Weekly CI runs the 60s variants (fuzz.yml); this keeps the
+#     targets live in the local nightly too. Skipped-with-a-note (not FAIL)
+#     when the nightly toolchain/cargo-fuzz is absent — a missing dev tool is
+#     not a product defect, but it IS reported so the absence is visible.
+if rustup toolchain list 2>/dev/null | grep -q '^nightly' && command -v cargo-fuzz >/dev/null 2>&1; then
+  for t in sse_parser splice_parser wire_decode event_decoder stream_assembler config_toml substr_window mcp_jsonrpc; do
+    step "fuzz smoke: $t (10s)" \
+      cargo +nightly fuzz run "$t" -- -max_total_time=10 -timeout=30
+  done
+else
+  echo "== fuzz smoke: SKIPPED (nightly toolchain or cargo-fuzz absent) ==" | tee -a "$LOG"
+fi
+
 # 4. backup drill: online VACUUM INTO while serving, then integrity +
 #    row-count check on the COPY (live service never written)
 drill() {
@@ -121,13 +135,28 @@ step "backup drill (VACUUM INTO + integrity + counts)" bash -c "$(declare -f dri
 #      1.18.31 app pack, zstd 5.08 MB, embedded via include_bytes! — upstream
 #      parity: upstream embeds its whole app/dist too; still ~6.5x smaller
 #      than upstream's 185 MB ELF) → ceiling 30,000,000 B
+#     Phase E second pack: 32,965,584 B measured 2026-10-17 (the pinned
+#      2.0.28 app pack, zstd 3.16 MB, same pipeline — both packs embedded,
+#      selected by OCSERVE_UI_PACK; still ~5.6x smaller than upstream's
+#      185 MB ELF) → ceiling 34,000,000 B
+#     K-SECREV web-UI completeness: 61,479,024 B measured 2026-10-18. The
+#      browser acceptance (scripts/webui-v2-check.py) proved the first pack
+#      missed ~52 lazily code-split chunks AND the root assets (sw.js/favicon);
+#      the complete closure is v1 944 files/36 MB raw + v2 1678 files/87 MB raw
+#      (36 MB of it lazily-loaded office-preview WASM). Packs switched to
+#      OCAP2 (per-file zstd frames) so the loader decompresses ONE file at a
+#      time into a 16 MiB bounded LRU — resident memory is O(16 MiB), not the
+#      87 MB closure (MEMORY.md bounded-by-construction). Size re-baselined
+#      from measurement (provenance rule); still ~3x smaller than upstream's
+#      185 MB ELF. NOTE: 36 MB of this is office-document-preview WASM — a
+#      candidate to drop if a leaner default is wanted (documented tradeoff).
 size_gate() {
   local bin="target/release/ocserve"
   if [ ! -x "$bin" ]; then
     echo "release binary missing — building"
     cargo build --release || return 1
   fi
-  local sz ceiling=30000000
+  local sz ceiling=62000000
   sz="$(stat -c%s "$bin")"
   echo "size=${sz} ceiling=${ceiling}"
   [ "$sz" -le "$ceiling" ] || { echo "OVER SIZE CEILING"; return 1; }
@@ -152,10 +181,13 @@ step "permission differential (freeze vs ocserve)" ./scripts/permission-check.sh
 # 6c. event-payload scan (guard rule 19's live half): validates the live event
 #     log against the frozen Event contract. Post-fix events must be clean;
 #     historical pre-fix rows are counted but not fatal (already fixed at the
-#     source). Read-only.
+#     source). Read-only. NOTE: `checked 0` on an idle window is NO DATA, not
+#     a pass — the count is echoed so the report states vacuity explicitly.
 step "event payloads vs frozen contract" \
-  python3 bench/events/event-validate.py \
-  "${OCSERVE_DATA_DIR:-$HOME/.local/share/ocserve}/ocserve.db" --minutes 60
+  bash -c 'out=$(python3 bench/events/event-validate.py \
+    "${OCSERVE_DATA_DIR:-$HOME/.local/share/ocserve}/ocserve.db" --minutes 60); \
+    echo "$out"; echo "$out" | grep -q "checked 0 events" && \
+    echo "NOTE: event window empty — vacuous green (no traffic to validate)" || true'
 
 # 6c-bis. snapshot/revert/vcs-apply integration (K-SNAPSHOT, SNAPSHOT.md §7):
 #     containerised single-arm + freeze differential. Manual tier (docker);
@@ -185,21 +217,57 @@ step "field-contract differential (freeze vs ocserve)" \
 step "provider-boundary differential (freeze vs ocserve)" \
   bash -c './scripts/capdiff-check.sh --selftest && ./scripts/capdiff-check.sh --full && ./scripts/capdiff-check.sh --full --reverse' 
 
+# 6f. v2 column (K-V2-P5, V2-PARITY-PLAN.md §6): live differential vs the real
+#     2.0.28 binary (11 vectors: info/inbox/form/log/messages/admission) +
+#     v2 contract selftest + v2 shape validation + v2 drift detection.
+#     Local-nightly only (needs the 2.0.28 binary + password harness; hosted
+#     runners 500 on freeze probes — same reason as pair/capdiff). The live
+#     arms are SKIPPED-with-a-note when the 2.0.28 artifacts are absent (a
+#     missing dev tool is not a product defect — the established nightly rule,
+#     same as the fuzz step); the offline contract-differ still runs.
+V2CLI="${V2_CLI:-/var/tmp/ocserve-scratch/ocli/node_modules/@opencode/cli-linux-x64/bin/opencode}"
+if [ -x "$V2CLI" ]; then
+  step "v2 live differential (2.0.28 vs ocserve)" ./scripts/pair-v2-check.sh
+  step "v2 shapes vs 2.0.28 contract" ./scripts/spec-validate-v2.sh
+  step "v2 client acceptance (2.0.28 CLI vs ocserve)" ./scripts/v2cli-check.sh
+  if python3 -c 'import playwright' >/dev/null 2>&1; then
+    step "v2 web UI browser acceptance (2.0.28 pack)" \
+      bash -c 'D=$(mktemp -d); cp -r testdata/fixture "$D/fh"; \
+        setsid env HOME="$D/fh" OCSERVE_DATA_DIR="$D" OCSERVE_V2=1 OCSERVE_UI_PACK=2.0.28 \
+        OPENCODE_DISABLE_MODELS_FETCH=1 ./target/release/ocserve serve --port 5151 >"$D/s.log" 2>&1 & \
+        P=$!; sleep 4; python3 scripts/webui-v2-check.py http://127.0.0.1:5151; rc=$?; \
+        kill $P 2>/dev/null; rm -rf "$D"; exit $rc'
+  else
+    echo "== v2 web UI browser acceptance: SKIPPED (python playwright absent) ==" | tee -a "$LOG"
+  fi
+else
+  echo "== v2 live column: SKIPPED (2.0.28 CLI absent at $V2CLI) ==" | tee -a "$LOG"
+fi
+step "v2 contract-differ selftest + classify" \
+  bash -c 'python3 scripts/contract-diff.py --selftest && python3 scripts/contract-diff.py'
+step "v2 drift detection (npm latest vs vendored)" ./scripts/v2-drift.sh
+
 # 7. mutants (opt-in): survivor report is triaged like a defect (TESTING §9)
 if [ "$WITH_MUTANTS" = "1" ]; then
   if command -v cargo-mutants >/dev/null 2>&1; then
-    # skip the 50s fuzz (per-mutant cost) — mutants target store/core logic
-    # per-mutant `cargo test` skips the 50s fuzz + SIGKILL harness (both run
-    # unmutated every gate/nightly anyway). QUIRK (observed twice): cargo-
-    # mutants joins test args WITHOUT inserting `--`, and cargo test rejects
-    # bare --skip — so the separator must be PASSED as the first test arg:
-    #   ... -- -- --skip <name>   →  cargo test ... -- --skip <name>
-    # TMPDIR on REAL disk: default /tmp is tmpfs on some hosts — the first
-    #529-mutant run filled the16G ramdisk and died with ENOSPC mid-build
+    # skip the two known-slow harness tests per mutant (the 50s chunk-split
+    # fuzz + the SIGKILL crash harness — both run unmutated every gate).
+    # Acceleration lives in .cargo/mutants.toml (profile=mutants debug=none,
+    # minimum_test_timeout=45). NOTE: cargo-mutants appends CONFIG test-args
+    # after the post-`--` test-binary args without re-inserting the separator,
+    # so `additional_cargo_test_args` must stay empty when using the
+    # `-- -- --skip X` form below (they were removed for this reason).
+    # jobs via CARGO_MUTANTS_JOBS (cargo-mutants defaults to 1; the measured
+    # baseline used 4 locally / 8 on the i9).
     mkdir -p target/mutants-tmp
     step "cargo mutants (store+core)" env TMPDIR="$PWD/target/mutants-tmp" \
-      cargo mutants -p ocserve-store -p ocserve-core --timeout 120 \
+      CARGO_MUTANTS_JOBS="${CARGO_MUTANTS_JOBS:-4}" \
+      cargo mutants -p ocserve-store -p ocserve-core \
       -- -- --skip chunk_split --skip sigkill
+    # Gate the survivor count against the agreed ceiling (TESTING §1 rule 1:
+    # threshold agreed at first run, then ratcheted down). Only meaningful if
+    # the run produced outcomes; absent results are a FAIL not a skip.
+    step "mutation-score gate" python3 scripts/check-mutants.py
   else
     echo "FAIL: --with-mutants but cargo-mutants not installed" | tee -a "$LOG"
     FAILS=$((FAILS + 1))

@@ -88,3 +88,11 @@ strip = true
 
 [profile.dev]
 debug = 1
+
+# Mutation-testing profile (cargo-mutants). Inherits `test`, drops debug
+# symbols — mutagen builds/links are dominated by link time and the debug
+# info is worthless when a mutant is *expected* to fail. Selected by
+# `.cargo/mutants.toml`. Faster, bounded memory.
+[profile.mutants]
+inherits = "test"
+debug = "none"

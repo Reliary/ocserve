@@ -1,0 +1,26 @@
+{
+  "permission": [
+    "evaluate"
+  ],
+  "session": [
+    "compaction",
+    "context",
+    "experimental.ws.handshake",
+    "experimental.ws.receive",
+    "experimental.ws.send",
+    "generate",
+    "http.request",
+    "http.response",
+    "model.request",
+    "prompt",
+    "retry",
+    "title"
+  ],
+  "shell": [
+    "create.before"
+  ],
+  "tool": [
+    "execute.after",
+    "execute.before"
+  ]
+}

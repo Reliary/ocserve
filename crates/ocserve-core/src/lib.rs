@@ -6,15 +6,19 @@
 //! land with M3 milestones.
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
+pub mod attempt;
 pub mod compact;
 pub mod compaction;
+pub mod coordinator;
 pub mod event;
+pub mod form;
 pub mod ids;
 pub mod loop_guard;
 pub mod permission;
 pub mod prompt;
 pub mod question;
 pub mod revert;
+pub mod shell;
 pub mod sift_boundary;
 pub mod snapshot;
 pub mod spec;

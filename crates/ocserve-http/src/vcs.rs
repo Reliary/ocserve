@@ -174,6 +174,144 @@ fn is_git(dir: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// v2 `Vcs.Info` projection (`{branch:{current, default}}`): same git
+/// queries as `info`, per-contract shape (v1 wants string branch — the two
+/// contracts conflict on the key, so no union; see v2::vcs_get).
+pub fn info_v2(dir: &str) -> Value {
+    let branch = run_git(dir, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .filter(|(t, c)| *c == 0 && !t.trim().is_empty())
+        .map(|(t, _)| t.trim().to_string());
+    let default_branch = run_git(dir, &["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .filter(|(t, c)| *c == 0 && !t.trim().is_empty())
+        .map(|(t, _)| {
+            t.trim()
+                .trim_start_matches("refs/remotes/origin/")
+                .to_string()
+        });
+    json!({
+        "branch": {
+            "current": branch,
+            "default": default_branch,
+        }
+    })
+}
+
+/// Base ref for diffs (`Vcs.Base{name, ref, source}`): the merge-base
+/// against the default branch, else HEAD. Null when not a git repo (never
+/// fabricated — the contract's `data` allows null).
+pub fn base(dir: &str) -> Value {
+    if !is_git(dir) {
+        return Value::Null;
+    }
+    let default_branch = run_git(dir, &["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .filter(|(t, c)| *c == 0 && !t.trim().is_empty())
+        .map(|(t, _)| {
+            t.trim()
+                .trim_start_matches("refs/remotes/origin/")
+                .to_string()
+        });
+    // v2 `source` enum is reflog|default (contract): a merge-base against
+    // the default branch reports "default"; HEAD fallback reports "reflog"
+    // only when resolvable, else the null-data path above already returned.
+    let (name, source) = match default_branch {
+        Some(b) => (b, "default"),
+        None => ("HEAD".to_string(), "reflog"),
+    };
+    let r = run_git(dir, &["merge-base", &name, "HEAD"])
+        .filter(|(t, c)| *c == 0 && !t.trim().is_empty())
+        .map(|(t, _)| t.trim().to_string())
+        .or_else(|| {
+            run_git(dir, &["rev-parse", "HEAD"])
+                .filter(|(t, c)| *c == 0 && !t.trim().is_empty())
+                .map(|(t, _)| t.trim().to_string())
+        });
+    match r {
+        Some(sha) => json!({"name": name, "ref": sha, "source": source}),
+        None => Value::Null,
+    }
+}
+
+/// Branch list (`Vcs.BranchList` = string array): local branches via
+/// `for-each-ref`. Empty (not an error) when not a git repo.
+pub fn branches(dir: &str) -> Value {
+    if !is_git(dir) {
+        return Value::Array(vec![]);
+    }
+    run_git(
+        dir,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+    )
+    .filter(|(_t, c)| *c == 0)
+    .map(|(t, _)| {
+        Value::Array(
+            t.lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .map(|l| json!(l))
+                .collect(),
+        )
+    })
+    .unwrap_or_else(|| Value::Array(vec![]))
+}
+
+/// Worktree list (`Worktree.List`): `git worktree list --porcelain` parsed
+/// to `[{directory}]`. Empty when not a git repo (never an error — the
+/// caller decides 404-vs-empty per contract).
+pub fn worktrees(dir: &str) -> Value {
+    if !is_git(dir) {
+        return Value::Array(vec![]);
+    }
+    run_git(dir, &["worktree", "list", "--porcelain"])
+        .filter(|(_, c)| *c == 0)
+        .map(|(t, _)| {
+            Value::Array(
+                t.lines()
+                    .filter_map(|l| l.strip_prefix("worktree "))
+                    .map(|d| json!({"directory": d.trim()}))
+                    .collect(),
+            )
+        })
+        .unwrap_or_else(|| Value::Array(vec![]))
+}
+
+/// Create a worktree (`git worktree add [--detach] <dir> [<branch>]`).
+/// Returns the directory on success, None with stderr on failure.
+pub fn worktree_add(dir: &str, path: &str, branch: Option<&str>) -> Result<String, String> {
+    if !is_git(dir) {
+        return Err("not a git repository".to_string());
+    }
+    let mut args = vec!["worktree", "add"];
+    if branch.is_some() {
+        args.push("--detach");
+    }
+    args.push(path);
+    if let Some(b) = branch {
+        args.push(b);
+    }
+    match run_git(dir, &args) {
+        Some((_, 0)) => Ok(path.to_string()),
+        Some((t, _)) => Err(t.trim().to_string()),
+        None => Err("git failed to spawn".to_string()),
+    }
+}
+
+/// Remove a worktree (`git worktree remove [--force] <dir>`).
+pub fn worktree_remove(dir: &str, path: &str, force: bool) -> Result<(), String> {
+    if !is_git(dir) {
+        return Err("not a git repository".to_string());
+    }
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(path);
+    match run_git(dir, &args) {
+        Some((_, 0)) => Ok(()),
+        Some((t, _)) => Err(t.trim().to_string()),
+        None => Err("git failed to spawn".to_string()),
+    }
+}
+
 pub fn status(dir: &str) -> Value {
     if !is_git(dir) {
         return Value::Array(vec![]);

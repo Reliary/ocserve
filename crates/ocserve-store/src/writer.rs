@@ -30,6 +30,43 @@ struct Batch {
     ack: mpsc::Sender<Result<usize>>,
 }
 
+/// Best-effort pre-migration snapshot (M1): when the on-disk `user_version`
+/// is BELOW the binary's `SCHEMA_VERSION`, copy the DB into
+/// `<data>/.safety/ocserve-pre-v<from>.db` before the version advances, so a
+/// rollback to the previous tag can restore it (an older binary refuses to
+/// boot a newer-versioned DB). No-op when already current (the common boot) or
+/// when the version is UNKNOWN/newer (that path bails in migrate anyway).
+/// Non-fatal: a failed backup warns and proceeds (the backup is a convenience,
+/// not a boot gate — the same fail-soft rule as post_maintenance).
+fn backup_before_migration(conn: &Connection, path: &Path) -> Result<()> {
+    let from: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(0);
+    if from == 0 || from >= crate::schema::SCHEMA_VERSION {
+        return Ok(()); // fresh DB (no data to lose) or already current
+    }
+    let dir = match path.parent() {
+        Some(d) => d.join(".safety"),
+        None => return Ok(()),
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("pre-migration backup: mkdir {}: {e:#}", dir.display());
+        return Ok(());
+    }
+    let dest = dir.join(format!("ocserve-pre-v{from}.db"));
+    if dest.exists() {
+        return Ok(()); // an earlier backup for this version already exists
+    }
+    match conn.execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()]) {
+        Ok(_) => tracing::info!(
+            "pre-migration backup: v{from} -> {} (restore with this file to roll back)",
+            dest.display()
+        ),
+        Err(e) => tracing::warn!("pre-migration backup failed (continuing): {e:#}"),
+    }
+    Ok(())
+}
+
 pub struct Writer {
     tx: Option<mpsc::Sender<Batch>>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -48,6 +85,13 @@ impl Writer {
         // Open + migrate SYNCHRONOUSLY (fail-fast at boot; the DB must exist
         // and be migrated before any reader can race us — M2 500 finding).
         let conn = crate::pragma::open_writer(&path)?;
+        // M1 (reliability review): a schema-ADVANCING migration is one-way —
+        // once user_version moves up, an older binary refuses to boot
+        // (`bail!` on a newer version), so a rollback would be bricked. Take a
+        // best-effort `VACUUM INTO` snapshot into a `.safety/` sibling BEFORE
+        // the version advances, so the previous tag can be restored. Skipped
+        // when already current (the common boot) and non-fatal on failure.
+        backup_before_migration(&conn, &path)?;
         crate::schema::migrate(&conn)?;
         let handle = std::thread::Builder::new()
             .name("ocserve-writer".into())

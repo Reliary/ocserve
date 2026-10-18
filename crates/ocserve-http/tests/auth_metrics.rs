@@ -84,6 +84,242 @@ async fn auth_basic_allows_correct_credentials() {
     }
 }
 
+/// Byte-exact upstream challenge (probed live on 2.0.28): 401 +
+/// `www-authenticate: Basic realm="Secure Area"` +
+/// `{"_tag":"UnauthorizedError","message":"Authentication required"}`.
+#[tokio::test]
+async fn auth_challenge_is_byte_exact() {
+    let resp = app_basic()
+        .oneshot(
+            Request::builder()
+                .uri("/api/info")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let challenge = resp
+        .headers()
+        .get(axum::http::header::WWW_AUTHENTICATE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        challenge, "Basic realm=\"Secure Area\"",
+        "challenge drifted"
+    );
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["_tag"], "UnauthorizedError");
+    assert_eq!(v["message"], "Authentication required");
+    // CONTROL: challenge without the header → browsers never prompt, red.
+}
+
+/// Absent and wrong credentials are indistinguishable (no oracle for
+/// attackers to distinguish "no creds" from "bad creds").
+#[tokio::test]
+async fn auth_absent_and_wrong_are_indistinguishable() {
+    use base64::Engine;
+    let bad = base64::engine::general_purpose::STANDARD.encode("u:wrong");
+    let plain = app_basic()
+        .oneshot(
+            Request::builder()
+                .uri("/api/info")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let denied = app_basic()
+        .oneshot(
+            Request::builder()
+                .uri("/api/info")
+                .header(axum::http::header::AUTHORIZATION, format!("Basic {bad}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plain.status(), denied.status());
+    let pb = plain.into_body().collect().await.unwrap().to_bytes();
+    let db = denied.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(pb, db, "absent vs wrong must be byte-identical");
+    // CONTROL: distinct messages per case → comparison fails, red.
+}
+
+/// Unknown paths stay public under auth (upstream parity, probed live:
+/// `/nonexistent-path-xyz` → 200 UI HTML). The fallback is deliberately
+/// outside the auth layer — the UI must load before it can prompt.
+#[tokio::test]
+async fn auth_unknown_paths_stay_public() {
+    for uri in ["/nonexistent-path-xyz", "/"] {
+        let resp = app_basic()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri} must stay public");
+    }
+    // CONTROL: fallback moved inside auth → 401 here, red (parity break).
+}
+
+/// Wrong-method on a bound API route (probed live on 2.0.28): 401
+/// unauthenticated, 404 authenticated — never the SPA. (v1 freeze serves
+/// the SPA here; `/api/*` is the v2 surface and follows v2.)
+#[tokio::test]
+async fn auth_wrong_method_matches_v2() {
+    use base64::Engine;
+    let denied = app_basic()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/info")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    let good = base64::engine::general_purpose::STANDARD.encode("u:p");
+    let nf = app_basic()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/info")
+                .header(axum::http::header::AUTHORIZATION, format!("Basic {good}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(nf.status(), StatusCode::NOT_FOUND);
+    // CONTROL: SPA fallback on /api wrong-method → 200 here, red.
+}
+
+/// F7 (security/reliability review): an UNBOUND `/api/*` GET must be a JSON
+/// 404, never the SPA index HTML (serving HTML 200 to an API client crashes the
+/// SDK's shape parse). Non-API unknown paths stay public UI (upstream parity).
+#[tokio::test]
+async fn unbound_api_path_is_json_404_not_html() {
+    let resp = app_off()
+        .oneshot(
+            Request::builder()
+                .uri("/api/definitely-not-a-bound-route")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let ct = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ct.contains("application/json"),
+        "unbound /api/* must be JSON, got content-type {ct}"
+    );
+    // CONTROL: removing the /api guard in ui_fallback → text/html, red.
+}
+
+/// CORS preflight through the PRODUCTION stack (perimeter layer outside the
+/// router, as serve() wires it): 204 on both routes, off and basic. The
+/// perimeter exists because fallback + MNF responses bypass router middleware
+/// in our builder order (proven empirically 2026-10-17: preflight resolved to
+/// ui_fallback/MNF with no 204 and no ACAO while routed GETs carried ACAO).
+/// A router-direct assertion pins the bypass so a future reorder restoring
+/// in-router coverage shows up as a changed test, not silent drift.
+#[tokio::test]
+async fn auth_cors_preflight_answers_without_credentials() {
+    for (label, app) in [("off", app_off()), ("basic", app_basic())] {
+        // Production shape: perimeter outside router (layer AFTER build).
+        let stack = app
+            .clone()
+            .layer(axum::middleware::from_fn(ocserve_http::ui::perimeter_cors));
+        for uri in ["/global/health", "/api/info"] {
+            let mut b = Request::builder().method("OPTIONS").uri(uri);
+            b = b
+                .header("Origin", "http://localhost:3000")
+                .header("Access-Control-Request-Method", "POST");
+            if label == "basic" {
+                b = b.header("Authorization", "Basic b3BlbmNvZGU6eHh4");
+            }
+            let resp = stack
+                .clone()
+                .oneshot(b.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NO_CONTENT,
+                "{label} preflight {uri}"
+            );
+            assert_eq!(
+                resp.headers()
+                    .get("access-control-allow-origin")
+                    .map(|v| v.to_str().unwrap().to_string()),
+                Some("http://localhost:3000".to_string()),
+                "{label} preflight ACAO {uri}"
+            );
+        }
+        // Router-direct pins the bypass (informational): /api/info OPTIONS
+        // resolves to the MNF (inline auth check), never to the gate.
+        let mut b = Request::builder().method("OPTIONS").uri("/api/info");
+        b = b
+            .header("Origin", "http://localhost:3000")
+            .header("Access-Control-Request-Method", "POST");
+        let resp = app
+            .clone()
+            .oneshot(b.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        if label == "off" {
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "router-direct MNF 404"
+            );
+        } else {
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "router-direct MNF challenges"
+            );
+        }
+    }
+}
+
+/// Edge credentials: user mismatch, empty, non-UTF8, malformed base64 —
+/// all deny without panic or oracle.
+#[tokio::test]
+async fn auth_edge_credentials_deny() {
+    use base64::Engine;
+    let cases = vec![
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("other:p")
+        ),
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("u:")
+        ),
+        "Basic !!!not-base64!!!".to_string(),
+        "Bearer u:p".to_string(),
+        "Basic".to_string(),
+    ];
+    for cred in cases {
+        let s = status_of(app_basic(), "/api/info", Some(&cred)).await;
+        assert_eq!(
+            s,
+            StatusCode::UNAUTHORIZED,
+            "edge credential allowed: {cred:?}"
+        );
+    }
+    // CONTROL: any allow → red.
+}
+
 /// /path key shape vs recorded golden projection (values are env-dependent,
 /// keys are the contract — manifest mode=keys).
 #[tokio::test]

@@ -1110,6 +1110,190 @@ pub fn page_messages(
     ))
 }
 
+/// Project one page of messages to v2 `Session.Message` shapes with REAL
+/// `content[]` (V2-PLAN.md P4 — replaces the skeletal `"content": []`).
+///
+/// Reads parts for the page's messages in ONE `IN` query per 64-message chunk
+/// (same bound as F3 — never a per-message query, never a whole-session
+/// prefetch). Part-type mapping:
+/// - `text` → `{type:"text", text, state:"completed"}`
+/// - `reasoning` → `{type:"reasoning", text, state:"completed"}`
+/// - `tool` → `{type:"tool", id, name, state, time}` from the stored state
+///   envelope (`{status,input,output,error,time}` → v2
+///   `completed{input,output}|error{input,error}|running{input}`)
+/// - `step-start`/`step-finish`/`patch`/`idle`/`busy`/`function` →
+///   folded into the assistant envelope (`snapshot`, `cost`, `finish`), never
+///   content elements (upstream has no message.part.* in v2 either)
+/// - user messages → `{type:"user", text, files, agents}` from info + file
+///   parts (upstream `Session.Message.User`)
+///
+/// Blobbed parts decode through the same `BlobStore` path as production.
+/// Explicit columns everywhere (rule 25/33).
+pub fn project_page_v2(
+    db: &std::path::Path,
+    page: &[(String, String)],
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    use serde_json::{Value, json};
+    let conn = pragma::open_reader(db)?;
+    let blobs = crate::blob::BlobStore::new(
+        db.parent()
+            .ok_or_else(|| anyhow::anyhow!("db parent"))?
+            .join("blobs"),
+    )?;
+    // Batch parts per 64-chunk (F3 bound).
+    const CHUNK: usize = 64;
+    let placeholders = vec!["?"; CHUNK].join(",");
+    let mut pstmt = conn.prepare_cached(&format!(
+        "SELECT message_id, type, inline, blob_sha, byte_len FROM msg_part \
+         WHERE message_id IN ({placeholders}) ORDER BY message_id, seq"
+    ))?;
+    type PartRow = (String, Option<String>, Option<(String, i64)>);
+    let mut parts: std::collections::HashMap<String, Vec<PartRow>> =
+        std::collections::HashMap::new();
+    let mut padded: Vec<Option<String>> = Vec::with_capacity(CHUNK);
+    let mut iter = page.iter();
+    loop {
+        let head: Vec<&(String, String)> = iter.by_ref().take(CHUNK).collect();
+        if head.is_empty() {
+            break;
+        }
+        padded.clear();
+        for (mid, _) in &head {
+            padded.push(Some((*mid).clone()));
+        }
+        while padded.len() < CHUNK {
+            padded.push(None);
+        }
+        let mut rows = pstmt.query(rusqlite::params_from_iter(padded.iter()))?;
+        while let Some(row) = rows.next()? {
+            let sha: Option<String> = row.get(3)?;
+            let len: i64 = row.get(4)?;
+            parts.entry(row.get::<_, String>(0)?).or_default().push((
+                row.get(1)?,
+                row.get(2)?,
+                sha.map(|s| (s, len)),
+            ));
+        }
+    }
+    let empty = Vec::new();
+    let mut out = Vec::with_capacity(page.len());
+    for (mid, info_txt) in page {
+        let info: Value = serde_json::from_str(info_txt).unwrap_or(Value::Null);
+        let role = info.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let created = info.pointer("/time/created").cloned().unwrap_or(json!(0));
+        let time = json!({"created": created});
+        let plist = parts.get(mid).map(|v| v.as_slice()).unwrap_or(&empty);
+        let mut content = Vec::new();
+        for (ptype, inline, blob) in plist {
+            let text_of = || -> String {
+                if let Some(t) = inline {
+                    return t.clone();
+                }
+                if let Some((s, len)) = blob
+                    && let Ok(bytes) = blobs.get(s, *len as u64)
+                {
+                    return String::from_utf8_lossy(&bytes).into_owned();
+                }
+                String::new()
+            };
+            match ptype.as_str() {
+                "text" => {
+                    let raw = text_of();
+                    let body: Value = serde_json::from_str(&raw).unwrap_or(json!({"text": ""}));
+                    content.push(json!({
+                        "type": "text",
+                        "text": body.get("text").cloned().unwrap_or(json!("")),
+                        "state": "completed",
+                    }));
+                }
+                "reasoning" => {
+                    let raw = text_of();
+                    let body: Value = serde_json::from_str(&raw).unwrap_or(json!({"text": ""}));
+                    content.push(json!({
+                        "type": "reasoning",
+                        "text": body.get("text").cloned().unwrap_or(json!("")),
+                        "state": "completed",
+                    }));
+                }
+                "tool" => {
+                    let raw = text_of();
+                    let body: Value = serde_json::from_str(&raw).unwrap_or(json!({}));
+                    let state = body.get("state").cloned().unwrap_or(json!({}));
+                    let status = state
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("running");
+                    let input = state.get("input").cloned().unwrap_or(json!({}));
+                    let v2state = match status {
+                        "completed" => json!({
+                            "status": "completed",
+                            "input": input,
+                            "output": state.get("output").cloned().unwrap_or(json!([])),
+                        }),
+                        "error" => json!({
+                            "status": "error",
+                            "input": input,
+                            "error": state.get("error").cloned().unwrap_or(json!("")),
+                        }),
+                        _ => json!({"status": "running", "input": input}),
+                    };
+                    content.push(json!({
+                        "type": "tool",
+                        "id": body.get("callID").cloned().unwrap_or(json!("")),
+                        "name": body.get("tool").cloned().unwrap_or(json!("")),
+                        "state": v2state,
+                        "time": state.get("time").cloned().unwrap_or(json!({})),
+                    }));
+                }
+                _ => {} // step-start/finish, patch, idle, busy, compaction: envelope, not content
+            }
+        }
+        match role {
+            "user" => {
+                let text = info
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // file/agent attachments travel as parts; surface the file ones.
+                let mut files = Vec::new();
+                let mut agents = Vec::new();
+                for (ptype, inline, _blob) in plist {
+                    if ptype == "file"
+                        && let Some(t) = inline
+                        && let Ok(v) = serde_json::from_str::<Value>(t)
+                    {
+                        files.push(v);
+                    } else if ptype == "agent"
+                        && let Some(t) = inline
+                        && let Ok(v) = serde_json::from_str::<Value>(t)
+                    {
+                        agents.push(v);
+                    }
+                }
+                out.push(json!({
+                    "id": mid, "time": time, "type": "user",
+                    "text": text, "files": files, "agents": agents,
+                }));
+            }
+            "assistant" => {
+                out.push(json!({
+                    "id": mid, "time": time, "type": "assistant",
+                    "agent": info.get("agent").cloned().unwrap_or(json!("build")),
+                    "model": {
+                        "id": info.get("modelID").cloned().unwrap_or(json!("")),
+                        "providerID": info.get("providerID").cloned().unwrap_or(json!("")),
+                    },
+                    "content": content,
+                    "cost": info.get("cost").cloned().unwrap_or(json!(0)),
+                    "tokens": info.get("tokens").cloned().unwrap_or(json!({})),
+                }));
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
 /// Walk a session's messages one at a time, yielding each message's FULL
 /// response JSON object (`{"info":…,"parts":[…]}`) to `visit`. Bounded by
 /// design (AGENTS §2.3): peak = one message — the old Vec<Value> path
@@ -1470,10 +1654,315 @@ pub fn next_event_seq(db: &std::path::Path, session_id: &str) -> anyhow::Result<
     Ok(seq)
 }
 
-/// Ring bound (STORAGE §4): per-session event cap + age window — declared
-/// at the call site (AGENTS §2.3: bounded by construction).
+/// v2 inbox engine (V2-PLAN.md P3). Server-owned pending-work queue mirroring
+/// upstream's admission → promote → deliver flow (`inbox.ts`):
+/// - admit: idempotent first-write-wins on `(session_id, type, id)`
+///   (cross-session/type reuse is a caller-level 409 — `reconcile` reports it)
+/// - deliver: delete the inbox row + insert the visible message in ONE op
+///   batch (atomic on the writer)
+/// - promote order: steers first, then exactly one queued item; compaction
+///   jumps ahead of steers but never across a move (caller enforces)
+/// - cancel/update: guarded (delivered/missing rows report `Gone`, not Ok)
+///
+/// All SQL names explicit columns (rule 25/33). Payloads are caller JSON.
+pub mod inbox {
+    use super::{WriteOp, Writer};
+    use anyhow::Result;
+
+    /// One inbox row: (id, item_type, payload_json, delivery, enqueued_seq).
+    pub type Item = (String, String, String, String, i64);
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Admit an inbox item. Returns `true` when newly inserted, `false` when
+    /// the id already exists (idempotent reconcile — first write wins).
+    pub fn admit(
+        writer: &Writer,
+        session_id: &str,
+        id: &str,
+        item_type: &str,
+        payload: &serde_json::Value,
+        delivery: &str,
+        enqueued_seq: i64,
+    ) -> Result<bool> {
+        let n = writer.write(vec![WriteOp::Sql {
+            sql: "INSERT OR IGNORE INTO session_inbox \
+                  (id, session_id, type, payload, delivery, enqueued_seq, time_created) \
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                .into(),
+            params: vec![
+                id.into(),
+                session_id.into(),
+                item_type.into(),
+                payload.to_string().into(),
+                delivery.into(),
+                enqueued_seq.into(),
+                now_ms().into(),
+            ],
+        }])?;
+        Ok(n == 1)
+    }
+
+    /// Fetch one pending item by id (explicit columns, rule 33).
+    pub fn get(db: &std::path::Path, id: &str) -> Result<Option<Item>> {
+        let conn = crate::pragma::open_reader(db)?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT session_id, type, payload, delivery, enqueued_seq \
+             FROM session_inbox WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map([id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// List pending items for a session in promote order
+    /// (enqueued_seq; caller partitions steer/queue/compaction/move).
+    pub fn list(db: &std::path::Path, session_id: &str) -> Result<Vec<Item>> {
+        let conn = crate::pragma::open_reader(db)?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, type, payload, delivery, enqueued_seq FROM session_inbox \
+             WHERE session_id = ?1 ORDER BY enqueued_seq ASC",
+        )?;
+        let rows = stmt.query_map([session_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Cancel a pending item. Returns `true` when a row was deleted,
+    /// `false` when already delivered/missing (caller maps to no-op/409).
+    pub fn cancel(writer: &Writer, id: &str) -> Result<bool> {
+        let n = writer.write(vec![WriteOp::Sql {
+            sql: "DELETE FROM session_inbox WHERE id = ?1".into(),
+            params: vec![id.into()],
+        }])?;
+        Ok(n == 1)
+    }
+
+    /// Flip a pending item's delivery. Returns `true` on update.
+    pub fn set_delivery(writer: &Writer, id: &str, delivery: &str) -> Result<bool> {
+        let n = writer.write(vec![WriteOp::Sql {
+            sql: "UPDATE session_inbox SET delivery = ?2 WHERE id = ?1".into(),
+            params: vec![id.into(), delivery.into()],
+        }])?;
+        Ok(n == 1)
+    }
+
+    /// Deliver: delete the inbox row. The caller appends the visible-message
+    /// insert ops to the SAME writer batch for atomicity — this helper builds
+    /// the delete op; see `deliver_ops`.
+    pub fn deliver_ops(id: &str) -> WriteOp {
+        WriteOp::Sql {
+            sql: "DELETE FROM session_inbox WHERE id = ?1".into(),
+            params: vec![id.to_string().into()],
+        }
+    }
+
+    /// Next promotable item id for a session: lowest-seq row, with the
+    /// caller's scope filter applied by choosing `deliveries` (e.g.
+    /// `("steer")` at a step boundary, `("steer","queue")` at idle).
+    /// Compaction-ahead-of-steers is a caller-side pick over `list()`.
+    pub fn next_promotable(
+        db: &std::path::Path,
+        session_id: &str,
+        deliveries: &[&str],
+    ) -> Result<Option<String>> {
+        let conn = crate::pragma::open_reader(db)?;
+        let placeholders = deliveries.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id FROM session_inbox WHERE session_id = ?1 \
+             AND delivery IN ({placeholders}) ORDER BY enqueued_seq ASC LIMIT 1"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&session_id];
+        for d in deliveries {
+            params.push(d);
+        }
+        let mut rows = stmt.query_map(params.as_slice(), |r| r.get::<_, String>(0))?;
+        Ok(rows.next().transpose()?)
+    }
+}
+
+/// Execution claims (V2-PLAN.md P3).
+///
+/// Claims are restart-recovery markers only (NOT fencing, NOT exactly-once):
+/// `claim` inserts iff no claim is held (re-claim no-op); `release` clears;
+/// `count_resume` increments the attempt budget (terminal at 10 — upstream
+/// `maxAttempts`). Boot recovery lists suspended sessions.
+///
+/// Claims live in their OWN table (`execution_claim`), not in
+/// `instruction_entry`: the journal is instruction domain state and a claim
+/// marker there would pollute epoch snapshots and entry listings.
+pub mod claim {
+    use super::{WriteOp, Writer};
+    use anyhow::Result;
+
+    /// Maximum resume attempts before a suspended session terminal-fails.
+    pub const MAX_RESUME_ATTEMPTS: i64 = 10;
+
+    /// Claim a session for execution. Returns `true` when newly claimed,
+    /// `false` when already held (re-claim no-op).
+    pub fn claim(writer: &Writer, session_id: &str, now_ms: i64) -> Result<bool> {
+        let n = writer.write(vec![WriteOp::Sql {
+            sql: "INSERT OR IGNORE INTO execution_claim (session_id, claimed_ms, resume_attempts) \
+                  VALUES (?1, ?2, 0)"
+                .into(),
+            params: vec![session_id.into(), now_ms.into()],
+        }])?;
+        Ok(n == 1)
+    }
+
+    /// Release a claim. Returns `true` when a claim was held.
+    pub fn release(writer: &Writer, session_id: &str) -> Result<bool> {
+        let n = writer.write(vec![WriteOp::Sql {
+            sql: "DELETE FROM execution_claim WHERE session_id = ?1".into(),
+            params: vec![session_id.into()],
+        }])?;
+        Ok(n == 1)
+    }
+
+    /// True when the session currently holds a claim.
+    pub fn held(db: &std::path::Path, session_id: &str) -> Result<bool> {
+        let conn = crate::pragma::open_reader(db)?;
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM execution_claim WHERE session_id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Increment the resume-attempt budget; returns the new total.
+    pub fn count_resume(writer: &Writer, session_id: &str, now_ms: i64) -> Result<i64> {
+        writer.write(vec![WriteOp::Sql {
+            sql: "UPDATE execution_claim SET resume_attempts = resume_attempts + 1, \
+                  claimed_ms = ?2 WHERE session_id = ?1"
+                .into(),
+            params: vec![session_id.into(), now_ms.into()],
+        }])?;
+        let conn = crate::pragma::open_reader(writer.db_path_ref())?;
+        conn.query_row(
+            "SELECT resume_attempts FROM execution_claim WHERE session_id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    /// Sessions holding claims (boot recovery scan). Bounded: at most the
+    /// sessions with live claims — claims release on terminal states.
+    pub fn list_suspended(db: &std::path::Path) -> Result<Vec<String>> {
+        let conn = crate::pragma::open_reader(db)?;
+        let mut stmt = conn.prepare_cached("SELECT session_id FROM execution_claim")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+}
 pub const EVENT_MAX_PER_SESSION: i64 = 200_000;
 pub const EVENT_MAX_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// Versioned event type discipline (V2-PLAN.md P2, C1 amendment).
+///
+/// Upstream v2 versions durable event types (`type@vN`) and addresses events
+/// by stable `evt_` ids with a per-aggregate `{aggregateID, seq, version}`
+/// envelope. Our `event` table carries the unversioned v1 type and an
+/// AUTOINCREMENT seq, and the two emitters (`prompt.rs emit_durable`,
+/// `lib.rs emit_durable_http`) each mint ids differently. This function is the
+/// SINGLE choke through which every durable emission flows (rule: no direct
+/// `append_event` calls from server paths — the guard enforces it):
+/// it stamps the versioned type, mints the stable id from the allocated seq,
+/// appends the row, and returns `(seq, id)` so the live frames and the stored
+/// row agree byte-for-byte. One write, two grammars (D5).
+pub fn emit_event(
+    writer: &Writer,
+    session_id: Option<&str>,
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> anyhow::Result<(i64, String)> {
+    let versioned = versioned_event_type(event_type);
+    append_event(writer, session_id, &versioned, payload)?;
+    // The row seq is AUTOINCREMENT; read back the row we just wrote on this
+    // writer's own connection path (MAX(seq) scoped to the session is exact
+    // here because the writer serializes all appends).
+    //
+    // PERF NOTE: this read-back costs one indexed MAX per emission. It is
+    // load-bearing ONLY where the caller needs the durable seq (inbox
+    // enqueued_seq). The hot prompt path uses `append_versioned` (no
+    // read-back) and keeps its pre-seeded local counter for sync twins.
+    let seq: i64 = {
+        let conn = pragma::open_reader(writer.db_path_ref())?;
+        conn.query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM event WHERE \
+             (session_id = ?1 OR (?1 IS NULL AND session_id IS NULL))",
+            [session_id],
+            |r| r.get(0),
+        )?
+    };
+    Ok((seq, format!("evt_{seq}")))
+}
+
+/// Versioned append WITHOUT the seq read-back (hot prompt path — V2-PLAN.md
+/// P2/C4: the per-emission MAX query showed up as pure overhead once the
+/// prompt-local counter proved authoritative for sync twins; admission paths
+/// that need the durable seq keep using `emit_event`).
+pub fn append_versioned(
+    writer: &Writer,
+    session_id: Option<&str>,
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> anyhow::Result<()> {
+    append_event(
+        writer,
+        session_id,
+        &versioned_event_type(event_type),
+        payload,
+    )
+}
+
+/// Suffix the durable version onto an event type (`type` → `type@v1`).
+/// Already-versioned types pass through; the v1 sync-twin suffix (`.1`) is
+/// preserved (it addresses the sync envelope, not the durable version).
+pub fn versioned_event_type(event_type: &str) -> String {
+    if event_type.contains('@') {
+        return event_type.to_string();
+    }
+    format!("{event_type}@v1")
+}
+
+/// Strip the durable version suffix (`type@vN` → `type`). The live v1 frames
+/// and the event-log validator operate on unversioned types.
+pub fn unversioned_event_type(event_type: &str) -> &str {
+    match event_type.rsplit_once('@') {
+        Some((base, suffix))
+            if suffix.len() > 1
+                && suffix.starts_with('v')
+                && suffix[1..].chars().all(|c| c.is_ascii_digit()) =>
+        {
+            base
+        }
+        _ => event_type,
+    }
+}
 
 /// Enforce the ring bound: keep the newest `max_per_session` rows per
 /// session and drop rows older than `max_age_ms` (explicit `now_ms` for
@@ -1516,6 +2005,406 @@ pub fn prune_events(
     Ok(aged + capped)
 }
 
+/// Full `SessionStats.Info` projection (V2-PARITY Phase F: the validator
+/// proved the summary shape insufficient). Every figure is a columnar
+/// aggregate — indexed COUNT/SUM/GROUP BY, never per-row JSON shredding:
+/// - cost: SUM(session.cost) (lifetime accumulator, token_accounting.rs)
+/// - tools: summary mode with real status split from
+///   `msg_part.inline.state.status` (completed/error/other→unfinished)
+///   grouped by tool name (bounded: distinct tools, not rows)
+/// - activeDays/streak/activity: GROUP BY day(time_created) over msg
+///   (bounded: distinct days); streak = trailing consecutive days to today
+/// - models: GROUP BY (model) with step/token/cost SUMs (bounded: models)
+pub fn session_stats_full(db: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+    let conn = pragma::open_reader(db)?;
+    #[allow(clippy::type_complexity)]
+    let (sessions, prompts, steps, tin, tout, treason, tcr, tcw, tcost, tmin, tmax): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        f64,
+        Option<i64>,
+        Option<i64>,
+    ) = conn.query_row(
+        "SELECT (SELECT count(*) FROM session), \
+                (SELECT count(*) FROM msg WHERE role = 'user'), \
+                (SELECT count(*) FROM msg WHERE role = 'assistant'), \
+                (SELECT COALESCE(SUM(tokens_input),0) FROM session), \
+                (SELECT COALESCE(SUM(tokens_output),0) FROM session), \
+                (SELECT COALESCE(SUM(tokens_reasoning),0) FROM session), \
+                (SELECT COALESCE(SUM(tokens_cache_read),0) FROM session), \
+                (SELECT COALESCE(SUM(tokens_cache_write),0) FROM session), \
+                (SELECT COALESCE(SUM(cost),0.0) FROM session), \
+                (SELECT MIN(time_created) FROM session), \
+                (SELECT MAX(time_updated) FROM session)",
+        [],
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+            ))
+        },
+    )?;
+    // Tool status split: completed → succeeded, error → failed, anything
+    // else (running/absent) → unfinished. One GROUP BY, not per-row decode.
+    let mut stmt = conn.prepare_cached(
+        "SELECT json_extract(inline, '$.tool'), json_extract(inline, '$.state.status'), count(*) \
+         FROM msg_part WHERE type = 'tool' GROUP BY 1, 2",
+    )?;
+    let mut calls: i64 = 0;
+    let mut succeeded: i64 = 0;
+    let mut failed: i64 = 0;
+    let mut by_name: std::collections::HashMap<String, (i64, i64, i64)> =
+        std::collections::HashMap::new();
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (tool, status, n) = row?;
+        calls += n;
+        let s = status.as_deref().unwrap_or("running");
+        if s == "completed" {
+            succeeded += n;
+        } else if s == "error" {
+            failed += n;
+        }
+        let e = by_name
+            .entry(tool.unwrap_or_else(|| "?".into()))
+            .or_insert((0, 0, 0));
+        e.0 += n;
+        if s == "completed" {
+            e.1 += n;
+        } else if s == "error" {
+            e.2 += n;
+        }
+    }
+    let unfinished = calls - succeeded - failed;
+    let mut by_name_arr: Vec<serde_json::Value> = by_name
+        .into_iter()
+        .map(|(name, (c, s, f))| {
+            serde_json::json!({"name": name, "calls": c, "succeeded": s, "failed": f,
+                               "unfinished": c - s - f})
+        })
+        .collect();
+    by_name_arr.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    // Day grain: one GROUP BY over msg time (bounded: distinct days).
+    let mut stmt = conn.prepare_cached(
+        "SELECT CAST(time_created / 86400000 AS INTEGER) AS day, count(*) \
+         FROM msg GROUP BY day ORDER BY day",
+    )?;
+    let day_rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+    let mut days: Vec<(i64, i64)> = Vec::new();
+    for row in day_rows {
+        days.push(row?);
+    }
+    let active_days = days.len() as i64;
+    // Streak: trailing consecutive UTC days ending today.
+    let today = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_millis() / 86400000) as i64)
+        .unwrap_or(0);
+    let mut streak: i64 = 0;
+    let mut want = today;
+    for (d, _) in days.iter().rev() {
+        if *d == want || (want == today && *d == today - 1) {
+            // Allow "yesterday" as streak start when today is empty so a
+            // daily user at 00:05 does not read streak 0.
+            streak += 1;
+            want = *d - 1;
+        } else {
+            break;
+        }
+    }
+    let activity: Vec<serde_json::Value> = days
+        .iter()
+        .map(|(d, n)| serde_json::json!({"date": chrono_day(*d), "steps": n}))
+        .collect();
+    // Models: GROUP BY session.model (bounded: distinct models).
+    let mut stmt = conn.prepare_cached(
+        "SELECT model, count(*), COALESCE(SUM(tokens_input),0), COALESCE(SUM(tokens_output),0), \
+                COALESCE(SUM(tokens_reasoning),0), COALESCE(SUM(cost),0.0) \
+         FROM session GROUP BY model",
+    )?;
+    let model_rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, i64>(4)?,
+            r.get::<_, f64>(5)?,
+        ))
+    })?;
+    let mut models: Vec<serde_json::Value> = Vec::new();
+    for row in model_rows {
+        let (model_json, steps, mi, mo, mr, mc) = row?;
+        let (pid, mid) = match model_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        {
+            Some(v) => (
+                v.get("providerID")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                v.get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+            ),
+            None => ("?".into(), "?".into()),
+        };
+        models.push(serde_json::json!({
+            "model": {"id": mid, "providerID": pid},
+            "steps": steps,
+            "tokens": {"input": mi, "output": mo, "reasoning": mr,
+                       "cache": {"read": 0, "write": 0}},
+            "cost": mc,
+        }));
+    }
+    models.sort_by(|a, b| a["model"]["id"].as_str().cmp(&b["model"]["id"].as_str()));
+    Ok(serde_json::json!({
+        "range": {"from": tmin.unwrap_or(0), "to": tmax.unwrap_or(0)},
+        "sessions": sessions,
+        "subagents": 0,
+        "prompts": prompts,
+        "steps": steps,
+        "tokens": {
+            "input": tin, "output": tout, "reasoning": treason,
+            "cache": {"read": tcr, "write": tcw},
+        },
+        "cost": tcost,
+        "tools": {"mode": "summary",
+                  "totals": {"calls": calls, "succeeded": succeeded,
+                             "failed": failed, "unfinished": unfinished}},
+        "activeDays": active_days,
+        "streak": streak,
+        "activity": activity,
+        "models": models,
+    }))
+}
+
+/// UTC day number → "YYYY-MM-DD" (stats activity axis; no chrono dep —
+/// civil-from-days arithmetic).
+fn chrono_day(day: i64) -> String {
+    // Howard Hinnant's civil_from_days (days since 1970-01-01 → y/m/d).
+    let z = day + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146097) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{:02}-{:02}", y + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+/// v2 instruction entries (Phase D): content-addressed key journal over the
+/// P2 `instruction_*` tables. Values store by sha256 in `instruction_blob`
+/// (dedupe by construction); `instruction_entry` carries the key→hash link.
+/// Explicit columns (rule 25/33).
+pub mod instruction {
+    use super::{WriteOp, Writer};
+    use anyhow::Result;
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    fn hash(value: &str) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(value.as_bytes()))
+    }
+
+    /// Put a key (insert-or-replace the link + the blob). Value is caller JSON.
+    pub fn put(writer: &Writer, session_id: &str, key: &str, value: &str) -> Result<()> {
+        let h = hash(value);
+        let now = now_ms();
+        writer.write(vec![
+            WriteOp::Sql {
+                sql: "INSERT OR IGNORE INTO instruction_blob (hash, value) VALUES (?1, ?2)".into(),
+                params: vec![h.clone().into(), value.into()],
+            },
+            WriteOp::Sql {
+                sql: "INSERT INTO instruction_entry (session_id, key, value, removed, time_created, time_updated) \
+                      VALUES (?1, ?2, ?3, 0, ?4, ?4) \
+                      ON CONFLICT (session_id, key) DO UPDATE SET value = ?3, removed = 0, time_updated = ?4"
+                    .into(),
+                params: vec![session_id.into(), key.into(), h.into(), now.into()],
+            },
+        ])?;
+        Ok(())
+    }
+
+    /// Remove a key (tombstone, not delete — the journal is append-biased;
+    /// reset clears). Returns true when a live key transitioned.
+    pub fn remove(writer: &Writer, session_id: &str, key: &str) -> Result<bool> {
+        let n = writer.write(vec![WriteOp::Sql {
+            sql: "UPDATE instruction_entry SET removed = 1, time_updated = ?3 \
+                  WHERE session_id = ?1 AND key = ?2 AND removed = 0"
+                .into(),
+            params: vec![session_id.into(), key.into(), now_ms().into()],
+        }])?;
+        Ok(n == 1)
+    }
+
+    /// Live entries for a session (key → value JSON), oldest first.
+    pub fn list(db: &std::path::Path, session_id: &str) -> Result<Vec<(String, String)>> {
+        let conn = crate::pragma::open_reader(db)?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT e.key, b.value FROM instruction_entry e \
+             JOIN instruction_blob b ON b.hash = e.value \
+             WHERE e.session_id = ?1 AND e.removed = 0 ORDER BY e.time_created ASC",
+        )?;
+        let rows = stmt.query_map([session_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+}
+
+/// v2 forms (V2-PLAN.md P4, L3-lite): persistent ask rendezvous state.
+/// The waiters live in `core::form::FormGate`; this module is the durable
+/// state (create/settle/get/list). Explicit columns (rule 25/33).
+pub mod form {
+    use super::{WriteOp, Writer};
+    use anyhow::Result;
+
+    /// One form row: (id, kind, title, fields_json, metadata_json, answered).
+    pub type Row = (String, String, String, String, String, Option<String>);
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Create a pending form. `fields`/`metadata` are caller JSON text.
+    pub fn create(
+        writer: &Writer,
+        session_id: &str,
+        id: &str,
+        title: &str,
+        metadata: &str,
+        fields: &str,
+    ) -> Result<()> {
+        let now = now_ms();
+        writer.write(vec![WriteOp::Sql {
+            sql: "INSERT INTO form (id, session_id, title, metadata, fields, state, time_created, time_updated) \
+                  VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6)"
+                .into(),
+            params: vec![
+                id.into(),
+                session_id.into(),
+                title.into(),
+                metadata.into(),
+                fields.into(),
+                now.into(),
+            ],
+        }])?;
+        Ok(())
+    }
+
+    /// Settle a form (answered/cancelled). Answer JSON text or None.
+    /// Returns `true` only when a pending row transitioned (re-settle is a
+    /// no-op false — settled forms stay settled).
+    pub fn settle(writer: &Writer, id: &str, state: &str, answer: Option<&str>) -> Result<bool> {
+        let n = writer.write(vec![WriteOp::Sql {
+            sql: "UPDATE form SET state = ?2, answer = ?3, time_updated = ?4 \
+                  WHERE id = ?1 AND state = 'pending'"
+                .into(),
+            params: vec![id.into(), state.into(), answer.into(), now_ms().into()],
+        }])?;
+        Ok(n == 1)
+    }
+
+    /// One form by id (explicit columns).
+    pub fn get(db: &std::path::Path, id: &str) -> Result<Option<Row>> {
+        let conn = crate::pragma::open_reader(db)?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT session_id, title, metadata, fields, state, answer FROM form WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map([id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Pending forms for a session, oldest first.
+    pub fn list_pending(
+        db: &std::path::Path,
+        session_id: &str,
+    ) -> Result<Vec<(String, String, String, String)>> {
+        let conn = crate::pragma::open_reader(db)?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, title, metadata, fields FROM form \
+             WHERE session_id = ?1 AND state = 'pending' ORDER BY time_created ASC",
+        )?;
+        let rows = stmt.query_map([session_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+}
+
+/// Events after a seq for durable replay (`log?after=` — V2-PLAN.md P4).
+/// Explicit columns (rule 25/33); ascending seq; unbounded LIMIT is safe
+/// here only because callers cap the session ring at EVENT_MAX_PER_SESSION
+/// — the result is at most one ring's worth of rows.
+pub fn events_after(
+    db: &std::path::Path,
+    session_id: &str,
+    after: i64,
+) -> anyhow::Result<Vec<(i64, String, String, i64)>> {
+    let conn = pragma::open_reader(db)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT seq, type, payload, time_created FROM event \
+         WHERE session_id = ?1 AND seq > ?2 ORDER BY seq ASC",
+    )?;
+    let rows = stmt.query_map((session_id, after), |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 /// Load a session's durable events (newest first, capped) projected to the v2
 /// `DurableEvent` shape: `{id,type,durable:{aggregateID,seq,version},data}`.
 /// ocserve persists the v1 event envelope; this is a faithful re-projection
@@ -1550,10 +2439,17 @@ pub fn load_session_events(
             .pointer("/properties")
             .cloned()
             .unwrap_or_else(|| data.clone());
+        // Stored types carry the durable version suffix (`type@v1`); the v2
+        // projection strips it (the envelope's `version` carries it).
+        let unversioned = unversioned_event_type(&ty);
+        let version: i64 = ty
+            .rsplit_once('@')
+            .and_then(|(_, s)| s.strip_prefix('v')?.parse().ok())
+            .unwrap_or(1);
         out.push(serde_json::json!({
             "id": format!("evt_{seq}"),
-            "type": ty,
-            "durable": {"aggregateID": session_id, "seq": seq, "version": 1},
+            "type": unversioned,
+            "durable": {"aggregateID": session_id, "seq": seq, "version": version},
             "data": body,
         }));
     }
@@ -1657,6 +2553,284 @@ pub fn session_directory(db: &std::path::Path, session_id: &str) -> anyhow::Resu
     Ok(d.filter(|s| !s.is_empty()))
 }
 
+/// A session's derived subagent ruleset (JSON array; v1 `{permission,
+/// pattern, action}`) from the dedicated `subagent_rules` column, or None
+/// when the session has none (F3: this is separate from `permission`, which
+/// holds always-grants). Used by the `task` tool's child-context build.
+pub fn session_permission(
+    db: &std::path::Path,
+    session_id: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let conn = pragma::open_reader(db)?;
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT subagent_rules FROM session WHERE id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(raw
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str(&s).ok()))
+}
+
+/// The `parent_id` of a session, or None when it is a root (or unknown). Used
+/// by the `task` tool's `task_id` lineage validation (K-TASK).
+pub fn session_parent(db: &std::path::Path, session_id: &str) -> anyhow::Result<Option<String>> {
+    let conn = pragma::open_reader(db)?;
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT parent_id FROM session WHERE id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(raw.flatten().filter(|s| !s.is_empty()))
+}
+
+/// The `agent` of a session, or None when unset (or unknown). Used by the
+/// `task` tool's `task_id` validation (K-TASK).
+pub fn session_agent(db: &std::path::Path, session_id: &str) -> anyhow::Result<Option<String>> {
+    let conn = pragma::open_reader(db)?;
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT agent FROM session WHERE id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(raw.flatten().filter(|s| !s.is_empty()))
+}
+
+// ---------------------------------------------------------------------------
+// Credentials (gap closure): upstream `credential` table semantics, verified
+// live against 2.0.28 — create returns the entry (label defaults "default",
+// active defaults true and single-actives same-integration siblings);
+// activate flips one active + siblings inactive (per-integration scope,
+// unknown id = 204 no-op); list echoes values in creation order (upstream
+// parity — authenticated clients only). Explicit columns (rule 25/33).
+// ---------------------------------------------------------------------------
+
+/// One credential row (mirrors Credential.Entry wire shape).
+pub struct Credential {
+    pub id: String,
+    pub integration_id: Option<String>,
+    pub label: String,
+    pub value: String,
+    pub active: bool,
+    pub time_created: i64,
+    pub time_updated: i64,
+}
+
+impl Credential {
+    pub fn to_wire(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "integrationID": self.integration_id,
+            "label": self.label,
+            "active": self.active,
+            "value": serde_json::from_str::<serde_json::Value>(&self.value).unwrap_or(serde_json::Value::Null),
+        })
+    }
+}
+
+fn credential_row(r: &rusqlite::Row) -> rusqlite::Result<Credential> {
+    Ok(Credential {
+        id: r.get(0)?,
+        integration_id: r.get(1)?,
+        label: r.get(2)?,
+        value: r.get(3)?,
+        active: r.get::<_, i64>(4)? != 0,
+        time_created: r.get(5)?,
+        time_updated: r.get(6)?,
+    })
+}
+
+/// List all credentials in creation order.
+pub fn credential_list(db: &std::path::Path) -> anyhow::Result<Vec<Credential>> {
+    let conn = pragma::open_reader(db)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, integration_id, label, value, active, time_created, time_updated \
+         FROM credential ORDER BY time_created, rowid",
+    )?;
+    let rows = stmt.query_map([], credential_row)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Insert a credential; when `active`, same-integration siblings deactivate
+/// (single-active per integration, verified live). Returns the entry.
+pub fn credential_create(
+    writer: &Writer,
+    id: &str,
+    integration_id: Option<&str>,
+    label: &str,
+    value: &str,
+    active: bool,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    let mut ops = vec![WriteOp::Sql {
+        sql: "INSERT INTO credential \
+              (id, integration_id, label, value, active, time_created, time_updated) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)"
+            .into(),
+        params: vec![
+            id.into(),
+            integration_id
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+            label.into(),
+            value.into(),
+            (if active { 1 } else { 0 }).into(),
+            now_ms.into(),
+        ],
+    }];
+    if active {
+        ops.push(WriteOp::Sql {
+            sql: "UPDATE credential SET active = 0, time_updated = ?2 \
+                  WHERE integration_id IS ?1 AND id != ?3"
+                .into(),
+            params: vec![
+                integration_id
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null),
+                now_ms.into(),
+                id.into(),
+            ],
+        });
+    }
+    writer.write(ops)?;
+    Ok(())
+}
+
+/// Activate one credential (target active + siblings inactive); unknown id =
+/// no-op Ok (upstream 204s unknown ids — idempotent, never 404).
+pub fn credential_activate(
+    writer: &Writer,
+    db: &std::path::Path,
+    id: &str,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    let conn = pragma::open_reader(db)?;
+    let row: Option<Option<String>> = conn
+        .query_row(
+            "SELECT integration_id FROM credential WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .ok();
+    let Some(integration) = row else {
+        return Ok(());
+    };
+    let flat: Option<String> = integration;
+    writer.write(vec![
+        WriteOp::Sql {
+            sql: "UPDATE credential SET active = 0, time_updated = ?2 \
+                  WHERE integration_id IS ?1 AND id != ?3"
+                .into(),
+            params: vec![
+                flat.clone()
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null),
+                now_ms.into(),
+                id.into(),
+            ],
+        },
+        WriteOp::Sql {
+            sql: "UPDATE credential SET active = 1, time_updated = ?2 WHERE id = ?1".into(),
+            params: vec![id.into(), now_ms.into()],
+        },
+    ])?;
+    Ok(())
+}
+
+/// The ACTIVE credential value for an integration (websearch key lookup).
+/// `None` when no active row exists.
+pub fn credential_active_value(
+    db: &std::path::Path,
+    integration_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let conn = pragma::open_reader(db)?;
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT value FROM credential \
+             WHERE integration_id = ?1 AND active != 0 \
+             ORDER BY time_updated DESC LIMIT 1",
+            [integration_id],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(v)
+}
+
+// ---------------------------------------------------------------------------
+// Session environment (gap closure, D-ENV): per-session string map, replaced
+// wholesale by PUT. Read once per turn; injected into tool subprocess env.
+// Never sent to the provider.
+// ---------------------------------------------------------------------------
+
+/// Replace the session's variables wholesale (REST replace semantics).
+pub fn environment_put(
+    writer: &Writer,
+    session_id: &str,
+    variables: &serde_json::Value,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    writer.write(vec![WriteOp::Sql {
+        sql: "INSERT INTO session_environment (session_id, variables, time_updated) \
+              VALUES (?1, ?2, ?3) \
+              ON CONFLICT(session_id) DO UPDATE SET variables = ?2, time_updated = ?3"
+            .into(),
+        params: vec![session_id.into(), variables.clone(), now_ms.into()],
+    }])?;
+    Ok(())
+}
+
+/// Load the session's variables (empty map when absent). Values are
+/// strings by contract; non-string JSON coerces via to_string.
+pub fn environment_get(
+    db: &std::path::Path,
+    session_id: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let conn = pragma::open_reader(db)?;
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT variables FROM session_environment WHERE session_id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .ok();
+    let mut out = Vec::new();
+    if let Some(raw) = raw
+        && let Ok(map) = serde_json::from_str::<serde_json::Value>(&raw)
+        && let Some(obj) = map.as_object()
+    {
+        for (k, v) in obj {
+            let s = v
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| v.to_string());
+            out.push((k.clone(), s));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// Set a session's directory (v2 `session.move` execution). Explicit columns
+/// (rule 25/33); returns rows affected (0 = unknown session).
+pub fn set_session_directory(
+    writer: &Writer,
+    session_id: &str,
+    directory: &str,
+) -> anyhow::Result<usize> {
+    writer.write(vec![WriteOp::Sql {
+        sql: "UPDATE session SET directory = ?2 WHERE id = ?1".into(),
+        params: vec![session_id.into(), directory.into()],
+    }])
+}
+
 /// All non-global, non-empty project `directory` values across sessions,
 /// newest first. Feeds `GET /project` so the web UI can group sessions under
 /// the directories they actually belong to (freeze derives its project list
@@ -1693,6 +2867,69 @@ pub fn insert_session(writer: &Writer, info: &serde_json::Value) -> anyhow::Resu
         ],
     }])?;
     Ok(())
+}
+
+/// Insert a SUBAGENT (task-tool) child session: parent_id, agent, and the
+/// derived permission ruleset (JSON array, v1 `{permission,pattern,action}`)
+/// stored in the dedicated `subagent_rules` column (F3: the `permission`
+/// column is reserved for always-grants and must not be overwritten). Used
+/// only by the `task` tool launcher (K-TASK).
+pub fn insert_child_session(
+    writer: &Writer,
+    info: &serde_json::Value,
+    parent_id: &str,
+    agent: &str,
+    permission: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let id = info["id"].as_str().unwrap_or_default().to_string();
+    writer.write(vec![WriteOp::Sql {
+        sql: "INSERT OR REPLACE INTO session (id, project_id, slug, directory, path, title, version, \
+              time_created, time_updated, parent_id, agent, subagent_rules) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+            .into(),
+        params: vec![
+            id.into(),
+            info["projectID"].as_str().unwrap_or("global").into(),
+            info["slug"].as_str().unwrap_or("").into(),
+            info["directory"].as_str().unwrap_or("").into(),
+            info["path"].as_str().unwrap_or("").into(),
+            info["title"].as_str().unwrap_or("").into(),
+            info["version"].as_str().unwrap_or("").into(),
+            info["time"]["created"].as_i64().unwrap_or(0).into(),
+            info["time"]["updated"].as_i64().unwrap_or(0).into(),
+            parent_id.into(),
+            agent.into(),
+            permission.to_string().into(),
+        ],
+    }])?;
+    Ok(())
+}
+
+/// Walk the `parent_id` chain from `session_id`; returns the number of
+/// ancestors (depth). A root session → 0. Missing session → None. Used by the
+/// `task` tool's `subagent_depth` guard (K-TASK).
+pub fn session_depth(db: &std::path::Path, session_id: &str) -> anyhow::Result<Option<u32>> {
+    let conn = pragma::open_reader(db)?;
+    let mut depth = 0u32;
+    let mut cur = session_id.to_string();
+    loop {
+        let next: Option<Option<String>> = conn
+            .query_row("SELECT parent_id FROM session WHERE id = ?1", [&cur], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()?;
+        match next {
+            None => return Ok(None), // session id unknown
+            Some(None) => return Ok(Some(depth)),
+            Some(Some(p)) => {
+                depth += 1;
+                if depth > 64 {
+                    return Ok(Some(depth)); // cycle guard (should never happen)
+                }
+                cur = p;
+            }
+        }
+    }
 }
 
 /// Full session wire object merged with `overrides` (upstream `patch()`:

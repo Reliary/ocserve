@@ -17,6 +17,12 @@ tests pass.
 | `DIFFERENTIATION.md` | what we build vs upstream and why: harness thesis, candidates D1–D7 with evidence, graveyard of killed ideas, primitives rolled in (sift placement law), phasing |
 | `PERF-10X.md` | performance program: 10× target + acceptance A–D, evidence base, fixes F1–F8, compiler track C1–C7, phases, kill-switches/ethics (dual cache reporting) |
 | `SNAPSHOT.md` | file snapshots, `revert`/`unrevert`/`session diff`, `/vcs/apply`: upstream mechanism line-cited, divergences, bounds, side-effect test plan, guard rule 29 (mutating-endpoint class closure) |
+| `V2-PLAN.md` | opencode2 engine (P0–P6): inbox/coordinator/claims, flat decoder, union wire, dual events, log replay, form service, pair-v2 oracles |
+| `V2-PARITY-PLAN.md` | full v2 parity (Phases A–F): TUI boot closure, aliases, S/M families, web pack, L-verdicts; maintenance machine (`bump.sh`), Rust-native rule, kill criteria K1–K7 |
+| `V2-PLAN.md` | v2 engine internals: inbox/coordinator/claims, union wire, dual events, log replay, form service, pair-v2 oracles |
+| `V2-EXECUTION-PLAN.md` | the pristine/impressive program (decisions D1–D7, Phases 0–5): guard self-proof, password auth, mutation baseline, v2 plugin shim, G2, drift |
+| `GAPS-PLAN.md` | gap closure (Tier 1 real holes + acceptance, Tier 2 v2 plugin depth, Tier 3 hygiene) |
+| `bench/BUMP-MACHINERY-TEST.md` | upgrade-machinery shakedown vs 2.0.32/1.19.3 (report-only; pins stay frozen) |
 | `TRACEABILITY.md` | requirement ↔ test ↔ evidence matrix (every F/N/K row) |
 | `THIRD-PARTY.md` | upstream MIT attribution and the compatibility framing |
 | `SECURITY.md` / `CONTRIBUTING.md` | vulnerability reporting + threat posture; contributor workflow |

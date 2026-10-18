@@ -23,3 +23,16 @@ pub const TAG: &str = "1.18.31";
 /// `packages/sdk/openapi.json` and to freeze's live `GET /doc` (verified
 /// 2026-10-08; re-verified per release).
 pub const SPEC_JSON: &str = include_str!("../assets/openapi/1.18.31.json");
+
+/// Reference pin for the v2 line (see `V2-PLAN.md` D3).
+pub const V2_TAG: &str = "2.0.28";
+
+/// The regenerated 2.0.28 OpenAPI document. Unlike the v1 asset this is NOT a
+/// verbatim upstream file: the checked-in `packages/protocol/openapi.json` is
+/// stale (2026-10-13: 136 ops vendored vs 140 declared), so this asset is the
+/// output of upstream's own pipeline (`OpenApi.fromApi(ClientApi)` + the
+/// content-addressed stabilize step) run against the PUBLISHED npm tarballs
+/// `@opencode/protocol@2.0.28` + `@opencode/schema@2.0.28`. Regenerate with
+/// `scripts/extract-spec.sh 2.0.28 --regen` (proven byte-reproducible
+/// 2026-10-16: 118 paths / 142 ops / 303 schemas).
+pub const SPEC_V2_JSON: &str = include_str!("../assets/openapi/2.0.28.json");
