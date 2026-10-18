@@ -47,11 +47,105 @@ function registration(list, cb) {
 }
 
 /**
+ * REST-backed domain methods — the v2 `Pick<XApi, ...>` half of a domain,
+ * bound ONLY where the ocserve route actually exists at that path.
+ *
+ * Why an explicit table and not the generic `client` proxy: the proxy derives
+ * paths as `{ns}/{verb}`, which is not how these routes are spelled
+ * (`permission.saved`, not `permission.list`). Binding a method to a path we
+ * have not verified would hand a plugin a 404 where upstream works — the
+ * "shape without mutation" class. Anything absent here keeps the named
+ * divergence (D-V2-DOMAIN) instead.
+ *
+ * `fetchJson` is the host-provided request function (same one `ctx.client`
+ * uses): `fetchJson(method, path, body)`.
+ */
+const REST_METHODS = {
+  session: {
+    get: { path: (id) => `/api/session/${enc(id)}` },
+    message: { path: (id) => `/api/session/${enc(id)}/message` },
+    context: { path: (id) => `/api/session/${enc(id)}/context` },
+    history: { path: (id) => `/api/session/${enc(id)}/history` },
+    inbox: { path: (id) => `/api/session/${enc(id)}/inbox` },
+    diff: { path: (id) => `/api/session/${enc(id)}/diff` },
+  },
+  permission: {
+    saved: { path: () => "/api/permission/saved" },
+    request: { path: () => "/api/permission/request" },
+  },
+};
+
+/**
+ * Build the REST half of a domain from REST_METHODS + the fetch function.
+ *
+ * Returns a PLAIN OBJECT with an own accessor per known verb, not a bare
+ * Proxy: object spread (`{ ...restDomain(...) }`) enumerates own keys, and a
+ * key-less Proxy spreads to nothing — which silently produced the very
+ * `ctx.session.get is not a function` this table exists to fix.
+ */
+function restDomain(name, fetchJson) {
+  const table = REST_METHODS[name] ?? {};
+  const out = {};
+  for (const verb of Object.keys(table)) {
+    Object.defineProperty(out, verb, {
+      enumerable: true,
+      value: (...args) => fetchJson("GET", table[verb].path(args[0]), args[1]),
+    });
+  }
+  // Unknown verbs keep the honest named divergence.
+  return new Proxy(out, {
+    get(target, prop) {
+      if (prop in target || typeof prop !== "string" || prop === "then") return target[prop];
+      return () => {
+        throw new Error(`D-V2-DOMAIN: ctx.${name}.${prop} has no bound ocserve route`);
+      };
+    },
+  });
+}
+
+function enc(v) {
+  return encodeURIComponent(String(v ?? ""));
+}
+
+/** Merge a domain's hook registrar with its bound REST half.
+ *
+ * The Proxy must survive as the object's PROTOTYPE chain holder, not be
+ * spread: spreading copies own keys and drops the trap, so unknown verbs
+ * became `undefined` (a TypeError at the call site) instead of the named
+ * divergence. We copy the REST verbs as own props onto a fresh object whose
+ * lookups fall through to the Proxy's trap for everything else.
+ */
+function mergeDomain(registrarObj, name, fetchJson) {
+  const rest = restDomain(name, fetchJson);
+  const merged = Object.create(rest); // unknown verbs → rest's throwing trap
+  Object.assign(merged, registrarObj); // hook/... own props win
+  // REST verbs must also be reachable as own props for `in`/spread users.
+  for (const verb of Object.keys(REST_METHODS[name] ?? {})) {
+    Object.defineProperty(merged, verb, {
+      enumerable: true,
+      value: rest[verb],
+    });
+  }
+  return merged;
+}
+
+/**
  * Build the v2 `ctx` (Context, promise/plugin.ts) over the host's dispatch
  * tables. `hooks` is the shared v2 hook table; `rpcs` is the RPC registry;
  * `storage` is the storage backend; `client` issues REST calls.
  */
-export function makeV2Context({ pluginId, options, hooks, rpcs, storage, client, location, app }) {
+export function makeV2Context({
+  pluginId,
+  options,
+  hooks,
+  rpcs,
+  storage,
+  client,
+  fetchJson,
+  location,
+  app,
+  pluginList,
+}) {
   const registrar = (domain) => ({
     hook: async (name, cb, _opts) => {
       if (!V2_HOOK_NAMES[domain] || !V2_HOOK_NAMES[domain].includes(name))
@@ -65,7 +159,8 @@ export function makeV2Context({ pluginId, options, hooks, rpcs, storage, client,
     app: app || { name: "ocserve", version: "0.3.1", channel: "local" },
     location,
     options: options ?? {},
-    session: { ...registrar("session") },
+    // hook registrar + the bound REST half (see REST_METHODS).
+    session: mergeDomain(registrar("session"), "session", fetchJson),
     tool: {
       ...registrar("tool"),
       // transform/list/reload operate on the tool registry — not bridged
@@ -77,7 +172,7 @@ export function makeV2Context({ pluginId, options, hooks, rpcs, storage, client,
       list: async () => [],
       reload: async () => {},
     },
-    permission: { ...registrar("permission") },
+    permission: mergeDomain(registrar("permission"), "permission", fetchJson),
     shell: { ...registrar("shell") },
     // event.subscribe: the host pushes bus events to it (same delivery as v1).
     event: {
@@ -126,7 +221,10 @@ export function makeV2Context({ pluginId, options, hooks, rpcs, storage, client,
     worktree: notBridged("worktree"),
     generate: notBridged("generate"),
     experimental: { terminal: { read: () => notBridged("experimental.terminal").read() } },
-    plugin: { list: async () => [] },
+    // Real inventory, not []. `/api/plugin` serves the loaded list, so a
+    // plugin asking here must see the same thing — an empty array would
+    // contradict a closed divergence and the route it mirrors.
+    plugin: { list: async () => (pluginList ? pluginList() : []) },
   };
 }
 

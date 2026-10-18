@@ -1,6 +1,6 @@
 # V2-PLAN.md — full `opencode2` backend (`feat/v2-engine`)
 
-Status (2026-10-13): plan committed; P0 in progress. Reference pin: `@opencode/cli@2.0.28`
+Status: P0–P6 built and green (2026-10-16). Reference pin: `@opencode/cli@2.0.28`
 + contract regenerated from `@opencode/protocol@2.0.28` sources (never the stale checked-in file).
 
 Progress 2026-10-16: P0–P5 built and green (see TRACEABILITY K-V2-P0…K-V2-P5).

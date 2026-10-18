@@ -1007,6 +1007,113 @@ export default PluginModule.server;
         Ok(())
     }
 
+    /// The v2 REST half of a domain is bound to the route that actually exists —
+    /// and an UNBOUND verb keeps the named divergence instead of a bare TypeError.
+    ///
+    /// The 2026-10-18 finding: `session: { ...registrar("session") }` gave
+    /// `ctx.session` only `hook`, so `ctx.session.get(id)` was
+    /// `TypeError: ... is not a function` — a crash, not the honest throw the rest
+    /// of the shim uses. `ctx.plugin.list()` likewise returned `[]` while
+    /// `/api/plugin` serves the real inventory (D-PLUGIN-INVENTORY was closed).
+    #[tokio::test]
+    async fn v2_domain_rest_methods_bind_real_routes() -> anyhow::Result<()> {
+        if !runtime_available() {
+            panic!(
+                "plugin-runtime binary ({}) required for plugin-host tests",
+                crate::plugin_runtime().program()
+            );
+        }
+        // A real HTTP responder so ctx.session.get() exercises an actual route
+        // (stdlib thread; the shim fetches it like any other client would).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let body = br#"{"id":"ses_bound","title":"bound-route"}"#;
+                let _ = s.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+                let _ = s.write_all(body);
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        // The fixture reports each probe's outcome back over RPC so the test can
+        // read real results (not shim internals).
+        std::fs::write(
+            dir.path().join("rest.mjs"),
+            r#"export default {
+  id: "restprobe",
+  setup: async (ctx) => {
+    const results = {};
+    // plugin.list must return the REAL inventory, not [].
+    results.pluginList = await ctx.plugin.list();
+    // session.get must reach the bound route.
+    try {
+      const s = await ctx.session.get("ses_bound");
+      results.sessionGet = { ok: true, id: s && s.id };
+    } catch (e) { results.sessionGet = { ok: false, err: String(e && e.message || e) }; }
+    // An UNBOUND verb must throw the NAMED divergence, not a TypeError.
+    try { await ctx.session.notARealVerb("x"); results.unbound = { threw: false }; }
+    catch (e) { results.unbound = { threw: true, msg: String(e && e.message || e) }; }
+    await ctx.rpc.register({ id: "probe" }, { results: async () => results });
+  },
+};"#,
+        )
+        .unwrap();
+
+        let host = materialize_host(&dir.path().join("host"))?;
+        let mut sc = Sidecar::spawn(&host, &format!("http://127.0.0.1:{port}"), "/work").await?;
+        let input = json!({"directory": "/work", "serverUrl": format!("http://127.0.0.1:{port}")});
+        sc.load(
+            "restprobe",
+            &dir.path().join("rest.mjs"),
+            &input,
+            &Value::Null,
+        )
+        .await?;
+
+        let r = sc.rpc_call("probe", "results", json!({})).await?;
+        let out = &r["output"];
+
+        // 1. plugin.list is real (contains our own id), not empty.
+        let listed = out["pluginList"].as_array().cloned().unwrap_or_default();
+        assert!(
+            listed.iter().any(|p| p["id"] == "restprobe"),
+            "ctx.plugin.list() must report the loaded plugin: {out}"
+        );
+
+        // 2. session.get hit the bound route (the stub answered ses_bound).
+        assert_eq!(
+            out["sessionGet"]["ok"], true,
+            "ctx.session.get must reach /api/session/{{id}}: {out}"
+        );
+        assert_eq!(out["sessionGet"]["id"], "ses_bound");
+
+        // 3. an unbound verb throws the NAMED divergence (D-V2-DOMAIN), not a
+        //    TypeError and not silently succeeding.
+        assert_eq!(
+            out["unbound"]["threw"], true,
+            "unbound verb must throw: {out}"
+        );
+        let msg = out["unbound"]["msg"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("D-V2-DOMAIN"),
+            "unbound verb must name the divergence (D-V2-DOMAIN), got: {msg}"
+        );
+
+        sc.shutdown().await;
+        Ok(())
+    }
+
     /// The `config` hook is dispatched (v1 parity, plugin/index.ts:244-251).
     /// Closes the registered-but-never-called class: a plugin whose `config`
     /// is a real hook must see it run (host `config` used to hard-code "ok").

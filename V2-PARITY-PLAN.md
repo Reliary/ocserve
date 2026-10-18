@@ -1,8 +1,9 @@
 # V2-PARITY-PLAN.md — full v2 feature parity on `feat/v2-engine`
 
-Status: plan committed 2026-10-16; executing Phases A→F. Companion to
-`V2-PLAN.md` (engine P0–P6, all green). Precedence: TESTING.md gates >
-PLAN.md > this document for parity-domain decisions.
+Status: Phases A→F complete (2026-10-16); superseded for gap closure by
+`GAPS-PLAN.md`. Companion to `V2-PLAN.md` (engine P0–P6, all green).
+Precedence: TESTING.md gates > PLAN.md > this document for parity-domain
+decisions.
 
 Locked decisions (user-approved 2026-10-16):
 - **Rust-native serving path**: no new processes/runtimes/interpreters in the
@@ -165,7 +166,9 @@ admit-only; the turn executor is unchanged). Binary 33,013,072 B ≤ 34M.
 - D-BACKGROUND-NOOP: background is an honest recorded 204 (no
   foreground/background tool distinction in the inline loop).
 - D-VIEW-NOWATERMARK: view records + 204s (no read watermark tracked).
-- D-PLUGIN-INVENTORY: plugin list honestly empty (no inventory RPC yet).
+- D-PLUGIN-INVENTORY: CLOSED — `/api/plugin` serves the real inventory, and
+  `ctx.plugin.list()` in the v2 shim reports the loaded plugins (it returned
+  `[]` before 2026-10-18; K-SHIM-HONESTY).
 - D-ENV: CLOSED — `PUT /api/session/{id}/environment` bound (replace
   semantics); `session_environment` table; read once per turn, injected
   into bash subprocess env; never sent to the provider (e2e asserts tool

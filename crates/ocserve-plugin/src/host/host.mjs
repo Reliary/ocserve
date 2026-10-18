@@ -188,8 +188,25 @@ async function loadPlugin({ spec, entry, input, options }) {
   const dialect = detectV2(mod);
   if (dialect) {
     const def = v2Definition(mod);
-    const client = makeClient(input.serverUrl ?? "http://127.0.0.1", input.directory ?? "/");
-    const location = { directory: input.directory ?? "/" };
+    const serverUrl = input.serverUrl ?? "http://127.0.0.1";
+    const directory = input.directory ?? "/";
+    const client = makeClient(serverUrl, directory);
+    const location = { directory };
+    // Same request path as ctx.client, shaped for the shim's REST_METHODS
+    // table: absolute path in, parsed JSON (or raw text) out.
+    const fetchJson = async (method, path, body) => {
+      const res = await fetch(serverUrl.replace(/\/$/, "") + path, {
+        method,
+        headers: { "content-type": "application/json", "x-opencode-directory": directory },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      const text = await res.text();
+      try {
+        return JSON.parse(text);
+      } catch {
+        return text;
+      }
+    };
     const ctx = makeV2Context({
       pluginId: def.id,
       options,
@@ -197,10 +214,23 @@ async function loadPlugin({ spec, entry, input, options }) {
       rpcs: v2State.rpcs,
       storage: makeV2Storage(def.id),
       client,
+      fetchJson,
       location,
+      pluginList: () => loadedV2.map((p) => ({ id: p.id, spec: p.spec, dialect: p.dialect })),
     });
-    const cleanup = await setupV2(def, dialect, ctx, resolveEffectFrom(def.id, entry));
-    loadedV2.push({ spec, id: def.id, dialect, cleanup });
+    // Register BEFORE setup so ctx.plugin.list() inside setup reports the
+    // plugin being loaded (upstream registers the plugin, then initialises
+    // it). On a setup failure the entry is removed again, so the inventory
+    // never lists a plugin that failed to load.
+    const rec = { spec, id: def.id, dialect, cleanup: null };
+    loadedV2.push(rec);
+    try {
+      rec.cleanup = await setupV2(def, dialect, ctx, resolveEffectFrom(def.id, entry));
+    } catch (e) {
+      const i = loadedV2.indexOf(rec);
+      if (i >= 0) loadedV2.splice(i, 1);
+      throw e;
+    }
     // Report the v2 hook names this plugin actually registered (observability).
     const names = [];
     for (const [domain, byName] of Object.entries(v2State.hooks)) {

@@ -1,7 +1,9 @@
 # Gap-closure plan: absolute compatibility (v1 + v2), low maintenance, high performance
 
-Status: **executing**. Scope agreed 2026-10-17 (all tiers; foreground-only `task`;
-v2 acceptance pinned to the vendored **2.0.28**; service-bound divergences kept).
+Status: **Tier 1 + Tier 3 complete** (2026-10-18); **Tier 2 scoped** to
+`command`/`skill` transforms. Scope agreed 2026-10-17 (all tiers;
+foreground-only `task`; v2 acceptance pinned to the vendored **2.0.28**;
+service-bound divergences kept).
 
 ## Findings this plan closes
 
