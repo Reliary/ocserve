@@ -17,6 +17,7 @@ import {
   newV2State,
   triggerV2,
   makeV2Context,
+  runTransforms,
 } from "./v2.mjs";
 
 // Runtime detection: under real Bun (upstream's runtime, preferred) the
@@ -217,6 +218,7 @@ async function loadPlugin({ spec, entry, input, options }) {
       fetchJson,
       location,
       pluginList: () => loadedV2.map((p) => ({ id: p.id, spec: p.spec, dialect: p.dialect })),
+      state: v2State,
     });
     // Register BEFORE setup so ctx.plugin.list() inside setup reports the
     // plugin being loaded (upstream registers the plugin, then initialises
@@ -424,6 +426,13 @@ async function handle(line) {
           plugins: loadedV2.map((p) => ({ spec: p.spec, id: p.id, dialect: p.dialect })),
           rpcs: Object.keys(v2State.rpcs),
         });
+        break;
+      // v2 command/skill transform pull (Phase 3/Tier 2). Rust calls this on
+      // config reload: it hands over the pristine command list, the plugin
+      // side returns the edited one. PULLED, never pushed — a payload can
+      // never serve a list from a reconcile that did not ask for it.
+      case "v2_transform_commands":
+        reply(await runTransforms(v2State, msg.params.commands));
         break;
       case "config": reply(await dispatchConfig(msg.params.config)); break;
       // v1 parity (plugin/index.ts:255-259): per-plugin hooks["event"]

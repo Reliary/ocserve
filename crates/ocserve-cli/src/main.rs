@@ -780,6 +780,17 @@ async fn serve(
             .set(std::sync::Arc::new(tokio::sync::Mutex::new(sc)));
         // P0e: bus → plugin `event` hook pump (v1 plugin/index.ts:255-259)
         ocserve_http::start_plugin_event_pump(&state);
+        // Tier 2 (2026-10-18): apply v2 command/skill transforms at BOOT too,
+        // not only on the next config reload — otherwise a plugin's commands
+        // and skills are missing until the operator edits a config file, and
+        // the skills block (which the MODEL reads every turn) would silently
+        // omit them. Same window discipline as reconcile: transform, then
+        // re-derive the wire cache, so `GET /command`, the skills block and
+        // the precomputed bytes agree.
+        let st = state.clone();
+        tokio::spawn(async move {
+            ocserve_http::watch::reconcile(&st).await.ok();
+        });
     }
     let app = ocserve_http::router(state.clone());
 
