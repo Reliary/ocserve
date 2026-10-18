@@ -3327,7 +3327,11 @@ pub(crate) fn agent_rules(st: &Arc<AppState>, agent: &str) -> Vec<ocserve_tools:
 /// Skills for the system-prompt block (system.ts:skills): the command payloads
 /// with source "skill", as (name, description, location). Built-in skills
 /// carry an empty location; upstream writes "<built-in>" for those.
-fn skill_entries(st: &Arc<AppState>) -> Vec<(String, String, String, String)> {
+///
+/// `pub` so the v2-transform integration test can assert against THIS function
+/// rather than a re-implementation of its filter — a copy proved nothing
+/// (the planted break stayed green).
+pub fn skill_entries(st: &Arc<AppState>) -> Vec<(String, String, String, String)> {
     let payloads = st.payloads.read();
     payloads
         .command

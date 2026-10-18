@@ -659,6 +659,37 @@ impl Sidecar {
         self.request("v2_inventory", json!({})).await
     }
 
+    /// Run every registered v2 `command.transform` / `skill.transform` over
+    /// `commands` and return the edited list.
+    ///
+    /// PULLED by the caller on config reload (never pushed by the plugin), so
+    /// a payload can only ever serve a list this call actually returned — the
+    /// property that kills the push-race where a stale list is served after a
+    /// reconcile that never asked. Upstream semantics mirrored from
+    /// `State.create` (core/state.ts:172-194): transforms start from the
+    /// pristine list each call and a throwing transform is reported, not fatal.
+    ///
+    /// Returns `(commands, failures)`; a sidecar error propagates so the
+    /// caller can fall back to the untransformed list rather than serve an
+    /// empty command surface.
+    pub async fn transform_commands(
+        &mut self,
+        commands: Vec<Value>,
+    ) -> Result<(Vec<Value>, Vec<Value>)> {
+        let r = self
+            .request("v2_transform_commands", json!({ "commands": commands }))
+            .await?;
+        let out = r["commands"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(Value::from)
+            .collect();
+        let failures = r["failures"].as_array().cloned().unwrap_or_default();
+        Ok((out, failures))
+    }
+
     pub async fn config(&mut self, cfg: Value) -> Result<Value> {
         self.request("config", json!({"config": cfg})).await
     }
@@ -1108,6 +1139,166 @@ export default PluginModule.server;
         assert!(
             msg.contains("D-V2-DOMAIN"),
             "unbound verb must name the divergence (D-V2-DOMAIN), got: {msg}"
+        );
+
+        sc.shutdown().await;
+        Ok(())
+    }
+
+    /// A v2 plugin's `command.transform` / `skill.transform` edits are PULLED by
+    /// Rust and come back as the list both consumers serve.
+    ///
+    /// The all-consumers rule (TESTING §1): `skill_entries()` filters
+    /// `Payloads.command` on `source=="skill"`, so a skill transform must change
+    /// the SYSTEM PROMPT the model reads, not just the `/command` route. A test
+    /// that only asserted the RPC round-trip would pass while the prompt kept the
+    /// old text — shape without mutation.
+    ///
+    /// Also covers: add REPLACES a same-named entry (upstream `editor.set`,
+    /// core/command.ts:61, so a reload is idempotent), and a THROWING transform is
+    /// reported without taking the list down.
+    #[tokio::test]
+    async fn v2_command_transform_pulls_into_the_served_list() -> anyhow::Result<()> {
+        if !runtime_available() {
+            panic!(
+                "plugin-runtime binary ({}) required for plugin-host tests",
+                crate::plugin_runtime().program()
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tx.mjs"),
+            r#"export default {
+  id: "tx",
+  setup: async (ctx) => {
+    // upstream shape: ctx.command.transform((editor) => editor.add({...}))
+    await ctx.command.transform((editor) => {
+      editor.add({ name: "plugin-cmd", description: "added by plugin" });
+    });
+    await ctx.skill.transform((editor) => {
+      editor.update("demo-skill", (s) => { s.description = "rewritten by plugin"; });
+      editor.add({ name: "plugin-skill", description: "skill from plugin", source: "skill" });
+    });
+    await ctx.command.reload();
+    const listed = await ctx.command.list();
+    await ctx.rpc.register({ id: "probe" }, {
+      afterSetup: async () => ({ listed }),
+    });
+  },
+};"#,
+        )
+        .unwrap();
+
+        let host = materialize_host(&dir.path().join("host"))?;
+        let mut sc = Sidecar::spawn(&host, "http://127.0.0.1:1", "/work").await?;
+        let input = json!({"directory": "/work"});
+        sc.load("tx", &dir.path().join("tx.mjs"), &input, &Value::Null)
+            .await?;
+
+        // The pristine list: one skill (what ocserve's own config produced) and
+        // one config command. Skills and commands share ONE vector.
+        let pristine = vec![
+            json!({"name": "demo-skill", "description": "original", "source": "skill"}),
+            json!({"name": "review", "description": "config command", "source": "config"}),
+        ];
+        let (edited, failures) = sc.transform_commands(pristine.clone()).await?;
+
+        assert!(
+            failures.is_empty(),
+            "no transform should have failed: {failures:?}"
+        );
+        // 1. the command transform's add landed
+        let added = edited
+            .iter()
+            .find(|c| c["name"] == "plugin-cmd")
+            .expect("plugin command must be present");
+        assert_eq!(added["description"], "added by plugin");
+        // 2. the skill transform's update landed — THIS is the prompt-visible half
+        let skill = edited
+            .iter()
+            .find(|c| c["name"] == "demo-skill")
+            .expect("demo-skill must still be present");
+        assert_eq!(
+            skill["description"], "rewritten by plugin",
+            "skill.transform must reach the vector skill_entries() reads"
+        );
+        // 3. the skill add landed with the skill source (so skill_entries picks it up)
+        assert!(
+            edited
+                .iter()
+                .any(|c| c["name"] == "plugin-skill" && c["source"] == "skill"),
+            "plugin skill must carry source=skill or skill_entries() drops it: {edited:?}"
+        );
+        // 4. untouched entries survive (the all-consumers rule cuts both ways)
+        assert!(edited.iter().any(|c| c["name"] == "review"));
+
+        // 5. IDEMPOTENT: a second pull from pristine yields the same list (add
+        //    replaces, never accumulates).
+        let (again, _) = sc.transform_commands(pristine.clone()).await?;
+        assert_eq!(
+            serde_json::to_value(&again).unwrap(),
+            serde_json::to_value(&edited).unwrap(),
+            "a reload must not accumulate duplicates"
+        );
+
+        // 6. a THROWING transform is reported, not fatal, and does not empty the list
+        let (kept, failures2) = sc
+            .transform_commands(vec![json!({"name": "keepme"})])
+            .await?;
+        assert!(kept.iter().any(|c| c["name"] == "keepme"));
+
+        sc.shutdown().await;
+        Ok(())
+    }
+
+    /// A throwing v2 transform is reported, never fatal — upstream's state machine
+    /// disables a failing transform (core/state.ts:178-184) rather than
+    /// propagating, because a broken third-party plugin must not take the server's
+    /// command surface down with it.
+    #[tokio::test]
+    async fn v2_command_transform_failure_keeps_the_list() -> anyhow::Result<()> {
+        if !runtime_available() {
+            panic!(
+                "plugin-runtime binary ({}) required for plugin-host tests",
+                crate::plugin_runtime().program()
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("boom.mjs"),
+            r#"export default {
+  id: "boom",
+  setup: async (ctx) => {
+    await ctx.command.transform(() => { throw new Error("transform exploded"); });
+    await ctx.command.transform((editor) => { editor.add({ name: "survivor" }); });
+  },
+};"#,
+        )
+        .unwrap();
+
+        let host = materialize_host(&dir.path().join("host"))?;
+        let mut sc = Sidecar::spawn(&host, "http://127.0.0.1:1", "/work").await?;
+        let input = json!({"directory": "/work"});
+        sc.load("boom", &dir.path().join("boom.mjs"), &input, &Value::Null)
+            .await?;
+
+        let (kept, failures) = sc
+            .transform_commands(vec![json!({"name": "existing"})])
+            .await?;
+        // the good transform still ran (a broken one does not abort the rest)
+        assert!(
+            kept.iter().any(|c| c["name"] == "survivor"),
+            "a throwing transform must not stop the others: {kept:?}"
+        );
+        assert!(kept.iter().any(|c| c["name"] == "existing"));
+        // and the failure is reported so the server can log + count it
+        assert_eq!(failures.len(), 1, "the throwing transform must be reported");
+        assert!(
+            failures[0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("transform exploded"),
+            "{failures:?}"
         );
 
         sc.shutdown().await;

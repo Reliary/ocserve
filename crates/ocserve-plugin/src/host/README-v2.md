@@ -46,7 +46,11 @@ identity, so this is exact.
 | `client` (REST proxy) | **bridged** — method-path proxy over the local HTTP API (same as v1's `client`) |
 | `event.subscribe` | **bridged** |
 | `plugin.list` | **bridged** — real inventory (`GET /api/plugin`) |
-| `agent`/`command`/`integration`/`mcp`/`model`/`provider`/`reference`/`skill`/`vcs`/`websearch`/`worktree`/`generate`/`aisdk`/`experimental` | **diverged** `D-V2-DOMAIN` — exposed as honest throwing proxies: a plugin that calls one gets a named error at the call site, never a crash at setup and never a fabricated success |
+| `command.transform` + `skill.transform` | **bridged** — Rust PULLS every registered transform on config reload (`v2_transform_commands` RPC) and stores the result in `Payloads.command`. Both consumers see it: `GET /command` **and** the `<available_skills>` block in the system prompt. Pushed-transforms would race a reload and serve a stale list; the pull makes the edit land in the same swap window as the payload. Upstream `editor.add` REPLACES a same-named entry (`core/command.ts:61`), so a reload is idempotent. A throwing transform is reported and skipped, never fatal, and an empty result is rejected (a plugin cannot silently erase the command surface). Applied at boot too, not only on reload. |
+| `command.list` / `skill.list` / `skill.get` | **bridged** — read the last pulled list |
+| `command.reload` / `skill.reload` | **bridged** — marks a reload; the next reconcile (or the boot-time pass) re-runs the pull |
+| `session`/`permission` (REST half) | **bridged** — each verb bound to the route that exists (`/api/session/{id}`, `/message`, `/context`, `/history`, `/inbox`, `/diff`; `/api/permission/saved`, `/request`). Unbound verbs throw `D-V2-DOMAIN`. |
+| `agent`/`integration`/`mcp`/`model`/`provider`/`reference`/`vcs`/`websearch`/`worktree`/`generate`/`aisdk`/`experimental` | **diverged** `D-V2-DOMAIN` — exposed as honest throwing proxies: a plugin that calls one gets a named error at the call site, never a crash at setup and never a fabricated success. `agent`/`model`/`provider` stay unbridged deliberately: their payloads feed registries and system-prompt assembly, so editing only the served list would be shape-without-mutation (A1 rule). |
 
 ## RPC dispatch
 

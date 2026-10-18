@@ -160,6 +160,67 @@ pub fn changed(st: &AppState) -> bool {
 /// Failure contract: load error → NOTHING is swapped (old config keeps
 /// serving), `result="error"` counted, Err returned for the caller to log;
 /// observed tuples are NOT advanced so the watcher retries.
+/// Let loaded v2 plugins transform `payloads.command` in place.
+///
+/// Bounded by construction (AGENTS §2.3): this runs inside `reconcile`, whose
+/// `reconcile_lock` serialises it, and it holds the plugin mutex only for the
+/// round-trip. A missing sidecar, a sidecar error, or a timeout all leave the
+/// untransformed list in place — a broken plugin must not empty the server's
+/// command surface (upstream's own state machine disables a failing transform
+/// rather than propagating).
+async fn apply_v2_transforms(st: &Arc<AppState>, payloads: &mut crate::Payloads) {
+    let Some(plugins) = st.plugins.get() else {
+        return;
+    };
+    let before = payloads.command.len();
+    let mut guard = plugins.lock().await;
+    let pulled = guard.transform_commands(payloads.command.clone()).await;
+    match pulled {
+        Ok((edited, failures)) => {
+            ocserve_metrics::labeled_counter("ocserve_plugin_transform_total", "result=\"ok\"", 1);
+            if !failures.is_empty() {
+                for f in &failures {
+                    tracing::warn!(
+                        "v2 transform failed (kind={} idx={}): {}",
+                        f["kind"].as_str().unwrap_or("?"),
+                        f["index"],
+                        f["message"].as_str().unwrap_or("?")
+                    );
+                }
+                ocserve_metrics::labeled_counter(
+                    "ocserve_plugin_transform_total",
+                    "result=\"transform_error\"",
+                    failures.len() as u64,
+                );
+            }
+            // A transform that dropped EVERY command would silently remove
+            // /command and the skills block from the model's prompt. Keep the
+            // pristine list in that case and say so.
+            if edited.is_empty() && before > 0 {
+                tracing::warn!(
+                    "v2 transform produced an empty command list from {} entries — keeping pristine",
+                    before
+                );
+                ocserve_metrics::labeled_counter(
+                    "ocserve_plugin_transform_total",
+                    "result=\"empty_rejected\"",
+                    1,
+                );
+                return;
+            }
+            payloads.command = edited;
+        }
+        Err(e) => {
+            tracing::warn!("v2 transform pull failed, keeping pristine list: {e}");
+            ocserve_metrics::labeled_counter(
+                "ocserve_plugin_transform_total",
+                "result=\"pull_error\"",
+                1,
+            );
+        }
+    }
+}
+
 pub async fn reconcile(st: &Arc<AppState>) -> anyhow::Result<()> {
     let _guard = st.reconcile_lock.lock().await;
     let Some(reload) = st.reloader.read().clone() else {
@@ -180,13 +241,20 @@ pub async fn reconcile(st: &Arc<AppState>) -> anyhow::Result<()> {
         .cloned()
         .unwrap_or_else(|| json!({}));
     let loaded = reload();
-    let (payloads, registry) = match loaded {
+    let (mut payloads, registry) = match loaded {
         Ok(pair) => pair,
         Err(e) => {
             ocserve_metrics::labeled_counter("ocserve_config_reload_total", "result=\"error\"", 1);
             return Err(e.context("config reload"));
         }
     };
+    // Tier 2 (2026-10-18): let v2 plugins transform the command list BEFORE the
+    // payload swap, so BOTH consumers see the same edited list in this same
+    // window — `GET /command` and `skill_entries()` → `skills_block()` → the
+    // composed system prompt. This is the all-consumers rule: editing only the
+    // served list would be shape-without-mutation, because the model reads
+    // skills from the system prompt, not from the route.
+    apply_v2_transforms(st, &mut payloads).await;
     // capture the changed-file set BEFORE observe() advances the tuples
     let changed_files: Vec<String> = {
         let w = st.watch.read();

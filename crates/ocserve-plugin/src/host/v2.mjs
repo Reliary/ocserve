@@ -145,6 +145,7 @@ export function makeV2Context({
   location,
   app,
   pluginList,
+  state,
 }) {
   const registrar = (domain) => ({
     hook: async (name, cb, _opts) => {
@@ -211,11 +212,40 @@ export function makeV2Context({
     model: notBridged("model"),
     provider: notBridged("provider"),
     agent: notBridged("agent"),
-    command: notBridged("command"),
+    // command: real. `transform` collects CommandEditor callbacks; Rust pulls
+    // `runTransforms` on config reload and stores what the plugins return.
+    command: {
+      // upstream `CommandDomain.transform` (command.ts) — the ONLY editor
+      // verb upstream ships is `add` (core/command.ts:61), so a plugin can
+      // contribute a command but not rewrite or drop an existing one.
+      transform: (callback) => {
+        state.commandTransforms.push(callback);
+        return registration(state.commandTransforms, callback);
+      },
+      list: async () => state.lastCommands,
+      reload: async () => {
+        // Rust re-runs the pull after this resolves, so the editor callbacks
+        // always run in the reconcile window (option A: never push).
+        state.reloadRequested = true;
+      },
+    },
+    // skill: real. Same underlying vector — `skill_entries` filters
+    // Payloads.command on source=="skill", so command + skill transforms
+    // compose over one list and both consumers see the result.
+    skill: {
+      transform: (callback) => {
+        state.skillTransforms.push(callback);
+        return registration(state.skillTransforms, callback);
+      },
+      list: async () => state.lastCommands.filter((c) => c && c.source === "skill"),
+      get: async (id) => state.lastCommands.find((c) => c && c.source === "skill" && c.name === id),
+      reload: async () => {
+        state.reloadRequested = true;
+      },
+    },
     integration: notBridged("integration"),
     mcp: notBridged("mcp"),
     reference: notBridged("reference"),
-    skill: notBridged("skill"),
     vcs: notBridged("vcs"),
     websearch: notBridged("websearch"),
     worktree: notBridged("worktree"),
@@ -333,7 +363,78 @@ export function newV2State() {
     hooks[domain] = {};
     for (const n of names) hooks[domain][n] = [];
   }
-  return { hooks, rpcs: {} };
+  return {
+    hooks,
+    rpcs: {},
+    // v2 command/skill transforms (command.ts CommandEditor, skill.ts
+    // SkillEditor). Rust PULLS these on config reload — the plugin never
+    // pushes an edit, so a payload can never serve a list from a reconcile
+    // that did not ask for it.
+    commandTransforms: [],
+    skillTransforms: [],
+    // what the last pull produced; backs ctx.command.list()/skill.list().
+    lastCommands: [],
+    reloadRequested: false,
+  };
+}
+
+/**
+ * Run every registered command/skill transform over `list`.
+ *
+ * Mirrors upstream `State.create` (core/state.ts:172-194): transforms start
+ * from the PRISTINE list each time, run in registration order, and a throwing
+ * transform is disabled for this run and reported — never fatal, because a
+ * broken third-party plugin must not take the server's command list with it.
+ *
+ * Returns `{ commands, failures }` so the caller can log every failure.
+ */
+export async function runTransforms(state, list) {
+  const out = Array.isArray(list) ? [...list] : [];
+  const failures = [];
+  for (const [kind, cbs] of [
+    ["command", state.commandTransforms],
+    ["skill", state.skillTransforms],
+  ]) {
+    for (let i = 0; i < cbs.length; i++) {
+      try {
+        await cbs[i]({
+          add: (def) => {
+            if (!def || typeof def.name !== "string" || def.name === "") return;
+            const existing = out.findIndex((c) => c && c.name === def.name);
+            // upstream `editor.set(name, definition)` (core/command.ts:61) —
+            // add REPLACES a same-named entry, so a plugin re-run is idempotent.
+            const entry = {
+              name: def.name,
+              description: typeof def.description === "string" ? def.description : "",
+              source: kind === "skill" ? "skill" : (def.source ?? "plugin"),
+              // `execute` is a closure — it cannot cross the wire, so the
+              // definition records that it was plugin-provided (named, not
+              // silently absent: execution routes are v1-owned).
+              pluginProvided: true,
+            };
+            if (existing >= 0) out[existing] = entry;
+            else out.push(entry);
+          },
+          // skill.ts SkillEditor verbs; command.ts ships only `add`, so these
+          // exist on the skill editor alone (same object, kind-checked).
+          list: () => out.filter((c) => c && c.source === "skill"),
+          get: (id) => out.find((c) => c && c.source === "skill" && c.name === id),
+          update: (id, mutate) => {
+            const hit = out.find((c) => c && c.source === "skill" && c.name === id);
+            if (hit) mutate(hit);
+          },
+          remove: (id) => {
+            const i = out.findIndex((c) => c && c.name === id);
+            if (i >= 0) out.splice(i, 1);
+          },
+        });
+      } catch (cause) {
+        failures.push({ kind, index: i, message: String((cause && cause.message) || cause) });
+      }
+    }
+  }
+  state.lastCommands = out;
+  return { commands: out, failures };
 }
 
 /** Fire a v2 domain hook; sequential, await, fail-open (logged by caller). */
