@@ -807,5 +807,13 @@ if python3 scripts/contract-diff.py --selftest >/dev/null 2>&1 \
 else
   echo "FAIL: contract-diff missing --v2/--delta (rule 37)"; fail=1
 fi
+# spec-validate must be VERSION-AGNOSTIC: a hardcoded `"2.0.28" in spec_path`
+# treated any other v2 tag as v1 and disabled the D-V2-UNION allowlist during a
+# bump (2026-10-18). The detection must parse the version, not a literal.
+if grep -vE '^\s*#' bench/openapi/spec-validate.py | grep -qE '"2\.0\.[0-9]+" in spec_path'; then
+  echo "FAIL: spec-validate v2 detection is a hardcoded literal (rule 37)"; fail=1
+else
+  echo "ok (spec-validate v2 detection is version-agnostic)"
+fi
 
 exit $fail

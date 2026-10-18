@@ -88,3 +88,32 @@ line) and requires it to go false — so the check can't pass vacuously.
   re-baseline) re-pin the freeze every v1 gate measures against — deferred, as the
   higher-risk line.
 - **Steps 5-9** remain operator-driven (need a running server + human D-rows/allowlists).
+
+## Compatibility result: does 2.0.32 work against ocserve?
+
+Tested with the **live oracles** against the real `@opencode/cli@2.0.32` binary and the
+regenerated 2.0.32 contract (no adoption — artifacts held in `/var/tmp`, pins unchanged):
+
+| oracle | target | result |
+|---|---|---|
+| `pair-v2-check.sh` (V2_BIN=2.0.32) | ocserve vs real 2.0.32 | **28 checks, 0 divergences** |
+| `spec-validate.py` (--spec 2.0.32) | ocserve v2 shapes vs 2.0.32 contract | **44 checked, 0 violations** |
+| `v2cli-check.sh` (V2_CLI=2.0.32) | real 2.0.32 CLI as a client | **PASS** (lists session, 5 routes JSON) |
+
+**Yes — 2.0.32 works.** ocserve (pinned at the 2.0.28 contract) is compatible with the
+real 2.0.32 binary, client, and contract on the tested surface. The contract delta is
+`0 conflicts, +1 op, +3 additive`, which is why: the new op (`POST
+/api/experimental/voice/session`) is unbound in ocserve and simply 404s (honest, like
+other unbuilt v2 surface) — it does not break any existing route.
+
+### One more tooling bug found by this test
+
+`spec-validate.py` detected v2 by the hardcoded literal `"2.0.28" in spec_path`. Validating
+against a `2.0.32.json` spec therefore fell through to the **v1** path — disabling the
+D-V2-UNION allowlist and the session seeding, producing a wall of false violations. Fixed
+to detect the major version from the filename; the normal 2.0.28 gate still reports 0
+(no regression). Guard rule 37 now also rejects a hardcoded literal there.
+
+(The two `/api/mcp status:"disabled"` lines seen mid-investigation were a *fixture*
+artifact — `testdata/fixture` ships disabled MCP servers; the canonical empty-mcp fixture
+the real gate uses reports 0, identically on 2.0.28 and 2.0.32.)

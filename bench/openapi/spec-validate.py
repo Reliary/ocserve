@@ -24,6 +24,7 @@ Exit 0 when no non-allowlisted route violates the contract; 1 otherwise.
 """
 import json
 import os
+import re
 import sys
 import urllib.request
 
@@ -141,7 +142,13 @@ def main():
         sys.exit("usage: spec-validate.py <base-url> [--spec <contract.json>]")
     base = args[0].rstrip("/")
     spec = json.load(open(spec_path, encoding="utf-8"))
-    is_v2 = "2.0.28" in spec_path
+    # v2 detection must be VERSION-AGNOSTIC: the old `"2.0.28" in spec_path`
+    # silently treated any other v2 tag (e.g. 2.0.32.json during a bump) as
+    # v1 — disabling the D-V2-UNION allowlist and the session seeding, so the
+    # bump produced a wall of false violations. Derive the major version from
+    # the filename instead.
+    _m = re.search(r"(\d+)\.\d+\.\d+\.json$", os.path.basename(spec_path))
+    is_v2 = bool(_m) and int(_m.group(1)) >= 2
 
     checked = 0
     skipped = 0
