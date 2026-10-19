@@ -68,6 +68,9 @@
 #      [plant: delegated selftest]
 #  39. every script with a `--selftest` is invoked by a gate (a selftest that
 #      nothing runs is the registered-but-never-called class) [plant: orphan]
+#  40. every shebang entry point is executable (a mode-644 `./scripts/x.py`
+#      fails with permission denied for anyone following the docs; git tracks
+#      the bit) [plant: fresh entry point left without the bit]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -864,6 +867,36 @@ if ./scripts/fetch-release.sh --selftest >/dev/null 2>&1; then
   echo "ok (fetch-release checksum gate rejects a corrupted tarball)"
 else
   echo "FAIL: fetch-release --selftest (checksum gate vacuous)"; fail=1
+fi
+
+echo "== guard: shebang entry points are executable (rule 40) =="
+# A script beginning with a shebang that has a __main__ entry point is meant to
+# be run directly. Losing the exec bit is invisible to `python3 x.py` callers
+# but breaks every doc that says `./scripts/x.py`, and git tracks the mode.
+needs_x() { # $1 = path -> 0 when it should be executable
+  head -1 "$1" 2>/dev/null | grep -q '^#!' || return 1
+  case "$1" in
+    *.sh) return 0 ;;
+    *.py) grep -q '__main__' "$1" 2>/dev/null && return 0 ;;
+  esac
+  return 1
+}
+bad40=""
+for f in $(find scripts bench -type f \( -name '*.sh' -o -name '*.py' \) 2>/dev/null); do
+  needs_x "$f" || continue
+  [ -x "$f" ] || bad40="$bad40 $f"
+done
+_plant40="scripts/__rule40_plant.py"
+printf '#!/usr/bin/env python3\nif __name__ == "__main__":\n    pass\n' > "$_plant40"
+_plant_caught=0
+needs_x "$_plant40" && [ ! -x "$_plant40" ] && _plant_caught=1
+rm -f "$_plant40"
+if [ -n "$bad40" ]; then
+  echo "FAIL: shebang entry point without exec bit:$bad40 (rule 40)"; fail=1
+elif [ "$_plant_caught" != 1 ]; then
+  echo "FAIL: rule 40 planted control not detected (check is vacuous)"; fail=1
+else
+  echo "ok (every entry point executable; planted chmod-less script flagged)"
 fi
 
 exit $fail
