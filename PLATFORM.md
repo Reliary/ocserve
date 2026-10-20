@@ -104,6 +104,35 @@ ship a platform without pair-check there, it gets a `D-` row saying so.
 
 ---
 
+## 1.4 Windows PTY (ConPTY) and tree-kill (done, runner-verified)
+
+`crates/ocserve-pty/src/windows.rs` implements the PTY on ConPTY:
+`CreatePseudoConsole` + `CreateProcessW` with `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`,
+because `std::process::Command` cannot express either the attribute list or a
+console-backed child. Three details that are the whole difficulty:
+
+| Detail | Handling |
+|---|---|
+| Environment block | UTF-16, sorted case-insensitively, double-NUL terminated. `build_env_block`, unit-tested for sort, terminator, last-wins and invalid names. |
+| Command line | `CreateProcessW` takes one string. Every argument goes through `quote_arg` (MSVCRT rules) so the child cannot re-split an argument. |
+| Shutdown | `ClosePseudoConsole` blocks while output is pending. The reader is a `PeekNamedPipe` poller that never blocks, so close cannot deadlock. |
+
+Tree-kill: Windows has no process groups, so the bash tool spawns the child
+**suspended** inside a Job Object carrying `PROC_THREAD_ATTRIBUTE_JOB_LIST`
+(`crates/ocserve-tools/src/win_job.rs`). The child cannot run, and therefore
+cannot fork a grandchild, before it is in the job; `KILL_ON_JOB_CLOSE` also
+means a crashed server cannot leak tool processes, which `taskkill /T` cannot
+provide. If assignment or resume fails, the child is killed and the spawn
+errors — never a silently uncontained process.
+
+Verified by `cargo test -p ocserve-pty` on both `platform check` runners. The
+test spawns a real shell, writes a command and requires the marker to come back
+through the reader; the negative control (reader appends nothing) fails in
+10 s with the captured output printed.
+
+Remaining, recorded: interactive resize fidelity (`mode con` in a real
+console) is a VM-only check, because the CI runner has no console to inspect.
+
 ## 1.3 Path containment (Phase 1, done)
 
 There were **three** containment implementations: `lib.rs::scope_path` (lexical

@@ -44,7 +44,7 @@ pub fn spawn(
     cwd: &str,
     env: &[(String, String)],
 ) -> Result<Proc, String> {
-    posix::reject_nul(command, args, cwd, env)?;
+    crate::posix_reject_nul(command, args, cwd, env)?;
 
     // Pre-build every C string BEFORE fork: only async-signal-safe calls are
     // permitted between fork and execve in a multi-threaded process.

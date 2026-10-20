@@ -11,6 +11,18 @@ fn app() -> axum::Router {
     ocserve_http::router(ocserve_http::AppState::new())
 }
 
+/// The shell these tests drive. On Windows that is `cmd.exe` (present on every
+/// install); the assertions about login flags are Unix-only and are gated at
+/// their call sites.
+fn shell() -> &'static str {
+    if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }
+}
+
+/// Whether the configured shell is a POSIX login shell (create() appends `-l`).
+fn shell_is_login() -> bool {
+    ocserve_pty::shells::login(shell())
+}
+
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
@@ -60,7 +72,7 @@ async fn create_get_update_delete_lifecycle() {
         &app,
         "POST",
         "/pty",
-        Some(serde_json::json!({"command": "/bin/sh"})),
+        Some(serde_json::json!({"command": shell()})),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -68,9 +80,13 @@ async fn create_get_update_delete_lifecycle() {
     let id = info["id"].as_str().unwrap().to_string();
     assert!(id.starts_with("pty_"));
     assert_eq!(info["status"], "running");
-    assert_eq!(info["command"], "/bin/sh");
-    // login shell: -l appended (sh is login:true)
-    assert_eq!(info["args"], serde_json::json!(["-l"]));
+    assert_eq!(info["command"], shell());
+    // login shell: -l appended (sh is login:true; cmd.exe is not)
+    if shell_is_login() {
+        assert_eq!(info["args"], serde_json::json!(["-l"]));
+    } else {
+        assert_eq!(info["args"], serde_json::json!([]));
+    }
     assert_eq!(
         info["title"].as_str().unwrap(),
         format!("Terminal {}", &id[id.len() - 4..])
@@ -142,7 +158,7 @@ async fn connect_token_gates() {
         &app,
         "POST",
         "/pty",
-        Some(serde_json::json!({"command": "/bin/sh"})),
+        Some(serde_json::json!({"command": shell()})),
     )
     .await;
     let id = body_json(resp).await["id"].as_str().unwrap().to_string();
@@ -226,7 +242,7 @@ async fn v2_pty_group_has_real_effects() {
         &app,
         "POST",
         "/api/pty",
-        Some(serde_json::json!({"command": "/bin/sh"})),
+        Some(serde_json::json!({"command": shell()})),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -262,7 +278,7 @@ async fn v2_pty_group_has_real_effects() {
         &app,
         "POST",
         "/api/pty",
-        Some(serde_json::json!({"command": "/bin/sh"})),
+        Some(serde_json::json!({"command": shell()})),
     )
     .await;
     let id2 = body_json(resp).await["data"]["id"]

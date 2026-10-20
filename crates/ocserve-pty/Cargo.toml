@@ -16,3 +16,17 @@ tokio = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# ConPTY, Job Objects, pipes and CreateProcessW. The module `windows.rs` is the
+# crate's second contained unsafe opt-in (see lib.rs); the feature list is kept
+# minimal so the dependency surface is auditable.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }

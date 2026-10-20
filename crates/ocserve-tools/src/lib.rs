@@ -11,6 +11,14 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 pub mod bash_patterns;
+// The bash tool's spawn/kill surface is the crate's contained unsafe opt-in:
+// `libc::killpg` on Unix and a Job Object here on Windows. Each site carries
+// its own safety notes; nothing else in the crate is unsafe.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod win_job;
+#[cfg(windows)]
+use win_job::WinJob;
 pub mod permission_asks;
 
 /// v1 Wildcard.match: glob → regex, `\`→`/`, trailing " *" tail optional.
@@ -346,7 +354,7 @@ fn resolve(cwd: &Path, p: &str) -> PathBuf {
     }
 }
 
-#[allow(unsafe_code)] // sole production unsafe: libc::killpg on timeout (below)
+#[allow(unsafe_code)] // contained spawn/kill surface: killpg (unix), Job Object (windows)
 fn bash(input: &Value, cwd: &Path, env: &[(String, String)]) -> Result<ToolResult> {
     let command = input["command"].as_str().context("bash.command")?;
     let timeout_ms = input["timeout"].as_u64().unwrap_or(120_000).min(600_000);
@@ -371,7 +379,16 @@ fn bash(input: &Value, cwd: &Path, env: &[(String, String)]) -> Result<ToolResul
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
+    // Windows: create the child suspended inside a Job Object so the timeout
+    // kill can reach the whole tree, and so a crashed server cannot leak tool
+    // processes (KILL_ON_JOB_CLOSE). `CREATE_SUSPENDED` closes the
+    // spawn-then-assign race: the child cannot run, and therefore cannot fork a
+    // grandchild, before it is in the job.
+    #[cfg(windows)]
+    let job = WinJob::attach(&mut cmd)?;
     let mut child = cmd.spawn().with_context(|| format!("spawn: {command}"))?;
+    #[cfg(windows)]
+    job.finish(&mut child)?;
     // K-EFFICIENCY: start the bounded drain BEFORE waiting — otherwise a
     // >pipe-buffer child stalls until the timeout kill (and full-capture
     // ratcheted unbounded bytes into RSS — the OOM chain).
@@ -406,6 +423,8 @@ fn bash(input: &Value, cwd: &Path, env: &[(String, String)]) -> Result<ToolResul
                             libc::killpg(child.id() as i32, libc::SIGKILL);
                         }
                     }
+                    #[cfg(windows)]
+                    job.terminate();
                     let _ = child.wait();
                     break;
                 }

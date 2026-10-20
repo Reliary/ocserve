@@ -18,8 +18,8 @@
 //!   is dropped, never an unbounded queue (AGENTS §2.3; upstream uses one
 //!   unbounded pending Vec per subscriber).
 //!
-//! Divergences (recorded): Windows PTY unsupported (stub error; upstream
-//! uses conpty); `workspace` query ignored (single-directory server).
+//! Divergences (recorded): `workspace` query ignored (single-directory server).
+//! Windows uses ConPTY + a Job Object (session-leader semantics are the Job).
 #![deny(unsafe_code)]
 
 use serde_json::{Value, json};
@@ -50,10 +50,36 @@ mod unix;
 
 #[cfg(target_os = "macos")]
 use macos::Proc;
-#[cfg(not(unix))]
-use stub::Proc;
 #[cfg(all(unix, not(target_os = "macos")))]
 use unix::Proc;
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows;
+#[cfg(windows)]
+use windows::Proc;
+
+/// Reject NUL bytes in any spawn input.
+///
+/// Shared by every platform: Windows paths and the UTF-16 conversion also
+/// cannot carry an interior NUL, and a NUL that reaches `CreateProcessW` is
+/// silently truncated rather than rejected.
+pub(crate) fn posix_reject_nul(
+    command: &str,
+    args: &[String],
+    cwd: &str,
+    env: &[(String, String)],
+) -> Result<(), String> {
+    let has_nul = command.contains('\0')
+        || cwd.contains('\0')
+        || args.iter().any(|a| a.contains('\0'))
+        || env
+            .iter()
+            .any(|(k, v)| k.contains('\0') || v.contains('\0'));
+    if has_nul {
+        return Err("pty spawn input contains a NUL byte".to_string());
+    }
+    Ok(())
+}
 
 /// Retained output cap (core/src/pty.ts BUFFER_LIMIT).
 pub const BUFFER_LIMIT: usize = 2 * 1024 * 1024;
@@ -135,7 +161,6 @@ impl Session {
 
     /// Append a chunk from the reader thread: advance cursor, retain ≤2 MiB,
     /// fan out to subscribers (bounded; full channel ⇒ drop subscriber).
-    #[cfg_attr(not(unix), allow(dead_code))] // only the unix reader calls it
     fn push_output(&self, chunk: String) {
         let len = utf16_len(&chunk);
         let mut buf = self.buf.lock().unwrap();
@@ -525,32 +550,24 @@ fn spawn_process(
     macos::spawn(command, args, cwd, env)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn spawn_process(
+    command: &str,
+    args: &[String],
+    cwd: &str,
+    env: &[(String, String)],
+) -> Result<Proc, String> {
+    windows::spawn(command, args, cwd, env)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn spawn_process(
     _command: &str,
     _args: &[String],
     _cwd: &str,
     _env: &[(String, String)],
 ) -> Result<Proc, String> {
-    Err("PTY sessions are not supported on this platform (upstream uses conpty; ocserve divergence D-PTY-2)".into())
-}
-
-#[cfg(not(unix))]
-mod stub {
-    pub struct Proc {
-        pub pid: u32,
-    }
-    impl Proc {
-        pub fn write(&self, _data: &str) {}
-        pub fn resize(&self, _rows: u16, _cols: u16) {}
-        pub fn kill(&self) {}
-        pub fn start(
-            &self,
-            _session: std::sync::Arc<super::Session>,
-            _on_exit: std::sync::Arc<dyn Fn(Option<i32>) + Send + Sync>,
-        ) {
-        }
-    }
+    Err("PTY sessions are not supported on this platform".into())
 }
 
 /// Ticket store: UUID v4, 60 s TTL, single use, scoped (pty + directory),
@@ -571,5 +588,139 @@ mod tests {
         assert_eq!(utf16_to_byte(s, 4), 7); // after emoji (4 bytes)
         assert_eq!(utf16_to_byte(s, 5), s.len());
         assert_eq!(utf16_to_byte(s, 99), s.len());
+    }
+}
+
+/// Cross-platform spawn acceptance: create a shell, write a command, and
+/// require its output to come back through the PTY.
+///
+/// This is the test that separates "the platform module compiles" from "a real
+/// process ran with a terminal attached". It is the only PTY test that needs no
+/// HTTP layer, so it runs on the `platform check` runners too.
+#[cfg(test)]
+mod spawn_acceptance {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    use std::sync::atomic::AtomicBool;
+
+    fn shell_and_echo() -> (&'static str, &'static str, &'static str) {
+        // (shell, command that prints a marker, expected marker)
+        if cfg!(windows) {
+            ("cmd.exe", "echo OCSERVE_PTY_OK\r\n", "OCSERVE_PTY_OK")
+        } else {
+            ("/bin/sh", "echo OCSERVE_PTY_OK\n", "OCSERVE_PTY_OK")
+        }
+    }
+
+    #[test]
+    fn real_shell_echoes_through_the_pty() {
+        let (shell, cmd, marker) = shell_and_echo();
+        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        let proc = match spawn_process(shell, &[], &cwd, &[]) {
+            Ok(p) => p,
+            // A platform without the expected shell is a skip, not a pass:
+            // report it so a green run cannot hide an unspawned PTY.
+            Err(e) => panic!("spawn {shell}: {e}"),
+        };
+        assert!(proc.pid > 0, "a real pid");
+
+        let out: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let collected = out.clone();
+        let exited: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let exited_seen = exited.clone();
+        // A bare Session is enough: it owns the buffer and the proc.
+        let session = Arc::new(Session {
+            id: "pty_test".into(),
+            inner: Mutex::new(SessionState {
+                title: "t".into(),
+                command: shell.into(),
+                args: vec![],
+                cwd: cwd.clone(),
+                pid: proc.pid,
+                status: "running",
+                exit_code: None,
+            }),
+            buf: Mutex::new(Buf {
+                data: String::new(),
+                buffer_cursor: 0,
+                cursor: 0,
+                subs: HashMap::new(),
+            }),
+            next_sub: AtomicU64::new(0),
+            proc,
+        });
+        {
+            let session = session.clone();
+            let collected = collected.clone();
+            let exited_seen = exited_seen.clone();
+            // Watch the buffer the same way an attach would.
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    {
+                        let buf = session.buf.lock().unwrap();
+                        let mut sink = collected.lock().unwrap();
+                        if buf.data.len() > sink.len() {
+                            *sink = buf.data.clone();
+                        }
+                    }
+                    if exited_seen.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    if Instant::now() > deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+        }
+        let session_start = session.clone();
+        session.proc.start(
+            session_start,
+            Arc::new(move |_code| {
+                exited.store(true, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+        // Give the shell a moment to paint its prompt, then type.
+        std::thread::sleep(Duration::from_millis(250));
+        session.write(cmd);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let seen = out.lock().unwrap().clone();
+            if seen.contains(marker) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PTY produced no output containing {marker:?}; saw: {seen:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        session.proc.kill();
+        session.end(None);
+    }
+
+    #[test]
+    fn resize_after_spawn_is_accepted() {
+        let (shell, _, _) = shell_and_echo();
+        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        let proc = spawn_process(shell, &[], &cwd, &[]).expect("spawn");
+        // Must not crash or hang; the visible-size proof is platform-specific
+        // (TIOCGWINSZ on Unix, `mode con` on Windows) and lives in the VM run.
+        proc.resize(40, 100);
+        proc.kill();
+    }
+
+    #[test]
+    fn kill_is_idempotent() {
+        let (shell, _, _) = shell_and_echo();
+        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        let proc = spawn_process(shell, &[], &cwd, &[]).expect("spawn");
+        proc.kill();
+        proc.kill();
+        proc.kill();
     }
 }

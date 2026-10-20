@@ -145,11 +145,23 @@ pub fn preferred(cwd_root: &str) -> String {
         return shell;
     }
     let _ = cwd_root;
-    let bash = "/bin/bash";
-    if std::path::Path::new(bash).is_file() {
-        return bash.to_string();
+    #[cfg(windows)]
+    {
+        // First acceptable entry of the Windows list: pwsh, powershell, git
+        // bash, COMSPEC. Never a POSIX path, which does not exist there.
+        return windows_shells()
+            .into_iter()
+            .find(|p| acceptable(p))
+            .unwrap_or_else(|| "cmd.exe".to_string());
     }
-    "/bin/sh".to_string()
+    #[cfg(not(windows))]
+    {
+        let bash = "/bin/bash";
+        if std::path::Path::new(bash).is_file() {
+            return bash.to_string();
+        }
+        "/bin/sh".to_string()
+    }
 }
 
 #[cfg(test)]

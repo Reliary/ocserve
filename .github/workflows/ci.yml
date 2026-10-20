@@ -207,6 +207,14 @@ jobs:
           name: check-${{ matrix.os }}
           path: check.log
           if-no-files-found: ignore
+      - name: PTY acceptance (real process, both platforms)
+        # `cargo check` proves the platform modules compile; this proves a real
+        # shell runs with a terminal attached and its output comes back. It is
+        # the only PTY test that needs no HTTP layer, so it belongs here.
+        # On Windows it is the first execution of the ConPTY path anywhere.
+        shell: bash
+        run: cargo test -p ocserve-pty -- --nocapture
+
       - name: guard suite (macOS)
         if: runner.os == 'macOS'
         # The guard suite is bash+python. Running it here proves the scripts are

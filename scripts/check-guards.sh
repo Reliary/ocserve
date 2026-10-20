@@ -1046,7 +1046,9 @@ plat_scan() {
     local start=$(( line > 40 ? line - 40 : 1 ))
     local ctx
     ctx=$(sed -n "${start},${line}p" "$file" 2>/dev/null)
-    if printf '%s' "$ctx" | grep -qE '#\[cfg\(\s*(unix|windows|target_os|not\(unix\)|not\(windows\))'; then
+    # `#![cfg(...)]` (inner, module-wide) is the strongest form of the same
+    # defence: the whole file vanishes off-platform.
+    if printf '%s' "$ctx" | grep -qE '#!?\[cfg\(\s*(unix|windows|target_os|not\(unix\)|not\(windows\))'; then
       continue
     fi
     if printf '%s' "$ctx" | grep -qE 'cfg!\(\s*(unix|windows|target_os)'; then

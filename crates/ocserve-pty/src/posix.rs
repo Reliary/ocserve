@@ -30,29 +30,6 @@ pub fn cstring(s: &str) -> Vec<u8> {
     v
 }
 
-/// Reject interior NULs before any allocation happens in the child.
-///
-/// `cstring` only appends a terminator, so a NUL inside the command truncates
-/// the executed binary while `info.command` still shows the full string, and a
-/// NUL inside an env value silently becomes extra env entries at `execve`.
-pub fn reject_nul(
-    command: &str,
-    args: &[String],
-    cwd: &str,
-    env: &[(String, String)],
-) -> Result<(), String> {
-    let has_nul = command.contains('\0')
-        || cwd.contains('\0')
-        || args.iter().any(|a| a.contains('\0'))
-        || env
-            .iter()
-            .any(|(k, v)| k.contains('\0') || v.contains('\0'));
-    if has_nul {
-        return Err("pty spawn input contains a NUL byte".to_string());
-    }
-    Ok(())
-}
-
 /// `WIFEXITED` → code; signal-terminated → `None` (upstream node-pty reports no
 /// exitCode on signals).
 pub fn exit_code(status: i32) -> Option<i32> {
