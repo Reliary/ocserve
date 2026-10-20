@@ -26,6 +26,9 @@ use crate::posix;
 /// Darwin `TIOCSWINSZ` — `<sys/ttycom.h>`, `_IOW('t', 103, struct winsize)`.
 const TIOCSWINSZ: u64 = 0x8008_7467;
 /// Darwin `TIOCGWINSZ` — `<sys/ttycom.h>`, `_IOR('t', 104, struct winsize)`.
+/// Used by the round-trip test below; compiled only there so `-D warnings` stays
+/// meaningful for genuinely dead code.
+#[cfg(test)]
 const TIOCGWINSZ: u64 = 0x4008_7468;
 
 /// Same shape as the Linux `Proc` so `lib.rs` is identical for both.
@@ -137,7 +140,10 @@ mod tests {
     /// than silently accepting a plausible-looking number.
     #[test]
     fn winsize_round_trips() {
-        let p = spawn("/bin/sh", &[], "/", &[]).expect("spawn");
+        let p = match spawn("/bin/sh", &[], "/", &[]) {
+            Ok(p) => p,
+            Err(e) => panic!("spawn failed: {e}"),
+        };
         p.resize(40, 120);
         let got = posix::get_winsize(posix::raw(&p.master), TIOCGWINSZ);
         assert_eq!(
@@ -152,7 +158,10 @@ mod tests {
     /// `forkpty`, so a bad command never creates a child.
     #[test]
     fn nul_rejected() {
-        let e = spawn("/bin/true", &["a\0b".into()], "/", &[]).unwrap_err();
+        let e = match spawn("/bin/true", &["a\0b".into()], "/", &[]) {
+            Err(e) => e,
+            Ok(_) => panic!("NUL in args must be rejected"),
+        };
         assert!(e.contains("NUL"), "{e}");
     }
 }
