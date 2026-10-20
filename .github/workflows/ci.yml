@@ -222,12 +222,16 @@ jobs:
           set -o pipefail
           cargo test -p ocserve-pty -- --nocapture --test-threads=1 2>&1 | tee pty.log
           rc=${PIPESTATUS[0]}
-          sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' pty.log \
-            | grep -E 'panicked|FAILED|^test .* FAILED|error\[|^error:' \
-            | head -20 \
-            | while IFS= read -r line; do
-                echo "::error title=pty ${{ matrix.os }}::$line"
-              done || true
+          # Emit the head and tail verbatim. Pattern-matching first was
+          # wrong: the failure produced no line matching panic/error, so the
+          # annotation step had nothing to say and the job stayed opaque.
+          {
+            head -8 pty.log
+            echo "---"
+            tail -30 pty.log
+          } | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' | while IFS= read -r line; do
+            echo "::error title=pty ${{ matrix.os }}::$line"
+          done || true
           exit "$rc"
       - name: upload pty log
         if: always()

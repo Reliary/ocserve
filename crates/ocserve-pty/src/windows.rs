@@ -277,139 +277,124 @@ pub fn spawn(
         return Err(e);
     }
 
-    // Attribute list: pseudoconsole + job.
-    let mut attrs_size: usize = 0;
-    // Safety: first call with a null list returns the required size.
-    unsafe {
-        InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut attrs_size);
-    }
-    let mut attrs_buf = vec![0u8; attrs_size];
-    let attrs = attrs_buf.as_mut_ptr() as *mut std::ffi::c_void;
-    // Safety: buffer is `attrs_size` bytes, as the API requested.
-    if unsafe { InitializeProcThreadAttributeList(attrs, 2, 0, &mut attrs_size) } == 0 {
-        let e = last_error("InitializeProcThreadAttributeList");
-        unsafe {
-            CloseHandle(job);
-            ClosePseudoConsole(console);
-            CloseHandle(input_write);
-            CloseHandle(output_read);
-        }
-        return Err(e);
-    }
-    let cleanup = |console: HPCON, job: HANDLE, attrs: *mut std::ffi::c_void| unsafe {
-        DeleteProcThreadAttributeList(attrs);
-        CloseHandle(job);
-        ClosePseudoConsole(console);
-    };
-    // The attribute value for the pseudoconsole is the HPCON itself, passed by
-    // value (not a pointer to it), which is what upstream's node-pty does too.
-    // Safety: attribute list is initialized; HPCON is a handle-sized value.
-    let ok_pc = unsafe {
-        UpdateProcThreadAttribute(
-            attrs,
-            0,
-            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-            console as *const std::ffi::c_void,
-            std::mem::size_of::<HPCON>(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-        )
-    };
-    if ok_pc == 0 {
-        let e = last_error("UpdateProcThreadAttribute(pseudoconsole)");
-        cleanup(console, job, attrs);
-        unsafe {
-            CloseHandle(input_write);
-            CloseHandle(output_read);
-        }
-        return Err(e);
-    }
-    // The job attribute wants a pointer to the handle variable.
-    // Safety: same initialization guarantees as above.
-    let ok_job = unsafe {
-        UpdateProcThreadAttribute(
-            attrs,
-            0,
-            windows_sys::Win32::System::Threading::PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-            &job as *const HANDLE as *const std::ffi::c_void,
-            std::mem::size_of::<HANDLE>(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-        )
-    };
-    if ok_job == 0 {
-        let e = last_error("UpdateProcThreadAttribute(job)");
-        cleanup(console, job, attrs);
-        unsafe {
-            CloseHandle(input_write);
-            CloseHandle(output_read);
-        }
-        return Err(e);
-    }
-
+    // Attribute lists: one with {pseudoconsole, job} and a fallback with the
+    // pseudoconsole only. The fallback exists because a parent already inside a
+    // non-nesting job (GitHub's runners, some service managers) makes the *job
+    // attribute* fail process creation with ERROR_ACCESS_DENIED; without the
+    // fallback the terminal would be unusable there.
     let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-    si.lpAttributeList = attrs;
-    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-
     let mut cmdline = build_command_line(command, args);
     let cwd_w = wide(cwd);
     let mut env_block = build_env_block(env);
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
-    // Safety: all pointers are valid for the duration of the call; the strings
-    // are NUL-terminated UTF-16; the process is created suspended into the job
-    // via the attribute list.
-    let created = unsafe {
-        CreateProcessW(
-            std::ptr::null(), // let the loader resolve `command` from the line
-            cmdline.as_mut_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            0, // no handle inheritance: ConPTY already owns the child's ends
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-            env_block.as_mut_ptr() as *const std::ffi::c_void,
-            cwd_w.as_ptr(),
-            &si.StartupInfo,
-            &mut pi,
-        )
+    // `create_with` builds a list of `n` attributes (the pseudoconsole is
+    // always first), calls CreateProcessW and deletes the list. It returns the
+    // OS error so the caller can decide whether to retry.
+    // Returns `None` on success, `Some(error)` otherwise. An io::Error
+    // carrying os-error 0 as a success sentinel would be unreadable.
+    let mut create_with = |with_job: bool,
+                           pi: &mut PROCESS_INFORMATION|
+     -> Option<std::io::Error> {
+        let count = if with_job { 2 } else { 1 };
+        let mut size: usize = 0;
+        unsafe {
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), count, 0, &mut size);
+        }
+        let mut buf = vec![0u8; size];
+        let list = buf.as_mut_ptr() as *mut std::ffi::c_void;
+        if unsafe { InitializeProcThreadAttributeList(list, count, 0, &mut size) } == 0 {
+            return Some(std::io::Error::last_os_error());
+        }
+        // The pseudoconsole value is the HPCON itself, not a pointer to it.
+        let pc = unsafe {
+            UpdateProcThreadAttribute(
+                list,
+                0,
+                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+                console as *const std::ffi::c_void,
+                std::mem::size_of::<HPCON>(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        if pc == 0 {
+            let e = std::io::Error::last_os_error();
+            unsafe { DeleteProcThreadAttributeList(list) };
+            return Some(e);
+        }
+        if with_job {
+            let j = unsafe {
+                UpdateProcThreadAttribute(
+                    list,
+                    0,
+                    windows_sys::Win32::System::Threading::PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                    &job as *const HANDLE as *const std::ffi::c_void,
+                    std::mem::size_of::<HANDLE>(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            };
+            if j == 0 {
+                let e = std::io::Error::last_os_error();
+                unsafe { DeleteProcThreadAttributeList(list) };
+                return Some(e);
+            }
+        }
+        si.lpAttributeList = list;
+        // Safety: strings are NUL-terminated UTF-16 and outlive the call; the
+        // attribute list is initialized and valid.
+        let ok = unsafe {
+            CreateProcessW(
+                std::ptr::null(),
+                cmdline.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                env_block.as_mut_ptr() as *const std::ffi::c_void,
+                cwd_w.as_ptr(),
+                &si.StartupInfo,
+                pi,
+            )
+        };
+        unsafe { DeleteProcThreadAttributeList(list) };
+        if ok == 0 {
+            Some(std::io::Error::last_os_error())
+        } else {
+            None
+        }
     };
-    // The attribute list is no longer needed by us either way.
-    unsafe { DeleteProcThreadAttributeList(attrs) };
-    if created == 0 {
-        let e = last_error("CreateProcessW");
+
+    let failed = match create_with(true, &mut pi) {
+        None => None,
+        // ERROR_ACCESS_DENIED: the parent job forbids nesting. Create without
+        // the job attribute and assign afterwards.
+        Some(e) if e.raw_os_error() == Some(5) => match create_with(false, &mut pi) {
+            None => {
+                // Safety: both handles are valid; a failed assign is
+                // non-fatal but means only the direct child is killable.
+                // Recorded in PLATFORM.md §1.4.
+                unsafe {
+                    AssignProcessToJobObject(job, pi.hProcess);
+                }
+                None
+            }
+            other => other,
+        },
+        Some(e) => Some(e),
+    };
+    if let Some(err) = failed {
         unsafe {
             CloseHandle(job);
             ClosePseudoConsole(console);
             CloseHandle(input_write);
             CloseHandle(output_read);
         }
-        return Err(e);
+        return Err(format!("CreateProcessW: {err}"));
     }
-    unsafe {
-        CloseHandle(pi.hThread);
-    }
-    // Belt and braces: the attribute list assigned the job at creation, but if
-    // the OS ignored it (older builds) the assign below is a no-op failure we
-    // must not swallow: without the job, `kill` cannot reach grandchildren.
-    // Safety: all handles valid.
-    let in_job = unsafe { AssignProcessToJobObject(job, pi.hProcess) };
-    if in_job == 0 {
-        let err = std::io::Error::last_os_error();
-        // ERROR_ACCESS_DENIED (5) here means the process is already in a job
-        // that does not allow nesting; that is acceptable because the outer job
-        // still reaps it. Any other failure means tree-kill is not guaranteed.
-        if err.raw_os_error() != Some(5) {
-            unsafe {
-                TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hProcess);
-                CloseHandle(job);
-                ClosePseudoConsole(console);
-                CloseHandle(input_write);
-                CloseHandle(output_read);
-            }
-            return Err(format!("AssignProcessToJobObject: {err}"));
-        }
-    }
+    unsafe { CloseHandle(pi.hThread) };
 
     Ok(Proc {
         pid: pi.dwProcessId,
