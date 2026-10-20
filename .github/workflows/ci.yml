@@ -180,8 +180,19 @@ jobs:
           set -o pipefail
           cargo check --workspace --all-targets 2>&1 | tee check.log
           rc=${PIPESTATUS[0]}
-          { echo "## cargo check (${{ matrix.os }})"; echo '```'; tail -80 check.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "## cargo check (${{ matrix.os }})"; echo '```'; tail -120 check.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
+      - name: annotate failures
+        if: failure()
+        shell: bash
+        # Step summaries and artifacts both need auth to read on this repo; an
+        # ANNOTATION is visible in the run UI without any. One line per distinct
+        # error so the failure is legible without `gh`.
+        run: |
+          grep -E '^error(\[|:)' check.log | sort -u | head -20 | while IFS= read -r line; do
+            echo "::error title=${{ matrix.os }}::$line"
+          done
+          exit 0
       - name: upload check log
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.0
