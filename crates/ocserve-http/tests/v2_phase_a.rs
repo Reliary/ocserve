@@ -176,6 +176,12 @@ async fn phase_c_projections_answer() {
     // F6 (security review): a SYMLINK inside the worktree pointing out of it
     // must not become a write escape via the not-found lexical branch. Create
     // `<worktree>/loot -> <outside>` then write through `loot/evil`.
+    //
+    // Unix-only: creating a directory symlink on Windows needs Developer Mode
+    // or elevation, so the test would be a false failure on a stock runner.
+    // The containment logic it covers is platform-independent and still
+    // exercised by the `../..` case above on every platform.
+    #[cfg(unix)]
     {
         let wt: String = st.paths["directory"].as_str().unwrap_or(".").to_string();
         let outside = std::env::temp_dir().join(format!("ocserve-f6-{}", std::process::id()));

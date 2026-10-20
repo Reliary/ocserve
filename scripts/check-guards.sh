@@ -996,7 +996,7 @@ plat_scan() {
     bad=1
   done < <(grep -rn --include='*.rs' -E \
       'use std::os::unix|use std::os::windows|std::os::unix::|std::os::windows::' \
-      crates/*/src 2>/dev/null)
+      crates/*/src crates/*/tests 2>/dev/null)
   return $bad
 }
 if out=$(plat_scan); then
