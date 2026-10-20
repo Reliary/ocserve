@@ -239,9 +239,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join(name);
         std::fs::write(&p, script).unwrap();
-        let mut perm = std::fs::metadata(&p).unwrap().permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(&p, perm).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+        }
         p
     }
 

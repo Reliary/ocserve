@@ -3204,6 +3204,8 @@ mod sift_wiring_tests {
         p
     }
 
+    // Uses `fake_shrink`, which is `#[cfg(unix)]` (it chmods a shell script).
+    #[cfg(unix)]
     #[test]
     fn history_rebuild_sifts_bash_but_not_read() {
         let _g = crate::sift_boundary::sift_env_lock();

@@ -153,6 +153,12 @@ jobs:
     #
     # Runtime behaviour is NOT covered here: no test is run. PLATFORM.md records
     # that as D-PLATFORM-UNVERIFIED until Phase P/W add PTY and shell e2e.
+    #
+    # Verified locally with `cargo xwin check --workspace --all-targets` before
+    # enabling: x86_64-msvc is clean (warnings only) and found two real
+    # test-target bugs that a plain `cargo check` missed. aarch64-msvc cannot be
+    # cross-checked on Linux (ring's pregenerated asm needs a clang that accepts
+    # `/imsvc`); that target is checked by the release build on a real runner.
     name: platform check (${{ matrix.os }})
     strategy:
       fail-fast: false
