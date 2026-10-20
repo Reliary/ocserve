@@ -173,24 +173,25 @@ and re-runs every oracle before claiming compatibility.
 
 ## Platform support
 
-Linux x86_64 and aarch64 (glibc) are supported and are the only published
-artifacts. Everything outside the terminal layer is already portable: the
-request path, storage, search and the wire contract touch no OS API, and the
-filesystem/process/shell assumptions now live behind one seam.
+Linux x86_64 and aarch64 (glibc) are the published artifacts and remain the
+reference platform.
 
-macOS and Windows are in progress, in that order, and the honest state is:
+**macOS** builds and runs, and its PTY layer is verified on a real macOS runner:
+`forkpty` spawn, write, resize (the Darwin `TIOCSWINSZ` constant is checked by a
+`TIOCGWINSZ` round-trip), exit code and kill. The client-facing contract is the
+same one Linux serves.
 
-- macOS: the PTY implementation is Linux-specific (`posix_openpt`/`ptsname_r`/
-  `TIOCSCTTY` do not exist there), so the build fails at that crate. Plan is
-  `openpty` + `login_tty`; it is not written yet.
-- Windows: the build is blocked on nothing in the request path, but the PTY
-  layer needs ConPTY, and plugin/MCP spawning previously assumed `sh` (now
-  behind a shell-family seam). Not yet verified on a runner.
+**Windows** runs the server, the shell tool and the frozen wire contract
+(verified in a Windows 11 LTSC VM, `pair-check` 18 compared / 0 divergent against
+`opencode-windows-x64@1.18.31`). What is **not** implemented there yet: the
+`/pty` terminal routes (ConPTY) still return the documented stub error, and the
+Windows-specific path normalization and long-path handling are outstanding.
+Plugin and MCP spawning no longer assumes `sh`, but their Windows path is only
+compile-checked.
 
-No macOS or Windows artifact is published, and no performance number is claimed
-for either: every measurement in this README comes from Linux, on the same
-machine, against the same freeze binary. `PLATFORM.md` records the per-platform
-plan, what is measured, and what is still a hypothesis.
+No performance number is claimed for macOS or Windows: every measurement in this
+README comes from Linux, on the same machine, against the same freeze binary.
+`PLATFORM.md` records the per-platform evidence and the open items.
 
 ## License
 
