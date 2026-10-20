@@ -212,8 +212,30 @@ jobs:
         # shell runs with a terminal attached and its output comes back. It is
         # the only PTY test that needs no HTTP layer, so it belongs here.
         # On Windows it is the first execution of the ConPTY path anywhere.
+        #
+        # Output is captured and re-emitted as annotations: job logs need
+        # repo-admin rights, and a red job nobody can read is the same defect
+        # class as a vacuous guard. `--test-threads=1` keeps the spawn tests
+        # from interleaving their output on a failure.
         shell: bash
-        run: cargo test -p ocserve-pty -- --nocapture
+        run: |
+          set -o pipefail
+          cargo test -p ocserve-pty -- --nocapture --test-threads=1 2>&1 | tee pty.log
+          rc=${PIPESTATUS[0]}
+          sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' pty.log \
+            | grep -E 'panicked|FAILED|^test .* FAILED|error\[|^error:' \
+            | head -20 \
+            | while IFS= read -r line; do
+                echo "::error title=pty ${{ matrix.os }}::$line"
+              done || true
+          exit "$rc"
+      - name: upload pty log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.0
+        with:
+          name: pty-${{ matrix.os }}
+          path: pty.log
+          if-no-files-found: ignore
 
       - name: guard suite (macOS)
         if: runner.os == 'macOS'
