@@ -165,7 +165,24 @@ jobs:
       - name: cargo check
         # `check`, not `build`: link-time gaps in the OS layer are Phase P/W work,
         # and a type error is what the two ungated unix imports used to produce.
-        run: cargo check --workspace --all-targets
+        #
+        # Output is captured to a file and re-printed, then uploaded: job logs
+        # need repo-admin rights on this private repo (HTTP 403 via `gh`), and a
+        # red job nobody can read is the same class of defect as a vacuous guard.
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check --workspace --all-targets 2>&1 | tee check.log
+          rc=${PIPESTATUS[0]}
+          { echo "## cargo check (${{ matrix.os }})"; echo '```'; tail -80 check.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+      - name: upload check log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.0
+        with:
+          name: check-${{ matrix.os }}
+          path: check.log
+          if-no-files-found: ignore
       - name: guard 43 (platform API behind a platform guard)
         if: runner.os != 'Windows'
         # The guard is bash+python; keep it on macOS so a macOS-only regression
