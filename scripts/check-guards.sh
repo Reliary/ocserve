@@ -71,6 +71,9 @@
 #  40. every shebang entry point is executable (a mode-644 `./scripts/x.py`
 #      fails with permission denied for anyone following the docs; git tracks
 #      the bit) [plant: fresh entry point left without the bit]
+#  41. every harness that boots a server isolates HOME (the default data dir
+#      derives from HOME; live probes on 4912 wrote 51 throwaway sessions into
+#      the real database, 2026-10-20) [plant: launcher with no HOME]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -901,4 +904,38 @@ else
   echo "ok (every entry point executable; planted chmod-less script flagged)"
 fi
 
+echo "== guard: every harness that boots a server isolates HOME (rule 41) =="
+# Manual live probes on port 4912 wrote 51 throwaway sessions into the real
+# database (2026-10-20 audit). The scripted harnesses were already clean; the
+# risk is a NEW script that launches a server without isolating it. The default
+# data dir is derived from HOME, so a launcher must set HOME (directly or via
+# `env HOME=`); OCSERVE_DATA_DIR is an acceptable explicit alternative.
+#
+# Deliberately ignores: comments, `pkill -f`, `printf`/heredoc unit templates,
+# and paths containing `$BIN`-style indirection (those are checked by the file
+# that sets BIN). A guard that fires on prose gets switched off, so the matcher
+# is narrow: only a real exec line counts.
+_launch_lines() { # $1 = path -> lines that actually exec a server
+  grep -nE '(^|[[:space:]])"?\$?[A-Za-z_./-]*(ocserve|opencode|refine)"?[[:space:]]+serve([[:space:]]|$)|[[:space:]](serve[[:space:]]+--port)' "$1" 2>/dev/null \
+    | grep -vE '^[0-9]+:[[:space:]]*#|pkill|printf|pgrep|>>?"\$?[A-Za-z_./-]*\.log"|echo ' || true
+}
+bad41=""
+for f in $(find scripts bench -maxdepth 2 -type f \( -name '*.sh' -o -name '*.py' \) 2>/dev/null); do
+  case "$f" in scripts/check-guards.sh) continue ;; esac   # this file
+  lines=$(_launch_lines "$f")
+  [ -n "$lines" ] || continue
+  grep -qE 'HOME=|env HOME' "$f" || bad41="$bad41 $f"
+done
+_plant41="scripts/__rule41_plant.sh"
+printf '#!/usr/bin/env bash\n"$BIN" serve --port 9999\n' > "$_plant41"
+_plant41_caught=0
+[ -n "$(_launch_lines "$_plant41")" ] && ! grep -q 'HOME=' "$_plant41" && _plant41_caught=1
+rm -f "$_plant41"
+if [ -n "$bad41" ]; then
+  echo "FAIL: server-launching script never isolates HOME:$bad41 (rule 41)"; fail=1
+elif [ "$_plant41_caught" != 1 ]; then
+  echo "FAIL: rule 41 planted control not detected (check is vacuous)"; fail=1
+else
+  echo "ok (every server-launching harness isolates HOME; planted one flagged)"
+fi
 exit $fail
