@@ -257,7 +257,10 @@ Exit: macOS runner green on the full suite *and* PTY e2e (create/type/resize/exi
 `D-MACOS-*` row, not a silent pass.
 
 **Interim:** `ci.yml` has a `platform-check` job (macOS + Windows) that runs
-`cargo check --workspace --all-targets`. It proves the type-level half — the two ungated
+`cargo check --workspace --all-targets`, plus the macOS-only guard suite, PTY
+acceptance tests, and a `jsonschema` install (the event validator's dependency is
+preinstalled on the Linux runner but absent from macOS's system Python; without
+it rule 19 fails closed). It proves the type-level half — the two ungated
 `std::os::unix` imports and any future `cfg` mistake — and nothing about behaviour. It runs
 on the target OS because the C dependencies (SQLite, zstd, ring, blake3) cannot be
 cross-compiled from Linux without the Windows SDK; that was verified here, not assumed
