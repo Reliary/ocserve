@@ -36,8 +36,12 @@ fi
 FH="$DATA/fixture-home"
 cp -r "$PWD/testdata/fixture" "$FH"
 
+# OCSERVE_REQ_LOG=1 is load-bearing: per-request logging was gated off for
+# throughput in the perf work, so this check had been silently extracting ZERO
+# paths and exiting 2 ("attach likely failed to boot") rather than passing
+# vacuously — a red gate nobody saw. With it set, the hit-set is real.
 setsid env HOME="$FH" OCSERVE_DATA_DIR="$DATA" OCSERVE_LEGACY_SYNC=0 \
-  OPENCODE_DISABLE_MODELS_FETCH=1 RUST_LOG=info "$OCSERVE_BIN" serve \
+  OCSERVE_REQ_LOG=1 OPENCODE_DISABLE_MODELS_FETCH=1 RUST_LOG=info "$OCSERVE_BIN" serve \
   --port "$PORT" >"$LOG" 2>&1 &
 PID=$!
 

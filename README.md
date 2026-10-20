@@ -132,10 +132,14 @@ ocserve. Verified live against the real `@opencode/cli` 2.0.28 binary:
 The same suite also passes against 2.0.32, the newest 2.x release at the time
 of writing.
 
-The v2 **run engine** (inbox admission, write-ahead execution claims,
+Everything that exists only in the 2.x contract is behind `OCSERVE_V2=1` and
+answers a clean JSON 404 without it. The gate is derived mechanically from the
+two contracts, not by path prefix: `/api/*` is part of the frozen 1.18.31
+contract too (58 operations, and the 1.18.31 TUI calls them), so those keep
+working. What the flag actually gates is the 96 operations present in 2.0.28
+and absent from 1.18.31: the run engine (inbox admission, write-ahead claims,
 `content[]` projection, dual-grammar events, `log?after&follow` replay, form
-service) is behind `OCSERVE_V2=1` and stays dark by default, so `/api/info`
-answers a JSON 404 until you enable it.
+service) plus the v2-only administration surface.
 
 v2 plugins work, in both authoring shapes (promise and Effect). `session.context`,
 `session.compaction`, `tool.execute.before` and `tool.execute.after` are bridged,

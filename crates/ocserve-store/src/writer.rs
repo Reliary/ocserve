@@ -17,6 +17,16 @@ pub enum WriteOp {
         sql: String,
         params: Vec<serde_json::Value>,
     },
+    /// Same as `Sql`, but captures one value from the statement's first
+    /// returned row. Used for allocation that MUST be atomic with the write:
+    /// `INSERT ... RETURNING seq`. Doing this with a separate reader after the
+    /// commit is a race (two emitters can both read the same MAX — proven by
+    /// `tests/event_seq.rs`, 115 duplicates in 200 concurrent emits).
+    SqlReturning {
+        sql: String,
+        params: Vec<serde_json::Value>,
+        capture: Capture,
+    },
     /// Register a blob object row (sha, len, chunks) after BlobStore::put completed.
     BlobPut {
         sha: String,
@@ -25,9 +35,24 @@ pub enum WriteOp {
     },
 }
 
+/// What `WriteOp::SqlReturning` captures from the first returned row.
+#[derive(Clone, Copy, Debug)]
+pub enum Capture {
+    /// A single integer column (`RETURNING seq`).
+    FirstColumnI64,
+}
+
+/// Result of one committed batch: rows affected, plus captured values in the
+/// order their ops appeared.
+#[derive(Debug, Default)]
+pub struct BatchAck {
+    pub affected: usize,
+    pub captured: Vec<i64>,
+}
+
 struct Batch {
     ops: Vec<WriteOp>,
-    ack: mpsc::Sender<Result<usize>>,
+    ack: mpsc::Sender<Result<BatchAck>>,
 }
 
 /// Best-effort pre-migration snapshot (M1): when the on-disk `user_version`
@@ -116,6 +141,14 @@ impl Writer {
 
     /// Submit ops; blocks until the batch commits. Returns rows affected (sum).
     pub fn write(&self, ops: Vec<WriteOp>) -> Result<usize> {
+        self.write_capture(ops).map(|ack| ack.affected)
+    }
+
+    /// Submit ops and return the full ack (rows affected + captured values).
+    /// Blocks until the batch commits — the transaction is already durable by
+    /// the time any captured value is returned, so it cannot race another
+    /// writer batch.
+    pub fn write_capture(&self, ops: Vec<WriteOp>) -> Result<BatchAck> {
         let (ack_tx, ack_rx) = mpsc::channel();
         let tx = self
             .tx
@@ -207,6 +240,14 @@ fn run_loop(conn: &Connection, rx: mpsc::Receiver<Batch>) {
         }
         let total_ops: usize = batch.iter().map(|b| b.ops.len()).sum();
         let mut affected = 0usize;
+        let mut captured: Vec<i64> = Vec::new();
+        // Per-caller results. A coalesced transaction commits once, but each
+        // caller must see ITS OWN rows-affected and captured values: the
+        // previous code handed every ack the coalesced totals, so two
+        // concurrent `INSERT OR IGNORE` callers both observed n=2 and each
+        // concluded "someone else inserted" (inbox::admit reads `n == 1`).
+        let mut per_batch_affected: Vec<usize> = vec![0; batch.len()];
+        let mut per_batch_captured: Vec<Vec<i64>> = vec![Vec::new(); batch.len()];
         // Track failure as a formatted string: anyhow::Error is not Clone, and each
         // batch ack needs its own Result.
         let mut failure: Option<String> = None;
@@ -214,18 +255,22 @@ fn run_loop(conn: &Connection, rx: mpsc::Receiver<Batch>) {
         if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
             failure = Some(format!("{e:#}"));
         } else {
-            for b in &batch {
+            for (i, b) in batch.iter().enumerate() {
                 if failure.is_some() {
                     break;
                 }
+                let affected_before = affected;
+                let captured_before = captured.len();
                 for op in &b.ops {
                     if failure.is_some() {
                         break;
                     }
-                    if let Err(e) = exec_op(conn, op, &mut affected) {
+                    if let Err(e) = exec_op(conn, op, &mut affected, &mut captured) {
                         failure = Some(format!("{e:#}"));
                     }
                 }
+                per_batch_affected[i] = affected - affected_before;
+                per_batch_captured[i] = captured[captured_before..].to_vec();
             }
             match &failure {
                 None => {
@@ -244,9 +289,14 @@ fn run_loop(conn: &Connection, rx: mpsc::Receiver<Batch>) {
             }
         }
         let _ = total_ops;
-        for b in batch {
+        // Each caller gets its own slice of the coalesced commit. On failure
+        // every ack reports the error (the transaction rolled back as a unit).
+        for (i, b) in batch.into_iter().enumerate() {
             let outcome = match &failure {
-                None => Ok(affected),
+                None => Ok(BatchAck {
+                    affected: per_batch_affected[i],
+                    captured: std::mem::take(&mut per_batch_captured[i]),
+                }),
                 Some(msg) => Err(anyhow::anyhow!("{msg}")),
             };
             let _ = b.ack.send(outcome);
@@ -254,10 +304,68 @@ fn run_loop(conn: &Connection, rx: mpsc::Receiver<Batch>) {
     }
 }
 
-fn exec_op(conn: &Connection, op: &WriteOp, affected: &mut usize) -> Result<()> {
+/// Bind params and run a statement that returns a row, capturing one column.
+/// Shares the schema-glitch recovery of `bind` (see its comment): a foreign
+/// DDL on another connection can poison the next fresh prepare once.
+fn bind_returning(
+    conn: &Connection,
+    sql: &str,
+    params: &[serde_json::Value],
+    capture: Capture,
+) -> Result<i64> {
+    let mut stmt = match conn.prepare_cached(sql) {
+        Ok(s) => s,
+        Err(first) => {
+            conn.flush_prepared_statement_cache();
+            conn.prepare_cached(sql).inspect(|_| {
+                tracing::debug!("prepare_cached(returning): recovered ({first})");
+            })?
+        }
+    };
+    let boxed: Vec<Box<dyn rusqlite::ToSql>> = params
+        .iter()
+        .map(|v| match v {
+            serde_json::Value::Null => Box::new(rusqlite::types::Value::Null) as _,
+            serde_json::Value::Bool(b) => Box::new(*b as i64) as _,
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Box::new(i) as _
+                } else if let Some(f) = n.as_f64() {
+                    Box::new(f) as _
+                } else {
+                    Box::new(n.to_string()) as _
+                }
+            }
+            serde_json::Value::String(s) => Box::new(s.clone()) as _,
+            other => Box::new(other.to_string()) as _,
+        })
+        .collect();
+    let refs: Vec<&dyn rusqlite::ToSql> = boxed.iter().map(|b| b.as_ref()).collect();
+    let value = match capture {
+        Capture::FirstColumnI64 => stmt.query_row(refs.as_slice(), |r| r.get::<_, i64>(0))?,
+    };
+    Ok(value)
+}
+
+fn exec_op(
+    conn: &Connection,
+    op: &WriteOp,
+    affected: &mut usize,
+    captured: &mut Vec<i64>,
+) -> Result<()> {
     match op {
         WriteOp::Sql { sql, params } => {
             *affected += bind(conn, sql, params)?;
+            Ok(())
+        }
+        WriteOp::SqlReturning {
+            sql,
+            params,
+            capture,
+        } => {
+            let value = bind_returning(conn, sql, params, *capture)?;
+            captured.push(value);
+            *affected += 1;
             Ok(())
         }
         WriteOp::BlobPut {
@@ -297,8 +405,9 @@ fn exec_op(conn: &Connection, op: &WriteOp, affected: &mut usize) -> Result<()> 
 /// part_* op builders (check-guards rule 4).
 pub fn apply_ops(conn: &Connection, ops: &[WriteOp]) -> Result<usize> {
     let mut affected = 0;
+    let mut captured = Vec::new();
     for op in ops {
-        exec_op(conn, op, &mut affected)?;
+        exec_op(conn, op, &mut affected, &mut captured)?;
     }
     if !ops.is_empty() {
         // F7/F8: caller-owned batches (importer/fork/tests) invalidate too

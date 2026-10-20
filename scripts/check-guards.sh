@@ -74,6 +74,9 @@
 #  41. every harness that boots a server isolates HOME (the default data dir
 #      derives from HOME; live probes on 4912 wrote 51 throwaway sessions into
 #      the real database, 2026-10-20) [plant: launcher with no HOME]
+#  42. the v2-only gate table matches (2.0.28 ops) - (1.18.31 ops) (a stale
+#      table silently reopens the OCSERVE_V2 leak; 32 ops answered with the
+#      flag unset on 2026-10-20) [plant: table entry not implied by the specs]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -938,4 +941,21 @@ elif [ "$_plant41_caught" != 1 ]; then
 else
   echo "ok (every server-launching harness isolates HOME; planted one flagged)"
 fi
+echo "== guard: v2-only gate table matches the vendored contracts (rule 42) =="
+# The `OCSERVE_V2` flag leaked 32 operations (2026-10-20 audit): the audit found
+# `GET /api/config`, `/api/config/shell`, `/api/debug/location` and
+# `/api/experimental/migration/v1` answering 200 with the flag unset. The gate
+# surface is spec-derived — (2.0.28 ops) - (1.18.31 ops) — so a regenerated
+# contract without a regenerated table silently reopens the leak. This checks
+# the committed table against the specs on every run.
+if [ -f scripts/gen-v2-gate.py ]; then
+  if out=$(python3 scripts/gen-v2-gate.py --check 2>&1); then
+    echo "$out"
+  else
+    echo "$out"; echo "FAIL: v2-only gate table stale (rule 42)"; fail=1
+  fi
+else
+  echo "FAIL: scripts/gen-v2-gate.py missing (rule 42)"; fail=1
+fi
+
 exit $fail

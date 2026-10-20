@@ -1729,6 +1729,18 @@ pub mod inbox {
 
     /// List pending items for a session in promote order
     /// (enqueued_seq; caller partitions steer/queue/compaction/move).
+    /// Cheap "is there queued work for this session" probe (the post-turn wake
+    /// gate). A count rather than a list so a 10k backlog does not allocate.
+    pub fn pending_count(db: &std::path::Path, session_id: &str) -> Result<i64> {
+        let conn = crate::pragma::open_reader(db)?;
+        conn.query_row(
+            "SELECT count(*) FROM session_inbox WHERE session_id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .map_err(Into::into)
+    }
+
     pub fn list(db: &std::path::Path, session_id: &str) -> Result<Vec<Item>> {
         let conn = crate::pragma::open_reader(db)?;
         let mut stmt = conn.prepare_cached(
@@ -1900,24 +1912,44 @@ pub fn emit_event(
     payload: &serde_json::Value,
 ) -> anyhow::Result<(i64, String)> {
     let versioned = versioned_event_type(event_type);
-    append_event(writer, session_id, &versioned, payload)?;
-    // The row seq is AUTOINCREMENT; read back the row we just wrote on this
-    // writer's own connection path (MAX(seq) scoped to the session is exact
-    // here because the writer serializes all appends).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    // Allocate the seq INSIDE the write transaction via `RETURNING seq`.
     //
-    // PERF NOTE: this read-back costs one indexed MAX per emission. It is
-    // load-bearing ONLY where the caller needs the durable seq (inbox
-    // enqueued_seq). The hot prompt path uses `append_versioned` (no
-    // read-back) and keeps its pre-seeded local counter for sync twins.
-    let seq: i64 = {
-        let conn = pragma::open_reader(writer.db_path_ref())?;
-        conn.query_row(
-            "SELECT COALESCE(MAX(seq),0) FROM event WHERE \
-             (session_id = ?1 OR (?1 IS NULL AND session_id IS NULL))",
-            [session_id],
-            |r| r.get(0),
-        )?
-    };
+    // The previous implementation appended, then opened a SEPARATE reader for
+    // `SELECT MAX(seq) WHERE session_id`. Its comment claimed the writer
+    // serialized all appends; that is true of the INSERT and false of the
+    // window after the commit. Two emitters on one session could both read the
+    // same MAX: `tests/event_seq.rs` measured 115 duplicate seq values across
+    // 200 concurrent emits before this change. Upstream allocates inside the
+    // transaction (`core/src/event.ts:318`, `EventSequenceTable` with
+    // `onConflictDoUpdate`), so the read-back was a mechanism divergence, not
+    // a shared quirk.
+    //
+    // The durable seq feeds the v1 sync-twin `seq` and the inbox
+    // `enqueued_seq` (ordered by `inbox_list`). The v2 log watermark uses the
+    // table's AUTOINCREMENT rowid and was never affected.
+    let ack = writer.write_capture(vec![WriteOp::SqlReturning {
+        sql: "INSERT INTO event (session_id, project_id, type, payload, time_created) \
+              VALUES (?1, 'global', ?2, ?3, ?4) RETURNING seq"
+            .into(),
+        params: vec![
+            session_id.map(|s| s.to_string()).into(),
+            versioned.into(),
+            payload.to_string().into(),
+            now.into(),
+        ],
+        capture: crate::writer::Capture::FirstColumnI64,
+    }])?;
+    let seq = ack
+        .captured
+        .first()
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("event insert returned no seq"))?;
+    // Retention stays on the same throttled tick as before.
+    crate::maybe_prune_events(writer, now)?;
     Ok((seq, format!("evt_{seq}")))
 }
 
@@ -2487,11 +2519,18 @@ pub fn append_event(
             now.into(),
         ],
     }])?;
-    // Throttled ring enforcement (STORAGE §4): every 1024th durable write
-    // enqueues the retention deletes — an in-band bound, not a cron hope.
-    // The cap-window DELETE is gated on an actual over-cap session (perf dive
-    // 2026-10-11): the ROW_NUMBER window previously ran on every tick and
-    // materialized the whole event table into a temp b-tree for nothing.
+    maybe_prune_events(writer, now)
+}
+
+/// Throttled ring enforcement (STORAGE §4): every 1024th durable write
+/// enqueues the retention deletes — an in-band bound, not a cron hope.
+/// The cap-window DELETE is gated on an actual over-cap session (perf dive
+/// 2026-10-11): the ROW_NUMBER window previously ran on every tick and
+/// materialized the whole event table into a temp b-tree for nothing.
+///
+/// Shared by `append_event` and `emit_event` so the two emission paths keep
+/// identical retention semantics.
+fn maybe_prune_events(writer: &Writer, now: i64) -> anyhow::Result<()> {
     static EVENT_PRUNE_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     use std::sync::atomic::Ordering;
     if EVENT_PRUNE_TICK.fetch_add(1, Ordering::Relaxed) % 1024 == 1023 {

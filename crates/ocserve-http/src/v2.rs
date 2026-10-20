@@ -3532,6 +3532,31 @@ pub(crate) async fn drain_session(st: Arc<AppState>, sid: String) {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0)
     };
+    // ONE mutex for both grammars.
+    //
+    // This function used to call the shared executor without taking
+    // `lock_session`, and the v1 prompt path never consults the claim table, so
+    // a v1 prompt and a v2 drain could interleave on one session — each
+    // appending messages and emitting `session.updated` (reachable in
+    // production because the v2 read surface answered with the flag unset).
+    //
+    // The lock wins over the claim table as the authority because it has a
+    // Drop guard: a crash mid-turn leaves no "busy forever" row (the orphaned-
+    // busy class already fixed once). Claims stay as the durable status record
+    // that `/api/session/active` reads.
+    //
+    // Busy means "leave the work queued and come back": consuming an inbox row
+    // here would drop the user's message. The wake that ends the v1 turn
+    // re-arms the drain (see `wake_inbox_after_turn`).
+    let Ok(release) = crate::lock_session(&st, &sid).await else {
+        return;
+    };
+    let Ok(guard) = release.arc().try_lock() else {
+        // A v1 prompt holds the session: leave everything queued, release the
+        // coordinator so a later wake can start a fresh drain.
+        st.coordinators.abort(&sid);
+        return;
+    };
     // Write-ahead claim in the same batch as the started event.
     let _ = ocserve_store::claim::claim(&st.writer, &sid, now_ms());
     let _ = crate::emit_durable_http(&st, &sid, "session.execution.started", json!({}));
@@ -3567,6 +3592,8 @@ pub(crate) async fn drain_session(st: Arc<AppState>, sid: String) {
             break;
         }
     }
+    drop(guard);
+    drop(release);
     let _ = ocserve_store::claim::release(&st.writer, &sid);
     let _ = crate::emit_durable_http(&st, &sid, "session.execution.succeeded", json!({}));
 }
@@ -4262,6 +4289,12 @@ pub async fn session_log(
     }
     let after: i64 = q.get("after").and_then(|a| a.parse().ok()).unwrap_or(0);
     let follow = q.get("follow").map(|f| f == "true").unwrap_or(false);
+    // Subscribe BEFORE reading the log. The previous order read first and
+    // subscribed second, so anything committed+published in that window was
+    // in neither the replay nor the live tail — a silent drop on the endpoint
+    // whose entire purpose is gap-free resume. (Same read-then-subscribe shape
+    // as the plugin publish-before-subscribe race already fixed once.)
+    let live_rx = follow.then(|| st.bus.subscribe());
     let sid = id.clone();
     let rows = run_blocking(&st.db, move |db| {
         ocserve_store::events_after(db, &sid, after)
@@ -4299,10 +4332,12 @@ pub async fn session_log(
             .map(|f| Ok::<_, std::convert::Infallible>(Event::default().data(f))),
     );
     if follow {
-        // Replay-then-live: the watermark marker, then the live bus filtered
-        // to v2-grammar frames for this session. Bounded by the same ring
-        // subscription as /api/event (no new channel).
-        let rx = st.bus.subscribe();
+        // Replay-then-live with the subscription taken before the read, so the
+        // overlap is a superset of the replay rather than a hole. Frames that
+        // carry a durable seq at or below the watermark are already in the
+        // replay and are skipped; seq-less frames cannot be deduped and are
+        // passed through (a duplicate is recoverable, a gap is not).
+        let rx = live_rx.expect("subscription taken when follow=true");
         let sid3 = id.clone();
         let live = stream::unfold(rx, move |mut rx| {
             let sid = sid3.clone();
@@ -4314,6 +4349,13 @@ pub async fn session_log(
                             // here means v2 twins + durable projections for
                             // this session (session check via data.sessionID).
                             if frame.contains("sessionID") && frame.contains(&sid as &str) {
+                                if let Ok(v) = serde_json::from_str::<Value>(&frame)
+                                    && let Some(seq) =
+                                        v.pointer("/durable/seq").and_then(|s| s.as_i64())
+                                    && seq <= watermark
+                                {
+                                    continue; // already replayed
+                                }
                                 return Some((Ok(Event::default().data(frame)), rx));
                             }
                         }

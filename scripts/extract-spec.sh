@@ -148,3 +148,9 @@ ops = sum(len([m for m in v if m in ("get","post","put","delete","patch")]) for 
 print(f"  openapi={d.get('openapi')} paths={len(d['paths'])} ops={ops} schemas={len(d.get('components',{}).get('schemas',{}))}")
 PY
 echo "wrote ${OUT}"
+
+# The v2 gate table is derived from the two vendored contracts, so it must be
+# regenerated whenever either one moves. Guard rule 42 fails the build on drift.
+if [ -f scripts/gen-v2-gate.py ]; then
+  python3 scripts/gen-v2-gate.py
+fi
