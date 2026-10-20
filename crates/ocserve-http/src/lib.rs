@@ -4364,6 +4364,21 @@ pub(crate) fn walk_files(
 /// spawn (bounded output, 5s); absoluteOffset is not derivable from grep
 /// output and this route has no callers in oc-remote — recorded as 0
 /// (documented, not silently invented).
+/// GET /find?pattern= — text search → SearchMatch list.
+///
+/// In-process `regex` instead of two `grep` spawns. Three reasons, in order of
+/// importance (PLATFORM.md Phase G):
+///  1. The engine must be the same one upstream uses (ripgrep = `regex`).
+///     Measured divergence: `grep -E '\\d+'` returns rc 1 on "abc123" where
+///     ripgrep matches, and the same for `(?i)` and lazy quantifiers — so the
+///     wire answer was wrong for common model-written patterns, not just slow.
+///  2. Windows has no `grep`.
+///  3. One pass replaces two processes per request.
+///
+/// Wire shape is unchanged: `{path:{text}, lines:{text}, line_number,
+/// absolute_offset, submatches:[{match:{text}, start, end}]}` with `start`/`end`
+/// as byte offsets within the line (freeze ripgrep.ts:56-72). `absolute_offset`
+/// is now computed exactly rather than reconstructed from a second grep pass.
 async fn find_text(
     State(st): State<Arc<AppState>>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -4378,10 +4393,11 @@ async fn find_text(
     }
     let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/")).to_path_buf();
     let pattern = pattern.to_string();
-    // Freeze uses ripgrep (gitignore-aware). ocserve shells to grep, so we must
-    // approximate the ignore behaviour: skip VCS/build/vendor dirs. Without
-    // this, `/find` scanned `target/` (gigabytes) and hung the request — a real
-    // bug (freeze returns matches instantly).
+
+    // `D-FIND-IGNORE`: freeze discovers ignores via gitignore; we use a fixed
+    // exclude list. Same list as before this change, so behaviour is
+    // unchanged on that axis — this route still diverges from upstream for
+    // repos whose .gitignore names other directories.
     const EXCLUDES: &[&str] = &[
         ".git",
         "node_modules",
@@ -4394,28 +4410,16 @@ async fn find_text(
         ".terraform",
         ".terragrunt-cache",
     ];
+
     let base2 = base.clone();
-    // Two bounded grep passes (both on the blocking pool):
-    //   A: line-level → path:line:lineByte:content  (path.text/lines.text/line_number/absolute_offset)
-    //   B: match-level → path:line:matchByte:matchText  (submatches[{match.text,start,end}])
-    // freeze's SearchMatch is {path:{text}, lines:{text}, line_number,
-    // absolute_offset, submatches:[{match:{text}, start, end}]} with start/end
-    // as byte offsets WITHIN the line (ripgrep.ts:56-72).
-    let out = tokio::task::spawn_blocking(move || {
-        let run = |extra: &[&str]| -> std::io::Result<std::process::Output> {
-            let mut c = std::process::Command::new("grep");
-            c.args(["-rnE", "--binary-files=without-match", "-m", "50"]);
-            c.args(extra);
-            for d in EXCLUDES {
-                c.arg(format!("--exclude-dir={d}"));
-            }
-            c.arg("--").arg(&pattern).arg(&base2);
-            c.env("LC_ALL", "C").output()
-        };
-        // A first (line-level, -n) then B (-o -b for each match offset)
-        let a = run(&["-n"])?;
-        let b = run(&["-on", "-b"])?;
-        Ok::<_, std::io::Error>((a, b))
+    let out = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Value>> {
+        let re =
+            regex::Regex::new(&pattern).map_err(|e| anyhow::anyhow!("invalid pattern: {e}"))?;
+        let mut matches: Vec<Value> = Vec::new();
+        // Bounded walk: 200 files is the wire's practical ceiling and keeps the
+        // response (and the regex scratch) bounded by construction.
+        walk_find(&base2, &base2, &re, EXCLUDES, &mut matches, 0, 200)?;
+        Ok(matches)
     })
     .await
     .map_err(|e| {
@@ -4425,100 +4429,98 @@ async fn find_text(
             message: format!("find worker: {e}"),
         })
     })?;
-    let (a_out, b_out) = match out {
-        Ok(o) => o,
-        Err(e) => {
-            return Err(HttpError::Api(ApiError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                name: "InternalError",
-                message: format!("grep spawn: {e}"),
-            }));
-        }
-    };
-    if a_out.status.code().unwrap_or(0) > 1 {
-        return Err(HttpError::Api(ApiError {
+
+    match out {
+        Ok(v) => Ok(Json(Value::Array(v))),
+        Err(e) => Err(HttpError::Api(ApiError {
             status: StatusCode::BAD_REQUEST,
             name: "BadRequest",
-            message: "invalid pattern".into(),
-        }));
+            message: format!("{e:#}"),
+        })),
     }
-    // match-level: (path, line) -> [(byteoffset, text)]
-    let mut subs: std::collections::HashMap<(String, i64), Vec<(usize, String)>> =
-        std::collections::HashMap::new();
-    for line in String::from_utf8_lossy(&b_out.stdout).lines() {
-        // path:line:byteoffset:text  (grep -o prints one match per output line)
-        if let Some((head, text)) = split3(line) {
-            let (path, ln, byte) = head;
-            subs.entry((path, ln)).or_default().push((byte, text));
-        }
-    }
-    let mut matches: Vec<Value> = Vec::new();
-    for line in String::from_utf8_lossy(&a_out.stdout).lines().take(200) {
-        // path:line:content (grep -n, no -b → third field is the content)
-        let (p1, rest) = match line.split_once(':') {
-            Some(x) => x,
-            None => continue,
-        };
-        let (ln, text) = match rest.split_once(':') {
-            Some(x) => x,
-            None => continue,
-        };
-        let ln: i64 = ln.parse().unwrap_or(0);
-        let line_start = text.as_ptr() as usize; // unused; offsets come from pass B
-        let _ = line_start;
-        let rel = std::path::Path::new(p1)
-            .strip_prefix(&base)
-            .map(|r| r.to_string_lossy().to_string())
-            .unwrap_or_else(|_| p1.to_string());
-        // absolute_offset = byte offset of the line's start within the file
-        // (freeze = ripgrep line start). Derive it from the first match's byte
-        // offset minus its in-line start; grep -m/-n gives us line text only, so
-        // compute the in-line start by locating the match text in the line.
-        let line_subs = subs.get(&(p1.to_string(), ln)).cloned().unwrap_or_default();
-        let mut submatch_json = Vec::new();
-        let mut absolute_offset: i64 = 0;
-        for (i, (byteoff, mtext)) in line_subs.iter().enumerate() {
-            // in-line byte start = find mtext in the line (first occurrence for
-            // the first sub; subsequent matches advance past prior ones)
-            let from = submatch_json
-                .last()
-                .and_then(|v: &Value| v["end"].as_u64())
-                .map(|e| e as usize + 1)
-                .unwrap_or(0);
-            let start = text[from.min(text.len())..]
-                .find(mtext.as_str())
-                .map(|p| p + from.min(text.len()))
-                .unwrap_or(0);
-            let end = start + mtext.len();
-            if i == 0 {
-                absolute_offset = (*byteoff as i64) - (start as i64);
-            }
-            submatch_json.push(json!({
-                "match": {"text": mtext},
-                "start": start,
-                "end": end,
-            }));
-        }
-        matches.push(json!({
-            "path": {"text": rel},
-            "lines": {"text": format!("{text}\n")},
-            "line_number": ln,
-            "absolute_offset": absolute_offset,
-            "submatches": submatch_json,
-        }));
-    }
-    Ok(Json(Value::Array(matches)))
 }
 
-/// Parse `path:line:byteoffset:text` (grep -o -b output; text may contain ':').
-fn split3(line: &str) -> Option<((String, i64, usize), String)> {
-    let (path, rest) = line.split_once(':')?;
-    let (ln, rest) = rest.split_once(':')?;
-    let (byte, text) = rest.split_once(':')?;
-    Some((
-        (path.to_string(), ln.parse().ok()?, byte.parse().ok()?),
-        text.to_string(),
-    ))
+/// Recursive search producing the exact `SearchMatch` shape.
+///
+/// `absolute_offset` is the byte offset of the line start within the file. The
+/// previous version derived it by subtracting a reconstructed in-line position
+/// from a `grep -b` match offset; here it is a running sum, so it is exact even
+/// for CRLF files and for matches after multibyte characters.
+fn walk_find(
+    base: &std::path::Path,
+    dir: &std::path::Path,
+    re: &regex::Regex,
+    excludes: &[&str],
+    out: &mut Vec<Value>,
+    depth: usize,
+    limit: usize,
+) -> anyhow::Result<()> {
+    if depth > 32 || out.len() >= limit {
+        return Ok(());
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries.flatten() {
+        if out.len() >= limit {
+            return Ok(());
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_s = name.to_string_lossy();
+        if excludes.contains(&name_s.as_ref()) {
+            continue;
+        }
+        if path.is_dir() {
+            walk_find(base, &path, re, excludes, out, depth + 1, limit)?;
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        // `--binary-files=without-match` parity: skip anything that is not
+        // valid UTF-8 rather than emitting lossy matches.
+        let Ok(content) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        let rel = path
+            .strip_prefix(base)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
+        let mut line_start: usize = 0;
+        let mut line_no: i64 = 0;
+        for line_with_end in content.split_inclusive('\n') {
+            line_no += 1;
+            let line = line_with_end.strip_suffix('\n').unwrap_or(line_with_end);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let subs: Vec<Value> = re
+                .find_iter(line)
+                .map(|m| {
+                    json!({
+                        "match": {"text": m.as_str()},
+                        "start": m.start(),
+                        "end": m.end(),
+                    })
+                })
+                .collect();
+            if !subs.is_empty() {
+                out.push(json!({
+                    "path": {"text": rel},
+                    "lines": {"text": format!("{line}\n")},
+                    "line_number": line_no,
+                    "absolute_offset": line_start,
+                    "submatches": subs,
+                }));
+                if out.len() >= limit {
+                    return Ok(());
+                }
+            }
+            line_start += line_with_end.len();
+        }
+    }
+    Ok(())
 }
 
 /// GET /question — all pending question requests (v1 Question.Request list;

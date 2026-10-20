@@ -223,6 +223,7 @@ pub fn maybe_sift(tool: &str, output: &str) -> Arc<str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
     fn big_noise() -> String {

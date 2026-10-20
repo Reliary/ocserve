@@ -290,9 +290,15 @@ fn acquire_lease_inner(root: &Path, key: &str, stale_ms: u64, timeout_ms: u64) -
         // --- tryAcquireLockDir ---
         match std::fs::create_dir(&lock_dir) {
             Ok(()) => {
-                // mode 0700 like upstream (best-effort; umask already applied)
-                use std::os::unix::fs::PermissionsExt as _;
-                let _ = std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o700));
+                // mode 0700 like upstream (best-effort; umask already applied).
+                // Unix-only: Windows has no mode bits; the lock dir inherits the
+                // ACL of its parent, which is the user's own state directory.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let _ =
+                        std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o700));
+                }
                 let token = random_token();
                 let hb_path = lock_dir.join("heartbeat");
                 let meta_path = lock_dir.join("meta.json");

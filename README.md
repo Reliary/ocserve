@@ -174,8 +174,23 @@ and re-runs every oracle before claiming compatibility.
 ## Platform support
 
 Linux x86_64 and aarch64 (glibc) are supported and are the only published
-artifacts. macOS and Windows are not supported today: the PTY layer depends on
-Linux.
+artifacts. Everything outside the terminal layer is already portable: the
+request path, storage, search and the wire contract touch no OS API, and the
+filesystem/process/shell assumptions now live behind one seam.
+
+macOS and Windows are in progress, in that order, and the honest state is:
+
+- macOS: the PTY implementation is Linux-specific (`posix_openpt`/`ptsname_r`/
+  `TIOCSCTTY` do not exist there), so the build fails at that crate. Plan is
+  `openpty` + `login_tty`; it is not written yet.
+- Windows: the build is blocked on nothing in the request path, but the PTY
+  layer needs ConPTY, and plugin/MCP spawning previously assumed `sh` (now
+  behind a shell-family seam). Not yet verified on a runner.
+
+No macOS or Windows artifact is published, and no performance number is claimed
+for either: every measurement in this README comes from Linux, on the same
+machine, against the same freeze binary. `PLATFORM.md` records the per-platform
+plan, what is measured, and what is still a hypothesis.
 
 ## License
 

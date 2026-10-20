@@ -697,8 +697,11 @@ echo "== guard: serving path is Rust-native (rule 34) =="
 # php, java. The plugin sidecar (Node, frozen) spawns only via ocserve-plugin.
 plant="crates/ocserve-core/src/__rule34_plant.rs"
 printf '%s\n' 'fn _plant() { let _ = std::process::Command::new("node"); }' > "$plant"
+# Comment lines cannot spawn anything, and a doc comment that NAMES the banned
+# pattern (explaining why `exe()` exists) was a false positive on first run.
+# Filter `//` lines only: the planted control is code, so it still trips.
 ban_hits=$(grep -rnE 'Command::new\("(node|bun|bunx|deno|python3?|npm|npx|yarn|pnpm|ruby|perl|php|java)"\)' crates/*/src 2>/dev/null \
-  | grep -v '__rule34_plant' || true)
+  | grep -v '__rule34_plant' | grep -vE ':[0-9]+: *//' || true)
 plant_hit=$(grep -rnE 'Command::new\("(node|bun|bunx|deno|python3?|npm|npx|yarn|pnpm|ruby|perl|php|java)"\)' crates/ocserve-core/src/__rule34_plant.rs 2>/dev/null || true)
 rm -f "$plant"
 if [ -z "$plant_hit" ]; then
@@ -956,6 +959,61 @@ if [ -f scripts/gen-v2-gate.py ]; then
   fi
 else
   echo "FAIL: scripts/gen-v2-gate.py missing (rule 42)"; fail=1
+fi
+
+
+echo "== guard: platform-specific API must sit behind a platform guard (rule 43) =="
+# The Windows build failed on two ungated `std::os::unix` imports, and the blob
+# writer's directory-fsync `?` was a hard runtime failure on Windows that no
+# compiler caught (PLATFORM.md §1.2). PSASpotter (arXiv:2607.17462) frames the
+# class: platform-specific API usage must be inside defensive code. Here the
+# only legitimate defences are `#[cfg(...)]` on the item/module or a
+# `cfg!(...)` branch in the same function.
+#
+# Allowed without a guard: files that are themselves platform modules
+# (`platform.rs`, `unix.rs`) — they are the seam, and the seam is allowed to be
+# platform-specific.
+plat_scan() {
+  local bad=0
+  while IFS= read -r hit; do
+    local file="${hit%%:*}"
+    case "$file" in
+      */platform.rs|*/unix.rs|*/windows.rs|*/macos.rs) continue ;;
+    esac
+    # Look backwards from the hit for a cfg gate within 12 lines, or a cfg!
+    # branch in the same function (approximated by the previous 40 lines).
+    local line="${hit#*:}"; line="${line%%:*}"
+    local start=$(( line > 40 ? line - 40 : 1 ))
+    local ctx
+    ctx=$(sed -n "${start},${line}p" "$file" 2>/dev/null)
+    if printf '%s' "$ctx" | grep -qE '#\[cfg\(\s*(unix|windows|target_os|not\(unix\)|not\(windows\))'; then
+      continue
+    fi
+    if printf '%s' "$ctx" | grep -qE 'cfg!\(\s*(unix|windows|target_os)'; then
+      continue
+    fi
+    echo "  $hit"
+    bad=1
+  done < <(grep -rn --include='*.rs' -E \
+      'use std::os::unix|use std::os::windows|std::os::unix::|std::os::windows::' \
+      crates/*/src 2>/dev/null)
+  return $bad
+}
+if out=$(plat_scan); then
+  echo "ok (every platform-specific import is cfg-gated)"
+else
+  echo "$out"; echo "FAIL: ungated platform-specific API (rule 43, PLATFORM.md §1.2)"; fail=1
+fi
+# Planted control: an ungated unix import must be flagged. Written to a temp
+# file under crates/ (removed immediately) so the scanner sees a real hit.
+plant="crates/ocserve-core/src/platform_plant.rs"
+printf 'use std::os::unix::fs::PermissionsExt;\n' > "$plant"
+if plat_scan >/dev/null 2>&1; then
+  echo "FAIL: rule 43 plant was not flagged (the guard is vacuous)"; fail=1
+  rm -f "$plant"
+else
+  echo "ok (planted ungated unix import flagged)"
+  rm -f "$plant"
 fi
 
 exit $fail

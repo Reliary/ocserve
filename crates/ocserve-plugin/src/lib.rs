@@ -228,17 +228,24 @@ impl PluginRuntime {
 /// Resolve an executable on PATH plus `~/.bun/bin` (the common user-local
 /// bun install location — systemd units do not see shell PATH extras).
 pub(crate) fn which(prog: &str) -> Option<PathBuf> {
+    // Windows resolves executables by suffix; `Path::join("bun")` never finds
+    // `bun.exe` (PLATFORM.md §1.2). The suffix lives in one place — ocserve-core
+    // — so the plugin host, the MCP client and the tools cannot drift.
+    let name = ocserve_store::platform::exe(prog);
     if let Ok(path) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path) {
-            let cand = dir.join(prog);
-            if cand.is_file() {
+            let cand = dir.join(&name);
+            if ocserve_store::platform::is_executable_file(&cand) {
                 return Some(cand);
             }
         }
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let cand = Path::new(&home).join(".bun/bin").join(prog);
-        if cand.is_file() {
+    for key in ["OCSERVE_HOME", "HOME", "USERPROFILE"] {
+        let Some(home) = std::env::var_os(key).filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        let cand = Path::new(&home).join(".bun/bin").join(&name);
+        if ocserve_store::platform::is_executable_file(&cand) {
             return Some(cand);
         }
     }
@@ -276,11 +283,18 @@ impl Sidecar {
         let program = which(runtime.program())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| runtime.program().to_string());
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(crate::OOM_CHILD_WRAPPER)
-            .arg("sh")
-            .arg(&program);
+        // Wrapper is POSIX shell only (same rule as ocserve-mcp: one wrapper,
+        // two copies, guard rule 10 keeps them byte-identical).
+        let mut cmd = if cfg!(unix) && ocserve_store::platform::has_posix_shell() {
+            let mut c = Command::new("sh");
+            c.arg("-c")
+                .arg(crate::OOM_CHILD_WRAPPER)
+                .arg("sh")
+                .arg(&program);
+            c
+        } else {
+            Command::new(&program)
+        };
         match runtime {
             // Bun (upstream's own plugin runtime): real bun:sqlite + TS
             // plugins load; `--smol` trades GC frequency for a lower RSS
@@ -1515,6 +1529,7 @@ mod runtime_selection_tests {
 mod oom_wrapper_tests {
     /// A3 proof: the spawn wrapper makes the CHILD report adj=500 so a
     /// memcg OOM kill takes the child (respawnable) — not the main service.
+    #[cfg(target_os = "linux")]
     #[test]
     fn wrapper_raises_child_oom_score_adj() {
         let out = std::process::Command::new("sh")

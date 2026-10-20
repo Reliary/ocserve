@@ -56,9 +56,9 @@ impl ShellRegistry {
             inner.remove(&victim);
         }
         let id = sh_id();
-        let child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
+        let (kind, program) = ocserve_store::platform::shell();
+        let mut sc = kind.command(&program, command);
+        let child = sc
             .current_dir(cwd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

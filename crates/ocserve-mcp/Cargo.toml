@@ -12,6 +12,7 @@ readme = "README.md"
 description = "MCP client: stdio + StreamableHTTP + legacy SSE; OAuth token store"
 
 [dependencies]
+ocserve-store = { workspace = true }
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

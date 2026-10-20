@@ -68,7 +68,7 @@ jobs:
       - name: crates are packageable
         run: |
           set -euo pipefail
-          for c in ocserve-metrics ocserve-llm ocserve-mcp ocserve-plugin ocserve-store \
+          for c in ocserve-store ocserve-metrics ocserve-llm ocserve-mcp ocserve-plugin \
                    ocserve-importer ocserve-tools ocserve-core ocserve-pty ocserve-http ocserve; do
             cargo package -p "$c" --list --allow-dirty >/dev/null
           done
@@ -79,7 +79,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
-          for c in ocserve-metrics ocserve-llm ocserve-mcp ocserve-plugin ocserve-store \
+          for c in ocserve-store ocserve-metrics ocserve-llm ocserve-mcp ocserve-plugin \
                    ocserve-importer ocserve-tools ocserve-core ocserve-pty ocserve-http ocserve; do
             echo "::group::dry-run $c"
             cargo publish -p "$c" --dry-run --allow-dirty --no-verify
@@ -104,7 +104,7 @@ jobs:
             echo "::endgroup::"
             sleep 30   # crates.io index propagation before dependents resolve
           }
-          for c in ocserve-metrics ocserve-llm ocserve-mcp ocserve-plugin ocserve-store \
+          for c in ocserve-store ocserve-metrics ocserve-llm ocserve-mcp ocserve-plugin \
                    ocserve-importer ocserve-tools ocserve-core ocserve-pty ocserve-http ocserve; do
             publish "$c"
           done

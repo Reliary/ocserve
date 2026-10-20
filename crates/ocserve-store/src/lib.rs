@@ -10,6 +10,7 @@ use rusqlite::OptionalExtension;
 
 pub mod blob;
 pub mod fork;
+pub mod platform;
 pub mod pragma;
 pub mod schema;
 pub mod writer;

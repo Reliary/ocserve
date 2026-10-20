@@ -16,6 +16,7 @@ name = "ocserve"
 path = "src/main.rs"
 
 [dependencies]
+libc.workspace = true
 axum.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true

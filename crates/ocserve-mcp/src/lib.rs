@@ -153,21 +153,26 @@ pub struct McpClient {
 /// showed `spawn context-mode: No such file`. Prepend standard user
 /// locations that exist and aren't already in PATH; never drop entries.
 pub fn mcp_child_path(parent_path: &str, home: &str) -> String {
-    let candidates = [
-        format!("{home}/.local/bin"),
-        format!("{home}/bin"),
-        format!("{home}/.bun/bin"), // bun global bins (context-mode)
-        "/home/linuxbrew/.linuxbrew/bin".to_string(),
-    ];
-    let existing: Vec<&str> = parent_path.split(':').collect();
-    let mut merged: Vec<String> = candidates
+    // Built with `Path` + `join_paths` so the separator is the platform's
+    // (`;` on Windows, `:` elsewhere) instead of a hardcoded ':' (PLATFORM.md A3).
+    let h = std::path::Path::new(home);
+    let mut candidates: Vec<std::path::PathBuf> =
+        vec![h.join(".local/bin"), h.join("bin"), h.join(".bun/bin")];
+    let brew = std::path::PathBuf::from("/home/linuxbrew/.linuxbrew/bin");
+    if cfg!(unix) {
+        candidates.push(brew);
+    }
+    let existing: Vec<std::path::PathBuf> = std::env::split_paths(parent_path).collect();
+    let mut merged: Vec<std::path::PathBuf> = candidates
         .into_iter()
-        .filter(|c| std::path::Path::new(c).is_dir() && !existing.contains(&c.as_str()))
+        .filter(|c| c.is_dir() && !existing.contains(c))
         .collect();
     if !parent_path.is_empty() {
-        merged.push(parent_path.to_string());
+        merged.extend(existing);
     }
-    merged.join(":")
+    std::env::join_paths(merged)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| parent_path.to_string())
 }
 
 /// `sh -c WRAPPER sh <prog> <args…>` → raise oom_score_adj, move into the
@@ -196,9 +201,22 @@ impl McpClient {
                 // by ensure_alive) instead of the main service. `exec`
                 // preserves the pid tokio tracks. Writing a HIGHER adj is
                 // always allowed unprivileged.
-                let mut cmd = tokio::process::Command::new("sh");
-                cmd.arg("-c").arg(OOM_CHILD_WRAPPER).arg("sh").arg(prog);
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+                // The wrapper is POSIX shell. On a host without one (Windows
+                // without git-bash) it is a syntax error, and MCP would be
+                // unstartable — so it is conditional, not assumed. Losing
+                // oom_score_adj off Linux is correct: there is no such knob.
+                let use_wrapper = cfg!(unix) && ocserve_store::platform::has_posix_shell();
+                let name = ocserve_store::platform::exe(prog);
+                let mut cmd = if use_wrapper {
+                    let mut c = tokio::process::Command::new("sh");
+                    c.arg("-c").arg(OOM_CHILD_WRAPPER).arg("sh").arg(&name);
+                    c
+                } else {
+                    tokio::process::Command::new(&name)
+                };
+                let home = ocserve_store::platform::home()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| ".".into());
                 let base_path = std::env::var("PATH").unwrap_or_default();
                 if let Some(k) = KIDS_CGROUP.get() {
                     cmd.env("OCSERVE_KIDS_CGROUP", k);
@@ -1040,6 +1058,7 @@ mod trust_status_tests {
 #[cfg(test)]
 mod oom_wrapper_tests {
     /// A3 proof (mcp spawn path): wrapper raises the child's adj to 500.
+    #[cfg(target_os = "linux")]
     #[test]
     fn wrapper_raises_child_oom_score_adj() {
         let out = std::process::Command::new("sh")

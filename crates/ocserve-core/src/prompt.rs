@@ -3187,6 +3187,7 @@ mod sift_wiring_tests {
     use super::*;
     use serde_json::json;
 
+    #[cfg(unix)]
     fn fake_shrink() -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = std::env::temp_dir().join(format!("ocserve-sift-wire-{}", std::process::id()));

@@ -1,0 +1,67 @@
+{
+  "why": "Every expectation here was produced by the engine upstream actually uses (ripgrep / the Rust regex crate). The 'gnu_grep' field records what the PREVIOUS implementation answered, measured with GNU grep 3.11 on Linux: it is the bug being fixed, not a target.",
+  "cases": [
+    {
+      "pattern": "\\d+",
+      "line": "abc123",
+      "regex": true,
+      "gnu_grep": false,
+      "note": "digit class: POSIX ERE has no \\d, so every model-written \\d pattern silently matched nothing"
+    },
+    {
+      "pattern": "(?i)ABC",
+      "line": "abc123",
+      "regex": true,
+      "gnu_grep": false,
+      "note": "inline flags unsupported by POSIX ERE"
+    },
+    {
+      "pattern": "a.*?c",
+      "line": "abcabc",
+      "regex": true,
+      "gnu_grep": true,
+      "note": "lazy quantifier: grep accepts it but treats '?' literally, so the MATCH TEXT differs (abc vs abcabc); see expect_text"
+    },
+    {
+      "pattern": "\\w+",
+      "line": "abc123",
+      "regex": true,
+      "gnu_grep": true,
+      "note": "\\w exists in GNU grep but is a GNU extension, absent in BSD/macOS grep"
+    },
+    {
+      "pattern": "a+",
+      "line": "aaa",
+      "regex": true,
+      "gnu_grep": true,
+      "note": "baseline: identical in both engines"
+    },
+    {
+      "pattern": "fn\\s+main",
+      "line": "fn main() {",
+      "regex": true,
+      "gnu_grep": true,
+      "note": "\\s is a GNU extension (same class as \\w): works on GNU grep, absent on BSD/macOS grep, so the macOS port would have failed even if the dialect matched"
+    },
+    {
+      "pattern": "(foo|bar)baz",
+      "line": "barbaz",
+      "regex": true,
+      "gnu_grep": true,
+      "note": "alternation+group: identical"
+    },
+    {
+      "pattern": "[[:alpha:]]+",
+      "line": "abc",
+      "regex": true,
+      "gnu_grep": true,
+      "note": "POSIX class is supported by regex crate too"
+    }
+  ],
+  "expect_text": {
+    "a.*?c": {
+      "regex": "abc",
+      "gnu_grep": "abcabc"
+    }
+  }
+}

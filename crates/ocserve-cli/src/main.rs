@@ -129,18 +129,22 @@ fn resolve_net(flag: Option<String>, env_key: &str, default: &str) -> String {
     }
 }
 
+/// Data directory. Delegates to `platform` so the `HOME`-unset case is a named
+/// error instead of silently landing in the process CWD (PLATFORM.md §1.2).
 fn default_data_dir() -> std::path::PathBuf {
-    std::env::var_os("OCSERVE_DATA_DIR")
-        .map(Into::into)
-        .unwrap_or_else(|| {
-            let mut p =
-                std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()));
-            p.push(".local/share/ocserve");
-            p
-        })
+    match platform::data_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            // Fatal, not a fallback: a database in the CWD is worse than no boot.
+            eprintln!("ocserve: {e:#}");
+            std::process::exit(2);
+        }
+    }
 }
 
 mod models_dev;
+// The platform seam lives in ocserve-core so every crate shares one copy.
+use ocserve_store::platform;
 mod partition;
 mod replay;
 mod resilience;
@@ -875,8 +879,35 @@ fn sidecar_rss(ppid: u32) -> Option<i64> {
     found
 }
 
+/// Wait for the shutdown signal.
+///
+/// systemd sends SIGTERM, not SIGINT. The previous version waited only on
+/// `ctrl_c()`, so `systemctl restart` never reached the drain path — the journal
+/// contains zero `shutdown: draining` lines across every restart on this box.
+/// That is a live Linux bug independent of the platform work.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        // If the handler cannot be installed, fall back to ctrl_c rather than
+        // panicking: losing graceful shutdown is bad, refusing to boot is worse.
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!("SIGTERM handler unavailable: {e}; waiting on ctrl_c only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
     tracing::info!("shutdown: draining");
 }
 

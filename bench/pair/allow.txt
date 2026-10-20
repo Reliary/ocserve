@@ -25,3 +25,17 @@ project          # D-PAIR-1 see header
 project_current  # D-PAIR-1 see header
 provider         # D-PAIR-2 see header
 session_list     # D-PAIR-3 see header
+# D-PAIR-4 (api_agent, api_command, api_location, api_reference) — the
+#   pair-check finding; the underlying divergence is D-V2-UNION.
+#   The v2 union projection deliberately adds keys that 1.18.31 does not emit —
+#   `location.project.canonical` (v2 Location.PublicInfo), `agent.name` and
+#   `agent.request.settings` (v2 Agent superset). These are the v2-only half of
+#   the dual-serve contract: a v2 client requires them, a v1 client ignores
+#   unknown keys, and the committed golden corpus already carries them
+#   (K-V2-CORPUS, TRACEABILITY.md:168). Additive only: no v1 key is removed or
+#   changed. Removing these entries requires splitting the projections per
+#   wire version, which would break the single-binary dual-serve design.
+api_agent        # D-PAIR-4 see header (D-V2-UNION)
+api_command      # D-PAIR-4 see header (D-V2-UNION)
+api_location     # D-PAIR-4 see header (D-V2-UNION)
+api_reference    # D-PAIR-4 see header (D-V2-UNION)

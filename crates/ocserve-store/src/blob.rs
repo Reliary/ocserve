@@ -125,11 +125,36 @@ fn atomic_write(final_path: &Path, data: &[u8]) -> Result<()> {
         f.write_all(data)?;
         f.sync_all()?;
     }
+    // Content-addressed and immutable: if the final path already exists the
+    // bytes are identical by construction, so publishing is a no-op. This also
+    // avoids Windows' `MoveFileEx(REPLACE_EXISTING)` failing with a sharing
+    // violation when a reader holds the destination open (PLATFORM.md A14).
+    if final_path.exists() {
+        let _ = fs::remove_file(&tmp);
+        return Ok(());
+    }
     fs::rename(&tmp, final_path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), final_path.display()))?;
-    // persist the directory entry
-    let df = fs::File::open(dir).with_context(|| format!("open dir {}", dir.display()))?;
-    df.sync_all().ok(); // not supported on all FS; best-effort
+    // Persist the directory entry. On Unix this requires opening the directory
+    // as a file; on Windows `File::open` on a directory fails with
+    // ERROR_ACCESS_DENIED, and the old `?` turned that into "every blob write
+    // fails" rather than a degrade (PLATFORM.md A14/§1.2). The open is therefore
+    // platform-gated and the sync stays best-effort exactly as its comment says.
+    #[cfg(unix)]
+    {
+        match fs::File::open(dir) {
+            Ok(df) => {
+                df.sync_all().ok();
+            }
+            Err(e) => tracing::warn!("dir fsync open {}: {e}", dir.display()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // No directory-file handle on this platform; the rename above is the
+        // durability point. Windows flushes metadata with the rename itself.
+        let _ = dir;
+    }
     Ok(())
 }
 

@@ -17,7 +17,6 @@
 //! `OCSERVE_CGROUP_PARTITION=0` always disables (kill switch). Anything else
 //! = Disabled: flat shared-cap behavior, one metric, silent.
 
-use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 /// Published by `setup()` on success so the sampler can gauge
@@ -129,7 +128,7 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
     let Some(uid) = our_uid_opt() else {
         return Partition::Unavailable("uid-unknown");
     };
-    if md.uid() != uid {
+    if !owned_by_uid(&md, uid) {
         return Partition::Unavailable("not-owned-by-us");
     }
     let Ok(controllers) = std::fs::read_to_string(root.join("cgroup.controllers")) else {
@@ -194,6 +193,22 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
     ocserve_plugin::set_kids_cgroup(&kids);
     ocserve_mcp::set_kids_cgroup(&kids);
     Partition::Ok
+}
+
+/// Ownership test. Unix has `MetadataExt::uid`; elsewhere there is no uid and
+/// the cgroup partition is unavailable anyway (`our_uid_opt` reads /proc), so
+/// this returns false rather than pretending an ACL check happened.
+fn owned_by_uid(md: &std::fs::Metadata, uid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        md.uid() == uid
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (md, uid);
+        false
+    }
 }
 
 fn our_uid_opt() -> Option<u32> {
@@ -304,6 +319,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn subtree_readonly_degrades() {
         let root = fixture(true);

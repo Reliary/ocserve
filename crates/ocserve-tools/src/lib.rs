@@ -221,6 +221,9 @@ pub fn schemas() -> Vec<Value> {
 /// Host shell basename (upstream `Shell.name`) + model temp dir
 /// (upstream `Global.Path.tmp`, which is `<tmp>/opencode`).
 fn host_shell_and_tmp() -> (String, String) {
+    // The description names the shell the model must write for. On Windows that
+    // is cmd, not sh — telling the model "sh" there produces commands that do
+    // not parse (PLATFORM.md §3.3).
     let shell = std::env::var("SHELL")
         .ok()
         .filter(|s| !s.is_empty())
@@ -229,7 +232,11 @@ fn host_shell_and_tmp() -> (String, String) {
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
         })
-        .unwrap_or_else(|| "sh".to_string());
+        .unwrap_or_else(|| match ocserve_store::platform::shell() {
+            (ocserve_store::platform::ShellKind::Posix, _) => "sh".to_string(),
+            (ocserve_store::platform::ShellKind::Cmd, _) => "cmd".to_string(),
+            (ocserve_store::platform::ShellKind::Pwsh, _) => "pwsh".to_string(),
+        });
     let tmp = std::env::temp_dir()
         .join("opencode")
         .to_string_lossy()
@@ -343,10 +350,12 @@ fn resolve(cwd: &Path, p: &str) -> PathBuf {
 fn bash(input: &Value, cwd: &Path, env: &[(String, String)]) -> Result<ToolResult> {
     let command = input["command"].as_str().context("bash.command")?;
     let timeout_ms = input["timeout"].as_u64().unwrap_or(120_000).min(600_000);
-    let mut cmd = std::process::Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(cwd)
+    // Shell family comes from the host (PLATFORM.md §3.3): POSIX on Unix,
+    // COMSPEC on Windows. Command strings are never translated between
+    // dialects — the model writes for the shell it is told about.
+    let (kind, program) = ocserve_store::platform::shell();
+    let mut cmd = kind.command(&program, command);
+    cmd.current_dir(cwd)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -715,16 +724,25 @@ fn collapse_lines(s: &str) -> String {
     out.trim_end().to_string()
 }
 
-/// regex via the `grep` binary (v1 parity: ripgrep semantics without the dep;
-/// spawn cost acceptable — M5 benches decide in-process alternative).
-fn grep_matcher(pattern: &str) -> Result<String> {
-    Ok(pattern.to_string())
+/// Compile the pattern once, like ripgrep does.
+///
+/// The old implementation spawned `grep -E` **per line** (~0.65 ms/line on this
+/// box, so ~0.7 s for a 1k-line file) and, worse, used the POSIX ERE dialect
+/// while upstream uses ripgrep's `regex` crate. Measured on this host:
+/// `grep -E '\d+'` returns rc 1 (no match) where ripgrep matches "123"; same
+/// for `(?i)` and lazy quantifiers. So the model asking for `\d+` silently got
+/// zero hits. This function is the fix for both problems.
+///
+/// `regex` is already linked (rolldown → lazy-regex → regex), so this adds no
+/// binary size; see PLATFORM.md Phase G.
+fn grep_matcher(pattern: &str) -> Result<regex::Regex> {
+    regex::Regex::new(pattern).map_err(|e| anyhow::anyhow!("invalid pattern: {e}"))
 }
 
 fn grep_walk(
     base: &Path,
     dir: &Path,
-    pattern: &str,
+    re: &regex::Regex,
     include: Option<&str>,
     out: &mut Vec<String>,
     depth: usize,
@@ -742,7 +760,7 @@ fn grep_walk(
             if entry.file_name() == ".git" {
                 continue;
             }
-            grep_walk(base, &path, pattern, include, out, depth + 1)?;
+            grep_walk(base, &path, re, include, out, depth + 1)?;
             continue;
         }
         let rel = path
@@ -759,7 +777,7 @@ fn grep_walk(
             continue;
         };
         for (i, line) in content.split('\n').enumerate() {
-            if regex_search_line(line, pattern) {
+            if re.is_match(line) {
                 out.push(format!("{}:{}:{}", rel, i + 1, line));
                 if out.len() > 10_000 {
                     return Ok(());
@@ -770,29 +788,104 @@ fn grep_walk(
     Ok(())
 }
 
-/// Substring/regex-lite search: full regex via `grep` binary when available,
-/// fallback to substring. Kept honest: no fake regex.
-fn regex_search_line(line: &str, pattern: &str) -> bool {
-    use std::process::Command;
-    let out = Command::new("grep")
-        .arg("-E")
-        .arg("-q")
-        .arg(pattern)
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .spawn();
-    match out {
-        Ok(mut child) => {
-            use std::io::Write;
-            if let Some(stdin) = child.stdin.as_mut() {
-                let _ = stdin.write_all(line.as_bytes());
-                let _ = stdin.flush();
-            }
-            drop(child.stdin.take());
-            child.wait().map(|s| s.success()).unwrap_or(false)
+#[cfg(test)]
+mod search_engine {
+    //! The grep tool must answer with ripgrep semantics, in-process.
+    //!
+    //! CONTROL (measured): the previous implementation spawned `grep -E` once
+    //! per line (0.65 ms/line) and returned no match for `\d+`. Both halves are
+    //! asserted here: correctness on the corpus patterns, and that a 1k-line
+    //! scan is no longer ~0.7 s of forks.
+
+    use super::*;
+
+    fn repo() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "abc123\nno digits\n\n").unwrap();
+        std::fs::write(d.path().join("b.rs"), "fn main() {\n    let x = 42;\n}\n").unwrap();
+        d
+    }
+
+    /// `\d+` is the canonical divergence: POSIX ERE has no `\d`.
+    #[test]
+    fn digit_class_matches_where_grep_ere_did_not() {
+        let d = repo();
+        let out = execute(
+            "grep",
+            &serde_json::json!({"pattern": "\\d+"}),
+            d.path(),
+            &[],
+        )
+        .unwrap();
+        assert!(
+            out.output.contains("a.txt:1:abc123"),
+            "\\d+ must match a line containing digits: {:?}",
+            out.output.as_str()
+        );
+        assert!(
+            !out.output.contains("no digits"),
+            "a line without digits must not match: {:?}",
+            out.output.as_str()
+        );
+    }
+
+    #[test]
+    fn inline_flags_are_supported() {
+        let d = repo();
+        let out = execute(
+            "grep",
+            &serde_json::json!({"pattern": "(?i)ABC"}),
+            d.path(),
+            &[],
+        )
+        .unwrap();
+        assert!(
+            out.output.contains("abc123"),
+            "got {:?}",
+            out.output.as_str()
+        );
+    }
+
+    #[test]
+    fn invalid_pattern_is_an_error_not_a_substring_fallback() {
+        // The deleted helper fell back to `line.contains(pattern)` on spawn
+        // failure, which silently turned a bad regex into a literal search.
+        let d = repo();
+        let err = match execute("grep", &serde_json::json!({"pattern": "a("}), d.path(), &[]) {
+            Ok(v) => panic!("invalid regex must fail, got {:?}", v.output),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("invalid pattern"),
+            "got {err:#}"
+        );
+    }
+
+    /// 1k lines with a hit on the first line: the old code forked 1k times.
+    #[test]
+    fn thousand_line_scan_is_fast() {
+        let d = tempfile::tempdir().unwrap();
+        let mut body = String::from("needle here\n");
+        for i in 0..1000 {
+            body.push_str(&format!("filler line {i}\n"));
         }
-        Err(_) => line.contains(pattern),
+        std::fs::write(d.path().join("big.txt"), body).unwrap();
+        let t0 = std::time::Instant::now();
+        let out = execute(
+            "grep",
+            &serde_json::json!({"pattern": "needle"}),
+            d.path(),
+            &[],
+        )
+        .unwrap();
+        let dt = t0.elapsed();
+        assert!(out.output.contains("needle here"));
+        // 0.65 ms/line * 1001 forks would be ~650 ms. 250 ms is a generous
+        // ceiling that still fails by >2x on the old implementation.
+        assert!(
+            dt < std::time::Duration::from_millis(250),
+            "1k-line scan took {dt:?}; the per-line spawn is back"
+        );
     }
 }
 

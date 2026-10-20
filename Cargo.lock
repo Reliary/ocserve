@@ -1454,6 +1454,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "libc",
  "metrics",
  "ocserve-core",
  "ocserve-http",
@@ -1522,6 +1523,7 @@ dependencies = [
  "ocserve-store",
  "ocserve-tools",
  "parking_lot",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",
@@ -1573,6 +1575,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "ocserve-metrics",
+ "ocserve-store",
  "parking_lot",
  "reqwest",
  "serde",
@@ -1592,6 +1595,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "ocserve-metrics",
+ "ocserve-store",
  "parking_lot",
  "rolldown",
  "rolldown_common",
@@ -1643,6 +1647,8 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "libc",
+ "ocserve-store",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
