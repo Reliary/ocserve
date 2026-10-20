@@ -710,8 +710,10 @@ echo "== guard: docs are not stale (rule 31) =="
 # Docs are the spec (AGENTS §1); nothing checked them, so dead references
 # accumulated (the 2026-10-13 audit: three files referenced but gone, a stale
 # divergence, dangling guard-rule numbers). The linter fails on: backticked
-# repo paths that don't exist, `rule N` refs with no real rule, and a removed
-# divergence still listed as current. Planted control: dead path + bogus rule.
+# repo paths that don't exist, `rule N` refs with no real rule, a removed
+# divergence still listed as current, a placeholder path whose directory is
+# gone, and an em dash in a reader-facing doc (house style: none). Planted
+# controls for all five live in `check-docs.py --selftest`.
 #
 # RESTORED 2026-10-16: the feat/v2-engine branch truncated this block (header
 # only, no body, no `exit $fail`) — doc-lint silently stopped running. The

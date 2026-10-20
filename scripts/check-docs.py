@@ -84,6 +84,9 @@ IGNORED = gitignored_dirs()
 # quietly skips it. This is the 2026-10-18 THIRD-PARTY.md finding.
 PLACEHOLDER = re.compile(r'`([A-Za-z0-9_][A-Za-z0-9_./-]*)<[A-Za-z0-9_-]+>([A-Za-z0-9_./-]*)`')
 
+# Reader-facing docs: what someone sees before they clone the repo.
+EM_DASH_DOCS = ("README.md", "SECURITY.md", "CONTRIBUTING.md")
+
 
 def check_dead_placeholder_dirs() -> list[str]:
     bad: list[str] = []
@@ -237,12 +240,33 @@ def check_closed_divergence_reopened() -> list[str]:
     return bad
 
 
+def check_em_dashes() -> list[str]:
+    """House style: no em dashes in user-facing docs.
+
+    Em dashes are the clearest tell of machine-written prose, and the README is
+    the page every visitor reads. Scope is the reader-facing documents; internal
+    design notes keep their prose untouched so this stays a style rule, not a
+    rewrite of the specification.
+    """
+    findings = []
+    for name in EM_DASH_DOCS:
+        path = os.path.join(ROOT, name)
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            for lineno, line in enumerate(f, 1):
+                if "\u2014" in line or "\u2013" in line:
+                    findings.append(f"{name}:{lineno}: em dash in a reader-facing doc")
+    return findings
+
+
 def run_all() -> list[str]:
     return (
         check_dead_paths()
         + check_rule_refs()
         + check_removed_divergence()
         + check_closed_divergence_reopened()
+        + check_em_dashes()
     )
 
 
@@ -294,15 +318,27 @@ def selftest() -> int:
     finally:
         shutil.move(ph_backup, ph_victim)
 
-    if caught_path and caught_rule and caught_closed and caught_placeholder:
+    # plant an em dash in a reader-facing doc (house style: none)
+    em_victim = os.path.join(ROOT, "README.md")
+    em_backup = em_victim + ".lintbak"
+    shutil.copy2(em_victim, em_backup)
+    caught_em = False
+    try:
+        with open(em_victim, "a", encoding="utf-8") as f:
+            f.write("\n(selftest) reader facing \u2014 dash\n")
+        caught_em = any("em dash" in x for x in run_all())
+    finally:
+        shutil.move(em_backup, em_victim)
+
+    if caught_path and caught_rule and caught_closed and caught_placeholder and caught_em:
         print(
             "selftest: PASS (dead path + bogus rule ref + reopened closed "
-            "divergence + dead placeholder dir all detected)"
+            "divergence + dead placeholder dir + em dash all detected)"
         )
         return 0
     print(
         f"selftest: FAIL (path={caught_path} rule={caught_rule} closed={caught_closed} "
-        f"placeholder={caught_placeholder}) — guard is vacuous",
+        f"placeholder={caught_placeholder} em_dash={caught_em}) - guard is vacuous",
         file=sys.stderr,
     )
     return 1
@@ -317,7 +353,7 @@ def main() -> int:
             print(f"FAIL: {x}")
         print(f"\n{len(findings)} doc staleness finding(s) — fix or correct the doc (rule 31).")
         return 1
-    print("ok (no dead doc paths, no dangling guard-rule refs, no stale/reopened divergences)")
+    print("ok (no dead doc paths, no dangling guard-rule refs, no stale/reopened divergences, no em dashes)")
     return 0
 
 

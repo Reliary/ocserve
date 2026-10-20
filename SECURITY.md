@@ -34,14 +34,14 @@ for a fix.
   (e.g. a Tailscale ACL or a socat forwarder); when bound non-loopback the auth
   policy is the frozen upstream contract (`off` by default, password via
   `OCSERVE_SERVER_PASSWORD` when set). **Fail-fast (2026-10-18):** binding a
-  non-loopback address with `auth_mode=off` is refused at boot — the credential
-  store echoes provider API keys on GET, so an open network-reachable bind would
-  expose them. Use `auth_mode="basic"` (with a mode-600 password file), or keep
+  non-loopback address with `auth_mode=off` is refused at boot, because the
+  credential store echoes provider API keys on GET, so an open network-reachable
+  bind would expose them. Use `auth_mode="basic"` (with a mode-600 password file), or keep
   the bind loopback and expose via the tailnet forwarder (the deployed pattern).
 - The credential store (`credential` table) holds provider API keys. The DB
   directory is locked to 0700 and the unit sets `UMask=0077`; SQLite's recreated
   WAL/SHM inherit owner-only access. `GET /api/credential` echoes values (upstream
-  parity) — safe only because the server is loopback or auth-gated.
+  parity). That is safe only because the server is loopback or auth-gated.
 - Access to filesystem routes is contained to the session worktree
   (`D-FS-CONTAIN`; writers additionally resolve the deepest existing ancestor so
   a symlink cannot redirect a create out of the tree); MCP tool trust is
@@ -52,8 +52,8 @@ for a fix.
 The parity ledger (`PLAN.md §17`, `bench/*/allow.txt`) names every intentional
 difference from upstream. One is security-relevant and documented, not hidden:
 
-- `D-PTY-1`: the PTY connect-token accepts a request with no `Origin` — safe on
-  a loopback bind, a hazard on a non-loopback bind.
+- `D-PTY-1`: the PTY connect-token accepts a request with no `Origin`. That is safe on
+  a loopback bind and a hazard on a non-loopback bind.
 
 ## Security Practices
 

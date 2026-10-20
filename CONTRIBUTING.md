@@ -30,7 +30,7 @@ Differential gates (need the vendored freeze binary; see `bench/pair/`):
    `test/<slug>`, `docs/<slug>`.
 2. Keep commits small and conventional (`feat:`, `fix:`, `docs:`, `test:`).
    A `crates/**/*.rs` change must stage a `TRACEABILITY.md` row (pre-commit).
-3. Run the gates above — all must pass locally before opening the PR.
+3. Run the gates above. All must pass locally before opening the PR.
 4. Open a PR against `main`. CI runs exactly the gates you ran plus the
    differential suite in `capdiff`/`pair`.
 
