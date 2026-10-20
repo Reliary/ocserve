@@ -44,6 +44,22 @@ flate2 = "1"
 brotli = "8"
 zstd.workspace = true
 
+# Kernel-enforced containment (openat2 RESOLVE_BENEATH) and directory
+# iteration from a verified fd. Unix-only by design; the Windows path uses
+# handle verification with Win32 APIs instead.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+# Handle -> real-path verification and the kernel's own string collation.
+# Without these the Windows containment branch does not compile, which is
+# exactly what platform-check caught on its first run.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Globalization",
+] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }

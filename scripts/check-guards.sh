@@ -77,6 +77,12 @@
 #  42. the v2-only gate table matches (2.0.28 ops) - (1.18.31 ops) (a stale
 #      table silently reopens the OCSERVE_V2 leak; 32 ops answered with the
 #      flag unset on 2026-10-20) [plant: table entry not implied by the specs]
+#  43. containment is handle-based (open/verify), never canonicalize+
+#      starts_with, and writers never create_dir_all an unresolved path
+#      [plant: canonicalize+starts_with scratch file]
+#  44. platform-specific API sits behind a cfg guard (PSASpotter class: an
+#      ungated `std::os::unix` import broke the Windows build)
+#      [plant: ungated unix import]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -746,6 +752,57 @@ else
   echo "FAIL: scripts/check-docs.py missing (rule 31)"; fail=1
 fi
 
+echo "== guard: containment is handle-based, not string-based (rule 43) =="
+# The 2026-10-20 rewrite replaced canonicalize+starts_with with open-then-
+# verify (TOCTOU-free) and unified the v1/v2 implementations. Two regression
+# shapes must stay impossible:
+#   (a) a new `canonicalize(...)` + `starts_with` containment check;
+#   (b) a writer that calls create_dir_all on an unresolved path.
+# Planted control: append a canonicalize+starts_with check to a scratch file.
+bad43=""
+# Strip comments before matching: the rule's own rationale mentions both
+# tokens, and docs describing the old design must not trip a code guard.
+for loc in $(grep -rln "canonicalize" crates/ocserve-http/src/ --include='*.rs' || true); do
+    code=$(sed -E 's://.*$::' "$loc")
+    if printf '%s' "$code" | grep -q "canonicalize" \
+       && printf '%s' "$code" | grep -q "starts_with"; then
+        # Only legal in containment.rs's own utility, never as a second gate.
+        case "$loc" in
+            *containment.rs) ;;
+            *) bad43="$bad43 $loc" ;;
+        esac
+    fi
+done
+# Ignore comments (the rule's own rationale mentions create_dir_all).
+if grep -rn "create_dir_all" crates/ocserve-http/src/v2.rs 2>/dev/null | grep -v ':[[:space:]]*//' | grep -v '^.*containment' | grep -q .; then
+    bad43="$bad43 v2.rs:create_dir_all"
+fi
+if [ -n "$bad43" ]; then
+    echo "FAIL: string-based containment or unchecked create_dir_all (rule 43):$bad43"; fail=1
+else
+    echo "ok (containment is handle-based)"
+fi
+# Planted control through the SAME predicate: a scratch file in src/ with a
+# canonicalize+starts_with pair must be flagged. Repo-local, trap-restored.
+_c43_plant="crates/ocserve-http/src/__rule43_plant.rs"
+_c43_restore() { rm -f "$_c43_plant"; }
+trap _c43_restore EXIT
+printf 'fn _p43(p:&std::path::Path){ let c=p.canonicalize().unwrap(); let _=c.starts_with(p); }\n' > "$_c43_plant"
+_c43_hit=""
+for loc in $(grep -rln "canonicalize" crates/ocserve-http/src/ --include='*.rs' || true); do
+    code=$(sed -E 's://.*$::' "$loc")
+    if printf '%s' "$code" | grep -q "canonicalize" \
+       && printf '%s' "$code" | grep -q "starts_with"; then
+        case "$loc" in *containment.rs) ;; *) _c43_hit="$_c43_hit $loc" ;; esac
+    fi
+done
+if [ -z "$_c43_hit" ]; then
+    echo "FAIL: planted control not detected (rule 43 vacuous)"; fail=1
+else
+    echo "ok (planted string-based containment detected)"
+fi
+_c43_restore
+
 echo "== guard: no absolute-path silent redirect in writers (rule 35) =="
 # resolve_within class (V2-PARITY Phase F): trim-leading-slash + join
 # silently redirects an absolute request path INSIDE the base and reports
@@ -965,7 +1022,7 @@ else
 fi
 
 
-echo "== guard: platform-specific API must sit behind a platform guard (rule 43) =="
+echo "== guard: platform-specific API must sit behind a platform guard (rule 44) =="
 # The Windows build failed on two ungated `std::os::unix` imports, and the blob
 # writer's directory-fsync `?` was a hard runtime failure on Windows that no
 # compiler caught (PLATFORM.md §1.2). PSASpotter (arXiv:2607.17462) frames the
@@ -1005,14 +1062,14 @@ plat_scan() {
 if out=$(plat_scan); then
   echo "ok (every platform-specific import is cfg-gated)"
 else
-  echo "$out"; echo "FAIL: ungated platform-specific API (rule 43, PLATFORM.md §1.2)"; fail=1
+  echo "$out"; echo "FAIL: ungated platform-specific API (rule 44, PLATFORM.md §1.2)"; fail=1
 fi
 # Planted control: an ungated unix import must be flagged. Written to a temp
 # file under crates/ (removed immediately) so the scanner sees a real hit.
 plant="crates/ocserve-core/src/platform_plant.rs"
 printf 'use std::os::unix::fs::PermissionsExt;\n' > "$plant"
 if plat_scan >/dev/null 2>&1; then
-  echo "FAIL: rule 43 plant was not flagged (the guard is vacuous)"; fail=1
+  echo "FAIL: rule 44 plant was not flagged (the guard is vacuous)"; fail=1
   rm -f "$plant"
 else
   echo "ok (planted ungated unix import flagged)"

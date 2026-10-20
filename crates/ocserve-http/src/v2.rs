@@ -623,103 +623,109 @@ pub async fn fs_list(
 /// inside `base` (so `fs/list?path=missing` reports "No such file" rather than
 /// silently passing). `..` that resolves outside `base` is rejected.
 fn resolve_within(base: &std::path::Path, rel: &str) -> std::io::Result<std::path::PathBuf> {
-    let base_canon = base.canonicalize()?;
-    // Absolute request paths resolve against the filesystem (NOT joined onto
-    // the base — joining silently redirects /tmp/x to <base>/tmp/x and
-    // reports success, a silent-lie the phase-C test debris proved). Both
-    // shapes then face the same containment gate.
+    // One containment rule for both wire families (containment.rs). The v2
+    // writer previously had its own deepest-existing-ancestor check while the
+    // v1 reader had a weaker lexical fallback; two implementations of a
+    // security boundary is the defect, not the fix.
+    use crate::containment::{OpenError, OpenKind, open_within};
+    // A path that does not exist yet is legitimate for the writer, so a read
+    // failure here is not fatal: verify the deepest existing ancestor instead.
+    match open_within(base, rel, OpenKind::File) {
+        Ok(c) => Ok(c.path().to_path_buf()),
+        Err(OpenError::Escape) | Err(OpenError::Invalid(_)) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path escapes the project directory",
+        )),
+        Err(OpenError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            verify_parent(base, rel)
+        }
+        Err(OpenError::Io(e)) => Err(e),
+    }
+}
+
+/// For a target that does not exist: open and verify the deepest existing
+/// ancestor through the same handle-based rule, then append the remainder.
+fn verify_parent(base: &std::path::Path, rel: &str) -> std::io::Result<std::path::PathBuf> {
+    use crate::containment::{OpenError, OpenKind, open_within};
     let requested = std::path::PathBuf::from(rel);
     let joined = if requested.is_absolute() {
         requested
     } else {
-        base_canon.join(rel.trim_start_matches('/'))
+        base.join(rel.trim_start_matches('/'))
     };
-    match joined.canonicalize() {
-        Ok(real) => {
-            if real.starts_with(&base_canon) {
-                Ok(real)
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "path escapes the project directory",
-                ))
-            }
-        }
-        // Not found: the target does not exist yet. A lexical check alone is
-        // NOT enough for writers (F6, security review): if any existing path
-        // component is a symlink (`<base>/link -> /etc`), `<base>/link/evil`
-        // passes the lexical test but `create_dir_all`+write follow the link
-        // out of the tree. Canonicalize the deepest EXISTING ancestor and
-        // require it to stay within base; the non-existent tail is then safe
-        // to create (it can only be created under that verified ancestor).
-        Err(_) => {
-            let lex = lexically_normalize(&joined);
-            let mut probe = lex.clone();
-            while probe.symlink_metadata().is_err() {
-                match probe.parent() {
-                    Some(p) if p != probe => probe = p.to_path_buf(),
-                    _ => break,
+    let mut probe = joined.clone();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match open_within(base, &probe.to_string_lossy(), OpenKind::Dir) {
+            Ok(c) => {
+                let mut out = c.path().to_path_buf();
+                for part in tail.iter().rev() {
+                    out.push(part);
                 }
+                return Ok(out);
             }
-            let ancestor_real = probe.canonicalize().map_err(|_| {
-                std::io::Error::new(
+            Err(OpenError::Escape) | Err(OpenError::Invalid(_)) => {
+                return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "path escapes the project directory",
-                )
-            })?;
-            if !ancestor_real.starts_with(&base_canon) || !lex.starts_with(&base_canon) {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "path escapes the project directory",
-                ))
-            } else {
-                Ok(joined)
+                ));
             }
+            Err(OpenError::Io(_)) => match (probe.file_name(), probe.parent()) {
+                (Some(name), Some(parent)) => {
+                    tail.push(name.to_os_string());
+                    probe = parent.to_path_buf();
+                }
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "path escapes the project directory",
+                    ));
+                }
+            },
         }
     }
 }
-
-/// Lexically resolve `.`/`..` without touching the filesystem (used only for
-/// the not-found branch; a normalized join stays comparable to a canonical base).
-fn lexically_normalize(p: &std::path::Path) -> std::path::PathBuf {
-    use std::path::Component;
-    let mut out = std::path::PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
-
 /// GET /api/fs/read/*path — raw bytes of one file (Uint8Array on the wire).
 pub async fn fs_read(
     State(st): State<Arc<AppState>>,
     Path(path): Path<String>,
 ) -> Result<axum::response::Response, ApiError> {
+    // Same containment rule as every other fs route (containment.rs), and the
+    // bytes are read from the verified handle rather than by re-resolving the
+    // path. This replaced a third copy of canonicalize+starts_with that the
+    // handle-based guard (rule 43) found on its first run.
     let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/")).to_path_buf();
-    let full = base.join(path.trim_start_matches('/'));
-    let canon = full.canonicalize().map_err(|_| ApiError {
-        status: StatusCode::NOT_FOUND,
-        name: "NotFoundError",
-        message: format!("File not found: {path}"),
-    })?;
-    if !canon.starts_with(&base) {
-        return Err(ApiError {
-            status: StatusCode::BAD_REQUEST,
-            name: "BadRequest",
-            message: "path escapes the project directory".into(),
-        });
-    }
-    let bytes = tokio::fs::read(&canon).await.map_err(|e| ApiError {
-        status: StatusCode::NOT_FOUND,
-        name: "NotFoundError",
-        message: format!("File not found: {path} ({e})"),
-    })?;
+    let raw = path.trim_start_matches('/').to_string();
+    let read =
+        tokio::task::spawn_blocking(move || -> Result<Vec<u8>, crate::containment::OpenError> {
+            use std::io::Read;
+            let c =
+                crate::containment::open_within(&base, &raw, crate::containment::OpenKind::File)?;
+            let mut f = c.into_file();
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf)
+                .map_err(crate::containment::OpenError::Io)?;
+            Ok(buf)
+        })
+        .await
+        .map_err(|e| internal(anyhow::anyhow!("read worker: {e}")))?;
+    let bytes = match read {
+        Ok(b) => b,
+        Err(crate::containment::OpenError::Escape) => {
+            return Err(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                name: "BadRequest",
+                message: "path escapes the project directory".into(),
+            });
+        }
+        Err(e) => {
+            return Err(ApiError {
+                status: StatusCode::NOT_FOUND,
+                name: "NotFoundError",
+                message: format!("File not found: {path} ({e})"),
+            });
+        }
+    };
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
         bytes,
@@ -988,25 +994,16 @@ pub async fn fs_write(
     let Some(rel) = q.get("path") else {
         return bad_request("Missing key\n  at [\"path\"]").into_response();
     };
-    let dest = match resolve_within(&base, rel) {
-        Ok(d) => d,
-        Err(_) => {
-            return crate::HttpError::TaggedData {
-                status: StatusCode::FORBIDDEN,
-                tag: "FileNotFoundError",
-                fields: json!({"message": "path escapes the project directory"}),
-            }
-            .into_response();
-        }
-    };
+    // Write through a contained create: every parent component is opened
+    // relative to the verified parent, so a symlinked component cannot redirect
+    // the write (the F6 class). `create_dir_all` on an unchecked path is the
+    // defect this replaces.
+    let base_for_write = base.clone();
+    let rel_for_write = rel.clone();
     let write_result = run_blocking(&st.db, move |_db| {
-        (|| -> anyhow::Result<()> {
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&dest, &body)?;
-            Ok(())
-        })()
+        crate::containment::create_within(&base_for_write, &rel_for_write, &body)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("{e}"))
     })
     .await;
     match write_result {
@@ -1015,7 +1012,20 @@ pub async fn fs_write(
             "data": {"path": rel},
         }))
         .into_response(),
-        Err(e) => internal(e).into_response(),
+        Err(e) => {
+            // Keep the probed envelope for containment failures; a real I/O
+            // error is still an internal error.
+            let msg = format!("{e:#}");
+            if msg.contains("escapes the project directory") {
+                return crate::HttpError::TaggedData {
+                    status: StatusCode::FORBIDDEN,
+                    tag: "FileNotFoundError",
+                    fields: json!({"message": "path escapes the project directory"}),
+                }
+                .into_response();
+            }
+            internal(e).into_response()
+        }
     }
 }
 

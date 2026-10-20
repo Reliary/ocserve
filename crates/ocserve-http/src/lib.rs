@@ -10,6 +10,8 @@ use axum::{Json, Router};
 use futures_util::StreamExt;
 use futures_util::stream;
 use serde_json::{Value, json};
+pub mod containment;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -4063,62 +4065,6 @@ async fn patch_part_route(
         .then_some(Json(part))
         .ok_or_else(|| ApiError::not_found(format!("Part not found: {pid}")))
 }
-
-// ---- oc-remote contract family (Batch 2: file/find/question) ----
-
-fn scope_path(base: &std::path::Path, raw: &str) -> Result<std::path::PathBuf, ApiError> {
-    let joined = if raw.is_empty() || raw == "." {
-        base.to_path_buf()
-    } else {
-        let p = std::path::Path::new(raw);
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            base.join(p)
-        }
-    };
-    let canon_base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
-    // Lexical containment FIRST: normalize `..` without touching the FS so an
-    // escape is rejected deterministically even when the target is missing
-    // (the previous code fell back to the raw `..`-laden path when canonicalize
-    // failed, and a lexically-`starts_with` check on that path passed for a
-    // traversal like `base/../../../etc`). Both the normalized join AND the
-    // canonicalized real path must stay inside the base.
-    let norm = lexically_normalize(&joined);
-    if !norm.starts_with(&canon_base) && !norm.starts_with(base) {
-        return Err(ApiError {
-            status: StatusCode::BAD_REQUEST,
-            name: "BadRequest",
-            message: format!("path escapes the session directory: {raw}"),
-        });
-    }
-    let canon = std::fs::canonicalize(&joined).unwrap_or(norm);
-    if !canon.starts_with(&canon_base) {
-        return Err(ApiError {
-            status: StatusCode::BAD_REQUEST,
-            name: "BadRequest",
-            message: format!("path escapes the session directory: {raw}"),
-        });
-    }
-    Ok(canon)
-}
-
-/// Lexically resolve `.`/`..` (no filesystem access).
-fn lexically_normalize(p: &std::path::Path) -> std::path::PathBuf {
-    use std::path::Component;
-    let mut out = std::path::PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
-
 /// GET /file?path= — directory listing (FileNode list, oc-remote file browser).
 async fn list_directory(
     State(st): State<Arc<AppState>>,
@@ -4126,30 +4072,31 @@ async fn list_directory(
 ) -> Result<Json<Value>, ApiError> {
     let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/"));
     let raw = q.get("path").map(String::as_str).unwrap_or(".");
-    let dir = scope_path(base, raw)?;
-    // M3 (same class as find_files): `read_dir` + per-entry `metadata()` is
-    // blocking syscalls, inline on a tokio worker. A directory with thousands
-    // of entries would park the worker for the whole loop.
-    let dir_for_worker = dir.clone();
+    // M3 (same class as find_files): opening and enumerating is blocking, so it
+    // runs on the worker pool. Containment is proven on the opened directory and
+    // entries are read from that handle (Unix), not by re-resolving the path.
+    let base_owned = base.to_path_buf();
     let raw_owned = raw.to_string();
-    let rd = tokio::task::spawn_blocking(move || std::fs::read_dir(&dir_for_worker))
-        .await
-        .map_err(|e| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            name: "InternalServerError",
-            message: format!("list worker: {e}"),
-        })?
-        .map_err(|e| ApiError {
-            status: StatusCode::BAD_REQUEST,
-            name: "BadRequest",
-            message: format!("list {}: {e}", dir.display()),
-        })?;
+    let raw_for_worker = raw_owned.clone();
+    let (dir, entries) = tokio::task::spawn_blocking(move || {
+        let c = containment::open_within(&base_owned, &raw_for_worker, containment::OpenKind::Dir)?;
+        let entries = c.read_entries()?;
+        Ok::<_, containment::OpenError>((c.path().to_path_buf(), entries))
+    })
+    .await
+    .map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalServerError",
+        message: format!("list worker: {e}"),
+    })?
+    .map_err(|e| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        name: "BadRequest",
+        message: format!("list: {e}"),
+    })?;
     let mut nodes: Vec<Value> = Vec::new();
-    for entry in rd.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let path = entry.path();
-        let meta = entry.metadata().ok();
-        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+    for (name, is_dir) in entries {
+        let path = dir.join(&name);
         let rel = if raw_owned.is_empty() || raw_owned == "." {
             name.clone()
         } else {
@@ -4193,13 +4140,50 @@ async fn read_file_content(
         .ok_or_else(|| HttpError::Query {
             message: "Missing key\n  at [\"path\"]".into(),
         })?;
-    let path = scope_path(base, raw).map_err(HttpError::Api)?;
-    // freeze returns an empty text body for a missing file (probed), not an
-    // error — the web UI probes optional paths.
+    // Containment is proven on the HANDLE, and the read then uses that handle:
+    // no path is re-resolved between check and use (TOCTOU-free).
+    let base_owned = base.to_path_buf();
+    let raw_owned = raw.to_string();
+    let opened = tokio::task::spawn_blocking(move || {
+        containment::open_within(&base_owned, &raw_owned, containment::OpenKind::File)
+    })
+    .await
+    .map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalServerError",
+        message: format!("read worker: {e}"),
+    })?;
+    let mut file = match opened {
+        Ok(c) => c.into_file(),
+        Err(containment::OpenError::Escape) => {
+            return Err(HttpError::Api(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                name: "BadRequest",
+                message: format!("path escapes the session directory: {raw}"),
+            }));
+        }
+        Err(containment::OpenError::Invalid(m)) => {
+            return Err(HttpError::Api(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                name: "BadRequest",
+                message: format!("invalid path: {m}"),
+            }));
+        }
+        // freeze returns an empty text body for a missing file (probed), not an
+        // error — the web UI probes optional paths.
+        Err(containment::OpenError::Io(_)) => {
+            return Ok(Json(json!({"type": "text", "content": ""})));
+        }
+    };
     // Perf dive 2026-10-11: the read ran INLINE on a tokio worker (up to 1 MB
     // blocking fs + copy — the M3 class). Move it to the blocking pool.
-    let read_path = path.clone();
-    let bytes = match tokio::task::spawn_blocking(move || std::fs::read(&read_path)).await {
+    let bytes = match tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).map(|_| buf)
+    })
+    .await
+    {
         Ok(Ok(b)) => b,
         _ => {
             return Ok(Json(json!({"type": "text", "content": ""})));

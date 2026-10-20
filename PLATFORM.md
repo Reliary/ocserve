@@ -104,6 +104,35 @@ ship a platform without pair-check there, it gets a `D-` row saying so.
 
 ---
 
+## 1.3 Path containment (Phase 1, done)
+
+There were **three** containment implementations: `lib.rs::scope_path` (lexical
+fallback), `v2.rs::resolve_within` (deepest-existing-ancestor), and
+`v2.rs::fs_read` (inline `canonicalize` + `starts_with`). All three compared
+strings, so all three had the check/use gap: a component could be swapped for a
+symlink between canonicalize and open.
+
+Now there is one: `crates/ocserve-http/src/containment.rs`.
+
+| Platform | Mechanism |
+|---|---|
+| Linux, relative path | `openat2(RESOLVE_BENEATH)` — the kernel refuses any resolution outside the base, including absolute symlink targets. There is no window to race. |
+| Linux, absolute path | open, then `readlink /proc/self/fd/N` and verify; the fd pins the inode. |
+| macOS | open, then `fcntl(F_GETPATH)` and verify. |
+| Windows | open, then `GetFinalPathNameByHandleW` and compare with `CompareStringOrdinal` (the kernel's collation, not `to_lowercase`). |
+
+Creation goes through `create_within`, which walks components with
+`mkdirat`+`openat2` from the previous verified fd, so `create_dir_all` on an
+unresolved path (the F6 escape) can no longer happen.
+
+Named residual: directory entries are read from the verified handle on Unix; on
+Windows std has no directory-fd iteration, so entries are read from the verified
+path (the directory itself is handle-verified). Closing that needs
+`GetFileInformationByHandleEx(FileIdBothDirectoryInfo)` and belongs to Phase W.
+
+Guard rule 43 makes a fourth string-based copy a build failure, with a planted
+control. Its first run found the third copy, which is why the rule exists.
+
 ## 2. Antagonism ledger
 
 Each entry is a design decision attacked before code. Status: `resolved` (design changed),

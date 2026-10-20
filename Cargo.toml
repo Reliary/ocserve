@@ -61,6 +61,9 @@ toml = "0.9"
 
 # misc
 libc = "0.2"
+# openat2(RESOLVE_BENEATH) / dir-from-fd: kernel-enforced containment on Linux.
+# Already in the tree transitively; this makes the direct use explicit.
+rustix = { version = "1", features = ["fs", "process"] }
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"

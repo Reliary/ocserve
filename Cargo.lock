@@ -1526,6 +1526,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
@@ -1535,6 +1536,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
