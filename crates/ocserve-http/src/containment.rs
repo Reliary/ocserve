@@ -401,7 +401,7 @@ pub fn create_within(base: &Path, raw: &str, body: &[u8]) -> Result<Contained, O
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn map_errno(e: rustix::io::Errno) -> OpenError {
     match e {
         rustix::io::Errno::XDEV | rustix::io::Errno::LOOP | rustix::io::Errno::ACCESS => {
