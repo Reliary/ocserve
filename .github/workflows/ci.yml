@@ -144,6 +144,34 @@ jobs:
       - name: cargo check (aarch64)
         run: cargo check --workspace --release --target aarch64-unknown-linux-gnu
 
+  platform-check:
+    # Proves the two Windows compile blockers stay fixed, on a real Windows and
+    # macOS toolchain. The C dependencies (SQLite/zstd/ring/blake3) cannot be
+    # cross-compiled from Linux without the Windows SDK, so this must run on the
+    # target OS — that is exactly why it is a separate job and not part of the
+    # Linux `check`.
+    #
+    # Runtime behaviour is NOT covered here: no test is run. PLATFORM.md records
+    # that as D-PLATFORM-UNVERIFIED until Phase P/W add PTY and shell e2e.
+    name: platform check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions-rust-lang/setup-rust-toolchain@46a9d261ee2ace4b93b3bd6e867168ac38627b38  # v1.12.0
+      - name: cargo check
+        # `check`, not `build`: link-time gaps in the OS layer are Phase P/W work,
+        # and a type error is what the two ungated unix imports used to produce.
+        run: cargo check --workspace --all-targets
+      - name: guard 43 (platform API behind a platform guard)
+        if: runner.os != 'Windows'
+        # The guard is bash+python; keep it on macOS so a macOS-only regression
+        # is caught by the platform that can actually compile.
+        run: ./scripts/check-guards.sh
+
   audit:
     name: audit + deny
     runs-on: ubuntu-latest
