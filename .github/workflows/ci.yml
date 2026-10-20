@@ -217,9 +217,13 @@ jobs:
         # preinstalled on the Linux runner but NOT on macOS; without it rule 19
         # reports "vacuous/broken" because the import fails. Installing it here
         # keeps the guard honest instead of skipping the rule on this platform.
+        # macOS ships a PEP-668 "externally managed" Python: `pip install` into
+        # it is refused. Use a throwaway venv instead of --break-system-packages
+        # so nothing on the runner image is mutated.
         run: |
-          python3 -m pip install --quiet --disable-pip-version-check jsonschema
-          ./scripts/check-guards.sh
+          python3 -m venv "$RUNNER_TEMP/guardvenv"
+          "$RUNNER_TEMP/guardvenv/bin/pip" install --quiet --disable-pip-version-check jsonschema
+          PATH="$RUNNER_TEMP/guardvenv/bin:$PATH" ./scripts/check-guards.sh
 
       - name: PTY acceptance (macOS)
         if: runner.os == 'macOS'
