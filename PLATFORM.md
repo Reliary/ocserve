@@ -230,6 +230,12 @@ Exit:
 
 ### Phase P — macOS
 
+**Verified on the macOS runner (2026-10-20):** `cargo test -p ocserve-pty` 7/7 including
+`macos::tests::winsize_round_trips`, and `cargo test -p ocserve-http --test pty` 6/6. That
+discharges `D-MACOS-RUNTIME`: the `forkpty` path spawns, writes, resizes (proving the Darwin
+`TIOCSWINSZ` constant against `TIOCGWINSZ`), reports exit codes and kills. `platform-check
+(macos-latest)` is now a required check alongside `platform-check (windows-latest)`.
+
 Deliverables: PTY variant; path probe from the darwin freeze binary; RSS via `task_info`
 (behind the existing `rss_bytes()` seam); trim measurement.
 
