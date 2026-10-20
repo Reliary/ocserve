@@ -114,6 +114,9 @@ async fn phase_a_vcs_aliases_answer() {
 #[tokio::test]
 async fn phase_c_projections_answer() {
     let (app, st) = app();
+    // `st` is read only by the symlink block below, which is unix-only.
+    #[cfg(not(unix))]
+    let _ = &st;
     // config entries: document + directory sources.
     let (s, v) = get(&app, "/api/config").await;
     assert_eq!(s, StatusCode::OK);

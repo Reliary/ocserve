@@ -30,16 +30,29 @@ use std::sync::{Arc, Mutex};
 pub mod shells;
 pub mod ticket;
 
-// The Unix PTY shim is the crate's single unsafe surface (libc openpty/fork/
-// ioctl/waitpid). Crate-root `#![deny(unsafe_code)]` stays; this module is the
-// documented, contained opt-in (AGENTS §2.10). Each unsafe block below carries
-// its own Safety comment.
+// The PTY shims are the crate's unsafe surfaces (libc openpty/forkpty/ioctl/
+// waitpid). Crate-root `#![deny(unsafe_code)]` stays; these modules are the
+// documented, contained opt-in (AGENTS §2.10).
+//
+// Split by platform capability rather than by OS name: Linux has the
+// `posix_openpt` family, macOS only has `forkpty`, and their shared post-fork
+// behaviour lives in `posix.rs` so the two cannot drift.
 #[allow(unsafe_code)]
 #[cfg(unix)]
+mod posix;
+
+#[allow(unsafe_code)]
+#[cfg(target_os = "macos")]
+mod macos;
+#[allow(unsafe_code)]
+#[cfg(all(unix, not(target_os = "macos")))]
 mod unix;
+
+#[cfg(target_os = "macos")]
+use macos::Proc;
 #[cfg(not(unix))]
 use stub::Proc;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 use unix::Proc;
 
 /// Retained output cap (core/src/pty.ts BUFFER_LIMIT).
@@ -492,7 +505,7 @@ pub fn utf16_to_byte(s: &str, want: usize) -> usize {
     s.len()
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn spawn_process(
     command: &str,
     args: &[String],
@@ -500,6 +513,16 @@ fn spawn_process(
     env: &[(String, String)],
 ) -> Result<Proc, String> {
     unix::spawn(command, args, cwd, env)
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_process(
+    command: &str,
+    args: &[String],
+    cwd: &str,
+    env: &[(String, String)],
+) -> Result<Proc, String> {
+    macos::spawn(command, args, cwd, env)
 }
 
 #[cfg(not(unix))]

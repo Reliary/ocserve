@@ -1,0 +1,48 @@
+# Windows VM for ocserve integration testing (PLATFORM.md Phase W).
+#
+# This is NOT a CI runner and NOT a persistent stage: bring it up for a test
+# session, take the snapshot, run the oracles, then `scripts/windows-vm.sh down
+# --purge`. The compose file stays in the repo so the environment is
+# reproducible on demand.
+#
+# A real Windows kernel is required for exactly four reasons:
+#   1. ConPTY (CreatePseudoConsole) has no equivalent anywhere else.
+#   2. Job Objects with KILL_ON_JOB_CLOSE are how a Windows process tree dies.
+#   3. NTFS semantics: case-insensitivity, 8.3 names, trailing dots, `\\?\`.
+#   4. Running the Windows freeze binary for pair-check parity.
+#
+# Requirements verified on the host: /dev/kvm present, user in kvm, /dev/net/tun
+# present, >=8 GB RAM free, >=32 GB disk.
+services:
+  windows:
+    image: dockurr/windows:latest
+    container_name: ocserve-windows
+    environment:
+      # Windows 11 LTSC: closest to a user's desktop, no Store/Cortana, 4.7 GB
+      # ISO. Fallback if TPM emulation misbehaves on this host: VERSION: "2022"
+      # (Server 2022, no TPM, same ConPTY and Job Object support).
+      VERSION: "11l"
+      RAM_SIZE: "8G"
+      CPU_CORES: "4"
+      DISK_SIZE: "32G"
+      USERNAME: "Docker"
+      PASSWORD: "${VM_PASSWORD:?set VM_PASSWORD in bench/windows/.env}"
+      LANGUAGE: "English"
+      REGION: "en-US"
+      KEYBOARD: "en-US"
+    devices:
+      - /dev/kvm
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    # Loopback only. The comparator reaches 4926/4927 over an SSH tunnel, so
+    # the HTTP ports are never exposed on the host's network.
+    ports:
+      - "127.0.0.1:8006:8006"   # web console (install + visual checks only)
+      - "127.0.0.1:2222:22"     # ssh
+    volumes:
+      - ./vm:/storage
+      - ./shared:/shared        # guest drive Z:
+      - ./oem:/oem              # C:\OEM + install.bat
+    restart: "no"
+    stop_grace_period: 2m

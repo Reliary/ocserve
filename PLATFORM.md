@@ -233,6 +233,25 @@ Exit:
 Deliverables: PTY variant; path probe from the darwin freeze binary; RSS via `task_info`
 (behind the existing `rss_bytes()` seam); trim measurement.
 
+**Implemented.** Darwin's libc is missing `ptsname_r`, `TIOCSCTTY` and `TIOCSWINSZ` (verified in
+the crate source), so the Linux open sequence cannot compile there — CI proved it with
+`error[E0425]: cannot find function ptsname_r`. But Darwin *does* have `forkpty`, which performs
+openpty + setsid + TIOCSCTTY + dup2 internally. So:
+
+- `posix.rs` — post-fork behaviour (reader thread, waiter thread, write, group kill, exit-code
+  mapping) in one copy used by both platforms.
+- `unix.rs` — reduced to the Linux-specific open sequence (`posix_openpt` … `TIOCSCTTY`).
+- `macos.rs` — `forkpty` + `execve`, with `TIOCSWINSZ`/`TIOCGWINSZ` declared as Darwin ABI
+  constants (`0x80087467` / `0x40087468`) and a `TIOCGWINSZ` round-trip test that fails if the
+  constant is wrong.
+
+**Verification boundary.** `cargo check --target x86_64-apple-darwin` and
+`--target aarch64-apple-darwin` under `-D warnings` both pass for the PTY modules. That is a
+real Darwin compile check, run through a libc-only harness because the full crate needs a macOS
+SDK for `libsqlite3-sys`. Runtime behaviour is **not** verified locally — the macOS CI runner is
+the oracle (`cargo test -p ocserve-pty` + `--test pty` + the winsize round-trip). Until it
+reports green, macOS runtime is `D-MACOS-RUNTIME`.
+
 Exit: macOS runner green on the full suite *and* PTY e2e (create/type/resize/exit/kill),
 `pair-check` against `opencode-darwin-arm64@1.18.31`, TUI attach. Any item not met is a
 `D-MACOS-*` row, not a silent pass.

@@ -1,20 +1,16 @@
-//! Unix PTY spawn: openpty + fork + setsid + TIOCSCTTY + execvp.
+//! Linux PTY spawn: `posix_openpt` + `fork` + `setsid` + `TIOCSCTTY` + `execve`.
 //!
-//! Mirrors the node-pty pattern upstream uses: open a pty pair, fork, in
-//! the child `setsid` + `TIOCSCTTY` + `dup2` the slave onto stdio +
-//! `chdir` + `execvp`; in the parent keep the master for read/write/resize.
+//! Mirrors the node-pty pattern upstream uses. Everything after the fork is in
+//! `posix.rs` and shared with macOS, so this file contains only the part that is
+//! genuinely Linux-specific: how the pty pair is opened and how the child is
+//! put into its own session with the slave as its controlling terminal.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use crate::Session;
-
-const F_SETFL: i32 = 4;
-const O_NONBLOCK: i32 = 0o4000;
-const EIO: i32 = 5;
-const EAGAIN: i32 = 11;
-const EBADF: i32 = 9;
+use crate::posix;
 
 pub struct Proc {
     pub pid: u32,
@@ -23,47 +19,29 @@ pub struct Proc {
     alive: Arc<AtomicBool>,
 }
 
-fn cstring(s: &str) -> Vec<u8> {
-    let mut v: Vec<u8> = s.bytes().collect();
-    v.push(0);
-    v
-}
-
 pub fn spawn(
     command: &str,
     args: &[String],
     cwd: &str,
     env: &[(String, String)],
 ) -> Result<Proc, String> {
-    // Reject interior NULs: `cstring` just appends a terminator, so a NUL in
-    // `command` truncates the executed binary while `info.command` shows the
-    // full string, and a NUL in an env value becomes extra env entries at
-    // execve (argv[0]/env would not match what the API reported).
-    let has_nul = command.contains('\0')
-        || cwd.contains('\0')
-        || args.iter().any(|a| a.contains('\0'))
-        || env
-            .iter()
-            .any(|(k, v)| k.contains('\0') || v.contains('\0'));
-    if has_nul {
-        return Err("pty spawn input contains a NUL byte".to_string());
-    }
+    posix::reject_nul(command, args, cwd, env)?;
 
-    // P4: pre-build every C string BEFORE fork. Only async-signal-safe calls
-    // are permitted between fork and execve in a multi-threaded process;
-    // `format!`/`Vec` growth there can deadlock on allocator contention.
-    let cwd_c = cstring(cwd);
+    // Pre-build every C string BEFORE fork. Only async-signal-safe calls are
+    // permitted between fork and execve in a multi-threaded process; `format!`
+    // and `Vec` growth there can deadlock on allocator contention.
+    let cwd_c = posix::cstring(cwd);
     let env_strings: Vec<Vec<u8>> = env
         .iter()
-        .map(|(k, v)| cstring(&format!("{k}={v}")))
+        .map(|(k, v)| posix::cstring(&format!("{k}={v}")))
         .collect();
     let mut envv: Vec<*const libc::c_char> = env_strings
         .iter()
         .map(|s| s.as_ptr() as *const libc::c_char)
         .collect();
     envv.push(std::ptr::null());
-    let file = cstring(command);
-    let arg_strings: Vec<Vec<u8>> = args.iter().map(|a| cstring(a)).collect();
+    let file = posix::cstring(command);
+    let arg_strings: Vec<Vec<u8>> = args.iter().map(|a| posix::cstring(a)).collect();
     let mut argv: Vec<*const libc::c_char> = Vec::with_capacity(args.len() + 2);
     argv.push(file.as_ptr() as *const libc::c_char);
     for a in &arg_strings {
@@ -99,7 +77,7 @@ pub fn spawn(
             return Err(format!("fork failed: {}", std::io::Error::last_os_error()));
         }
         if fd == 0 {
-            // child: new session, controlling tty = slave, stdio = slave.
+            // Child: new session, controlling tty = slave, stdio = slave.
             let slave = libc::open(name.as_ptr(), flags);
             if slave < 0 {
                 libc::_exit(127);
@@ -116,9 +94,8 @@ pub fn spawn(
 
             libc::chdir(cwd_c.as_ptr() as *const libc::c_char);
 
-            // The child's env is passed explicitly (execvpe-style via
-            // execve); upstream merges process.env + overrides — the caller
-            // pre-merges, so use execve with an explicit envp.
+            // The child's env is passed explicitly (execve); the caller
+            // pre-merges process env + overrides.
             libc::execve(
                 file.as_ptr() as *const libc::c_char,
                 argv.as_ptr(),
@@ -127,11 +104,8 @@ pub fn spawn(
             libc::_exit(127);
         }
 
-        // parent: non-blocking master for the reader thread.
-        let f = libc::fcntl(master, F_SETFL, O_NONBLOCK);
-        if f < 0 {
-            // non-fatal: blocking reader still works, just slower to stop
-        }
+        // Parent: non-blocking master for the reader thread.
+        let _ = libc::fcntl(master, posix::F_SETFL, libc::O_NONBLOCK);
         Ok(Proc {
             pid: fd as u32,
             master: OwnedFd::from_raw_fd(master),
@@ -142,140 +116,28 @@ pub fn spawn(
 
 impl Proc {
     pub fn write(&self, data: &str) {
-        let bytes = data.as_bytes();
-        let fd = self.master.as_raw_fd();
-        let mut off = 0usize;
-        while off < bytes.len() {
-            let n = unsafe {
-                libc::write(
-                    fd,
-                    bytes[off..].as_ptr() as *const libc::c_void,
-                    bytes.len() - off,
-                )
-            };
-            if n <= 0 {
-                break;
-            }
-            off += n as usize;
-        }
+        posix::write_fd(self.master.as_raw_fd(), data.as_bytes());
     }
 
     pub fn resize(&self, rows: u16, cols: u16) {
-        let ws = libc::winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        unsafe {
-            libc::ioctl(
-                self.master.as_raw_fd(),
-                libc::TIOCSWINSZ as _,
-                &ws as *const libc::winsize,
-            );
-        }
+        posix::set_winsize(self.master.as_raw_fd(), libc::TIOCSWINSZ, rows, cols);
     }
 
     pub fn kill(&self) {
-        if !self.alive.load(Ordering::SeqCst) {
+        if !self.alive.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        unsafe {
-            // process group (setsid child): negative pid; fall back to pid.
-            if libc::kill(-(self.pid as i32), libc::SIGTERM) != 0 {
-                libc::kill(self.pid as i32, libc::SIGTERM);
-            }
-        }
+        posix::kill_group(self.pid);
     }
 
-    /// Reader + waiter threads.
     pub fn start(&self, session: Arc<Session>, on_exit: Arc<dyn Fn(Option<i32>) + Send + Sync>) {
-        // Reader gets its own dup of the master; the parent keeps the
-        // original for write/resize.
-        let master = unsafe { libc::dup(self.master.as_raw_fd()) };
-        if master < 0 {
-            // Without a reader there is no output path; still wait for exit.
-        }
-        let alive = self.alive.clone();
-        let alive_reader = self.alive.clone();
-        let pid = self.pid as i32;
-
-        if master >= 0 {
-            std::thread::Builder::new()
-                .name("pty-reader".into())
-                .spawn(move || {
-                    // OwnedFd closes the dup on drop.
-                    // keep the raw fd and read via libc (OwnedFd has no
-                    // Read impl); closed on drop through a guard.
-                    struct FdGuard(i32);
-                    impl Drop for FdGuard {
-                        fn drop(&mut self) {
-                            unsafe { libc::close(self.0) };
-                        }
-                    }
-                    let _guard = FdGuard(master);
-                    let mut buf = [0u8; 65536];
-                    loop {
-                        let n = unsafe {
-                            libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-                        };
-                        if n > 0 {
-                            session.push_output(
-                                String::from_utf8_lossy(&buf[..n as usize]).into_owned(),
-                            );
-                            continue;
-                        }
-                        let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                        match err {
-                            0 if n == 0 => break, // EOF
-                            EIO | EBADF => break,
-                            EAGAIN => {
-                                std::thread::sleep(std::time::Duration::from_millis(1));
-                                if !alive_reader.load(Ordering::SeqCst) {
-                                    break;
-                                }
-                            }
-                            _ => break,
-                        }
-                    }
-                })
-                .ok();
-        }
-
-        std::thread::Builder::new()
-            .name("pty-waiter".into())
-            .spawn(move || {
-                let mut status: i32 = 0;
-                let code = loop {
-                    let r = unsafe { libc::waitpid(pid, &mut status, 0) };
-                    if r == pid {
-                        break exit_code(status);
-                    }
-                    if r < 0 {
-                        // ECHILD (already reaped) or EINTR — stop looping on
-                        // ECHILD.
-                        let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                        if err == libc::ECHILD {
-                            break None;
-                        }
-                    }
-                };
-                alive.store(false, Ordering::SeqCst);
-                // let the reader drain final output before subscribers end
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                on_exit(code);
-            })
-            .ok();
-    }
-}
-
-/// WIFEXITED → code; signal-terminated → None (upstream node-pty reports
-/// no exitCode on signals).
-fn exit_code(status: i32) -> Option<i32> {
-    if status & 0x7f == 0 {
-        Some((status >> 8) & 0xff)
-    } else {
-        None
+        posix::start_threads(
+            self.pid,
+            self.master.as_raw_fd(),
+            self.alive.clone(),
+            session,
+            on_exit,
+        );
     }
 }
 

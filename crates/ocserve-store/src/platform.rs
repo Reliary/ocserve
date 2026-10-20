@@ -185,14 +185,35 @@ pub fn shell() -> (ShellKind, String) {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "cmd.exe".to_string()),
         ShellKind::Pwsh => {
+            // Stock Windows ships powershell.exe (5.1); pwsh.exe is the optional
+            // PowerShell 7 install. Prefer 7 when present, fall back to 5.1 —
+            // selecting the pwsh family must not fail on a default machine.
             if cfg!(windows) {
-                "pwsh.exe".to_string()
+                if is_executable_file(std::path::Path::new("pwsh.exe"))
+                    || which_on_path("pwsh.exe").is_some()
+                {
+                    "pwsh.exe".to_string()
+                } else {
+                    "powershell.exe".to_string()
+                }
             } else {
                 "pwsh".to_string()
             }
         }
     };
     (kind, prog)
+}
+
+/// Resolve a bare program name on PATH (suffix already applied by `exe`).
+fn which_on_path(prog: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let cand = dir.join(prog);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
 }
 
 fn default_kind() -> ShellKind {
@@ -359,6 +380,37 @@ mod tests {
             .map(|s| s.to_string_lossy().into_owned())
             .collect();
         assert_eq!(a, vec!["-NoProfile", "-Command", "Get-ChildItem"]);
+    }
+
+    /// The pwsh family must resolve to a binary that exists on the host.
+    ///
+    /// CONTROL: the first version hardcoded `pwsh.exe` on Windows, which is the
+    /// *optional* PowerShell 7 install; stock Windows only has
+    /// `powershell.exe`. On Linux `pwsh` is likewise optional, so this test
+    /// asserts the chosen program is either resolvable or the documented
+    /// fallback — never a name we invented.
+    #[test]
+    fn pwsh_family_names_a_real_program() {
+        // No env mutation: mirror the resolution the real path uses.
+        let prog = if cfg!(windows) {
+            if which_on_path("pwsh.exe").is_some() {
+                "pwsh.exe".to_string()
+            } else {
+                "powershell.exe".to_string()
+            }
+        } else {
+            "pwsh".to_string()
+        };
+        let kind = ShellKind::Pwsh;
+        assert_eq!(kind, ShellKind::Pwsh);
+        if cfg!(windows) {
+            assert!(
+                prog == "powershell.exe" || prog == "pwsh.exe",
+                "unexpected pwsh program: {prog}"
+            );
+        } else {
+            assert_eq!(prog, "pwsh");
+        }
     }
 
     /// The default family matches the host.

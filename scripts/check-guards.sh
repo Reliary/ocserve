@@ -568,7 +568,10 @@ capdiff_restore() { [ -f "$_capdiff_plant_bak" ] && mv -f "$_capdiff_plant_bak" 
 trap capdiff_restore EXIT
 cp bench/capdiff/capdiff.py "$_capdiff_plant_bak"
 trap 'capdiff_restore; trap - EXIT' EXIT
-sed -i 's/^def provider_view(/def provider_view_DISABLED(/' bench/capdiff/capdiff.py
+# `-i.bak` is the portable form: BSD sed (macOS) requires a suffix argument,
+# GNU sed tolerates one. The backup is removed right after.
+sed -i.bak 's/^def provider_view(/def provider_view_DISABLED(/' bench/capdiff/capdiff.py
+rm -f bench/capdiff/capdiff.py.bak
 if grep -q "^def provider_view(" bench/capdiff/capdiff.py; then
   echo "FAIL: planted comparator removal not detected (rule 27 vacuous)"; fail=1
 else

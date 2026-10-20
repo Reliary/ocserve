@@ -3182,7 +3182,10 @@ fn compute_cost(pricing: &Option<(f64, f64, f64)>, u: &Usage) -> f64 {
         / 1_000_000.0
 }
 
-#[cfg(test)]
+// Every test here spawns a chmodded shell script, so the whole module is
+// unix-only. Gating only the test left its imports unused on Windows, where CI
+// runs with `-D warnings` (PLATFORM.md §1.2).
+#[cfg(all(test, unix))]
 mod sift_wiring_tests {
     use super::*;
     use serde_json::json;

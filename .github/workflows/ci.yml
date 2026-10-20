@@ -188,10 +188,17 @@ jobs:
         # Step summaries and artifacts both need auth to read on this repo; an
         # ANNOTATION is visible in the run UI without any. One line per distinct
         # error so the failure is legible without `gh`.
+        # `check.log` carries ANSI colour codes, so `^error` never matched and
+        # `-eo pipefail` failed the diagnostic step itself. Strip escapes, and
+        # never let this step fail the job (`|| true`): diagnostics that can go
+        # red are the same defect class as a guard nobody can observe.
         run: |
-          grep -E '^error(\[|:)' check.log | sort -u | head -20 | while IFS= read -r line; do
-            echo "::error title=${{ matrix.os }}::$line"
-          done
+          sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' check.log \
+            | grep -E '^error(\[|:)' \
+            | sort -u | head -20 \
+            | while IFS= read -r line; do
+                echo "::error title=${{ matrix.os }}::$line"
+              done || true
           exit 0
       - name: upload check log
         if: always()
@@ -200,11 +207,24 @@ jobs:
           name: check-${{ matrix.os }}
           path: check.log
           if-no-files-found: ignore
-      - name: guard 43 (platform API behind a platform guard)
-        if: runner.os != 'Windows'
-        # The guard is bash+python; keep it on macOS so a macOS-only regression
-        # is caught by the platform that can actually compile.
+      - name: guard suite (macOS)
+        if: runner.os == 'macOS'
+        # The guard suite is bash+python. Running it here proves the scripts are
+        # BSD-userland clean (the rule-27 plant used `sed -i` without a suffix,
+        # which is GNU-only).
         run: ./scripts/check-guards.sh
+
+      - name: PTY acceptance (macOS)
+        if: runner.os == 'macOS'
+        # This is the line between "wrote a macOS PTY" and "a macOS runner
+        # exercised it": real forkpty spawn, type, resize (TIOCGWINSZ round-trip
+        # proves the Darwin ioctl constant), exit code, and kill.
+        # `-D warnings` matches the toolchain's default RUSTFLAGS.
+        shell: bash
+        run: |
+          set -o pipefail
+          RUSTFLAGS="-D warnings" cargo test -p ocserve-pty -- --nocapture 2>&1 | tee pty.log
+          RUSTFLAGS="-D warnings" cargo test -p ocserve-http --test pty 2>&1 | tee -a pty.log
 
   audit:
     name: audit + deny
