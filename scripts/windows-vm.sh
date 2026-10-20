@@ -28,6 +28,33 @@ die() { echo "windows-vm: $*" >&2; exit 1; }
 
 compose() { (cd "$W" && docker compose --env-file .env "$@"); }
 
+# Start/stop the guest arms through a scheduled task.
+#
+# `Start-Process` inside an SSH session dies when the session closes: Win32
+# OpenSSH puts the remote shell in a job object and tears the tree down.
+# Measured: the first attempt logged one line and vanished, leaving no listeners.
+# A scheduled task run as SYSTEM is the supported way to detach.
+arms_start() {
+  ssh "${SSH_OPTS[@]}" Docker@127.0.0.1 '
+    schtasks /Create /TN ocserve-arms /TR "powershell -NoProfile -ExecutionPolicy Bypass -File C:\ocserve\start-arms.ps1" /SC ONCE /ST 00:00 /RU SYSTEM /F >NUL &&
+    schtasks /Run /TN ocserve-arms >NUL' || die "could not launch the arms task"
+  for _ in $(seq 1 60); do
+    if ssh "${SSH_OPTS[@]}" Docker@127.0.0.1 \
+        'powershell -NoProfile -Command "if ((Test-NetConnection 127.0.0.1 -Port 4926 -InformationLevel Quiet) -and (Test-NetConnection 127.0.0.1 -Port 4927 -InformationLevel Quiet)) { exit 0 } else { exit 1 }"' 2>/dev/null; then
+      say "arms listening"
+      return 0
+    fi
+    sleep 2
+  done
+  die "arms never listened (C:\\ocserve\\*.err.log in the guest)"
+}
+
+arms_stop() {
+  ssh "${SSH_OPTS[@]}" Docker@127.0.0.1 '
+    schtasks /End /TN ocserve-arms >NUL 2>&1
+    powershell -NoProfile -Command "Get-Process ocserve,freeze -ErrorAction SilentlyContinue | Stop-Process -Force"' >/dev/null 2>&1 || true
+}
+
 wait_ssh() {
   local deadline=$(( $(date +%s) + ${1:-2400} ))
   say "waiting for ssh on 127.0.0.1:2222 (first boot installs Windows: 15-40 min)"
@@ -80,6 +107,9 @@ case "${1:-}" in
     # on Linux (it is the same binary used for every other pair run).
     [ -f target/x86_64-pc-windows-msvc/debug/ocserve.exe ] ||
       die "build first: cargo xwin build -p ocserve --target x86_64-pc-windows-msvc"
+    # Windows refuses to overwrite a running executable ("dest open: Failure"),
+    # which silently left the arms on a stale binary until this was added.
+    arms_stop
     ssh "${SSH_OPTS[@]}" Docker@127.0.0.1 'if not exist C:\ocserve mkdir C:\ocserve' || true
     scp -i "$KEY" -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       target/x86_64-pc-windows-msvc/debug/ocserve.exe Docker@127.0.0.1:C:/ocserve/ocserve.exe
@@ -94,12 +124,11 @@ case "${1:-}" in
     # `pair-check.sh` cannot be reused here because it boots its own arms; this
     # invokes the comparator it wraps (`replay --pair`) directly.
     say "starting freeze + ocserve in the guest"
-    ssh "${SSH_OPTS[@]}" Docker@127.0.0.1 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\ocserve\start-arms.ps1' \
-      || die "start-arms.ps1 failed (see C:\ocserve\*.log in the guest)"
+    arms_start
 
     ssh "${SSH_OPTS[@]}" -N -L 4926:127.0.0.1:4926 -L 4927:127.0.0.1:4927 Docker@127.0.0.1 &
     tun=$!
-    trap 'kill $tun 2>/dev/null || true; ssh "${SSH_OPTS[@]}" Docker@127.0.0.1 "powershell -NoProfile -File C:\\ocserve\\stop-arms.ps1" >/dev/null 2>&1 || true' EXIT
+    trap 'kill $tun 2>/dev/null || true; arms_stop' EXIT
     sleep 5
 
     allow="$PWD/bench/pair/allow.txt"

@@ -271,6 +271,23 @@ cross-compiled from Linux without the Windows SDK; that was verified here, not a
 Deliverables: ConPTY (Job Object first); shell families; `scope_path` normalizer + corpus;
 `EXE_SUFFIX` end-to-end (bun/node/MCP); `taskkill`/Job Object tree kill; long-path policy.
 
+**Status: partially complete, verified in a real VM.** Windows 11 LTSC 24H2 under
+`dockurr/windows` (KVM). What the VM proved, in the order it was found:
+
+1. **The release binary did not start.** Exit `0xC0000135` (STATUS_DLL_NOT_FOUND): the MSVC build
+   imports `VCRUNTIME140.dll`, which is on a developer machine and not on stock Windows. Fixed with
+   `+crt-static` in `.cargo/config.toml` (verified by import table: dynamic = 1 VCRUNTIME import,
+   static = 0; only the static binary runs).
+2. **`config.username` was missing**, because the code reads `USER`/`LOGNAME` and Windows sets
+   `USERNAME`. Real divergence from freeze on every Windows machine.
+3. **`/pty/shells` returned `/bin/bash`, `/bin/zsh`, `/bin/sh`** — POSIX paths that do not exist.
+   Now enumerates `pwsh` → `powershell.exe` → git-bash → `%COMSPEC%`, matching upstream's `win()`.
+4. **`POST /shell` works**: the shell-family seam runs `cmd` and returns real output.
+5. **pair-check inside the VM: 18 compared, 0 divergent** against `opencode-windows-x64@1.18.31`.
+
+Still open (W1–W4): ConPTY (the PTY route still returns the documented stub error), Job Object
+tree-kill, `scope_path` Windows normalizer, long-path policy. None of those are claimed.
+
 Exit: Windows runner: full suite, PTY e2e, `cmd` and `pwsh` bash-tool e2e, `pair-check`
 against `opencode-windows-x64@1.18.31`, WAL-on-network-share detection test.
 

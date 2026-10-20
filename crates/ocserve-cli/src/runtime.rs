@@ -600,8 +600,13 @@ impl Runtime {
             for k in ["agent", "command", "mode"] {
                 obj.entry(k).or_insert(json!({}));
             }
+            // Windows sets USERNAME, not USER/LOGNAME. Without it the key was
+            // simply absent there, and /config diverged from freeze on every
+            // Windows machine (found by the Windows pair run).
             if !obj.contains_key("username")
-                && let Ok(u) = std::env::var("USER").or_else(|_| std::env::var("LOGNAME"))
+                && let Ok(u) = std::env::var("USER")
+                    .or_else(|_| std::env::var("LOGNAME"))
+                    .or_else(|_| std::env::var("USERNAME"))
                 && !u.is_empty()
             {
                 obj.insert("username".into(), json!(u));

@@ -1,0 +1,15 @@
+# Windows: link the C runtime statically.
+#
+# Without this, an MSVC build depends on `VCRUNTIME140.dll`, which is present on
+# a developer machine (Visual Studio / the redistributable) but NOT on a stock
+# Windows install. Measured in the Windows 11 LTSC VM: the dynamic binary exits
+# `0xC0000135` (STATUS_DLL_NOT_FOUND) before printing anything; the same binary
+# with `+crt-static` runs and reports its version.
+#
+# That is a distribution bug, not a test artefact: a release tarball a user
+# unpacks on a clean machine has to start.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
