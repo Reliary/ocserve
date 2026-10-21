@@ -27,6 +27,69 @@ pub const EIO: i32 = libc::EIO;
 pub const EAGAIN: i32 = libc::EAGAIN;
 pub const EBADF: i32 = libc::EBADF;
 
+/// Pre-open a class leaf's `cgroup.procs` in the parent so the child can move
+/// itself with a single async-signal-safe `write` — no allocation and no path
+/// lookup between `fork` and `execve` (the rule this file already follows).
+/// Linux-only: cgroup v2 has no macOS equivalent, and `leaf()` is None there.
+#[cfg(target_os = "linux")]
+pub fn open_leaf_procs() -> Option<std::os::fd::OwnedFd> {
+    let path = ocserve_store::cgroup::leaf("pty")?.join("cgroup.procs");
+    let f = std::fs::OpenOptions::new().write(true).open(path).ok()?;
+    Some(f.into())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn open_leaf_procs() -> Option<std::os::fd::OwnedFd> {
+    None
+}
+
+/// Child half of PTY containment. `procs` is the pre-opened fd from
+/// [`open_leaf_procs`]. Linux-only; must stay async-signal-safe (raw `open`
+/// and `write`, a stack-formatted pid, no allocation).
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // async-signal-safe child path: raw getpid/write/open/close
+pub fn contain_child(procs: Option<&std::os::fd::OwnedFd>) {
+    use std::os::fd::AsRawFd;
+    // Format the pid by hand: `format!` allocates, and allocation between
+    // fork and execve in a multi-threaded process can deadlock.
+    let mut buf = [0u8; 16];
+    let mut n = 0usize;
+    let mut v = unsafe { libc::getpid() } as u64;
+    let mut digits = [0u8; 20];
+    let mut d = digits.len();
+    loop {
+        d -= 1;
+        digits[d] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    buf[n..n + (digits.len() - d)].copy_from_slice(&digits[d..]);
+    n += digits.len() - d;
+    buf[n] = b'\n';
+    n += 1;
+    if let Some(file) = procs {
+        unsafe {
+            libc::write(file.as_raw_fd(), buf.as_ptr().cast(), n);
+            libc::close(file.as_raw_fd());
+        }
+    }
+    // Raise our own OOM badness: a memcg kill takes the terminal, not the
+    // server. `/proc` is Linux-only, which is why this lives here.
+    unsafe {
+        let adj = c"/proc/self/oom_score_adj";
+        let fd = libc::open(adj.as_ptr(), libc::O_WRONLY);
+        if fd >= 0 {
+            libc::write(fd, c"500".as_ptr().cast(), 3);
+            libc::close(fd);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn contain_child(_procs: Option<&std::os::fd::OwnedFd>) {}
+
 /// NUL-terminated bytes for `execve`'s argv/envp.
 pub fn cstring(s: &str) -> Vec<u8> {
     let mut v: Vec<u8> = s.bytes().collect();

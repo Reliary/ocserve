@@ -42,6 +42,10 @@ pub fn spawn(
     envv.push(std::ptr::null());
     let file = posix::cstring(command);
     let arg_strings: Vec<Vec<u8>> = args.iter().map(|a| posix::cstring(a)).collect();
+    // Containment: pre-open the class leaf's cgroup.procs in the PARENT so the
+    // child can move itself with one raw write (SRE §5.2). Pre-opening also
+    // means the child never does a path lookup or allocation after fork.
+    let procs = posix::open_leaf_procs();
     let mut argv: Vec<*const libc::c_char> = Vec::with_capacity(args.len() + 2);
     argv.push(file.as_ptr() as *const libc::c_char);
     for a in &arg_strings {
@@ -93,6 +97,9 @@ pub fn spawn(
             libc::close(master);
 
             libc::chdir(cwd_c.as_ptr() as *const libc::c_char);
+
+            // Move into kids/pty and raise oom_score_adj before execve.
+            posix::contain_child(procs.as_ref());
 
             // The child's env is passed explicitly (execve); the caller
             // pre-merges process env + overrides.

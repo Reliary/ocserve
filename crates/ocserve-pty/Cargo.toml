@@ -10,6 +10,7 @@ homepage.workspace = true
 
 [dependencies]
 ocserve-core = { workspace = true }
+ocserve-store = { workspace = true }
 serde_json.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }

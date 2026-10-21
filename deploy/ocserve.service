@@ -26,6 +26,13 @@ UMask=0077
 # Re-add with real allocator wiring if/when profiling justifies it.
 Restart=on-failure
 RestartSec=5
+# Pin child OOM badness explicitly. The kernel default is inherited from the
+# manager (systemd.exec: "defaults to the OOM score adjustment level of the
+# service manager itself"), and on this distro every user unit lands at 200
+# while the user manager is at 100 — a value we could not trace to any unit
+# file. Making 200 a property of OUR config instead of a distro default means
+# the 300-point gap to children (wrapper sets 500) is guaranteed, not lucky.
+OOMScoreAdjust=200
 # Combined cgroup budget: ocserve ≤300MB + node plugin sidecar ≤160MB +
 # streaming-generation burst margin. Measured 2026-10: cgroup steady
 # 341-347MB (ocserve + sidecar); a first-run long generation tripped a 480M
@@ -71,6 +78,14 @@ OOMPolicy=continue
 # memory.peak pinned at exactly 786,432,000. Kids ceiling stays 700M;
 # 1024M = kids 700 + main ~250 allowance + slab. Kill switch evidence kept:
 # bytehound proved fragmentation-not-leak, so this is spike headroom.
+# 2026-10-21: the cap number was never the bug — PLACEMENT was. A bash tool
+# call ran `nohup cargo build &`; the tool returned, the shell exited, and the
+# build kept running in main/ (no ceiling, adj=200) until the kernel OOM-killed
+# the SERVER at 321MB while the build held ~600MB. Children now move
+# themselves into per-class leaves (kids/{plugin,mcp,tools,pty}) before exec,
+# so the same build is capped and reclaimable. `kids.max + main.low` vs this
+# cap is logged at boot: 700 + 320 leaves 4 MB for slab/cache, which is tight
+# and is the next number to settle from per-leaf soak peaks, not from a guess.
 MemoryMax=1024M
 MemorySwapMax=0
 ProtectSystem=strict

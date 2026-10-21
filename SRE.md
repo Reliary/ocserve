@@ -191,11 +191,25 @@ other than the async worker (thread identity recorded by a test-only seam).
      "first node/bun child" scan could hit the browser host after any
      respawn). Metrics: `ocserve_sidecar_recycle_total{reason="rss"}`.
   3. **L2 cgroup partition** (`partition.rs`): `mkdir main kids → move self
-     into main/ → +memory → kids/memory.max=700M` (kernel no-internal-
-     process rule); the A3 wrapper moves every child into `kids/` via
-     per-Command `OCSERVE_KIDS_CGROUP` env. Children get a chosen ceiling
-     (covers the measured 614 MB embedding burst); main's reserve under
-     `MemoryMax` becomes structural instead of an `oom_score_adj` lottery.
+     into main/ → +memory +pids → kids/memory.max=700M`, then four class
+     leaves (`kids/{plugin,mcp,tools,pty}`) each with `memory.oom.group=1`
+     and `pids.max=1024` (kernel no-internal-process rule). Every child spawn
+     goes through `ocserve_store::cgroup` (guard rule 45), whose wrapper
+     moves the child into its leaf and sets `oom_score_adj=500` before `exec`.
+     **Placement is the control; the cap is the guardrail** (2026-10-21: a
+     bash tool ran `nohup cargo build &`; the tool returned, the shell exited,
+     and the build stayed in `main/` at adj=200 until the kernel killed the
+     SERVER at 321 MB while the build held ~600 MB. Had it been in
+     `kids/tools`, total would have been 223+600=823 MB — under the cap, no
+     OOM at all. The cap number was never the bug). Leaves are separate
+     because `kids/` holds independent services: `oom.group=1` on the
+     aggregate would kill the browser host because a build spiked.
+     `main/memory.low=320M` makes main the reclaim-protected side, so
+     pressure shrinks kids first. Boot logs the budget (`kids.max + main.low`
+     vs parent `MemoryMax`, wanting 64 MB of slab/cache headroom) and WARNs
+     when it is tight. Current numbers are tight by that test: 700 + 320
+     against 1024 leaves 4 MB, which is the next thing to settle from a soak
+     with per-leaf peaks, not from a guess.
      **Probe-first:** root-exists / owned-by-us / `memory` in controllers /
      subtree-writable probed before any mutation; any failure → metric
      `ocserve_cgroup_partition{result="unavailable"}` + today's flat shared
@@ -223,8 +237,17 @@ other than the async worker (thread identity recorded by a test-only seam).
      section; kill-policy proof and recycle gauge unchanged. A
      larger ceiling costs **nothing at idle** (cgroups charge on touch) —
      leak detection is the recycle gauge + soak slope, never cap proximity.
-     Also: `Delegate=yes` (systemd stops managing the unit subtree so the
-     dance can run), `MemorySwapMax=0` (fail-fast over swap — the reason
+     Also: the dance needs a **delegated** cgroup tree. It works because the
+     user manager (`user@.service`) is delegated; the unit itself does NOT set
+     `Delegate=yes` (an earlier revision of this section claimed it did, and
+     no unit ever carried the line). `memory.low` on `main/` rather than a
+     cap is deliberate: a hard main cap kills the server during a
+     migration-class spike, while protection plus a capped kids subtree makes
+     the kernel pick a child. `OOMScoreAdjust=200` is pinned in the unit
+     because the inherited value could not be traced to any unit file on this
+     host (the manager sits at 100, every user unit at 200); pinning makes the
+     300-point gap to children a property of our config.
+     `MemorySwapMax=0` (fail-fast over swap — the reason
      no `MemoryHigh` soft throttle ships yet: without swap it stalls
      instead of shrinking; PSI gauge `ocserve_mem_pressure_avg10` is the
      measure-first gate for revisiting), `Restart=on-failure`,

@@ -25,8 +25,9 @@
 #      after a crash loads as a syntax error at boot; D1) [suite]
 #   9. unit template keeps OOMPolicy=continue (child OOM must not bounce the
 #      service — the 2026-10-06 stop-policy bounce; A3's completion) [suite]
-#  10. A3 child wrapper stays byte-identical in ocserve-mcp + ocserve-plugin
-#      (two copies, no shared dep — drift would silently drop oom_score_adj) [suite]
+#  10. the child containment wrapper is defined exactly once (ocserve-store::cgroup
+#      — the old two-copy form could only protect the two spawn paths that had
+#      it, while tools/pty/git had none) [suite]
 #  11. installer/uninstaller never delete shared opencode state (config, auth,
 #      legacy db, model cache, packages — only ocserve-derived *.normalized.mjs) [suite]
 #  12. pair-check allowlist entries must cite a named D-PAIR row [suite]
@@ -83,6 +84,10 @@
 #  44. platform-specific API sits behind a cfg guard (PSASpotter class: an
 #      ungated `std::os::unix` import broke the Windows build)
 #      [plant: ungated unix import]
+#  45. every runtime child spawn uses the containment seam (the 2026-10-21
+#      OOM: a `nohup ... &` tool child stayed in main/ and the kernel killed
+#      the server; caps do nothing when the child is in the wrong cgroup)
+#      [plant: new spawn file with no seam]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -170,12 +175,16 @@ else
   echo "FAIL: deploy/ocserve.service lost OOMPolicy=continue — child OOM will bounce the whole unit again (A3 class)"; fail=1
 fi
 
-echo "== guard: A3/L1 child wrapper identical in mcp + plugin =="
-w1=$(grep -h 'oom_score_adj' crates/ocserve-mcp/src/lib.rs | grep 'exec' || true)
-w2=$(grep -h 'oom_score_adj' crates/ocserve-plugin/src/lib.rs | grep 'exec' || true)
-if [ -z "$w1" ] || [ -z "$w2" ] || [ "$w1" != "$w2" ]; then
-  echo "mcp:    $w1"; echo "plugin: $w2"
-  echo "FAIL: OOM_CHILD_WRAPPER copies drifted (rule 10 — both spawn paths must carry adj+kids move)"; fail=1
+echo "== guard: child wrapper defined exactly once (rule 10) =="
+# 2026-10-21: L2 moved from "two byte-identical copies" to one definition in
+# ocserve-store::cgroup, because a third and fourth spawn class (tools, pty)
+# never had the wrapper at all — the duplication guard could only protect the
+# two that did.
+copies=$(grep -rl 'oom_score_adj 2>/dev/null; \[ -n "$OCSERVE_KIDS_CGROUP"' crates/*/src 2>/dev/null | wc -l)
+defs=$(grep -rn 'pub const WRAPPER' crates/*/src 2>/dev/null | wc -l)
+if [ "$copies" -ne 1 ] || [ "$defs" -ne 1 ]; then
+  grep -rn 'OCSERVE_KIDS_CGROUP' crates/*/src 2>/dev/null | head -8
+  echo "FAIL: child wrapper must exist exactly once, in ocserve-store/src/cgroup.rs (rule 10; found $copies copies, $defs constants)"; fail=1
 else
   echo "ok"
 fi
@@ -1077,5 +1086,38 @@ else
   echo "ok (planted ungated unix import flagged)"
   rm -f "$plant"
 fi
+
+echo "== guard: every runtime child spawn goes through the containment seam (rule 45) =="
+# The 2026-10-21 kill: a bash tool child stayed in main/ because its spawn site
+# never asked for a leaf. Caps do nothing if the child is in the wrong cgroup,
+# so the check is on spawn SITES, not on limits. File-level, because the seam
+# returns a shape the caller must apply: a file that spawns must also call it.
+spawn_files() {
+  grep -rl 'Command::new(' crates/*/src 2>/dev/null \
+    | grep -v 'crates/ocserve-store/src/cgroup.rs' \
+    | grep -v 'crates/ocserve-store/src/platform.rs' \
+    | grep -v 'crates/ocserve-cli/src/main.rs' \
+    | grep -v 'crates/ocserve-cli/src/lib.rs' \
+    | while read -r f; do
+        grep -q 'cgroup::' "$f" || echo "$f"
+      done
+}
+out=$(spawn_files)
+if [ -n "$out" ]; then
+  echo "$out"
+  echo "FAIL: child spawn without ocserve_store::cgroup containment (rule 45) — see SRE §5.2"
+  fail=1
+else
+  echo "ok"
+fi
+# Planted control: a new spawn site with no seam must be flagged.
+plant="crates/ocserve-core/src/cgroup_plant.rs"
+printf '%s\n' 'fn f() { std::process::Command::new("git").arg("status"); }' > "$plant"
+if spawn_files | grep -q cgroup_plant; then
+  echo "ok (planted uncontained spawn flagged)"
+else
+  echo "FAIL: rule 45 plant was not flagged (the guard is vacuous)"; fail=1
+fi
+rm -f "$plant"
 
 exit $fail

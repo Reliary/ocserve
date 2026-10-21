@@ -362,7 +362,27 @@ fn bash(input: &Value, cwd: &Path, env: &[(String, String)]) -> Result<ToolResul
     // COMSPEC on Windows. Command strings are never translated between
     // dialects — the model writes for the shell it is told about.
     let (kind, program) = ocserve_store::platform::shell();
-    let mut cmd = kind.command(&program, command);
+    // Containment (SRE §5.2): a tool's process tree moves itself into
+    // kids/tools before it executes anything, so a runaway command (or a
+    // `&`-backgrounded one that outlives this call) is capped and reclaimable
+    // without competing with the server in `main/`. Observed 2026-10-21: a
+    // `nohup cargo build &` stayed in main/ at adj=200 and the kernel killed
+    // the server at 321MB while the build held ~600MB.
+    let mut cmd = {
+        let base = kind.command(&program, command);
+        let shape = ocserve_store::cgroup::contained(&program, "tools");
+        if shape.program == "sh" {
+            let mut wrapped = std::process::Command::new(&shape.program);
+            wrapped.args(&shape.prefix);
+            wrapped.args(base.get_args());
+            if let Some(p) = &shape.cgroup {
+                wrapped.env(ocserve_store::cgroup::ENV, p);
+            }
+            wrapped
+        } else {
+            base
+        }
+    };
     cmd.current_dir(cwd)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(std::process::Stdio::null())

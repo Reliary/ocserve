@@ -1930,7 +1930,7 @@ fn freeze_dir_path(dir: &str) -> (String, String) {
 /// `git rev-parse --show-toplevel` for `dir` (no shell). None when the dir is
 /// absent, not a repo, or git is unavailable.
 fn git_toplevel(dir: &str) -> Option<String> {
-    let out = std::process::Command::new("git")
+    let out = ocserve_store::cgroup::command("git", "tools")
         .arg("-C")
         .arg(dir)
         .args(["rev-parse", "--show-toplevel"])

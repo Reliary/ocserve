@@ -161,6 +161,11 @@ size_gate() {
   echo "size=${sz} ceiling=${ceiling}"
   [ "$sz" -le "$ceiling" ] || { echo "OVER SIZE CEILING"; return 1; }
 }
+# cgroup containment (SRE §5.2): boots a transient unit and drives the REAL
+# /shell route. Local-only by design - the dance needs a delegated systemd
+# tree that CI runners do not provide; `check-guards.sh` rule 45 is the CI
+# proxy (static, with a planted control).
+step "child containment battery" bash -c './scripts/cgroup-battery.sh'
 step "uninstall selftest (canary battery)" bash -c './scripts/uninstall.sh --selftest'
 step "binary size ceiling" bash -c "$(declare -f size_gate); size_gate"
 

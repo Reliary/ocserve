@@ -1687,6 +1687,7 @@ version = "0.4.1"
 dependencies = [
  "libc",
  "ocserve-core",
+ "ocserve-store",
  "serde_json",
  "tokio",
  "tracing",

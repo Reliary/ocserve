@@ -160,22 +160,13 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
         tracing::warn!("partition: self-move failed: {e}");
         return Partition::Unavailable("self-move");
     }
-    // now this cgroup has no processes → kernel allows enabling +memory
-    let sc = root.join("cgroup.subtree_control");
-    let existing = std::fs::read_to_string(&sc).unwrap_or_default();
-    if !existing
-        .split_whitespace()
-        .any(|c| c.trim_start_matches('+') == "memory")
-    {
-        let next = if existing.trim().is_empty() {
-            "+memory".to_string()
-        } else {
-            format!("{} +memory", existing.trim())
-        };
-        if let Err(e) = std::fs::write(&sc, next) {
-            tracing::warn!("partition: enable +memory failed: {e}");
-            return Partition::Unavailable("enable-memory");
-        }
+    // now this cgroup has no processes → kernel allows enabling controllers
+    if let Err(e) = enable(
+        root.join("cgroup.subtree_control").as_path(),
+        &["memory", "pids"],
+    ) {
+        tracing::warn!("partition: enable controllers failed: {e}");
+        return Partition::Unavailable("enable-memory");
     }
     let mb: u64 = std::env::var("OCSERVE_KIDS_MEMORY_MAX_MB")
         .ok()
@@ -188,11 +179,126 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
     }
     let kids = root.join("kids");
     let _ = KIDS.set(kids.clone());
-    // hand the path to BOTH spawners (per-crate OnceLock → child env on the
-    // Command itself; no process-global env mutation, no races)
-    ocserve_plugin::set_kids_cgroup(&kids);
-    ocserve_mcp::set_kids_cgroup(&kids);
+
+    // Per-class leaves. `kids/` is a set of independent services, so
+    // `oom.group=1` belongs on each leaf (kill this class as a unit), never on
+    // the aggregate: that would kill the browser host because a build spiked.
+    // Enabling controllers on kids/ requires it to have no processes — true at
+    // boot; if it ever is not (a stale hierarchy), degrade to the flat kids cap
+    // rather than failing the service.
+    let leaves_ok = enable(
+        kids.join("cgroup.subtree_control").as_path(),
+        &["memory", "pids"],
+    )
+    .is_ok();
+    if leaves_ok {
+        for name in ocserve_store::cgroup::LEAVES {
+            let leaf = kids.join(name);
+            if let Err(e) = std::fs::create_dir_all(&leaf) {
+                tracing::warn!("partition: mkdir kids/{name} failed: {e}");
+                continue;
+            }
+            // kill the whole class together; partial death is worse for a
+            // single service than total death (kernel cgroup-v2 §memory.oom.group)
+            write_or_warn(&leaf.join("memory.oom.group"), "1".to_string());
+            // fork-bomb guard: a tool call cannot outrun the class budget
+            write_or_warn(&leaf.join("pids.max"), "1024".to_string());
+        }
+    } else {
+        tracing::warn!(
+            "partition: kids subtree not delegable (processes present) — flat kids cap only"
+        );
+    }
+    // Protection, not a cap: under pressure the kernel reclaims from kids
+    // first. 320M matches main's measured 196-223MB idle envelope with margin.
+    write_or_warn(
+        &root.join("main/memory.low"),
+        (320u64 * 1024 * 1024).to_string(),
+    );
+
+    ocserve_store::cgroup::publish(root);
+    log_budget(root, &kids, mb);
     Partition::Ok
+}
+
+/// Enable controllers in a `cgroup.subtree_control` (idempotent, additive).
+fn enable(sc: &Path, wanted: &[&str]) -> std::io::Result<()> {
+    let existing = std::fs::read_to_string(sc).unwrap_or_default();
+    let missing: Vec<&str> = wanted
+        .iter()
+        .copied()
+        .filter(|w| {
+            !existing
+                .split_whitespace()
+                .any(|c| c.trim_start_matches('+') == *w)
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut next = existing.trim().to_string();
+    for w in missing {
+        if !next.is_empty() {
+            next.push(' ');
+        }
+        next.push('+');
+        next.push_str(w);
+    }
+    std::fs::write(sc, next)
+}
+
+fn write_or_warn(path: &Path, value: String) {
+    if let Err(e) = std::fs::write(path, value) {
+        tracing::warn!("partition: write {} failed: {e}", path.display());
+    }
+}
+
+/// Say the budget out loud instead of implying it in a comment. The 2026-10-21
+/// kill was caused by placement, but the arithmetic was structurally
+/// over-committed: kids 700 + main 320 exceeds the 1024 parent before slab.
+/// Reading the numbers from the kernel keeps this honest if a knob changes.
+fn log_budget(root: &Path, kids: &Path, kids_mb: u64) {
+    let parent_mb = std::fs::read_to_string(root.join("memory.max"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|b| b / 1024 / 1024);
+    let main_low_mb = std::fs::read_to_string(root.join("main/memory.low"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        / 1024
+        / 1024;
+    let leaves = ocserve_store::cgroup::LEAVES
+        .iter()
+        .filter(|n| kids.join(n).is_dir())
+        .count();
+    match parent_mb {
+        Some(p) => {
+            // 64 MB is the working reserve for slab, page tables and the page
+            // cache the server actually touches; a budget that fits only by a
+            // few MB is over-committed in practice (2026-10-21: kids 700 +
+            // main 320 against 1024 leaves 4 MB).
+            const HEADROOM_MB: u64 = 64;
+            let committed = kids_mb + main_low_mb;
+            if committed + HEADROOM_MB > p {
+                tracing::warn!(
+                    "memory budget tight: parent {p}M, kids.max {kids_mb}M + main.low \
+                     {main_low_mb}M leaves {}M for slab/cache (want {HEADROOM_MB}M) — kids \
+                     is reclaimed first so main survives; SRE §5.5",
+                    p.saturating_sub(committed)
+                );
+            } else {
+                tracing::info!(
+                    "memory budget: parent {p}M, kids.max {kids_mb}M + main.low {main_low_mb}M, \
+                     {}M headroom",
+                    p - committed
+                );
+            }
+        }
+        None => tracing::info!(
+            "memory budget: kids.max {kids_mb}M, main.low {main_low_mb}M, {leaves} class leaves"
+        ),
+    }
 }
 
 /// Ownership test. Unix has `MetadataExt::uid`; elsewhere there is no uid and
@@ -242,6 +348,38 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("cgroup.subtree_control"), "").unwrap();
         root
+    }
+
+    #[test]
+    fn leaves_are_created_and_capped() {
+        let root = fixture(true);
+        assert_eq!(setup_in(&root, false), Partition::Ok);
+        for name in ocserve_store::cgroup::LEAVES {
+            let leaf = root.join("kids").join(name);
+            assert!(leaf.is_dir(), "leaf {name} missing");
+            assert_eq!(
+                std::fs::read_to_string(leaf.join("memory.oom.group")).unwrap(),
+                "1",
+                "leaf {name} must die as a unit"
+            );
+            assert_eq!(
+                std::fs::read_to_string(leaf.join("pids.max")).unwrap(),
+                "1024",
+                "leaf {name} needs a fork-bomb bound"
+            );
+        }
+        // Aggregate must NOT carry oom.group: kids/ is a set of independent
+        // services, so a build spiking must not take the browser host with it.
+        assert!(
+            !root.join("kids/memory.oom.group").exists(),
+            "kids/ must not be an oom group"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("main/memory.low")).unwrap(),
+            (320u64 * 1024 * 1024).to_string(),
+            "main must be the reclaim-protected side"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

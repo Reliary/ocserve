@@ -175,18 +175,6 @@ pub fn mcp_child_path(parent_path: &str, home: &str) -> String {
         .unwrap_or_else(|_| parent_path.to_string())
 }
 
-/// `sh -c WRAPPER sh <prog> <args…>` → raise oom_score_adj, move into the
-/// L2 kids cgroup (if the partition dance published one), then exec.
-/// Kept identical in ocserve-mcp + ocserve-plugin (no shared dep) — A3/L2.
-pub const OOM_CHILD_WRAPPER: &str = r#"echo 500 >/proc/self/oom_score_adj 2>/dev/null; [ -n "$OCSERVE_KIDS_CGROUP" ] && echo $$ >"$OCSERVE_KIDS_CGROUP/cgroup.procs" 2>/dev/null; exec "$@""#;
-
-/// L2 partition: path published by ocserve's cgroup dance; children get
-/// it as a per-Command env (race-free — no process-global set_var).
-static KIDS_CGROUP: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-pub fn set_kids_cgroup(p: impl Into<std::path::PathBuf>) {
-    let _ = KIDS_CGROUP.set(p.into());
-}
-
 impl McpClient {
     /// Spawn (local) or prepare (remote). Errors are transport-level only;
     /// initialize() performs the handshake.
@@ -205,21 +193,16 @@ impl McpClient {
                 // without git-bash) it is a syntax error, and MCP would be
                 // unstartable — so it is conditional, not assumed. Losing
                 // oom_score_adj off Linux is correct: there is no such knob.
-                let use_wrapper = cfg!(unix) && ocserve_store::platform::has_posix_shell();
                 let name = ocserve_store::platform::exe(prog);
-                let mut cmd = if use_wrapper {
-                    let mut c = tokio::process::Command::new("sh");
-                    c.arg("-c").arg(OOM_CHILD_WRAPPER).arg("sh").arg(&name);
-                    c
-                } else {
-                    tokio::process::Command::new(&name)
-                };
+                let shape = ocserve_store::cgroup::contained(&name, "mcp");
+                let mut cmd = tokio::process::Command::new(&shape.program);
+                cmd.args(&shape.prefix);
                 let home = ocserve_store::platform::home()
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|| ".".into());
                 let base_path = std::env::var("PATH").unwrap_or_default();
-                if let Some(k) = KIDS_CGROUP.get() {
-                    cmd.env("OCSERVE_KIDS_CGROUP", k);
+                if let Some(p) = &shape.cgroup {
+                    cmd.env(ocserve_store::cgroup::ENV, p);
                 }
                 cmd.args(rest)
                     .env("PATH", mcp_child_path(&base_path, &home))
@@ -1063,7 +1046,7 @@ mod oom_wrapper_tests {
     fn wrapper_raises_child_oom_score_adj() {
         let out = std::process::Command::new("sh")
             .arg("-c")
-            .arg(super::OOM_CHILD_WRAPPER)
+            .arg(ocserve_store::cgroup::WRAPPER)
             .arg("sh")
             .arg("cat")
             .arg("/proc/self/oom_score_adj")

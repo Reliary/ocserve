@@ -60,6 +60,7 @@ pub fn spawn(
     envv.push(std::ptr::null());
     let file = posix::cstring(command);
     let arg_strings: Vec<Vec<u8>> = args.iter().map(|a| posix::cstring(a)).collect();
+    let procs = posix::open_leaf_procs();
     let mut argv: Vec<*const libc::c_char> = Vec::with_capacity(args.len() + 2);
     argv.push(file.as_ptr() as *const libc::c_char);
     for a in &arg_strings {
@@ -86,6 +87,7 @@ pub fn spawn(
         }
         if pid == 0 {
             // Child. `forkpty` has already done setsid + TIOCSCTTY + dup2.
+            posix::contain_child(procs.as_ref());
             libc::chdir(cwd_c.as_ptr() as *const libc::c_char);
             libc::execve(
                 file.as_ptr() as *const libc::c_char,

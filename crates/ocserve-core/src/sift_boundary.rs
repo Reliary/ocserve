@@ -50,7 +50,8 @@ fn cmd_available(cmd: &[String]) -> bool {
 }
 
 fn probe(cmd: &[String]) -> bool {
-    let mut c = std::process::Command::new(&cmd[0]);
+    // Containment (SRE §5.2): sift is a tool, not server work.
+    let mut c = ocserve_store::cgroup::command(&cmd[0], "tools");
     c.args(&cmd[1..]);
     // mirror the MCP PATH fix: systemd PATH lacks ~/.local/bin
     if let Ok(home) = std::env::var("HOME") {
@@ -89,7 +90,7 @@ fn cache() -> &'static Mutex<HashMap<u64, Option<Arc<str>>>> {
 }
 
 fn run_sift(cmd: &[String], raw: &str) -> Option<String> {
-    let mut c = std::process::Command::new(&cmd[0]);
+    let mut c = ocserve_store::cgroup::command(&cmd[0], "tools");
     c.args(&cmd[1..])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

@@ -2209,7 +2209,7 @@ pub async fn vcs_init_api(
         .map(String::from)
         .unwrap_or_else(|| st.paths["directory"].as_str().unwrap_or("/").to_string());
     let out = run_blocking(&st.db, move |_db| {
-        std::process::Command::new("git")
+        ocserve_store::cgroup::command("git", "tools")
             .args(["init", &dir])
             .output()
             .map(|o| {

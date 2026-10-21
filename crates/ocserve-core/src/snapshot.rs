@@ -13,7 +13,9 @@
 //! off the tokio workers (`spawn_blocking`), matching the F1 convoy rule.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::OnceLock;
 
 /// Untracked-file cap (upstream `limit = 2 * 1024 * 1024`).
@@ -692,7 +694,9 @@ fn run_git(
     stdin: Option<&str>,
     env: &[(&str, &str)],
 ) -> GitResult {
-    let mut cmd = Command::new("git");
+    // Containment: shadow-git runs inside kids/tools so a large pack/diff
+    // cannot compete with the server in main/ (SRE §5.2).
+    let mut cmd = ocserve_store::cgroup::command("git", "tools");
     cmd.args(args);
     if let Some(d) = cwd {
         cmd.current_dir(d);
@@ -742,7 +746,8 @@ fn hash_hex(s: &str) -> String {
 
 /// `git rev-parse --show-toplevel` for a directory (the worktree root).
 pub fn git_toplevel(dir: &str) -> Option<String> {
-    let out = Command::new("git")
+    let mut cmd = ocserve_store::cgroup::command("git", "tools");
+    let out = cmd
         .current_dir(dir)
         .args(["rev-parse", "--show-toplevel"])
         .output()

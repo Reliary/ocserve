@@ -9,6 +9,7 @@
 use rusqlite::OptionalExtension;
 
 pub mod blob;
+pub mod cgroup;
 pub mod fork;
 pub mod platform;
 pub mod pragma;

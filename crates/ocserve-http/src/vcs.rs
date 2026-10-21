@@ -21,7 +21,6 @@
 //! §5); `vcs::apply` is the shell-out used by the v2 handler.
 
 use serde_json::{Value, json};
-use std::process::Command;
 
 const MAX_TOTAL_PATCH_BYTES: usize = 10_000_000;
 /// Full context, matching freeze PATCH_CONTEXT_LINES (2^31-1) semantics when
@@ -29,7 +28,8 @@ const MAX_TOTAL_PATCH_BYTES: usize = 10_000_000;
 const FULL_CONTEXT: &str = "2147483647";
 
 fn run_git(dir: &str, args: &[&str]) -> Option<(String, i32)> {
-    let out = Command::new("git")
+    // Containment: a vcs walk on a huge worktree is tool work, not server work.
+    let out = ocserve_store::cgroup::command("git", "tools")
         .current_dir(dir)
         .args(args)
         .output()
@@ -124,7 +124,7 @@ pub fn apply(dir: &str, patch: &str) -> Option<bool> {
     if !is_git(dir) {
         return None;
     }
-    let mut child = Command::new("git")
+    let mut child = ocserve_store::cgroup::command("git", "tools")
         .current_dir(dir)
         .args(["apply", "-"])
         .stdin(std::process::Stdio::piped())

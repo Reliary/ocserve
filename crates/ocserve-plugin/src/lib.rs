@@ -195,18 +195,6 @@ pub struct Sidecar {
     recycled: bool,
 }
 
-/// `sh -c WRAPPER sh <prog> <args…>` → raise oom_score_adj, move into the
-/// L2 kids cgroup (if the partition dance published one), then exec.
-/// Kept identical in ocserve-mcp + ocserve-plugin (no shared dep) — A3/L2.
-pub const OOM_CHILD_WRAPPER: &str = r#"echo 500 >/proc/self/oom_score_adj 2>/dev/null; [ -n "$OCSERVE_KIDS_CGROUP" ] && echo $$ >"$OCSERVE_KIDS_CGROUP/cgroup.procs" 2>/dev/null; exec "$@""#;
-
-/// L2 partition: path published by ocserve's cgroup dance; children get
-/// it as a per-Command env (race-free — no process-global set_var).
-static KIDS_CGROUP: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-pub fn set_kids_cgroup(p: impl Into<std::path::PathBuf>) {
-    let _ = KIDS_CGROUP.set(p.into());
-}
-
 /// Plugin-host runtime: Bun preferred (upstream runs plugins under Bun; real
 /// `bun:sqlite`, TS plugins load, lower RSS floor), Node fallback.
 /// `OCSERVE_PLUGIN_RUNTIME=node|bun` forces one (lab A/B control).
@@ -283,18 +271,15 @@ impl Sidecar {
         let program = which(runtime.program())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| runtime.program().to_string());
-        // Wrapper is POSIX shell only (same rule as ocserve-mcp: one wrapper,
-        // two copies, guard rule 10 keeps them byte-identical).
-        let mut cmd = if cfg!(unix) && ocserve_store::platform::has_posix_shell() {
-            let mut c = Command::new("sh");
-            c.arg("-c")
-                .arg(crate::OOM_CHILD_WRAPPER)
-                .arg("sh")
-                .arg(&program);
-            c
-        } else {
-            Command::new(&program)
-        };
+        // Containment (SRE §5.2): the child moves itself into kids/plugin and
+        // raises its oom_score_adj before exec, so a memcg kill takes the
+        // sidecar (ensure_alive respawns it) instead of the server.
+        let shape = ocserve_store::cgroup::contained(&program, "plugin");
+        let mut cmd = Command::new(&shape.program);
+        cmd.args(&shape.prefix);
+        if let Some(p) = &shape.cgroup {
+            cmd.env(ocserve_store::cgroup::ENV, p);
+        }
         match runtime {
             // Bun (upstream's own plugin runtime): real bun:sqlite + TS
             // plugins load; `--smol` trades GC frequency for a lower RSS
@@ -318,9 +303,6 @@ impl Sidecar {
                 ));
                 cmd.arg("--max-semi-space-size=2");
             }
-        }
-        if let Some(k) = KIDS_CGROUP.get() {
-            cmd.env("OCSERVE_KIDS_CGROUP", k);
         }
         cmd.arg(host_path)
             .stdin(std::process::Stdio::piped())
@@ -1636,7 +1618,7 @@ mod oom_wrapper_tests {
     fn wrapper_raises_child_oom_score_adj() {
         let out = std::process::Command::new("sh")
             .arg("-c")
-            .arg(crate::OOM_CHILD_WRAPPER)
+            .arg(ocserve_store::cgroup::WRAPPER)
             .arg("sh")
             .arg("cat")
             .arg("/proc/self/oom_score_adj")
