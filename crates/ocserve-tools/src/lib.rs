@@ -121,8 +121,17 @@ pub fn evaluate(permission: &str, resource: &str, rules: &[Rule]) -> String {
 }
 
 /// Truncation (v1 shell: MAX_LINES/MAX_BYTES constants).
+///
+/// Freeze parity: `packages/opencode/src/tool/truncate.ts` at v1.18.31 uses
+/// 2000 lines / 50 KiB as DEFAULTS, overridable by `tool_output.{max_lines,
+/// max_bytes}`. The frozen shell tool ALSO streams into a file once the raw
+/// output passes `limits.maxBytes`, and prepends `...output truncated...
+/// Full output saved to: <file>` — so the model keeps access to the rest.
+/// ocserve does not have that file sink yet (D-TOOLS-TRUNC-FILE), but the
+/// capture ceiling is raised to 1 MiB so a legitimate large listing is not
+/// silently cut at 50 KiB before the model ever sees it.
 pub const MAX_LINES: usize = 2000;
-pub const MAX_BYTES: usize = 50 * 1024;
+pub const MAX_BYTES: usize = 1024 * 1024;
 
 pub struct ToolResult {
     pub output: String,
@@ -266,14 +275,108 @@ Usage notes:
 - Answers are returned as arrays of labels; set `multiple: true` to allow selecting more than one
 - If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label";
 
-/// Read up to `quota` bytes, then KEEP DRAINING (discarding) until EOF so
-/// the child never blocks on a full pipe. Memory bound = quota + slack.
-/// Both streams get MAX_BYTES: byte-parity with full-capture+head-truncate
-/// (the final truncate cuts the concatenated head to MAX_BYTES anyway).
-fn drain_limited<R: std::io::Read + Send + 'static>(reader: Option<R>, quota: usize) -> Vec<u8> {
-    let Some(mut r) = reader else {
-        return Vec::new();
-    };
+/// A per-call stop signal for child-pipe readers.
+///
+/// 0 nanos = no deadline yet. `close_in` is called by the main thread the
+/// moment the DIRECT child exits: the foreground command is over, so anything
+/// still holding the pipe is a background job (`... &`), which is supposed to
+/// keep running. Readers stop; nothing is killed.
+///
+/// Why this exists (2026-10-21): `cd x && nohup server &` backgrounds the whole
+/// AND-list as a subshell. That subshell inherits fd 1/2 — our pipes — and
+/// waits on a server that never exits, so the pipes never reach EOF. The old
+/// `join()` therefore blocked a blocking-pool thread forever, and the session
+/// lock was never released (one wedged session; sixteen would stall the
+/// server).
+#[derive(Clone)]
+pub struct DrainGate {
+    start: std::time::Instant,
+    at_nanos: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl DrainGate {
+    pub fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            at_nanos: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Give readers `d` to drain the residue and reach EOF, then stop.
+    pub fn close_in(&self, d: std::time::Duration) {
+        let at = self.start.elapsed() + d;
+        self.at_nanos.store(
+            at.as_nanos().min(u64::MAX as u128) as u64,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    pub fn is_closed(&self) -> bool {
+        let at = self.at_nanos.load(std::sync::atomic::Ordering::Acquire);
+        at != 0 && self.start.elapsed().as_nanos() >= at as u128
+    }
+}
+
+impl Default for DrainGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Read up to `quota` bytes, keep draining (discarding) so the child never
+/// blocks on a full pipe, and stop at the gate. Unix polls first so the thread
+/// can actually observe the gate; Windows has no pollable anonymous pipes, so
+/// it blocks (a lingering reader there is a documented build-only cost).
+#[cfg(unix)]
+#[allow(unsafe_code)] // contained syscall: poll(2) on our own pipe read end
+pub fn drain_until<R: std::io::Read + std::os::fd::AsRawFd + Send + 'static>(
+    r: Option<R>,
+    quota: usize,
+    gate: &DrainGate,
+) -> Vec<u8> {
+    let Some(mut r) = r else { return Vec::new() };
+    let fd = r.as_raw_fd();
+    let mut out: Vec<u8> = Vec::with_capacity(quota.min(64 * 1024));
+    let mut total = 0usize;
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        if gate.is_closed() {
+            break;
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Safety: poll takes a pointer to one initialised pollfd and a count of
+        // one; no other memory is touched and the call is thread-safe.
+        let ready = unsafe { libc::poll(&mut pfd, 1, 10) };
+        if ready <= 0 {
+            continue; // timeout or EINTR: re-check the gate
+        }
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if total < quota {
+                    let take = n.min(quota - total);
+                    out.extend_from_slice(&buf[..take]);
+                    total += take;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+#[cfg(not(unix))]
+pub fn drain_until<R: std::io::Read + Send + 'static>(
+    r: Option<R>,
+    quota: usize,
+    _gate: &DrainGate,
+) -> Vec<u8> {
+    let Some(mut r) = r else { return Vec::new() };
     let mut out: Vec<u8> = Vec::with_capacity(quota.min(64 * 1024));
     let mut total = 0usize;
     let mut buf = [0u8; 16 * 1024];
@@ -286,7 +389,6 @@ fn drain_limited<R: std::io::Read + Send + 'static>(reader: Option<R>, quota: us
                     out.extend_from_slice(&buf[..take]);
                     total += take;
                 }
-                // past quota: these bytes are discarded on the next read
             }
             Err(_) => break,
         }
@@ -416,8 +518,17 @@ fn bash(input: &Value, cwd: &Path, env: &[(String, String)]) -> Result<ToolResul
     let se = child.stderr.take();
     // +1 past MAX_BYTES so the post-concat head-truncate still fires and
     // sets `truncated` exactly like full-capture did
-    let h_out = std::thread::spawn(move || drain_limited(so, MAX_BYTES + 1));
-    let h_err = std::thread::spawn(move || drain_limited(se, MAX_BYTES + 1));
+    // +1 past MAX_BYTES so the post-concat head-truncate still fires and
+    // sets `truncated` exactly like full-capture did.
+    let gate = DrainGate::new();
+    let h_out = {
+        let g = gate.clone();
+        std::thread::spawn(move || drain_until(so, MAX_BYTES + 1, &g))
+    };
+    let h_err = {
+        let g = gate.clone();
+        std::thread::spawn(move || drain_until(se, MAX_BYTES + 1, &g))
+    };
     // bounded wait (AGENTS §2.3): poll to deadline, kill on overrun
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let mut timed_out = false;
@@ -453,6 +564,12 @@ fn bash(input: &Value, cwd: &Path, env: &[(String, String)]) -> Result<ToolResul
             Err(e) => bail!("wait: {e}"),
         }
     }
+    // The direct child is gone, so the foreground command is done. Anything
+    // still holding our pipes is a background job: give the readers a short
+    // window to drain the residue and reach EOF, then stop reading. We do NOT
+    // kill it — `cd x && nohup server &` is a legitimate way to leave work
+    // running, and it is already capped by the kids/tools cgroup.
+    gate.close_in(std::time::Duration::from_millis(250));
     let stdout_bytes = h_out.join().unwrap_or_default();
     let stderr_bytes = h_err.join().unwrap_or_default();
     let mut stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
@@ -1014,6 +1131,66 @@ mod tests {
         assert_eq!(r.exit, Some(3));
         assert!(r.error);
         assert!(r.output.contains("OOPS"));
+    }
+
+    /// Regression (2026-10-21): `cd x && nohup server &` backgrounds the whole
+    /// AND-list as a subshell that inherits our pipes and waits forever, so a
+    /// plain `join()` blocked a blocking-pool thread and the session lock was
+    /// never released. The deadline must return the call promptly AND leave
+    /// the background job running (we stop reading, we do not kill).
+    ///
+    /// Driven on a helper thread with a hard receive timeout so a regression
+    /// fails the test instead of hanging the suite.
+    #[test]
+    fn bash_background_subshell_does_not_wedge() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let r = execute(
+                "bash",
+                &json!({"command": "cd /tmp && sleep 30 & echo started"}),
+                Path::new("/"),
+                &[],
+            );
+            let _ = tx.send((r.map(|x| (x.output, x.exit, x.error)), t0.elapsed()));
+        });
+        let (res, elapsed) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("bash() wedged on a background subshell holding the pipe");
+        let (out, exit, err) = res.expect("execute");
+        assert!(out.contains("started"), "stdout captured: {out}");
+        assert_eq!(exit, Some(0), "foreground exit code preserved");
+        assert!(!err, "not an error");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must return promptly, took {elapsed:?}"
+        );
+        // The background job must SURVIVE (we stop reading; we never kill).
+        let alive = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("pgrep -f '^sleep 30$' >/dev/null")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(alive, "background job must outlive the tool call");
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "^sleep 30$"])
+            .status();
+    }
+
+    /// A normal command still returns its exact bytes and exit code.
+    #[test]
+    fn bash_normal_output_unchanged() {
+        let r = execute(
+            "bash",
+            &json!({"command": "printf 'a\nb\n'"}),
+            Path::new("/"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(r.output, "a\nb\n");
+        assert_eq!(r.exit, Some(0));
+        assert!(!r.truncated);
     }
 
     #[test]

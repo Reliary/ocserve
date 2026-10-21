@@ -104,17 +104,21 @@ fn run_sift(cmd: &[String], raw: &str) -> Option<String> {
         let mut stdin = child.stdin.take()?;
         stdin.write_all(raw.as_bytes()).ok()?;
     } // EOF — reader thread drains stdout so a hung binary can't block us
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut out = Vec::new();
-        let _ = stdout.read_to_end(&mut out);
-        out
-    });
+    let stdout = child.stdout.take()?;
+    // Bounded read (rule 46): a reader that only stops at EOF can outlive the
+    // call if the child leaves a descendant holding the pipe. The gate is
+    // closed when the direct child is gone or the timeout fires; the thread
+    // then stops reading instead of being joined forever.
+    let gate = ocserve_tools::DrainGate::new();
+    let reader = {
+        let gate = gate.clone();
+        std::thread::spawn(move || ocserve_tools::drain_until(Some(stdout), usize::MAX, &gate))
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(TIMEOUT_MS);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                gate.close_in(std::time::Duration::ZERO);
                 let out = reader.join().ok()?;
                 if !status.success() {
                     return None;
@@ -125,6 +129,8 @@ fn run_sift(cmd: &[String], raw: &str) -> Option<String> {
                 if std::time::Instant::now() > deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    gate.close_in(std::time::Duration::ZERO);
+                    let _ = reader.join();
                     return None; // timeout => caller falls back to raw
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));

@@ -12,7 +12,9 @@ const SHELL_TEMPLATE: &str = include_str!("../assets/tool/shell.txt");
 const COMMAND_SECTION: &str = include_str!("../assets/tool/bash-command-section.txt");
 
 const MAX_LINES: usize = 2000;
-const MAX_BYTES: usize = 50 * 1024;
+/// Must equal `lib.rs::MAX_BYTES`: the description tells the model when output
+/// is truncated, so advertising 50 KiB while capturing 1 MiB would be a lie.
+const MAX_BYTES: usize = super::MAX_BYTES;
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
 /// Upstream `chainGuidance` for the bash (posix) profile.
@@ -94,7 +96,10 @@ mod tests {
         )));
         assert!(d.contains("Use `/tmp/opencode` for temporary work"));
         assert!(d.contains("commands will time out after 120000ms"));
-        assert!(d.contains("exceeds 2000 lines or 51200 bytes"));
+        // Derived from the constants, not hardcoded: the description and the
+        // capture limit must never drift apart (a stale advert is a lie to the
+        // model about when its output gets cut).
+        assert!(d.contains(&format!("exceeds {MAX_LINES} lines or {MAX_BYTES} bytes")));
         assert!(d.contains("\n   - If the command will create new directories"));
         assert!(!d.contains("${"));
     }

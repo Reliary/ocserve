@@ -307,6 +307,12 @@ pub struct AppState {
             std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
         >,
     >,
+    /// When each held prompt lock was first requested. Purely observational:
+    /// the sampler turns the oldest into `ocserve_prompt_lock_age_seconds` and
+    /// warns past the watchdog. A wedged blocking task cannot be cancelled, so
+    /// visibility is the honest remedy (2026-10-21 incident).
+    pub lock_ages:
+        std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
     /// Background prompt tasks per session: (generation, JoinHandle) —
     /// POST /abort cancels the current generation (v1 session.abort).
     /// Bound: one entry per in-flight async prompt, removed on completion.
@@ -635,6 +641,9 @@ impl AppState {
             mcp: std::sync::OnceLock::new(),
             plugins: std::sync::OnceLock::new(),
             prompt_locks: std::sync::Arc::new(parking_lot::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            lock_ages: std::sync::Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             prompt_tasks: std::sync::Arc::new(parking_lot::Mutex::new(
@@ -3593,6 +3602,7 @@ struct LockRelease {
             std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
         >,
     >,
+    ages: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
     sid: String,
     lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
@@ -3614,6 +3624,7 @@ impl Drop for LockRelease {
             && std::sync::Arc::strong_count(arc) <= 2
         {
             map.remove(&self.sid);
+            self.ages.lock().remove(&self.sid);
         }
     }
 }
@@ -3633,12 +3644,22 @@ pub(crate) async fn lock_session(st: &Arc<AppState>, sid: &str) -> Result<LockRe
                 message: "too many concurrent prompts".into(),
             });
         }
-        map.entry(sid.to_string())
+        let entry = map
+            .entry(sid.to_string())
             .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+            .clone();
+        if std::sync::Arc::strong_count(&entry) == 1 {
+            // first waiter for this session: start the clock
+            st.lock_ages
+                .lock()
+                .entry(sid.to_string())
+                .or_insert_with(std::time::Instant::now);
+        }
+        entry
     };
     Ok(LockRelease {
         locks: std::sync::Arc::clone(&st.prompt_locks),
+        ages: std::sync::Arc::clone(&st.lock_ages),
         sid: sid.to_string(),
         lock,
     })

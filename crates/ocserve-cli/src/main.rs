@@ -612,6 +612,11 @@ async fn serve(
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut n: u64 = 0;
             let mut recycle_hi: u32 = 0;
+            let mut warned_locks: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            // 10 minutes: the tool's own cap is 120 s (600 s max), so anything
+            // past this is not a slow command.
+            const LOCK_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(600);
             loop {
                 tick.tick().await;
                 n += 1;
@@ -688,7 +693,40 @@ async fn serve(
                 {
                     ocserve_metrics::gauge("ocserve_kids_bytes", v);
                 }
+                // Lock age (visibility, never cancellation): a wedged tool
+                // call cannot be cancelled in the blocking pool, so the only
+                // honest signal is "this session has been held for N seconds".
+                // 2026-10-21: a backgrounded AND-list held the tool's pipe, the
+                // lock never released, and nothing in metrics said so.
                 ocserve_metrics::gauge("ocserve_prompt_locks", st.prompt_locks.lock().len() as i64);
+                let (oldest, stale) = {
+                    let aged = st.lock_ages.lock();
+                    let oldest = aged
+                        .values()
+                        .map(|t| t.elapsed().as_secs())
+                        .max()
+                        .unwrap_or(0);
+                    let stale: Vec<(String, u64)> = aged
+                        .iter()
+                        .filter(|(_, t)| t.elapsed() >= LOCK_WATCHDOG)
+                        .map(|(sid, t)| (sid.clone(), t.elapsed().as_secs()))
+                        .collect();
+                    (oldest, stale)
+                };
+                ocserve_metrics::gauge("ocserve_prompt_lock_age_seconds", oldest as i64);
+                for (sid, secs) in stale {
+                    if warned_locks.insert(sid.clone()) {
+                        tracing::warn!(
+                            "session {sid} has held the prompt lock for {secs}s — a tool call \
+                             may be wedged (ocserve_prompt_lock_age_seconds); restart the unit \
+                             to reap it (SRE §5.7)"
+                        );
+                    }
+                }
+                {
+                    let live = st.lock_ages.lock();
+                    warned_locks.retain(|s| live.contains_key(s));
+                }
                 ocserve_metrics::gauge("ocserve_prompt_tasks", st.prompt_tasks.lock().len() as i64);
                 ocserve_metrics::gauge(
                     "ocserve_question_pending",

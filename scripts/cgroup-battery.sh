@@ -210,6 +210,37 @@ else
   esac
 fi
 
+# --- E: a backgrounded AND-list must not wedge the call --------------------
+# The 2026-10-21 incident: `cd x && nohup server &` backgrounds the whole
+# AND-list as a subshell that inherits the tool's pipes, so the pipes never
+# reach EOF. The call must return promptly and the server must stay
+# responsive; the background job is allowed to live (contained, capped).
+T0=$(date +%s)
+timeout 30 curl -s -o /dev/null -X POST "http://127.0.0.1:$PORT/session/$SID/shell" \
+  -H 'content-type: application/json' \
+  -d '{"agent":"build","command":"cd /tmp && sleep 240 & echo bg-started","model":null}'
+RC=$?
+ELAPSED=$(( $(date +%s) - T0 ))
+[ "$RC" -eq 0 ] && [ "$ELAPSED" -le 10 ] \
+  && ok "backgrounded AND-list returned in ${ELAPSED}s (no pipe wedge)" \
+  || bad "backgrounded AND-list call rc=$RC after ${ELAPSED}s — the 2026-10-21 wedge is back"
+
+# server still answers reads
+H=$(timeout 5 curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/session" || echo 000)
+[ "$H" = "200" ] && ok "server still responsive after the backgrounded call" \
+                 || bad "server unresponsive after the backgrounded call (HTTP $H)"
+# the background job survived, and is in kids/tools
+BGPID=$(find_in_unit '^sleep 240$') || BGPID=""
+if [ -n "$BGPID" ]; then
+  case "$(cgroup_of "$BGPID")" in
+    */kids/tools) ok "backgrounded job survived and is contained ($BGPID)" ;;
+    *)            bad "backgrounded job in unexpected cgroup: $(cgroup_of "$BGPID")" ;;
+  esac
+  kill -9 "$BGPID" 2>/dev/null
+else
+  bad "backgrounded job did not survive (we must stop reading, not kill)"
+fi
+
 echo
 log "result: $pass passed, $failn failed"
 [ "$failn" -eq 0 ] || exit 1

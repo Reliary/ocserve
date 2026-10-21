@@ -79,21 +79,70 @@ fn label_and_publish(result: Partition) -> &'static str {
 }
 
 fn enabled() -> bool {
+    let rel = cgroup_rel();
+    let exec_pid = std::env::var("SYSTEMD_EXEC_PID")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok());
     enabled_from(
         std::env::var("OCSERVE_CGROUP_PARTITION").ok().as_deref(),
         std::env::var("INVOCATION_ID").ok().as_deref(),
+        exec_pid,
+        std::process::id(),
+        rel.as_deref(),
+    )
+}
+
+/// `/proc/self/cgroup` → the cgroup-v2 path (`0::/a/b/c` → `/a/b/c`).
+fn cgroup_rel() -> Option<String> {
+    let cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    Some(
+        cg.lines()
+            .find_map(|l| l.strip_prefix("0::"))?
+            .trim()
+            .to_string(),
     )
 }
 
 /// Pure gate (tested): `OCSERVE_CGROUP_PARTITION=0` kills, `=1` forces,
-/// unset/other → only under systemd (`INVOCATION_ID`) — bare/test/harness
-/// runs must never restructure a terminal's or cargo's cgroup tree.
-fn enabled_from(env: Option<&str>, invocation_id: Option<&str>) -> bool {
+/// unset/other → only as a systemd unit's MAIN process, at its cgroup root.
+///
+/// `INVOCATION_ID` is inherited by every descendant and by every test server
+/// spawned from a unit, so presence alone proved nothing. Two independent
+/// conditions are required:
+///
+/// * `SYSTEMD_EXEC_PID == self` — we ARE the unit's main process. This is what
+///   stops a nested `ocserve serve` (started by a tool, or by `cargo test`
+///   running inside the user's shell unit) from restructuring its parent's
+///   hierarchy.
+/// * the cgroup path is a unit root (last component `.service`/`.scope`), not
+///   already `main/` or `kids/…`.
+///
+/// `SYSTEMD_EXEC_PID` exists since systemd 248; when it is absent we decline
+/// rather than guess (the dance is optional and already degrades to a flat
+/// cap, and a wrong guess mutates somebody else's tree).
+fn enabled_from(
+    env: Option<&str>,
+    invocation_id: Option<&str>,
+    exec_pid: Option<u32>,
+    self_pid: u32,
+    cgroup: Option<&str>,
+) -> bool {
     match env {
         Some("0") => false,
         Some("1") => true,
-        _ => invocation_id.is_some(),
+        _ => {
+            invocation_id.is_some()
+                && exec_pid == Some(self_pid)
+                && cgroup.is_some_and(at_unit_root)
+        }
     }
+}
+
+/// True when the path names a unit root: its last component is a
+/// `.service`/`.scope` unit, not a `main`/`kids/<class>` child of one.
+fn at_unit_root(path: &str) -> bool {
+    let last = path.rsplit('/').find(|c| !c.is_empty()).unwrap_or("");
+    last.ends_with(".service") || last.ends_with(".scope")
 }
 
 /// `0::/path` → `/sys/fs/cgroup/path` (relative join — `Path::join` with an
@@ -198,6 +247,11 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
                 tracing::warn!("partition: mkdir kids/{name} failed: {e}");
                 continue;
             }
+            // Sweep strays: a nested ocserve launched from a tool used to run
+            // the dance here and leave empty `main/` / `kids/` dirs behind.
+            // Harmless for the +memory gate (that needs no processes, not no
+            // children) but they must not accumulate.
+            sweep_stray_subdirs(&leaf, name);
             // kill the whole class together; partial death is worse for a
             // single service than total death (kernel cgroup-v2 §memory.oom.group)
             write_or_warn(&leaf.join("memory.oom.group"), "1".to_string());
@@ -219,6 +273,24 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
     ocserve_store::cgroup::publish(root);
     log_budget(root, &kids, mb);
     Partition::Ok
+}
+
+/// Remove empty `main` / `kids` subdirectories a nested ocserve left inside a
+/// class leaf. Only empty directories are removed; anything holding processes
+/// is left alone and reported.
+fn sweep_stray_subdirs(leaf: &Path, name: &str) {
+    for stray in ["main", "kids"] {
+        let p = leaf.join(stray);
+        if !p.is_dir() {
+            continue;
+        }
+        match std::fs::remove_dir(&p) {
+            Ok(()) => tracing::info!("partition: swept stray kids/{name}/{stray}"),
+            Err(e) => tracing::debug!(
+                "partition: kids/{name}/{stray} not swept ({e}) — likely still holds processes"
+            ),
+        }
+    }
 }
 
 /// Enable controllers in a `cgroup.subtree_control` (idempotent, additive).
@@ -354,6 +426,23 @@ mod tests {
     }
 
     #[test]
+    fn stray_leaf_subdirs_are_swept_but_occupied_ones_survive() {
+        let root = fixture(true);
+        assert_eq!(setup_in(&root, false), Partition::Ok);
+        let leaf = root.join("kids/tools");
+        // Simulate the nested-server leftovers: two EMPTY dirs and one that
+        // still looks occupied (we cannot add processes to a fake cgroup, so
+        // a file stands in for "not empty").
+        std::fs::create_dir_all(leaf.join("main")).unwrap();
+        std::fs::create_dir_all(leaf.join("kids")).unwrap();
+        std::fs::write(leaf.join("kids/occupied"), "x").unwrap();
+        sweep_stray_subdirs(&leaf, "tools");
+        assert!(!leaf.join("main").exists(), "empty main/ swept");
+        assert!(leaf.join("kids").exists(), "non-empty kids/ left alone");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn leaves_are_created_and_capped() {
         let root = fixture(true);
         assert_eq!(setup_in(&root, false), Partition::Ok);
@@ -482,18 +571,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    const ROOT: Option<&str> =
+        Some("/user.slice/user-1000.slice/user@1000.service/app.slice/ocserve.service");
+
     #[test]
-    fn enabled_requires_force_or_systemd_invocation() {
+    fn enabled_requires_force_or_the_units_main_process() {
         // bare/test/harness (no env, no INVOCATION_ID) → NEVER restructures
-        assert!(!enabled_from(None, None));
-        // kill switch wins over systemd
-        assert!(!enabled_from(Some("0"), Some("some-invocation")));
+        assert!(!enabled_from(None, None, None, 42, ROOT));
+        // kill switch wins over everything
+        assert!(!enabled_from(Some("0"), Some("id"), Some(42), 42, ROOT));
         // force works without systemd (manual experiments)
-        assert!(enabled_from(Some("1"), None));
-        // systemd default: on
-        assert!(enabled_from(None, Some("some-invocation")));
+        assert!(enabled_from(Some("1"), None, None, 42, None));
+        // systemd main process at the unit root → on
+        assert!(enabled_from(None, Some("id"), Some(42), 42, ROOT));
         // junk env = unset (never panics, never guesses)
-        assert!(!enabled_from(Some("junk"), None));
-        assert!(enabled_from(Some("junk"), Some("id")));
+        assert!(!enabled_from(Some("junk"), None, Some(42), 42, ROOT));
+        assert!(enabled_from(Some("junk"), Some("id"), Some(42), 42, ROOT));
+    }
+
+    /// Inherited INVOCATION_ID is not identity: a test server (or a nested
+    /// `ocserve serve` started by a tool) carries the parent's exec pid.
+    #[test]
+    fn inherited_unit_identity_never_restructures() {
+        assert!(
+            !enabled_from(None, Some("inherited"), Some(1195), 9999, ROOT),
+            "child of a unit must decline"
+        );
+        // absent SYSTEMD_EXEC_PID (systemd < 248): decline rather than guess
+        assert!(!enabled_from(None, Some("inherited"), None, 9999, ROOT));
+    }
+
+    /// The nested-server bug: a tool child inherits INVOCATION_ID, so presence
+    /// alone is not enough. Shape decides.
+    #[test]
+    fn nested_cgroup_never_restructures() {
+        let unit = "/user.slice/u.service/app.slice/ocserve.service";
+        for nested in [
+            format!("{unit}/main"),
+            format!("{unit}/kids/tools"),
+            format!("{unit}/kids/tools/main"),
+            format!("{unit}/kids/plugin"),
+        ] {
+            assert!(
+                !enabled_from(None, Some("inherited-id"), Some(7), 7, Some(&nested)),
+                "{nested} must decline the dance"
+            );
+        }
+        assert!(enabled_from(
+            None,
+            Some("inherited-id"),
+            Some(7),
+            7,
+            Some(unit)
+        ));
+        assert!(at_unit_root("/user.slice/u.service/app.slice/run-1.scope"));
+        assert!(!at_unit_root(
+            "/user.slice/u.service/app.slice/ocserve.service/kids"
+        ));
+        assert!(!at_unit_root(""));
     }
 }

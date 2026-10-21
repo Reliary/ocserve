@@ -33,9 +33,14 @@ pub const LEAVES: [&str; 4] = ["plugin", "mcp", "tools", "pty"];
 /// `echo 500 > oom_score_adj` makes a memcg kill prefer this child over the
 /// server (200). The cgroup move is a no-op when no leaf was published
 /// (bare/foreground runs, non-systemd, Windows without a POSIX shell).
+/// The two `unset` lines matter (2026-10-21): `INVOCATION_ID` is inherited by
+/// every descendant, and a tool that runs `ocserve serve` inherited it too,
+/// so the nested server believed it was the unit's main process and ran the
+/// partition dance inside `kids/tools` (EBUSY, plus a stray `main/` leaf).
+/// Unit identity must not leak into tool children.
 /// `exec` preserves the pid, so the caller's `killpg`/job-object semantics
 /// are unchanged.
-pub const WRAPPER: &str = r#"echo 500 >/proc/self/oom_score_adj 2>/dev/null; [ -n "$OCSERVE_KIDS_CGROUP" ] && echo $$ >"$OCSERVE_KIDS_CGROUP/cgroup.procs" 2>/dev/null; exec "$@""#;
+pub const WRAPPER: &str = r#"unset INVOCATION_ID SYSTEMD_EXEC_PID 2>/dev/null; echo 500 >/proc/self/oom_score_adj 2>/dev/null; [ -n "$OCSERVE_KIDS_CGROUP" ] && echo $$ >"$OCSERVE_KIDS_CGROUP/cgroup.procs" 2>/dev/null; exec "$@""#;
 
 /// Environment variable carrying the leaf path to the child.
 pub const ENV: &str = "OCSERVE_KIDS_CGROUP";

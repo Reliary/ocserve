@@ -88,6 +88,10 @@
 #      OOM: a `nohup ... &` tool child stayed in main/ and the kernel killed
 #      the server; caps do nothing when the child is in the wrong cgroup)
 #      [plant: new spawn file with no seam]
+#  46. no unbounded join/wait on a child-pipe reader (2026-10-21: a
+#      backgrounded AND-list held the tool's pipes, `join()` blocked a
+#      blocking-pool thread forever, and the session lock never released)
+#      [plant: a raw JoinHandle::join in a reader]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -1117,6 +1121,38 @@ if spawn_files | grep -q cgroup_plant; then
   echo "ok (planted uncontained spawn flagged)"
 else
   echo "FAIL: rule 45 plant was not flagged (the guard is vacuous)"; fail=1
+fi
+rm -f "$plant"
+
+echo "== guard: child-pipe readers never join unboundedly (rule 46) =="
+# The 2026-10-21 wedge: `cd x && nohup server &` backgrounds the whole AND-list
+# as a subshell that inherits our pipes; the pipes never EOF, so `.join()`
+# blocked a blocking-pool thread and the session lock was never released.
+# A join is only legal when the gate was CLOSED just before it (bounded).
+pipe_scan() {
+  grep -rnE '\b(reader|h_out|h_err|stdout_reader|stderr_reader)\.join\(\)' crates/*/src 2>/dev/null \
+  | while IFS=: read -r f l rest; do
+      lo=$((l > 6 ? l - 6 : 1))
+      if ! sed -n "${lo},${l}p" "$f" | grep -q 'close_in'; then
+        echo "$f:$l:$rest"
+      fi
+    done
+}
+out=$(pipe_scan)
+if [ -n "$out" ]; then
+  echo "$out"
+  echo "FAIL: unbounded join on a child-pipe reader (rule 46) — close the DrainGate first"
+  fail=1
+else
+  echo "ok"
+fi
+# Planted control: a bare reader join must be flagged.
+plant="crates/ocserve-core/src/pipe_reader_plant.rs"
+printf '%s\n' 'fn f(reader: std::thread::JoinHandle<Vec<u8>>) { let _ = reader.join(); }' > "$plant"
+if pipe_scan | grep -q pipe_reader_plant; then
+  echo "ok (planted unbounded reader join flagged)"
+else
+  echo "FAIL: rule 46 plant was not flagged (the guard is vacuous)"; fail=1
 fi
 rm -f "$plant"
 

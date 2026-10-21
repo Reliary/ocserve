@@ -228,6 +228,28 @@ other than the async worker (thread identity recorded by a test-only seam).
      died. `continue` = log + survive, so `ensure_alive` respawns the
      sidecar; a MAIN-process OOM still restarts via normal exit handling.
      guard rule 9).
+  6. **Drain deadline (2026-10-21 wedge).** `bash` starts a reader thread per
+     stream and used to `join()` them after the direct child exited. A command
+     like `cd x && nohup server &` backgrounds the **whole AND-list as a
+     subshell**; that subshell inherits fd 1/2 (our pipes) and waits on a
+     server that never exits, so the pipes never reach EOF. The join blocked a
+     blocking-pool thread **forever** and the session lock was never released
+     (one wedged session, two of sixteen threads; sixteen incidents would stall
+     every `spawn_blocking` caller). The tool timeout never applied because the
+     direct child had exited normally.
+     Fix: each call owns a `DrainGate`. The moment the direct child is reaped
+     the gate closes after a 250 ms grace; Unix readers `poll(2)` with a 10 ms
+     timeout so they can observe the gate, then stop reading. **Nothing is
+     killed** — `cd x && nohup dev-server &` is a legitimate way to leave work
+     running, and it is already contained by `kids/tools`. Windows keeps the
+     blocking read (no pollable anonymous pipes) and documents the lingering
+     reader as a build-only cost. `sift` uses the same gate. Guard rule 46
+     requires a `close_in` before any reader `join`.
+  7. **Lock-age visibility.** `ocserve_prompt_lock_age_seconds` plus a
+     one-shot WARN past 600 s (the tool's own hard cap is 600 s). A wedged
+     blocking task cannot be cancelled, so the honest remedy is to say so and
+     let the operator restart the unit, which reaps the whole cgroup.
+
   5. **Backstop:** `MemoryMax=1024M` — kids 700 + main reserve ~324 (≈ 2×
      the measured 180 MB envelope); provenance comment chain in the unit
      template (history: 480 → 600 → 750 → 1024, each step measured).
