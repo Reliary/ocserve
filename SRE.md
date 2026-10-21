@@ -206,8 +206,11 @@ other than the async worker (thread identity recorded by a test-only seam).
      aggregate would kill the browser host because a build spiked.
      `main/memory.low=320M` makes main the reclaim-protected side, so
      pressure shrinks kids first. Boot logs the budget (`kids.max + main.low`
-     vs parent `MemoryMax`, wanting 64 MB of slab/cache headroom) and WARNs
-     when it is tight. Current numbers are tight by that test: 700 + 320
+     vs parent `MemoryMax`, wanting 64 MB of anon+slab headroom) and WARNs
+     when it is tight. The comparison is deliberately about unreclaimable
+     memory: page cache is charged to the parent but reclaimed under
+     pressure (measured: 924 MB of 1024 MB used with 364 MB of it file
+     cache, no OOM). Current numbers are tight by that test: 700 + 320
      against 1024 leaves 4 MB, which is the next thing to settle from a soak
      with per-leaf peaks, not from a guess.
      **Probe-first:** root-exists / owned-by-us / `memory` in controllers /

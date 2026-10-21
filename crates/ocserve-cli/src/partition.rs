@@ -274,17 +274,20 @@ fn log_budget(root: &Path, kids: &Path, kids_mb: u64) {
         .count();
     match parent_mb {
         Some(p) => {
-            // 64 MB is the working reserve for slab, page tables and the page
-            // cache the server actually touches; a budget that fits only by a
-            // few MB is over-committed in practice (2026-10-21: kids 700 +
-            // main 320 against 1024 leaves 4 MB).
+            // The comparison is about UNRECLAIMABLE memory: `kids.max` +
+            // `main.low` are anon+slab commitments, while page cache is
+            // charged to the parent but reclaimed on pressure (measured
+            // 2026-10-21: 924M used of 1024M, of which 364M was file cache).
+            // 64 MB is the working reserve for slab and page tables; a budget
+            // that fits only by a few MB is over-committed in practice
+            // (kids 700 + main 320 against 1024 leaves 4 MB).
             const HEADROOM_MB: u64 = 64;
             let committed = kids_mb + main_low_mb;
             if committed + HEADROOM_MB > p {
                 tracing::warn!(
                     "memory budget tight: parent {p}M, kids.max {kids_mb}M + main.low \
-                     {main_low_mb}M leaves {}M for slab/cache (want {HEADROOM_MB}M) — kids \
-                     is reclaimed first so main survives; SRE §5.5",
+                     {main_low_mb}M leaves {}M for anon+slab (want {HEADROOM_MB}M; file cache \
+                     is reclaimable) — kids is reclaimed first so main survives; SRE §5.5",
                     p.saturating_sub(committed)
                 );
             } else {

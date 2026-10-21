@@ -84,8 +84,9 @@ OOMPolicy=continue
 # the SERVER at 321MB while the build held ~600MB. Children now move
 # themselves into per-class leaves (kids/{plugin,mcp,tools,pty}) before exec,
 # so the same build is capped and reclaimable. `kids.max + main.low` vs this
-# cap is logged at boot: 700 + 320 leaves 4 MB for slab/cache, which is tight
-# and is the next number to settle from per-leaf soak peaks, not from a guess.
+# cap is logged at boot: 700 + 320 leaves 4 MB for anon+slab (page cache is
+# reclaimable and does not count), which is tight and is the next number to
+# settle from per-leaf soak peaks, not from a guess.
 MemoryMax=1024M
 MemorySwapMax=0
 ProtectSystem=strict
