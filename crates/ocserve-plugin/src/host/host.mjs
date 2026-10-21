@@ -242,7 +242,12 @@ async function loadPlugin({ spec, entry, input, options }) {
       }
       for (const [n, list] of Object.entries(byName)) if (list.length) names.push(`${domain}.${n}`);
     }
-    return { hooks: names, id: def.id, dialect: "v2" };
+    return {
+      hooks: names,
+      id: def.id,
+      dialect: "v2",
+      unbridged_transforms: [...new Set(v2State.unbridgedTransforms)],
+    };
   }
   // v1 extraction (plugin/index.ts readV1Plugin + getLegacyPlugins), in order:
   // PluginModule.server → default object's .server → default function (legacy)
@@ -425,6 +430,7 @@ async function handle(line) {
         reply({
           plugins: loadedV2.map((p) => ({ spec: p.spec, id: p.id, dialect: p.dialect })),
           rpcs: Object.keys(v2State.rpcs),
+          unbridged_transforms: [...new Set(v2State.unbridgedTransforms)],
         });
         break;
       // v2 command/skill transform pull (Phase 3/Tier 2). Rust calls this on

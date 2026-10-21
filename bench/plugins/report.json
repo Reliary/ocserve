@@ -1,14 +1,13 @@
 {
-  "generated_at": "2026-10-21T09:18:00.635Z",
+  "generated_at": "2026-10-21T13:04:52.333Z",
   "node": "v26.3.0",
   "host": "crates/ocserve-plugin/src/host/host.mjs",
   "corpus": 20,
   "summary": {
-    "v2-registered": 5,
-    "load-error": 5,
+    "v2-registered": 11,
     "registered-only": 2,
     "hooks-ran": 5,
-    "missing-dependency": 2,
+    "missing-dependency": 1,
     "loaded-no-hooks": 1
   },
   "results": [
@@ -38,13 +37,17 @@
         "sdk_v2": true
       },
       "entry": "dist/index.js",
-      "status": "load-error",
-      "dialect": null,
-      "hooks": [],
-      "invoked": {},
+      "status": "loaded",
+      "dialect": "v2",
+      "hooks": [
+        "event"
+      ],
+      "invoked": {
+        "skipped": "v2 dispatch is domain-typed; registration only"
+      },
       "event": null,
-      "error": "Error: D-V2-DOMAIN: ctx.integration.transform is not bridged in ocserve\n    at <anonymous> (/work/crates/ocserve-plugin/src/host/v2.mjs:269:21)\n    at <anonymous> (/corpus/opencode-models-discovery/dist/runtime.js:3584:25)\n    at setupV2 (/corpus/opencode-models-discovery/dist/runtime.js:3720:9)\n    at setupV2 (/work/crates/ocserve-plugin/src/host/v2.mjs:337:31)\n    at loadPlugin (/work/crates/ocs",
-      "class": "load-error"
+      "error": null,
+      "class": "v2-registered"
     },
     {
       "name": "@openviking/opencode-plugin",
@@ -54,13 +57,22 @@
         "sdk_v2": false
       },
       "entry": "index.mjs",
-      "status": "load-error",
-      "dialect": null,
-      "hooks": [],
-      "invoked": {},
+      "status": "loaded",
+      "dialect": "v2",
+      "hooks": [
+        "event",
+        "session.prompt",
+        "session.context",
+        "session.compaction",
+        "tool.execute.before",
+        "tool.execute.after"
+      ],
+      "invoked": {
+        "skipped": "v2 dispatch is domain-typed; registration only"
+      },
       "event": null,
-      "error": "Error: D-V2-DOMAIN: ctx.mcp.transform is not bridged in ocserve\n    at <anonymous> (/work/crates/ocserve-plugin/src/host/v2.mjs:269:21)\n    at startV2Plugin (/corpus/@openviking__opencode-plugin/lib/v2-plugin.mjs:41:19)\n    at setup (/corpus/@openviking__opencode-plugin/index.mjs:100:12)\n    at setupV2 (/work/crates/ocserve-plugin/src/host/v2.mjs:337:31)\n    at loadPlugin (/work/crates/ocserve-plu",
-      "class": "load-error"
+      "error": null,
+      "class": "v2-registered"
     },
     {
       "name": "@sjawhar/opencode-legion-envoy",
@@ -134,13 +146,15 @@
         "sdk_v2": true
       },
       "entry": "dist/index.js",
-      "status": "load-error",
-      "dialect": null,
+      "status": "loaded",
+      "dialect": "v2",
       "hooks": [],
-      "invoked": {},
+      "invoked": {
+        "skipped": "v2 dispatch is domain-typed; registration only"
+      },
       "event": null,
-      "error": "Error: D-V2-DOMAIN: ctx.integration.transform is not bridged in ocserve\n    at <anonymous> (/work/crates/ocserve-plugin/src/host/v2.mjs:269:21)\n    at setup (/corpus/opencode-gitlab-auth/dist/index.js:122:31)\n    at setupV2 (/work/crates/ocserve-plugin/src/host/v2.mjs:337:31)\n    at loadPlugin (/work/crates/ocserve-plugin/src/host/host.mjs:230:27)\n    at async handle (/work/crates/ocserve-plugin/s",
-      "class": "load-error"
+      "error": null,
+      "class": "v2-registered"
     },
     {
       "name": "opencode-usage-quota-tracker",
@@ -168,13 +182,15 @@
         "sdk_v2": true
       },
       "entry": "index.ts",
-      "status": "dependency",
-      "dialect": null,
+      "status": "loaded",
+      "dialect": "v2",
       "hooks": [],
-      "invoked": {},
+      "invoked": {
+        "skipped": "v2 dispatch is domain-typed; registration only"
+      },
       "event": null,
-      "error": "ResolveMessage: Cannot find package 'opencode-plugin-kit' imported from /corpus/opencode-model-recommender/index.ts",
-      "class": "missing-dependency"
+      "error": null,
+      "class": "v2-registered"
     },
     {
       "name": "@dietrichgebert/ponytail",
@@ -205,13 +221,24 @@
         "sdk_v2": false
       },
       "entry": "dist/index.js",
-      "status": "load-error",
-      "dialect": null,
-      "hooks": [],
-      "invoked": {},
+      "status": "loaded",
+      "dialect": "v2",
+      "hooks": [
+        "event",
+        "session.prompt",
+        "session.context",
+        "session.compaction",
+        "session.model.request",
+        "session.retry",
+        "tool.execute.before",
+        "tool.execute.after"
+      ],
+      "invoked": {
+        "skipped": "v2 dispatch is domain-typed; registration only"
+      },
       "event": null,
-      "error": "Error: Unable to snapshot configured MCP namespaces: this host cannot expose configured MCP namespaces; update to a supported v2 host\n    at <anonymous> (/corpus/oh-my-opencode-slim/dist/index.js:67064:19)\n    at async setupV2 (/work/crates/ocserve-plugin/src/host/v2.mjs:337:31)\n    at async loadPlugin (/work/crates/ocserve-plugin/src/host/host.mjs:230:27)\n    at async handle (/work/crates/ocserve",
-      "class": "load-error"
+      "error": null,
+      "class": "v2-registered"
     },
     {
       "name": "@tarquinen/opencode-dcp",
@@ -346,13 +373,23 @@
         "sdk_v2": false
       },
       "entry": "dist/index.js",
-      "status": "load-error",
-      "dialect": null,
-      "hooks": [],
-      "invoked": {},
+      "status": "loaded",
+      "dialect": "v2",
+      "hooks": [
+        "event",
+        "session.context",
+        "session.compaction",
+        "session.generate",
+        "session.http.response",
+        "tool.execute.before",
+        "tool.execute.after"
+      ],
+      "invoked": {
+        "skipped": "v2 dispatch is domain-typed; registration only"
+      },
       "event": null,
-      "error": "Error: D-V2-TOOL-EDITOR: ctx.tool.transform is not bridged in ocserve\n    at transform (/work/crates/ocserve-plugin/src/host/v2.mjs:171:19)\n    at registerTools (/corpus/@cortexkit__opencode-magic-context/dist/context-3znk23va.js:4260:22)\n    at registerContext (/corpus/@cortexkit__opencode-magic-context/dist/context-3znk23va.js:4732:55)\n    at async setup (/corpus/@cortexkit__opencode-magic-conte",
-      "class": "load-error"
+      "error": null,
+      "class": "v2-registered"
     },
     {
       "name": "@iam-brain/opencode-codex-auth",

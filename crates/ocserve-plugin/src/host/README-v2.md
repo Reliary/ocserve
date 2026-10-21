@@ -38,11 +38,19 @@ identity, so this is exact.
 
 ## Domains
 
+**Registration is not dispatch.** Every domain that exposes `transform` accepts
+the callback and records it, even when ocserve cannot apply the edit. A throw at
+registration time fails the plugin's entire `setup`, which loses the hooks that
+*are* bridged — a divergence must cost one capability, not the plugin. Genuine
+*use* of an unbridged domain (calling a verb, not registering) still throws the
+named `D-V2-DOMAIN` error, because the capability really is absent. The accepted
+domains are reported in the plugin inventory as `unbridged_transforms`.
+
 | v2 domain | Status |
 |---|---|
 | `storage` (get/set/remove/scan) | **bridged** — in-memory per-plugin KV. Named divergence `D-V2-STORAGE-MEM`: upstream is disk-backed; ocserve's store is process-lifetime (cleared on restart). |
 | `rpc` (register/call/events) | **partially bridged** — `register` + handler dispatch + `/api/rpc/{id}/{method}` are real. `Registration.events.emit` → `D-V2-RPC-EVENTS` (upstream emits over the RPC socket; not bridged). |
-| `tool.transform/list/reload` | **diverged** `D-V2-TOOL-EDITOR` — the tool registry is static; `transform` throws the named error rather than silently no-op'ing |
+| `tool.transform/list/reload` | **partially bridged** — `transform` REGISTERS (the callback is recorded, never invoked: the tool registry is static, `D-V2-TOOL-EDITOR`) and `list` returns `[]`; `reload` is a no-op. Registration must not throw: v2 plugins register transforms during `setup`, and failing there would discard the hooks we do bridge (found by the real-plugin corpus, 2026-10-21). |
 | `client` (REST proxy) | **bridged** — method-path proxy over the local HTTP API (same as v1's `client`) |
 | `event.subscribe` | **bridged** |
 | `plugin.list` | **bridged** — real inventory (`GET /api/plugin`) |

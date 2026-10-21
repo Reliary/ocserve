@@ -167,8 +167,12 @@ export function makeV2Context({
       // transform/list/reload operate on the tool registry — not bridged
       // (named divergence D-V2-TOOL-EDITOR); present so detection does not
       // crash, but a call throws the named error rather than lying.
-      transform: () => {
-        throw new Error("D-V2-TOOL-EDITOR: ctx.tool.transform is not bridged in ocserve");
+      // Registered, never run: failing `setup` here would lose the plugin's
+      // execute.before/after hooks, which ARE bridged. D-V2-TOOL-EDITOR.
+      transform: async (callback) => {
+        state.toolTransforms.push(callback);
+        state.unbridgedTransforms.push("tool");
+        return registration(state.toolTransforms, callback);
       },
       list: async () => [],
       reload: async () => {},
@@ -208,10 +212,10 @@ export function makeV2Context({
     client,
     // Domains with no ocserve backing: exposing them as honest throwing
     // proxies (named divergences) beats undefined-property crashes at setup.
-    aisdk: notBridged("aisdk"),
-    model: notBridged("model"),
-    provider: notBridged("provider"),
-    agent: notBridged("agent"),
+    aisdk: unbridgedDomain("aisdk", state, []),
+    model: unbridgedDomain("model", state, []),
+    provider: unbridgedDomain("provider", state, []),
+    agent: unbridgedDomain("agent", state, []),
     // command: real. `transform` collects CommandEditor callbacks; Rust pulls
     // `runTransforms` on config reload and stores what the plugins return.
     command: {
@@ -243,14 +247,22 @@ export function makeV2Context({
         state.reloadRequested = true;
       },
     },
-    integration: notBridged("integration"),
-    mcp: notBridged("mcp"),
-    reference: notBridged("reference"),
-    vcs: notBridged("vcs"),
-    websearch: notBridged("websearch"),
-    worktree: notBridged("worktree"),
-    generate: notBridged("generate"),
-    experimental: { terminal: { read: () => notBridged("experimental.terminal").read() } },
+    integration: unbridgedDomain("integration", state, []),
+    mcp: unbridgedDomain("mcp", state, []),
+    reference: unbridgedDomain("reference", state, []),
+    vcs: unbridgedDomain("vcs", state, []),
+    websearch: unbridgedDomain("websearch", state, []),
+    worktree: unbridgedDomain("worktree", state, []),
+    generate: unbridgedDomain("generate", state, []),
+    // `experimental.terminal.read` is a real verb we do not implement; keep it
+    // throwing on use (there is no registration form for it).
+    experimental: {
+      terminal: {
+        read: () => {
+          throw new Error("D-V2-DOMAIN: ctx.experimental.terminal.read is not bridged in ocserve");
+        },
+      },
+    },
     // Real inventory, not []. `/api/plugin` serves the loaded list, so a
     // plugin asking here must see the same thing — an empty array would
     // contradict a closed divergence and the route it mirrors.
@@ -258,13 +270,46 @@ export function makeV2Context({
   };
 }
 
-/** A domain proxy whose async methods throw a named divergence on use. */
-function notBridged(name) {
+/**
+ * A domain whose edit surface is not bridged.
+ *
+ * `transform` MUST exist and MUST NOT throw at registration time: v2 plugins
+ * register transforms during `setup`, and a throw there fails the whole plugin
+ * — losing every other hook it registered, including the ones ocserve does
+ * bridge. So the transform is accepted, recorded as unbridged, and never
+ * invoked. The editor callback is never called, which is the honest behaviour
+ * (the plugin's edit does not happen); the divergence is reported at boot from
+ * the pending list rather than by killing the plugin.
+ *
+ * Any *other* property is genuine use of an unbridged domain and throws the
+ * named divergence, as before.
+ */
+function unbridgedDomain(name, state, pending) {
   return new Proxy(
     {},
     {
       get: (_, prop) => {
         if (prop === "then") return undefined;
+        if (prop === "transform") {
+          return async (callback) => {
+            // Recorded, not run. `pending` is reported so the operator sees a
+            // plugin asked for an edit ocserve cannot apply.
+            pending.push({ domain: name, callback });
+            if (state && Array.isArray(state.unbridgedTransforms)) {
+              state.unbridgedTransforms.push(name);
+            }
+            return registration(pending, callback);
+          };
+        }
+        if (prop === "reload") {
+          // `reload` asks the host to re-run transforms and refresh. Since no
+          // transform of this domain is ever applied, there is nothing to
+          // refresh: resolving is honest (it asserts no change) and keeps the
+          // plugin's OTHER capabilities alive. A plugin that calls
+          // transform → reload → list is common; failing on `reload` would
+          // discard hooks ocserve does bridge, for no gain.
+          return async () => {};
+        }
         return () => {
           throw new Error(`D-V2-DOMAIN: ctx.${name}.${String(prop)} is not bridged in ocserve`);
         };
@@ -372,6 +417,10 @@ export function newV2State() {
     // that did not ask for it.
     commandTransforms: [],
     skillTransforms: [],
+    // Transforms for domains we do not bridge: recorded so the plugin's setup
+    // succeeds, never invoked. `unbridgedTransforms` is the report.
+    toolTransforms: [],
+    unbridgedTransforms: [],
     // what the last pull produced; backs ctx.command.list()/skill.list().
     lastCommands: [],
     reloadRequested: false,

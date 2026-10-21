@@ -1051,6 +1051,108 @@ export default PluginModule.server;
         Ok(())
     }
 
+    /// A v2 plugin that registers a transform on an UNBRIDGED domain must still
+    /// load, and the divergence must be reported.
+    ///
+    /// The corpus run on 2026-10-21 found four real plugins failing to load with
+    /// `D-V2-DOMAIN: ctx.<domain>.transform is not bridged`. They were not
+    /// broken plugins: they register transforms during `setup`, which is
+    /// upstream's only way to contribute to those domains, and our shim threw on
+    /// the registration call. That failed the WHOLE plugin, discarding the hooks
+    /// we do bridge — `session.context`, `tool.execute.before`, events. A
+    /// divergence must degrade one capability, never the plugin.
+    ///
+    /// The transform is accepted and recorded, never invoked (calling it would
+    /// mean applying an edit ocserve cannot apply), and the domain is reported in
+    /// the inventory so the operator can see it.
+    #[tokio::test]
+    async fn v2_unbridged_transform_registers_instead_of_failing_setup() -> anyhow::Result<()> {
+        if !runtime_available() {
+            panic!(
+                "plugin-runtime binary ({}) required for plugin-host tests",
+                crate::plugin_runtime().program()
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("p_v2_edit.mjs"),
+            r#"export default {
+  id: "v2edit",
+  setup: async (ctx) => {
+    // A transform on a domain ocserve does not bridge (upstream's registration
+    // form, so this is what real plugins do).
+    await ctx.tool.transform((editor) => { editor.remove("bash"); });
+    await ctx.integration.transform(() => {});
+    // The common transform -> reload -> list sequence: reload must resolve.
+    await ctx.provider.reload();
+    // The hooks we DO bridge must survive.
+    await ctx.session.hook("context", (ev) => { ev.survived = true; });
+  },
+};"#,
+        )
+        .unwrap();
+
+        let host = materialize_host(&dir.path().join("host"))?;
+        let mut sc = Sidecar::spawn(&host, "http://127.0.0.1:9", "/work").await?;
+        let input = json!({"directory": "/work", "serverUrl": "http://127.0.0.1:9"});
+
+        let hooks = sc
+            .load(
+                "v2edit",
+                &dir.path().join("p_v2_edit.mjs"),
+                &input,
+                &Value::Null,
+            )
+            .await
+            .expect("a transform on an unbridged domain must not fail setup");
+
+        // The bridged hook registered by the same plugin still works.
+        assert!(
+            hooks.contains(&"session.context".to_string()),
+            "the bridged hook must survive: {hooks:?}"
+        );
+        let out = sc.trigger_v2("session", "context", json!({})).await?;
+        assert_eq!(out["matched"], 1);
+        assert_eq!(out["output"]["survived"], true);
+
+        // And the unbridged domains are reported, not silently swallowed.
+        let inv = sc.v2_inventory().await?;
+        let unbridged: Vec<String> = inv["unbridged_transforms"]
+            .as_array()
+            .expect("inventory must list unbridged transforms")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(unbridged.contains(&"tool".to_string()), "{inv}");
+        assert!(unbridged.contains(&"integration".to_string()), "{inv}");
+
+        // Genuine USE of an unbridged domain still throws its named divergence
+        // (the capability really is absent; only registration is tolerated).
+        std::fs::write(
+            dir.path().join("p_v2_use.mjs"),
+            r#"export default {
+  id: "v2use",
+  setup: async (ctx) => { await ctx.model.list(); },
+};"#,
+        )
+        .unwrap();
+        let err = sc
+            .load(
+                "v2use",
+                &dir.path().join("p_v2_use.mjs"),
+                &input,
+                &Value::Null,
+            )
+            .await
+            .expect_err("using an unbridged domain must still fail loudly");
+        let text = format!("{err:#}");
+        assert!(text.contains("D-V2-DOMAIN"), "{text}");
+        assert!(text.contains("model"), "{text}");
+
+        sc.shutdown().await;
+        Ok(())
+    }
+
     /// The v2 REST half of a domain is bound to the route that actually exists —
     /// and an UNBOUND verb keeps the named divergence instead of a bare TypeError.
     ///

@@ -23,6 +23,7 @@ tests pass.
 | `V2-EXECUTION-PLAN.md` | the pristine/impressive program (decisions D1–D7, Phases 0–5): guard self-proof, password auth, mutation baseline, v2 plugin shim, G2, drift |
 | `PLATFORM.md` | macOS/Windows support: measured ground truth per platform, antagonism ledger A1–A15, the platform seam design, phases S/G/P/W/V with per-phase exit criteria, divergence ledger, and the performance position (no cross-platform claim) |
 | `GAPS-PLAN.md` | gap closure (Tier 1 real holes + acceptance, Tier 2 v2 plugin depth, Tier 3 hygiene) |
+| `bench/plugins/README.md` | real-plugin compatibility corpus: method, result classes, sandbox bounds, limits (registration is not effect) |
 | `bench/BUMP-MACHINERY-TEST.md` | upgrade-machinery shakedown vs 2.0.32/1.19.3 (report-only; pins stay frozen) |
 | `TRACEABILITY.md` | requirement ↔ test ↔ evidence matrix (every F/N/K row) |
 | `THIRD-PARTY.md` | upstream MIT attribution and the compatibility framing |
