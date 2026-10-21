@@ -44,7 +44,6 @@ ocserve-importer = { path = "crates/ocserve-importer", version = "0.4.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs", "io-util", "net"] }
 axum = { version = "0.8", features = ["json", "ws"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
 hyper = "1"
 bytes = "1"
 
@@ -52,7 +51,7 @@ bytes = "1"
 rusqlite = { version = "0.40", features = ["bundled", "blob", "column_decltype"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.35"
-zstd = "0.13"
+zstd = "0.14"
 
 # serialization
 serde = { version = "1", features = ["derive"] }
