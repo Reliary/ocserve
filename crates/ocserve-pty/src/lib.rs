@@ -537,7 +537,8 @@ fn spawn_process(
     cwd: &str,
     env: &[(String, String)],
 ) -> Result<Proc, String> {
-    unix::spawn(command, args, cwd, env)
+    let merged = merge_env(env);
+    unix::spawn(command, args, cwd, &merged)
 }
 
 #[cfg(target_os = "macos")]
@@ -547,7 +548,8 @@ fn spawn_process(
     cwd: &str,
     env: &[(String, String)],
 ) -> Result<Proc, String> {
-    macos::spawn(command, args, cwd, env)
+    let merged = merge_env(env);
+    macos::spawn(command, args, cwd, &merged)
 }
 
 #[cfg(windows)]
@@ -557,7 +559,27 @@ fn spawn_process(
     cwd: &str,
     env: &[(String, String)],
 ) -> Result<Proc, String> {
-    windows::spawn(command, args, cwd, env)
+    let merged = merge_env(env);
+    windows::spawn(command, args, cwd, &merged)
+}
+
+/// The child environment: the server's environment with the request's
+/// overrides applied on top.
+///
+/// Passing only the overrides is a real bug, not a simplification: the child
+/// got no `PATH`, and on Windows no `SystemRoot` either, so `cmd.exe` could not
+/// start and every terminal on that platform was dead. Upstream (node-pty)
+/// inherits `process.env` and merges the caller's map, which is also what a
+/// user expects when a terminal cannot see `git` on their PATH.
+fn merge_env(overrides: &[(String, String)]) -> Vec<(String, String)> {
+    let mut merged: Vec<(String, String)> = std::env::vars().collect();
+    for (k, v) in overrides {
+        match merged.iter_mut().find(|(ek, _)| ek.eq_ignore_ascii_case(k)) {
+            Some(slot) => slot.1 = v.clone(),
+            None => merged.push((k.clone(), v.clone())),
+        }
+    }
+    merged
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -604,6 +626,14 @@ mod spawn_acceptance {
     use std::time::{Duration, Instant};
 
     use std::sync::atomic::AtomicBool;
+
+    /// Test-only env write. Contained here so the production crate keeps its
+    /// `deny(unsafe_code)` posture and the unsafe is one line, in a test.
+    #[allow(unsafe_code)]
+    fn set_var_for_test(k: &str, v: &str) {
+        // Safety: no other thread in this test binary reads or writes this key.
+        unsafe { std::env::set_var(k, v) };
+    }
 
     fn shell_and_echo() -> (&'static str, &'static str, &'static str) {
         // (shell, command that prints a marker, expected marker)
@@ -712,6 +742,38 @@ mod spawn_acceptance {
         // (TIOCGWINSZ on Unix, `mode con` on Windows) and lives in the VM run.
         proc.resize(40, 100);
         proc.kill();
+    }
+
+    #[test]
+    fn child_inherits_parent_env_and_overrides_win() {
+        // The bug this pins: the PTY child used to receive ONLY the overrides,
+        // so it had no PATH (and no SystemRoot on Windows; cmd.exe could not
+        // start at all).
+        let key = "OCSERVE_PTY_ENV_TEST";
+        // `set_var` is unsafe in edition 2024 because a concurrent getenv is a
+        // data race. This test is the only writer of this key, and the module
+        // is compiled with the crate's usual test allowance.
+        set_var_for_test(key, "from-parent");
+        let merged = merge_env(&[("OCSERVE_PTY_OVERRIDE".into(), "x".into())]);
+        assert!(
+            merged.iter().any(|(k, v)| k == key && v == "from-parent"),
+            "parent environment must be inherited"
+        );
+        assert!(
+            merged.iter().any(|(k, _)| k == "OCSERVE_PTY_OVERRIDE"),
+            "overrides must be present"
+        );
+        let merged = merge_env(&[(key.into(), "from-request".into())]);
+        let value = merged
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone());
+        assert_eq!(value.as_deref(), Some("from-request"), "override must win");
+        // A PATH must reach the child, or no terminal can run a command.
+        assert!(
+            merged.iter().any(|(k, _)| k.eq_ignore_ascii_case("PATH")),
+            "PATH must be inherited"
+        );
     }
 
     #[test]
