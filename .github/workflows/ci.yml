@@ -144,6 +144,50 @@ jobs:
       - name: cargo check (aarch64)
         run: cargo check --workspace --release --target aarch64-unknown-linux-gnu
 
+  musl-check:
+    # musl is the static-Linux target: no glibc version skew, runs on Alpine and
+    # any distro. It compiles today, and building it found one real portability
+    # bug (`TIOCSWINSZ` is u64 on glibc, i32 on musl). The C dependencies
+    # (SQLite/zstd/brotli/ring) need a cross C toolchain, which zig provides
+    # through cargo-zigbuild.
+    #
+    # The build is the gate, not `cargo check`: a `check` passes while the link
+    # fails, and this target's whole point is the artifact.
+    name: musl build (static x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions-rust-lang/setup-rust-toolchain@46a9d261ee2ace4b93b3bd6e867168ac38627b38  # v1.12.0
+      - name: install zig + musl target
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          python3 -m pip install --quiet --user ziglang
+          python3 -c "import ziglang,os;print(os.path.dirname(ziglang.__file__))" > /tmp/zigdir
+          echo "PATH=$HOME/.local/bin:$(cat /tmp/zigdir):$PATH" >> "$GITHUB_ENV"
+          cargo install --quiet --locked cargo-zigbuild
+      - name: cargo zigbuild
+        run: RUSTFLAGS="-D warnings" cargo zigbuild --release -p ocserve --target x86_64-unknown-linux-musl
+      - name: assert static
+        run: |
+          set -eu
+          b=target/x86_64-unknown-linux-musl/release/ocserve
+          file "$b" | grep -q "statically linked"
+          if ldd "$b" 2>&1 | grep -qv "not a dynamic executable"; then
+            echo "::error::musl binary is dynamically linked"; exit 1
+          fi
+          # Boot it: a static binary that links but cannot start is not a build.
+          mkdir -p /tmp/oc-home /tmp/oc-data
+          env -i PATH=/usr/bin:/bin HOME=/tmp/oc-home OCSERVE_DATA_DIR=/tmp/oc-data \
+            OCSERVE_LEGACY_SYNC=0 "$b" serve --hostname 127.0.0.1 --port 4971 &
+          pid=$!
+          for _ in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:4971/global/health >/dev/null 2>&1; then
+              echo "musl server healthy"; kill "$pid"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::musl binary started but never became healthy"; kill "$pid" 2>/dev/null; exit 1
+
   platform-check:
     # Proves the two Windows compile blockers stay fixed, on a real Windows and
     # macOS toolchain. The C dependencies (SQLite/zstd/ring/blake3) cannot be

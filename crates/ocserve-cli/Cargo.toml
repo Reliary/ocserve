@@ -16,6 +16,7 @@ name = "ocserve"
 path = "src/main.rs"
 
 [dependencies]
+
 libc.workspace = true
 axum.workspace = true
 anyhow.workspace = true
@@ -42,3 +43,11 @@ sha1 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
+
+# musl has no malloc_trim, and its allocator retained the freed catalog build
+# pages (measured 447 MB RSS vs 193 MB on glibc for the same boot). mimalloc
+# plus an explicit mi_collect is the portable purge; glibc keeps malloc_trim.
+# Target-scoped so the glibc and Darwin binaries are unchanged.
+[target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
+mimalloc = { version = "0.1" }
+libmimalloc-sys = { version = "0.1", features = ["extended"] }

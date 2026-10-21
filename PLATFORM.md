@@ -104,6 +104,31 @@ ship a platform without pair-check there, it gets a `D-` row saying so.
 
 ---
 
+## 1.5 musl / static Linux (done)
+
+`x86_64-unknown-linux-musl` builds and runs: a **statically linked** 60.2 MB
+artifact (`file`: "statically linked", `ldd`: "not a dynamic executable") that
+boots, serves the full API, and exits cleanly on SIGTERM. No glibc version skew,
+so it runs on Alpine and any distro.
+
+What had to change:
+
+| Finding | Fix |
+|---|---|
+| `libc::TIOCSWINSZ` is `c_ulong` on glibc but `c_int` on musl | cast through `i64` (real portability bug, found by the first musl build) |
+| musl has no `malloc_trim`; freed catalog pages stayed resident | the musl build uses **mimalloc** as the global allocator, and `trim_heap()` calls `mi_collect(true)` there. Measured on the same boot: **447 MB RSS before, 176 MB after** (glibc: 193 MB) |
+| The C dependencies (SQLite, zstd, brotli, ring) need a musl C toolchain | `cargo zigbuild` (zig cc) in CI and release; no host musl toolchain needed |
+
+Tests: **113 of 114 musl test binaries pass**. The one "failure" is the
+`ocserve` bin target, which is not a test and exits 2 with its usage text when
+run with no arguments. The trim contract is now target-derived (`glibc ||
+musl` have a purge; anything else is a documented no-op) instead of assuming
+non-glibc means no purge.
+
+Performance is **not** claimed on musl: the Linux numbers in the README are
+glibc. Boot RSS and route latency are close (176 vs 193 MB at boot), but the
+load harness has not been re-run against a static build.
+
 ## 1.4 Windows PTY (ConPTY) and tree-kill (done, runner-verified)
 
 `crates/ocserve-pty/src/windows.rs` implements the PTY on ConPTY:

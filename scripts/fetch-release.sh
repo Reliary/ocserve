@@ -11,7 +11,8 @@
 #   scripts/fetch-release.sh --selftest
 #
 # Defaults: TAG = latest release, platform = linux-x86_64 (override for
-# linux-aarch64). --dest defaults to the OS temp dir ($TMPDIR).
+# linux-aarch64, or append -musl for the static build). --dest defaults to the
+# OS temp dir ($TMPDIR).
 #
 # Refuses on: checksum mismatch, missing asset, unpinned download tool.
 # --selftest proves the checksum gate bites (corrupt the tarball, expect fail).
@@ -71,8 +72,8 @@ if [ -z "$TAG" ]; then
 fi
 
 case "$PLATFORM" in
-  linux-x86_64|linux-aarch64) ;;
-  *) say "FAIL: unsupported --platform (linux-x86_64|linux-aarch64)"; exit 1 ;;
+  linux-x86_64|linux-aarch64|linux-x86_64-musl|linux-aarch64-musl) ;;
+  *) say "FAIL: unsupported --platform (linux-x86_64[-musl]|linux-aarch64[-musl])"; exit 1 ;;
 esac
 
 VER=${TAG#v}

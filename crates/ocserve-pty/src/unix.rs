@@ -120,7 +120,15 @@ impl Proc {
     }
 
     pub fn resize(&self, rows: u16, cols: u16) {
-        posix::set_winsize(self.master.as_raw_fd(), libc::TIOCSWINSZ, rows, cols);
+        // `TIOCSWINSZ` is `c_ulong` (already u64) on glibc but `c_int` on musl.
+        // Go through `i64` so the cast is meaningful on both and clippy's
+        // useless-cast lint stays quiet on the glibc build.
+        posix::set_winsize(
+            self.master.as_raw_fd(),
+            libc::TIOCSWINSZ as i64 as u64,
+            rows,
+            cols,
+        );
     }
 
     pub fn kill(&self) {

@@ -5,12 +5,21 @@
 //! Single test fn per file = no env race (integration test files run in
 //! separate processes; see TESTING §1 flaky-test rules).
 
+/// glibc has `malloc_trim`; musl builds use mimalloc, whose `mi_collect` is
+/// the equivalent; everywhere else the trim is a documented no-op.
+fn purge_available() -> bool {
+    cfg!(all(target_os = "linux", target_env = "gnu"))
+        || cfg!(all(target_os = "linux", target_env = "musl"))
+}
+
 #[test]
 fn trim_heap_respects_killswitch() {
-    // default (no env): must actually call malloc_trim on this platform
-    assert!(
-        ocserve_http::watch::trim_heap(),
-        "trim_heap must be active by default on linux-gnu"
+    // Default (no env): reports whether a real purge ran on this target.
+    let trimmed = ocserve_http::watch::trim_heap();
+    assert_eq!(
+        trimmed,
+        purge_available(),
+        "trim_heap must report whether a real purge ran on this target"
     );
 
     // killswitch: OCSERVE_TRIM=0 → no-op, returns false
@@ -21,16 +30,12 @@ fn trim_heap_respects_killswitch() {
         "OCSERVE_TRIM=0 must disable trim (lab negative control depends on it)"
     );
 
-    // unrelated value: active again
+    // unrelated value: active again (same platform dependence as above)
     unsafe { std::env::set_var("OCSERVE_TRIM", "1") };
-    assert!(
-        ocserve_http::watch::trim_heap(),
-        "OCSERVE_TRIM=1 stays active"
-    );
+    let trimmed = ocserve_http::watch::trim_heap();
+    assert_eq!(trimmed, purge_available(), "OCSERVE_TRIM=1 stays active");
 
     unsafe { std::env::remove_var("OCSERVE_TRIM") };
-    assert!(
-        ocserve_http::watch::trim_heap(),
-        "env removed → active again"
-    );
+    let trimmed = ocserve_http::watch::trim_heap();
+    assert_eq!(trimmed, purge_available(), "env removed → active again");
 }

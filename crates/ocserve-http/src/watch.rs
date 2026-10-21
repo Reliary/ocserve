@@ -64,7 +64,23 @@ pub fn trim_heap() -> bool {
         }
         true
     }
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    // musl has no malloc_trim. Under the musl binary the global allocator is
+    // mimalloc (see ocserve-cli), and `mi_collect(true)` is its equivalent:
+    // force a collection and return free pages. Without this the same boot
+    // retained 447 MB instead of 193 MB.
+    #[cfg(all(target_os = "linux", target_env = "musl"))]
+    {
+        // Safety: `mi_collect` is thread-safe and takes no pointers from us; it
+        // operates on mimalloc's own heap metadata.
+        unsafe {
+            libmimalloc_sys::mi_collect(true);
+        }
+        true
+    }
+    #[cfg(not(any(
+        all(target_os = "linux", target_env = "gnu"),
+        all(target_os = "linux", target_env = "musl")
+    )))]
     {
         false
     }

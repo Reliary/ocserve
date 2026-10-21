@@ -4,6 +4,14 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+// musl's allocator is the default global allocator otherwise, and it retains
+// freed pages (no malloc_trim equivalent). mimalloc exposes mi_collect, which
+// the trim hook calls; glibc and Darwin keep the system allocator because their
+// measured behaviour is already good and this is not a free change.
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(
     name = "ocserve",
