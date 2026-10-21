@@ -130,8 +130,20 @@ test spawns a real shell, writes a command and requires the marker to come back
 through the reader; the negative control (reader appends nothing) fails in
 10 s with the captured output printed.
 
+Both runners exercise it. Building it found four platform bugs that no compile
+check could, all now fixed and covered by that test:
+
+| Bug | Effect | Cause |
+|---|---|---|
+| Child environment was overrides only | no `PATH`, no `SystemRoot`: `cmd.exe` could not start | spawn passed only `TERM` + the request map; now inherits and merges |
+| No `STARTF_USESTDHANDLES` | ConPTY init arrived, but `cmd`'s banner went to the *server's* stdout | without it the child inherits std handles by value even with `bInheritHandles=FALSE` |
+| `EAGAIN` hardcoded to 11 | macOS reader exited on the first poll; every terminal empty | Darwin uses 35; the constants now come from libc |
+| env "last wins" kept the first spelling | block carried a name the caller never supplied | duplicate rule now replaces the whole entry |
+
 Remaining, recorded: interactive resize fidelity (`mode con` in a real
 console) is a VM-only check, because the CI runner has no console to inspect.
+Nested-job parents (CI) fall back to post-spawn job assignment, so a grandchild
+could escape in that window; `KILL_ON_JOB_CLOSE` still covers a crashed server.
 
 ## 1.3 Path containment (Phase 1, done)
 

@@ -181,13 +181,15 @@ reference platform.
 `TIOCGWINSZ` round-trip), exit code and kill. The client-facing contract is the
 same one Linux serves.
 
-**Windows** runs the server, the shell tool and the frozen wire contract
-(verified in a Windows 11 LTSC VM, `pair-check` 18 compared / 0 divergent against
-`opencode-windows-x64@1.18.31`). What is **not** implemented there yet: the
-`/pty` terminal routes (ConPTY) still return the documented stub error, and the
-Windows-specific path normalization and long-path handling are outstanding.
-Plugin and MCP spawning no longer assumes `sh`, but their Windows path is only
-compile-checked.
+**Windows** runs the server, the shell tool, the terminal routes and the frozen
+wire contract. The wire is verified in a Windows 11 LTSC VM (`pair-check` 18
+compared / 0 divergent against `opencode-windows-x64@1.18.31`); the terminal
+routes use ConPTY and are verified on the Windows CI runner by a test that
+spawns a real shell and requires its output back through the PTY. Building that
+found four bugs no compile check could, all fixed (child environment, std
+handles, Darwin errno values, env duplicate spelling). What is **not** there
+yet: Windows-specific path normalization beyond the handle-based containment
+check, long-path handling, and plugin/MCP spawning is still compile-checked only.
 
 No performance number is claimed for macOS or Windows: every measurement in this
 README comes from Linux, on the same machine, against the same freeze binary.
