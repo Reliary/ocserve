@@ -284,6 +284,17 @@ pub fn spawn(
     // fallback the terminal would be unusable there.
     let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    // Without STARTF_USESTDHANDLES the child inherits the parent's standard
+    // handles by value, even with bInheritHandles=FALSE. It then writes its
+    // banner and prompt to the *server's* stdout instead of the pseudoconsole,
+    // which is exactly what the runner showed: ConPTY's own init sequences
+    // arrived on the output pipe (`ESC]0;...cmd.exe`), but `cmd`'s banner landed
+    // in the test log and its stdin was the harness's. Nulling all three is
+    // what node-pty's conpty.cc does, with the same comment.
+    si.StartupInfo.dwFlags |= windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = std::ptr::null_mut();
+    si.StartupInfo.hStdOutput = std::ptr::null_mut();
+    si.StartupInfo.hStdError = std::ptr::null_mut();
     let mut cmdline = build_command_line(command, args);
     let cwd_w = wide(cwd);
     let mut env_block = build_env_block(env);

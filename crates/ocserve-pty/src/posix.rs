@@ -19,9 +19,13 @@ use crate::Session;
 // These are used by `unix.rs`, `macos.rs`, or both. They stay public and
 // compiled on every platform so the shared surface cannot quietly diverge.
 pub const F_SETFL: i32 = 4;
-pub const EIO: i32 = 5;
-pub const EAGAIN: i32 = 11;
-pub const EBADF: i32 = 9;
+// These MUST come from libc. They were hardcoded to the Linux values, and
+// `EAGAIN` is 35 on Darwin rather than 11: the reader therefore treated the
+// normal "no data yet" case as an unknown error and exited on the first poll,
+// so every macOS terminal produced an empty buffer (caught by the runner).
+pub const EIO: i32 = libc::EIO;
+pub const EAGAIN: i32 = libc::EAGAIN;
+pub const EBADF: i32 = libc::EBADF;
 
 /// NUL-terminated bytes for `execve`'s argv/envp.
 pub fn cstring(s: &str) -> Vec<u8> {
