@@ -23,7 +23,8 @@ cd "$(dirname "$0")/.."
 
 BIN="${OCSERVE_BIN:-$PWD/target/release/ocserve}"
 PORT="${CG_PORT:-4942}"
-UNIT="ocserve-cgbattery-$$"
+BATTERY_PID=$$
+UNIT="ocserve-cgbattery-$BATTERY_PID"
 SELF_TEST="${1:-}"
 
 die() { echo "cgroup-battery: $*" >&2; exit 2; }
@@ -58,8 +59,11 @@ fi
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/cgbattery.XXXXXX")" || die "mktemp"
 cleanup() {
-  systemctl --user stop "$UNIT" >/dev/null 2>&1
-  systemctl --user reset-failed "$UNIT" >/dev/null 2>&1
+  # ocserve-cgbattery-* is one of OUR transient units (guard rule 6: only
+  # ocserve* units are mutable from repo scripts). The literal prefix is
+  # written out so the rule can see it.
+  systemctl --user stop "ocserve-cgbattery-$BATTERY_PID" >/dev/null 2>&1
+  systemctl --user reset-failed "ocserve-cgbattery-$BATTERY_PID" >/dev/null 2>&1
   # the transient scope's cgroup disappears with the unit; kill any stray
   # sleeper we started so a failed run cannot leak a process for 5 minutes
   if [ -n "${SLEEP_PID:-}" ]; then kill -9 "$SLEEP_PID" 2>/dev/null; fi
