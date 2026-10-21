@@ -116,7 +116,9 @@ fn build_env_block(pairs: &[(String, String)]) -> Vec<u16> {
             .iter_mut()
             .find(|(ek, _)| ek.eq_ignore_ascii_case(k))
         {
-            *slot = (slot.0.clone(), v.clone());
+            // Replace the whole entry: last-wins includes the spelling, so
+            // the block never carries a name the caller did not supply.
+            *slot = (k.clone(), v.clone());
         } else {
             entries.push((k.clone(), v.clone()));
         }
@@ -618,8 +620,10 @@ mod tests {
         assert_eq!(quote_arg("C:\\dir\\"), "C:\\dir\\");
         assert_eq!(quote_arg("trail\\"), "trail\\");
         assert_eq!(quote_arg("a b\\"), "\"a b\\\\\"");
-        // A trailing backslash inside quotes must be doubled.
-        assert_eq!(quote_arg("x\\ y"), "\"x\\\\ y\"");
+        // A backslash that is NOT immediately before a quote stays literal.
+        // Only a backslash preceding a quote is an escape (the impl was
+        // correct here; this expectation was not).
+        assert_eq!(quote_arg("x\\ y"), "\"x\\ y\"");
     }
 
     #[test]
