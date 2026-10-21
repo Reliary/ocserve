@@ -1,0 +1,414 @@
+{
+  "generated_at": "2026-10-21T09:18:00.635Z",
+  "node": "v26.3.0",
+  "host": "crates/ocserve-plugin/src/host/host.mjs",
+  "corpus": 20,
+  "summary": {
+    "v2-registered": 5,
+    "load-error": 5,
+    "registered-only": 2,
+    "hooks-ran": 5,
+    "missing-dependency": 2,
+    "loaded-no-hooks": 1
+  },
+  "results": [
+    {
+      "name": "@langfuse/opencode-observability-plugin",
+      "version": "0.5.2",
+      "declared": {
+        "sdk_v1": true,
+        "sdk_v2": true
+      },
+      "entry": "dist/index.js",
+      "status": "loaded",
+      "dialect": "v2",
+      "hooks": [],
+      "invoked": {
+        "skipped": "v2 dispatch is domain-typed; registration only"
+      },
+      "event": null,
+      "error": null,
+      "class": "v2-registered"
+    },
+    {
+      "name": "opencode-models-discovery",
+      "version": "2.0.0",
+      "declared": {
+        "sdk_v1": true,
+        "sdk_v2": true
+      },
+      "entry": "dist/index.js",
+      "status": "load-error",
+      "dialect": null,
+      "hooks": [],
+      "invoked": {},
+      "event": null,
+      "error": "Error: D-V2-DOMAIN: ctx.integration.transform is not bridged in ocserve\n    at <anonymous> (/work/crates/ocserve-plugin/src/host/v2.mjs:269:21)\n    at <anonymous> (/corpus/opencode-models-discovery/dist/runtime.js:3584:25)\n    at setupV2 (/corpus/opencode-models-discovery/dist/runtime.js:3720:9)\n    at setupV2 (/work/crates/ocserve-plugin/src/host/v2.mjs:337:31)\n    at loadPlugin (/work/crates/ocs",
+      "class": "load-error"
+    },
+    {
+      "name": "@openviking/opencode-plugin",
+      "version": "2026.10.21-1",
+      "declared": {
+        "sdk_v1": false,
+        "sdk_v2": false
+      },
+      "entry": "index.mjs",
+      "status": "load-error",
+      "dialect": null,
+      "hooks": [],
+      "invoked": {},
+      "event": null,
+      "error": "Error: D-V2-DOMAIN: ctx.mcp.transform is not bridged in ocserve\n    at <anonymous> (/work/crates/ocserve-plugin/src/host/v2.mjs:269:21)\n    at startV2Plugin (/corpus/@openviking__opencode-plugin/lib/v2-plugin.mjs:41:19)\n    at setup (/corpus/@openviking__opencode-plugin/index.mjs:100:12)\n    at setupV2 (/work/crates/ocserve-plugin/src/host/v2.mjs:337:31)\n    at loadPlugin (/work/crates/ocserve-plu",
+      "class": "load-error"
+    },
+    {
+      "name": "@sjawhar/opencode-legion-envoy",
+      "version": "8.18.0",
+      "declared": {
+        "sdk_v1": true,
+        "sdk_v2": false
+      },
+      "entry": "dist/src/server.js",
+      "status": "loaded",
+      "dialect": "v1",
+      "hooks": [
+        "config",
+        "shell.env",
+        "event",
+        "dispose",
+        "tool"
+      ],
+      "invoked": {},
+      "event": "delivered",
+      "error": null,
+      "config": "ran",
+      "class": "registered-only"
+    },
+    {
+      "name": "@mastra/opencode",
+      "version": "0.1.37",
+      "declared": {
+        "sdk_v1": true,
+        "sdk_v2": false
+      },
+      "entry": "dist/index.js",
+      "status": "loaded",
+      "dialect": "v1",
+      "hooks": [
+        "event",
+        "experimental.chat.messages.transform",
+        "experimental.chat.system.transform",
+        "tool"
+      ],
+      "invoked": {
+        "experimental.chat.system.transform": "ran"
+      },
+      "event": "delivered",
+      "error": null,
+      "class": "hooks-ran"
+    },
+    {
+      "name": "opencode-poe-auth",
+      "version": "0.0.4",
+      "declared": {
+        "sdk_v1": true,
+        "sdk_v2": false
+      },
+      "entry": "dist/index.js",
+      "status": "loaded",
+      "dialect": "v1",
+      "hooks": [
+        "auth"
+      ],
+      "invoked": {},
+      "event": null,
+      "error": null,
+      "class": "registered-only"
+    },
+    {
+      "name": "opencode-gitlab-auth",
+      "version": "3.0.0",
+      "declared": {
+        "sdk_v1": false,
+        "sdk_v2": true
+      },
+      "entry": "dist/index.js",
+      "status": "load-error",
+      "dialect": null,
+      "hooks": [],
+      "invoked": {},
+      "event": null,
+      "error": "Error: D-V2-DOMAIN: ctx.integration.transform is not bridged in ocserve\n    at <anonymous> (/work/crates/ocserve-plugin/src/host/v2.mjs:269:21)\n    at setup (/corpus/opencode-gitlab-auth/dist/index.js:122:31)\n    at setupV2 (/work/crates/ocserve-plugin/src/host/v2.mjs:337:31)\n    at loadPlugin (/work/crates/ocserve-plugin/src/host/host.mjs:230:27)\n    at async handle (/work/crates/ocserve-plugin/s",
+      "class": "load-error"
+    },
+    {
+      "name": "opencode-usage-quota-tracker",
+      "version": "1.0.0-alpha.6",
+      "declared": {
+        "sdk_v1": false,
+        "sdk_v2": true
+      },
+      "entry": "index.ts",
+      "status": "loaded",
+      "dialect": "v2",
+      "hooks": [],
+      "invoked": {
+        "skipped": "v2 dispatch is domain-typed; registration only"
+      },
+      "event": null,
+      "error": null,
+      "class": "v2-registered"
+    },
+    {
+      "name": "opencode-model-recommender",
+      "version": "1.0.0-alpha.7",
+      "declared": {
+        "sdk_v1": false,
+        "sdk_v2": true
+      },
+      "entry": "index.ts",
+      "status": "dependency",
+      "dialect": null,
+      "hooks": [],
+      "invoked": {},
+      "event": null,
+      "error": "ResolveMessage: Cannot find package 'opencode-plugin-kit' imported from /corpus/opencode-model-recommender/index.ts",
+      "class": "missing-dependency"
+    },
+    {
+      "name": "@dietrichgebert/ponytail",
+      "version": "5.3.2",
+      "declared": {
+        "sdk_v1": false,
+        "sdk_v2": false
+      },
+      "entry": ".opencode/plugins/ponytail.mjs",
+      "status": "loaded",
+      "dialect": "v2",
+      "hooks": [
+        "session.context",
+        "session.compaction"
+      ],
+      "invoked": {
+        "skipped": "v2 dispatch is domain-typed; registration only"
+      },
+      "event": null,
+      "error": null,
+      "class": "v2-registered"
+    },
+    {
+      "name": "oh-my-opencode-slim",
+      "version": "3.0.5",
+      "declared": {
+        "sdk_v1": true,
+        "sdk_v2": false
+      },
+      "entry": "dist/index.js",
+      "status": "load-error",
+      "dialect": null,
+      "hooks": [],
+      "invoked": {},
+      "event": null,
+      "error": "Error: Unable to snapshot configured MCP namespaces: this host cannot expose configured MCP namespaces; update to a supported v2 host\n    at <anonymous> (/corpus/oh-my-opencode-slim/dist/index.js:67064:19)\n    at async setupV2 (/work/crates/ocserve-plugin/src/host/v2.mjs:337:31)\n    at async loadPlugin (/work/crates/ocserve-plugin/src/host/host.mjs:230:27)\n    at async handle (/work/crates/ocserve",
+      "class": "load-error"
+    },
+    {
+      "name": "@tarquinen/opencode-dcp",
+      "version": "3.2.0",
+      "declared": {
+        "sdk_v1": true,
+        "sdk_v2": false
+      },
+      "entry": "dist/index.js",
+      "status": "dependency",
+      "dialect": null,
+      "hooks": [],
+      "invoked": {},
+      "event": null,
+      "error": "ResolveMessage: Cannot find package '@opencode-ai/plugin' imported from /corpus/@tarquinen__opencode-dcp/dist/index.js",
+      "class": "missing-dependency"
+    },
+    {
+      "name": "opencode-pty",
+      "version": "0.4.0",
+      "declared": {
+        "sdk_v1": true,
+        "sdk_v2": false
+      },
+      "entry": "dist/index.js",
+      "status": "loaded",
+      "dialect": "v1",
+      "hooks": [
+        "command.execute.before",
+        "tool",
+        "config",
+        "event"
+      ],
+      "invoked": {
+        "command.execute.before": "ran"
+      },
+      "event": "delivered",
+      "error": null,
+      "config": "ran",
+      "class": "hooks-ran"
+    },
+    {
+      "name": "openrtk",
+      "version": "0.1.0",
+      "declared": {
+        "sdk_v1": true,
+        "sdk_v2": false
+      },
+      "entry": "lib/index.js",
+      "status": "loaded",
+      "dialect": "v1",
+      "hooks": [],
+      "invoked": {},
+      "event": null,
+      "error": null,
+      "class": "loaded-no-hooks"
+    },
+    {
+      "name": "opencode-skills-collection",
+      "version": "4.1.20",
+      "declared": {
+        "sdk_v1": true,
+        "sdk_v2": true
+      },
+      "entry": "dist/index.js",
+      "status": "loaded",
+      "dialect": "v2",
+      "hooks": [],
+      "invoked": {
+        "skipped": "v2 dispatch is domain-typed; registration only"
+      },
+      "event": null,
+      "error": null,
+      "class": "v2-registered"
+    },
+    {
+      "name": "opencode-plugin-browser",
+      "version": "1.0.0-alpha.6",
+      "declared": {
+        "sdk_v1": false,
+        "sdk_v2": true
+      },
+      "entry": "index.ts",
+      "status": "loaded",
+      "dialect": "v2",
+      "hooks": [],
+      "invoked": {
+        "skipped": "v2 dispatch is domain-typed; registration only"
+      },
+      "event": null,
+      "error": null,
+      "class": "v2-registered"
+    },
+    {
+      "name": "rolebox",
+      "version": "2.0.0",
+      "declared": {
+        "sdk_v1": true,
+        "sdk_v2": true
+      },
+      "entry": "dist/entries/opencode.js",
+      "status": "loaded",
+      "dialect": "v1",
+      "hooks": [
+        "tool",
+        "event",
+        "config",
+        "chat.message",
+        "tool.execute.after",
+        "tool.execute.before",
+        "experimental.chat.system.transform",
+        "experimental.session.compacting",
+        "dispose"
+      ],
+      "invoked": {
+        "chat.message": "ran",
+        "tool.execute.after": "ran",
+        "tool.execute.before": "ran",
+        "experimental.chat.system.transform": "ran",
+        "experimental.session.compacting": "ran"
+      },
+      "event": "delivered",
+      "error": null,
+      "config": "ran",
+      "class": "hooks-ran"
+    },
+    {
+      "name": "@cortexkit/opencode-magic-context",
+      "version": "0.49.16",
+      "declared": {
+        "sdk_v1": true,
+        "sdk_v2": false
+      },
+      "entry": "dist/index.js",
+      "status": "load-error",
+      "dialect": null,
+      "hooks": [],
+      "invoked": {},
+      "event": null,
+      "error": "Error: D-V2-TOOL-EDITOR: ctx.tool.transform is not bridged in ocserve\n    at transform (/work/crates/ocserve-plugin/src/host/v2.mjs:171:19)\n    at registerTools (/corpus/@cortexkit__opencode-magic-context/dist/context-3znk23va.js:4260:22)\n    at registerContext (/corpus/@cortexkit__opencode-magic-context/dist/context-3znk23va.js:4732:55)\n    at async setup (/corpus/@cortexkit__opencode-magic-conte",
+      "class": "load-error"
+    },
+    {
+      "name": "@iam-brain/opencode-codex-auth",
+      "version": "1.10.0",
+      "declared": {
+        "sdk_v1": true,
+        "sdk_v2": false
+      },
+      "entry": "dist/index.js",
+      "status": "loaded",
+      "dialect": "v1",
+      "hooks": [
+        "event",
+        "config",
+        "auth",
+        "chat.message",
+        "chat.params",
+        "chat.headers",
+        "experimental.session.compacting",
+        "experimental.text.complete",
+        "dispose",
+        "tool"
+      ],
+      "invoked": {
+        "chat.message": "ran",
+        "chat.params": "ran",
+        "chat.headers": "ran",
+        "experimental.session.compacting": "ran",
+        "experimental.text.complete": "ran"
+      },
+      "event": "delivered",
+      "error": null,
+      "config": "ran",
+      "class": "hooks-ran"
+    },
+    {
+      "name": "opencode-notify",
+      "version": "0.3.1",
+      "declared": {
+        "sdk_v1": true,
+        "sdk_v2": false
+      },
+      "entry": "dist/index.js",
+      "status": "loaded",
+      "dialect": "v1",
+      "hooks": [
+        "permission.ask",
+        "event",
+        "tool.execute.before"
+      ],
+      "invoked": {
+        "tool.execute.before": "ran"
+      },
+      "event": "delivered",
+      "error": null,
+      "class": "hooks-ran"
+    }
+  ]
+}

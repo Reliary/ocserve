@@ -4,10 +4,21 @@ name: release
 # tarball + sha256, and attach everything to a GitHub Release. The release
 # assets are the product; CI builds a linux-x86_64 artifact on every push so a
 # broken release build is caught before tag day.
+#
+# `workflow_dispatch` runs the SAME build matrix without publishing. That
+# exists because at v0.4.0 every non-Linux target failed while
+# `continue-on-error` made the run green, so the release silently contained two
+# tarballs. Tag day must not be the first time a target is built.
 
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      note:
+        description: 'reason for this build-only run'
+        required: false
+        default: 'pre-tag verification' 
 
 permissions:
   contents: read
@@ -42,8 +53,9 @@ jobs:
     # Every target below is required EXCEPT aarch64-pc-windows-msvc, which needs
     # the ARM64 MSVC toolchain on an x64 runner and has never been proven here.
     # Making that one hard would block releases on an environment gap rather
-    # than a code defect; the other five are covered by the platform-check job
-    # (type level) and, for macOS, by the PTY acceptance tests.
+    # than a code defect. The other six are covered before tag day: the glibc
+    # targets by the size and cross jobs, macOS and Windows by the required
+    # platform checks, and musl by its own required build job.
     continue-on-error: ${{ matrix.target == 'aarch64-pc-windows-msvc' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
@@ -83,7 +95,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          # On a tag the ref name is the version. On workflow_dispatch it is a
+          # branch name, so the version must come from Cargo.toml or the
+          # artifact would be named after the branch.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          fi
           EXT=""
           case "${{ matrix.target }}" in
             *windows*) OS=windows; EXT=".exe" ;;
@@ -116,6 +135,9 @@ jobs:
 
   release:
     name: attach release assets
+    # Only a tag publishes. A dispatch is a build-only verification run; its
+    # artifacts are still uploaded per-target above.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
     permissions:
