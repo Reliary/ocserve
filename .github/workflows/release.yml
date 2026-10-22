@@ -59,7 +59,7 @@ jobs:
     continue-on-error: ${{ matrix.target == 'aarch64-pc-windows-msvc' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions-rust-lang/setup-rust-toolchain@46a9d261ee2ace4b93b3bd6e867168ac38627b38  # v1.12.0
+      - uses: actions-rust-lang/setup-rust-toolchain@c8ff772090ab9d00f7f7bd7b388f3c3032282e3b  # v1.12.0
         with:
           target: ${{ matrix.target }}
 
