@@ -376,7 +376,20 @@ async fn serve(
     }
     // The plugin `config` hook (v1 parity) needs the resolved config; capture
     // it before `into_payloads` consumes rt.
-    let plugin_config = rt.config.clone();
+    let mut plugin_config = rt.config.clone();
+    // v1 derives `plugin_origins` before dispatching the `config` hook
+    // (config.ts:113-115): each winning spec with the file and scope that
+    // declared it. Freeze sends it, so a plugin that branches on scope sees it.
+    if !plugin_specs.is_empty() {
+        let origin = std::env::var("HOME")
+            .map(|h| format!("{h}/.config/opencode"))
+            .unwrap_or_default();
+        let origins: Vec<serde_json::Value> = plugin_specs
+            .iter()
+            .map(|(spec, _)| serde_json::json!({"spec": spec, "source": origin, "scope": "global"}))
+            .collect();
+        plugin_config["plugin_origins"] = serde_json::Value::Array(origins);
+    }
     let payloads = rt.into_payloads(); // consumed after llm/mcp/plugins took their pieces
     let db_path = ocserve_store::writer::db_path(&data_dir);
     let writer = std::sync::Arc::new(

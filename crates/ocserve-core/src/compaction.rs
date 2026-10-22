@@ -176,7 +176,10 @@ async fn request_hooks(
     let sys_out = hook_mutate(
         ctx.plugins.as_ref(),
         "experimental.chat.system.transform",
-        json!({"sessionID": session_id, "model": model}),
+        json!({
+            "sessionID": session_id,
+            "model": {"providerID": ctx.provider_id, "id": model, "modelID": model},
+        }),
         json!({"system": sys_vec}),
     )
     .await;
@@ -204,16 +207,22 @@ async fn request_hooks(
     let hook_in = json!({
         "sessionID": session_id,
         "agent": agent,
-        "model": model,
-        "provider": ctx.provider_id,
+        "model": {"providerID": ctx.provider_id, "id": model, "modelID": model},
+        "provider": {"providerID": ctx.provider_id, "name": ctx.provider_id},
         "message": message,
     });
     let params_out = hook_mutate(
         ctx.plugins.as_ref(),
         "chat.params",
         hook_in.clone(),
+        // freeze seeds maxOutputTokens with the resolved default, not null; a
+        // plugin that only adjusts temperature still sees a complete object.
         json!({"temperature": Value::Null, "topP": Value::Null,
-               "topK": Value::Null, "maxOutputTokens": Value::Null,
+               "topK": Value::Null,
+               "maxOutputTokens": crate::prompt::default_max_tokens(
+                   None,
+                   ctx.model_limit["output"].as_u64().unwrap_or(0),
+               ),
                "options": {}}),
     )
     .await;
@@ -354,13 +363,25 @@ pub async fn process(
     };
 
     // messages.transform fires on the SESSION-SHAPED clone (compaction.ts:
-    // 379) — this site mirrors upstream's raw shape (the main builder sends
-    // OpenAI shape, §17). Fail-open: output must be the same length with
-    // info/parts or the original head serializes unchanged.
+    // 379), and the result is used verbatim: upstream assigns
+    // `const msgs = structuredClone(selected.head)` then triggers on `msgs`,
+    // so a splicing/injecting transform is exactly what produces the summary
+    // prompt. The old `arr.len() == head_len` guard rejected Magic Context's
+    // whole mechanism (`messages.splice(...)`), silently falling back to the
+    // untransformed head.
     let head_vals: Vec<Value> = sel_msgs[..head_len]
         .iter()
         .map(|(info, parts)| json!({"info": info, "parts": parts}))
         .collect();
+    // hooks: compacting (prompt ?? [built, ...context]) then the model-shaped
+    // request messages get messages.transform at the builder site below
+    let c_out = hook_mutate(
+        ctx.plugins.as_ref(),
+        "experimental.session.compacting",
+        json!({"sessionID": session_id}),
+        json!({"context": [], "prompt": Value::Null}),
+    )
+    .await;
     let mt_out = hook_mutate(
         ctx.plugins.as_ref(),
         "experimental.chat.messages.transform",
@@ -368,10 +389,16 @@ pub async fn process(
         json!({"messages": head_vals}),
     )
     .await;
+    // Any length is accepted. Validation is structural only: every element must
+    // be `{info: object, parts: array}`. An invalid array fails open to the
+    // original head rather than crashing the serializer, and the synthetic
+    // messages a transform injects feed the REQUEST only — `tail_start_id`
+    // comes from the untransformed `select()`, so nothing synthetic can reach
+    // persistence.
     let head_final: Vec<(Value, Vec<Value>)> =
         match mt_out.get("messages").and_then(|a| a.as_array()) {
             Some(arr)
-                if arr.len() == head_len
+                if !arr.is_empty()
                     && arr
                         .iter()
                         .all(|m| m["info"].is_object() && m["parts"].is_array()) =>
@@ -395,15 +422,6 @@ pub async fn process(
         .collect();
     let entries = bounded_entries(head);
 
-    // hooks: compacting (prompt ?? [built, ...context]) then the model-shaped
-    // request messages get messages.transform at the builder site below
-    let c_out = hook_mutate(
-        ctx.plugins.as_ref(),
-        "experimental.session.compacting",
-        json!({"sessionID": session_id}),
-        json!({"context": [], "prompt": Value::Null}),
-    )
-    .await;
     // v2 Phase 3: session.compaction — v2's SessionCompaction carries a
     // `result` override ({summary,...}) that SKIPS the model request when set
     // (promise/session.ts). Map it onto the same prompt channel: a v2 plugin

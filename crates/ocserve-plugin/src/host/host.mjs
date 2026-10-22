@@ -87,48 +87,93 @@ const loadedV2 = [];
 const v2State = newV2State();
 
 function makeClient(serverUrl, directory, headers = {}) {
-  // Generic fetch-backed client: method path → HTTP (upper camel → kebab),
-  // e.g. client.session.get(id) → GET {serverUrl}/session/{id}. Plugins that
-  // only need directory/project never touch it (reliary8).
-  const call = (parts, body, method) => async (...args) => {
+  // The SDK convention is `client.<ns>.<method>({ path, query, body })`, NOT
+  // positional arguments. Treating the argument OBJECT as a body is what broke
+  // Magic Context's historian: `session.messages({path:{id}})` became
+  // `GET /session/messages` (404) and `session.create({path,query,body})` sent
+  // the envelope as the payload. Measured 2026-10-22.
+  //
+  // Path segments are interpolated from `path` in declaration order, so
+  // `{ path: { id } }` on `session.get` yields `/session/<id>`. `query` is
+  // encoded; `body` is JSON. A bare string first argument is still accepted for
+  // the legacy shorthand (`session.get(id)`).
+  const call = (parts, method) => async (arg) => {
     let path = "/" + parts.map((p) => p.replace(/[A-Z]/g, (c) => "-" + c.toLowerCase())).join("/");
     let query = "";
-    if (method === "GET" && typeof args[0] === "string" && parts.at(-1) === "get") {
-      path = path.replace(/\/get$/, "/" + encodeURIComponent(args[0]));
-      args = [];
-    }
-    if (typeof args[0] === "object" && args[0] && method !== "GET") {
-      body = JSON.stringify(args[0]);
-      args = [];
+    let body;
+    if (typeof arg === "string") {
+      path += "/" + encodeURIComponent(arg);
+    } else if (arg && typeof arg === "object") {
+      const { path: pathObj, query: queryObj, body: bodyObj } = arg;
+      if (pathObj && typeof pathObj === "object") {
+        if (Object.keys(pathObj).length > 0) {
+          path += "/" + Object.values(pathObj).map((v) => encodeURIComponent(String(v))).join("/");
+        }
+      }
+      if (queryObj && typeof queryObj === "object") {
+        const qs = new URLSearchParams();
+        for (const [k, v] of Object.entries(queryObj)) {
+          if (v !== undefined && v !== null) qs.append(k, String(v));
+        }
+        const s = qs.toString();
+        if (s) query = "?" + s;
+      }
+      if (bodyObj !== undefined) body = JSON.stringify(bodyObj);
     }
     const url = serverUrl.replace(/\/$/, "") + path + query;
     const res = await fetch(url, {
       method,
-      headers: { "content-type": "application/json", "x-opencode-directory": directory, ...headers },
-      body: body ?? undefined,
+      headers: {
+        "content-type": "application/json",
+        "x-opencode-directory": directory,
+        ...headers,
+      },
+      body: method === "GET" || method === "HEAD" ? undefined : body,
     });
     const text = await res.text();
-    try { return JSON.parse(text); } catch { return text; }
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
   };
   const cache = new Map();
-  return new Proxy({}, {
-    get(_, ns) {
-      if (typeof ns !== "string") return undefined;
-      if (!cache.has(ns)) {
-        cache.set(ns, new Proxy({}, {
-          get(_, verbRaw) {
-            const verb = String(verbRaw);
-            if (!cache.has(ns + verb)) {
-              const method = verb === "get" || verb === "list" || verb === "find" || verb === "search" ? "GET" : verb === "create" || verb === "post" ? "POST" : verb === "update" || verb === "patch" ? "PATCH" : verb === "delete" || verb === "remove" ? "DELETE" : "GET";
-              cache.set(ns + verb, call([ns, verb], undefined, method));
-            }
-            return cache.get(ns + verb);
-          },
-        }));
-      }
-      return cache.get(ns);
+  return new Proxy(
+    {},
+    {
+      get(_, ns) {
+        if (typeof ns !== "string") return undefined;
+        if (!cache.has(ns)) {
+          cache.set(
+            ns,
+            new Proxy(
+              {},
+              {
+                get(_, verbRaw) {
+                  const verb = String(verbRaw);
+                  if (!cache.has(ns + verb)) {
+                    const method =
+                      verb === "get" || verb === "list" || verb === "find" || verb === "search"
+                        ? "GET"
+                        : verb === "create" || verb === "post"
+                          ? "POST"
+                          : verb === "update" || verb === "patch"
+                            ? "PATCH"
+                            : verb === "delete" || verb === "remove"
+                              ? "DELETE"
+                              : "GET";
+                    cache.set(ns + verb, call([ns, verb], method));
+                  }
+                  return cache.get(ns + verb);
+                },
+              },
+            ),
+          );
+        }
+        return cache.get(ns);
+      },
     },
-  });
+  );
 }
 
 // ---- v2 support helpers (Phase 3) -----------------------------------

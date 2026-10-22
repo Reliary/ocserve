@@ -92,6 +92,12 @@
 #      backgrounded AND-list held the tool's pipes, `join()` blocked a
 #      blocking-pool thread forever, and the session lock never released)
 #      [plant: a raw JoinHandle::join in a reader]
+#  47. the hook-contract replay is non-vacuous (a comparator that cannot fail is
+#      theatre; the selftest plants a kind change and a missing trigger) [suite]
+#  48. the real-plugin corpus invokes only hooks the reference actually fires
+#      (it shipped "chat.messages.transform", which exists nowhere) [suite]
+#  49. no hand-written hook payload literals in tests/bench (the {role, content}
+#      transform fixture agreed with the caller's bug) [plant: grep]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -1155,5 +1161,41 @@ else
   echo "FAIL: rule 46 plant was not flagged (the guard is vacuous)"; fail=1
 fi
 rm -f "$plant"
+
+echo "== guard: hook-contract replay is non-vacuous (rule 47) =="
+# A comparator that cannot fail is theatre. Run the harness's own selftest
+# (planted kind change, planted missing trigger, allow filtering) and prove the
+# gate is WIRED to the capture/diff/effects scripts it claims to run.
+if ./scripts/hook-contract-check.sh --self-test >/dev/null 2>&1; then
+  echo "ok"
+else
+  echo "FAIL: hook-contract-check --self-test (the comparator is vacuous or broken)"; fail=1
+fi
+if grep -q 'capture-hooks.sh' scripts/hook-contract-check.sh \
+   && grep -q 'normalise.py diff' scripts/hook-contract-check.sh \
+   && grep -q 'effects.py' scripts/capture-hooks.sh; then
+  echo "ok (gate wires capture + diff + effects)"
+else
+  echo "FAIL: hook-contract-check no longer runs capture/diff/effects (rule 47)"; fail=1
+fi
+
+echo "== guard: the plugin corpus invokes only real hooks (rule 48) =="
+# The corpus listed "chat.messages.transform", a name that exists in neither the
+# SDK nor any plugin, so it reported hooks-ran while never calling the real
+# transform. Every name in V1_HOOKS must appear in the captured surface.
+if python3 scripts/check-corpus-hooks.py; then
+  echo "ok"
+else
+  echo "FAIL: bench/plugins/check.mjs invokes a hook the reference never fires (rule 48)"; fail=1
+fi
+
+echo "== guard: hook payload literals come from the corpus (rule 49) =="
+# Hand-written payloads let the fixture agree with the caller's bug (the
+# {role, content} transform fixture did exactly that).
+if out=$(grep -rn 'output\.messages\.push({ *role:' crates/ bench/plugins 2>/dev/null); then
+  echo "$out"; echo "FAIL: hand-written hook payload (rule 49)"; fail=1
+else
+  echo "ok"
+fi
 
 exit $fail

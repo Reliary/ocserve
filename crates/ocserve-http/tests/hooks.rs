@@ -237,7 +237,11 @@ export const PluginModule = {
   id: "hooks-fixture",
   server: async () => ({
     "chat.message": async (input, output) => {
-      if (!input.sessionID || !input.messageID) throw new Error("chat.message input incomplete");
+      // Contract: sessionID is required; messageID/agent/model/variant are
+      // OPTIONAL (the SDK marks them `?`), and the reference omits unset ones.
+      // The old fixture required messageID, which the reference never sends.
+      if (!input.sessionID || !output.message || !Array.isArray(output.parts))
+        throw new Error("chat.message payload violates the SDK contract");
       output.message = { ...output.message, hooked: true };
       output.parts = output.parts.map((p) =>
         p.type === "text" ? { ...p, text: p.text + " [CM]" } : p);
@@ -255,8 +259,20 @@ export const PluginModule = {
     "experimental.text.complete": async (_i, output) => {
       output.text = output.text + " [TC]";
     },
+    // Contract check INSIDE the fixture: a plugin that receives the old
+    // OpenAI-shaped payload throws here (Magic Context's findSessionId does
+    // exactly this), so the test cannot pass on the caller's own mistake.
     "experimental.chat.messages.transform": async (_i, output) => {
-      output.messages.push({ role: "user", content: "[MT]" });
+      if (!Array.isArray(output.messages) ||
+          !output.messages.every((m) => m && m.info && typeof m.info.role === "string" && typeof m.info.sessionID === "string" && Array.isArray(m.parts))) {
+        throw new Error("contract: messages must be {info, parts}[]");
+      }
+      // Length-changing on purpose: a splicing transform (Magic Context's
+      // mechanism) must reach the request; the old compaction guard rejected it.
+      output.messages.push({
+        info: { role: "user", sessionID: output.messages[0].info.sessionID },
+        parts: [{ type: "text", text: "[MT]" }],
+      });
     },
     "tool.execute.before": async (_i, output) => {
       if (output.args && typeof output.args.command === "string") {

@@ -465,6 +465,25 @@ results either way); matches part payload JSON text; blobbed parts included;
 `truncated=true` when more hits remain past limit+offset; snippet = ±80 chars
 around the first match with ellipses; hits ordered by message time DESC.
 
+## 16.9. Plugin-contract classes (2026-10-22)
+
+The plugin surface is guarded by **capture, not inference**. `scripts/capture-hooks.sh`
+loads a probe plugin into the reference implementation and records every v1 trigger with
+its real `input`/`output`; `bench/hooks/normalise.py` compares key sets *and* value kinds
+(a string where the contract says object is a break); `bench/hooks/order_check.py` asserts
+the per-request order (`system.transform` → `chat.params` → `chat.headers`); and the
+**active** probe proves the mutation is consumed (provider request, persisted tool part,
+child env).
+
+Named divergence:
+
+| id | what | evidence |
+|---|---|---|
+| `D-HOOK-TRANSFORM-PER-TURN` | `experimental.chat.messages.transform` fires once per turn here, once per LLM request upstream (`prompt.ts:1255` is inside `while(true)` at `:1088`). The converted list is reused across tool rounds, which is what makes the trimmed/injected history survive to the end of the turn. | measured: 1 transform per tool turn vs the reference's 2 |
+
+Guards: rule 47 (replay non-vacuity), rule 48 (corpus must invoke real hook names),
+rule 49 (no hand-written hook payload literals).
+
 ## 17. oc-remote route coverage (exhaustive client audit)
 
 Source: static extraction of all58 route templates + call graph from

@@ -501,6 +501,149 @@ fn canonical_tool_args(v: &Value) -> String {
     }
 }
 
+/// `tool.definition` (SDK `Hooks["tool.definition"]`): fired once per tool
+/// before the schema reaches the provider, with `{toolID}` input and
+/// `{description, parameters}` output. Upstream recomputes the JSON Schema only
+/// when the plugin changed `parameters` (registry.ts:319-322); mirroring that
+/// avoids a pointless conversion on every request.
+async fn transform_tool_definitions(ctx: &PromptContext, tools: Vec<Value>) -> Vec<Value> {
+    if ctx.plugins.is_none() {
+        return tools;
+    }
+    let mut out = Vec::with_capacity(tools.len());
+    for mut tool in tools {
+        let Some(id) = tool
+            .pointer("/function/name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
+            out.push(tool);
+            continue;
+        };
+        let res = hook_mutate(
+            ctx.plugins.as_ref(),
+            "tool.definition",
+            json!({"toolID": id}),
+            json!({
+                "description": tool.pointer("/function/description").cloned().unwrap_or(Value::Null),
+                "parameters": tool.pointer("/function/parameters").cloned().unwrap_or(Value::Null),
+                // upstream passes the same schema under `jsonSchema` and only
+                // recomputes when the plugin replaced `parameters`
+                // (registry.ts:319-322)
+                "jsonSchema": tool.pointer("/function/parameters").cloned().unwrap_or(Value::Null),
+            }),
+        )
+        .await;
+        if let Some(d) = res.get("description").and_then(|v| v.as_str()) {
+            tool["function"]["description"] = json!(d);
+        }
+        if let Some(p) = res.get("parameters")
+            && p.is_object()
+        {
+            tool["function"]["parameters"] = p.clone();
+        }
+        out.push(tool);
+    }
+    out
+}
+
+/// `shell.env` (SDK `Hooks["shell.env"]`): fired before each shell spawn, input
+/// `{cwd, sessionID, callID}`, output `{env}`. Upstream merges the returned vars
+/// over the process env (`shell.ts:418`), so a plugin can inject credentials or
+/// flags without touching the server's own environment.
+pub async fn shell_env_hook(
+    plugins: Option<&Arc<tokio::sync::Mutex<ocserve_plugin::Sidecar>>>,
+    session_id: &str,
+    call_id: Option<&str>,
+    cwd: &str,
+) -> Vec<(String, String)> {
+    if plugins.is_none() {
+        return Vec::new();
+    }
+    let mut input = json!({"cwd": cwd, "sessionID": session_id});
+    if let Some(id) = call_id {
+        input["callID"] = json!(id);
+    }
+    let out = hook_mutate(plugins, "shell.env", input, json!({"env": {}})).await;
+    out.get("env")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `chat.message` input, matching the SDK: optional keys are OMITTED when unset
+/// (freeze omits them; sending `null` is a different key set), and `model` is
+/// `{providerID, modelID}`, never a bare string.
+fn chat_message_input(
+    session_id: &str,
+    agent: &str,
+    provider_id: &str,
+    model_id: &str,
+    variant: Option<&str>,
+) -> Value {
+    let mut v = json!({ "sessionID": session_id, "agent": agent });
+    v["model"] = json!({
+        "providerID": provider_id,
+        "modelID": model_id,
+    });
+    if let Some(var) = variant {
+        v["variant"] = json!(var);
+    }
+    v
+}
+
+/// Apply `experimental.chat.messages.transform` to the session-shaped message
+/// graph and return the plugin's result.
+///
+/// Contract (SDK `Hooks`): `output.messages: {info: Message, parts: Part[]}[]`,
+/// mutated in place, any length. Upstream fires this on the graph and converts
+/// afterwards; the returned graph is request-scoped and never persisted.
+///
+/// Fail-open: a missing/unparseable array, or an element that is not
+/// `{info, parts}`, keeps the ORIGINAL graph. Structural validation is not
+/// optional — a plugin returning `[null]` would otherwise crash the converter.
+async fn transform_messages(
+    ctx: &PromptContext,
+    history: &[(Value, Vec<Value>)],
+) -> Vec<(Value, Vec<Value>)> {
+    let Some(_) = ctx.plugins.as_ref() else {
+        return history.to_vec();
+    };
+    if history.is_empty() {
+        return history.to_vec();
+    }
+    let graph: Vec<Value> = history
+        .iter()
+        .map(|(info, parts)| json!({"info": info, "parts": parts}))
+        .collect();
+    let out = hook_mutate(
+        ctx.plugins.as_ref(),
+        "experimental.chat.messages.transform",
+        json!({}),
+        json!({"messages": graph}),
+    )
+    .await;
+    let Some(arr) = out.get("messages").and_then(|v| v.as_array()) else {
+        return history.to_vec();
+    };
+    let parsed: Option<Vec<(Value, Vec<Value>)>> = arr
+        .iter()
+        .map(|m| {
+            let info = m.get("info").filter(|v| v.is_object())?;
+            let parts = m.get("parts").filter(|v| v.is_array())?;
+            Some((info.clone(), parts.as_array().cloned().unwrap_or_default()))
+        })
+        .collect();
+    match parsed {
+        Some(p) => p,
+        None => history.to_vec(),
+    }
+}
+
 pub(crate) fn to_provider_messages(history: &[(Value, Vec<Value>)]) -> Vec<ChatMessage> {
     // tail-weighted budget: find the oldest message we can afford to keep
     let mut total: usize = history
@@ -1290,13 +1433,18 @@ pub async fn run_prompt_with(
         let out = hook_mutate(
             ctx.plugins.as_ref(),
             "chat.message",
-            json!({
-                "sessionID": session_id,
-                "agent": agent,
-                "model": model,
-                "messageID": user_msg_id,
-                "variant": req.variant.clone().map(Value::String).unwrap_or(Value::Null),
-            }),
+            // Contract (SDKm Hooks.chat.message): input is
+            // {sessionID, agent?, model?, messageID?, variant?} where `model` is
+            // a {providerID, modelID} object. Freeze sends only the keys that
+            // are actually set (optional keys are omitted, not null), so this
+            // mirrors that: extra keys and a bare model string are both wrong.
+            chat_message_input(
+                session_id,
+                &agent,
+                &ctx.provider_id,
+                &model,
+                req.variant.as_deref(),
+            ),
             json!({"message": user_info, "parts": user_parts}),
         )
         .await;
@@ -1493,6 +1641,28 @@ pub async fn run_prompt_with(
             let filtered = crate::compact::filter_compacted(&history);
             let history: Vec<(Value, Vec<Value>)> =
                 filtered.iter().map(|&i| history[i].clone()).collect();
+            // v1 parity: experimental.chat.messages.transform (prompt.ts:1255).
+            // Upstream transforms the session-shaped graph and only then
+            // converts to model messages; ocserve used to hand the plugin
+            // OpenAI-shaped `{role,content}` objects, which Magic Context could
+            // not read (`message.info.role`) — it threw internally, returned the
+            // input unchanged, and every turn shipped the raw history.
+            //
+            // ORDER MATTERS: the 8 MB budget drops from the FRONT
+            // (to_provider_messages). Magic Context injects its compartment
+            // block at index 0. Transform-then-budget would therefore delete
+            // the injection; filter -> transform -> convert keeps it.
+            //
+            // PLACEMENT (named divergence D-HOOK-TRANSFORM-PER-TURN): upstream
+            // fires this inside the request loop (prompt.ts:1255 is inside
+            // `while (true)` at :1088), once per LLM request. Ocserve fires it
+            // once per TURN. The converted messages are kept for the whole
+            // turn, so the trimmed/injected history survives every tool round —
+            // which is what the overflow fix needs — but a plugin does not get a
+            // second look at mid-turn tool results. Making it per-request is a
+            // message-rebuild refactor, tracked as a named gap rather than
+            // pretended.
+            let history = transform_messages(ctx, &history).await;
             messages.extend(to_provider_messages(&history));
         }
         let mut tools = if opts.tools_enabled {
@@ -1514,6 +1684,11 @@ pub async fn run_prompt_with(
                     });
             tools.extend(mcp_tools);
         }
+        // v1 parity: tool.definition fires per tool before the schema reaches
+        // the provider (registry.ts:318). Without it a plugin cannot rewrite a
+        // description or parameter schema, which is how prompt-shaping plugins
+        // steer tool use.
+        let mut tools = transform_tool_definitions(ctx, tools).await;
         // v1 visibleTools/disabled parity: deny'd tools are never sent to the
         // model (ask/allow stay visible — ask flows at exec time instead).
         tools.retain(|spec| {
@@ -1527,34 +1702,11 @@ pub async fn run_prompt_with(
         // leading system messages in `messages` (starts with the single
         // pre-built system message; system.transform may reshape the prefix)
         let mut sys_count: usize = 1;
-        // v1 parity: experimental.chat.messages.transform — prompt.ts:1255 (main
-        // inference) AND compaction.ts:379 (summarize): ocserve funnels both
-        // flows through this builder, so ONE site covers both upstream sites.
-        // The system prefix is NOT exposed (upstream fires on the stored
-        // conversation; system is built separately there). Live-request only —
-        // DB history untouched by construction. Fail-open on shape mismatch.
-        // Shape note (§17): OpenAI messages (ocserve's wire), documented
-        // divergence from upstream's AI-SDK ModelMessage shape.
-        if ctx.plugins.is_some() {
-            let conv: Vec<ChatMessage> = messages.split_off(sys_count);
-            let mt_out = hook_mutate(
-                ctx.plugins.as_ref(),
-                "experimental.chat.messages.transform",
-                json!({}),
-                json!({
-                    "messages": serde_json::to_value(&conv).unwrap_or(Value::Null)
-                }),
-            )
-            .await;
-            match mt_out
-                .get("messages")
-                .cloned()
-                .and_then(|v| serde_json::from_value::<Vec<ChatMessage>>(v).ok())
-            {
-                Some(parsed) => messages.extend(parsed),
-                None => messages.extend(conv), // no/unparseable array → fail-open
-            }
-        }
+        // `experimental.chat.messages.transform` fires on the STORED message
+        // graph ({info, parts}) at the history site above, before conversion —
+        // exactly upstream's order (prompt.ts:1255 then toModelMessagesEffect).
+        // A transform therefore sees the same objects a plugin expects and can
+        // splice/replace freely; only the resulting text reaches the wire.
         loop {
             step += 1;
             if max_rounds > 0 && step > max_rounds {
@@ -1616,7 +1768,10 @@ pub async fn run_prompt_with(
             let sys_out = hook_mutate(
                 ctx.plugins.as_ref(),
                 "experimental.chat.system.transform",
-                json!({"sessionID": session_id, "model": model}),
+                json!({
+                    "sessionID": session_id,
+                    "model": {"providerID": ctx.provider_id, "id": model, "modelID": model},
+                }),
                 json!({"system": sys_vec}),
             )
             .await;
@@ -1643,11 +1798,15 @@ pub async fn run_prompt_with(
                 .collect();
             messages.splice(0..sys_count, sys_msgs);
             sys_count = sys_vec.len();
+            // Contract (SDK Hooks.chat.params / chat.headers): `model` is the
+            // SDK Model object and `provider` is a {providerID, name?, ...}
+            // context object. Freeze sends both as objects; a bare string is a
+            // shape break even though the key set matches.
             let hook_in = json!({
                 "sessionID": session_id,
                 "agent": agent,
-                "model": model,
-                "provider": ctx.provider_id,
+                "model": {"providerID": ctx.provider_id, "id": model, "modelID": model},
+                "provider": {"providerID": ctx.provider_id, "name": ctx.provider_id},
                 "message": user_info,
             });
             let params_out = hook_mutate(
@@ -1655,7 +1814,11 @@ pub async fn run_prompt_with(
                 "chat.params",
                 hook_in.clone(),
                 json!({"temperature": Value::Null, "topP": Value::Null,
-                   "topK": Value::Null, "maxOutputTokens": Value::Null,
+                   "topK": Value::Null,
+                   "maxOutputTokens": default_max_tokens(
+                       None,
+                       ctx.model_limit["output"].as_u64().unwrap_or(0),
+                   ),
                    "options": {}}),
             )
             .await;
@@ -2058,7 +2221,7 @@ pub async fn run_prompt_with(
                     // ---- question tool: own rendezvous, no permission gate
                     // (upstream QuestionTool never ctx.ask()s) ----
                     if call.name == "question" {
-                        let (output, state) = question_tool_state(
+                        let (mut output, state) = question_tool_state(
                             ctx,
                             writer,
                             session_id,
@@ -2070,34 +2233,61 @@ pub async fn run_prompt_with(
                         .await?;
                         running["state"] = state;
                         if let Some(plug) = &ctx.plugins {
+                            // Contract (SDK Hooks.tool.execute.after): input is
+                            // exactly {tool, sessionID, callID, args}. The old
+                            // payload invented messageID/agent/modelID/session,
+                            // which no plugin reads and the type does not allow.
                             let hook_in = json!({
-                                "sessionID": session_id,
-                                "messageID": assistant_id,
-                                "callID": call.id,
                                 "tool": call.name,
-                                "agent": agent,
-                                "modelID": model,
+                                "sessionID": session_id,
+                                "callID": call.id,
                                 "args": serde_json::from_str::<Value>(&call.arguments)
                                     .unwrap_or_else(|_| json!({})),
-                                "session": {"id": session_id},
                             });
                             let mut guard = plug.lock().await;
                             let hook_t0 = std::time::Instant::now();
                             let hook_res = guard
-                                .trigger("tool.execute.after", hook_in, json!({"output": output}))
+                                .trigger(
+                                    "tool.execute.after",
+                                    hook_in,
+                                    json!({"title": "", "output": output, "metadata": {}}),
+                                )
                                 .await;
                             ocserve_metrics::observe(
                                 "ocserve_plugin_hook_duration_seconds",
                                 "hook=\"tool.execute.after\",result=\"ok\"",
                                 hook_t0.elapsed().as_micros() as u64,
                             );
-                            if let Err(e) = &hook_res {
-                                ocserve_metrics::labeled_counter(
-                                    "ocserve_plugin_hook_errors_total",
-                                    "hook=\"tool.execute.after\"",
-                                    1,
-                                );
-                                tracing::warn!("plugin tool.execute.after: {e:#}");
+                            match &hook_res {
+                                Ok(out) => {
+                                    if let Some(t) = out.get("title").and_then(|v| v.as_str())
+                                        && !t.is_empty()
+                                    {
+                                        running["state"]["title"] = json!(t);
+                                    }
+                                    if let Some(o) = out.get("output").and_then(|v| v.as_str()) {
+                                        output = o.to_string();
+                                        running["state"]["output"] = json!(o);
+                                    }
+                                    if let Some(m) = out.get("metadata").and_then(|v| v.as_object())
+                                        && !m.is_empty()
+                                    {
+                                        if !running["state"]["metadata"].is_object() {
+                                            running["state"]["metadata"] = json!({});
+                                        }
+                                        for (k, v) in m {
+                                            running["state"]["metadata"][k] = v.clone();
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    ocserve_metrics::labeled_counter(
+                                        "ocserve_plugin_hook_errors_total",
+                                        "hook=\"tool.execute.after\"",
+                                        1,
+                                    );
+                                    tracing::warn!("plugin tool.execute.after: {e:#}");
+                                }
                             }
                         }
                         emit_durable(
@@ -2387,7 +2577,21 @@ pub async fn run_prompt_with(
                             // (subagent-permissions.ts, RCM framing).
                             task_exec(ctx, writer, session_id, &input).await
                         } else if builtin {
-                            spawn_tool(&call.name, input, &ctx.directory, &session_env).await
+                            {
+                                // shell.env (SDK): plugin-injected vars are merged
+                                // over the session env for THIS spawn only.
+                                let mut env = session_env.clone();
+                                env.extend(
+                                    shell_env_hook(
+                                        ctx.plugins.as_ref(),
+                                        session_id,
+                                        Some(&call.id),
+                                        &ctx.directory,
+                                    )
+                                    .await,
+                                );
+                                spawn_tool(&call.name, input, &ctx.directory, &env).await
+                            }
                         } else if let Some(hub) = &ctx.mcp {
                             match hub.call(&call.name, input.clone()).await {
                                 Some(Ok(text)) => Ok(ocserve_tools::ToolResult {
@@ -2400,12 +2604,33 @@ pub async fn run_prompt_with(
                                 }),
                                 Some(Err(e)) => Err(e),
                                 None => {
-                                    spawn_tool(&call.name, input, &ctx.directory, &session_env)
-                                        .await
+                                    let mut env = session_env.clone();
+                                    env.extend(
+                                        shell_env_hook(
+                                            ctx.plugins.as_ref(),
+                                            session_id,
+                                            Some(&call.id),
+                                            &ctx.directory,
+                                        )
+                                        .await,
+                                    );
+                                    spawn_tool(&call.name, input, &ctx.directory, &env).await
                                 }
                             }
                         } else {
-                            spawn_tool(&call.name, input, &ctx.directory, &session_env).await
+                            {
+                                let mut env = session_env.clone();
+                                env.extend(
+                                    shell_env_hook(
+                                        ctx.plugins.as_ref(),
+                                        session_id,
+                                        Some(&call.id),
+                                        &ctx.directory,
+                                    )
+                                    .await,
+                                );
+                                spawn_tool(&call.name, input, &ctx.directory, &env).await
+                            }
                         };
                         match exec {
                             Ok(r) => {
@@ -2497,34 +2722,62 @@ pub async fn run_prompt_with(
                     // v1 hook: tool.execute.after (sequential in-host; failures are
                     // logged host-side, never block the tool result — M4b)
                     if let Some(plug) = &ctx.plugins {
+                        // Contract (SDK Hooks.tool.execute.after): exactly
+                        // {tool, sessionID, callID, args}.
                         let hook_in = json!({
-                            "sessionID": session_id,
-                            "messageID": assistant_id,
-                            "callID": call.id,
                             "tool": call.name,
-                            "agent": agent,
-                            "modelID": model,
+                            "sessionID": session_id,
+                            "callID": call.id,
                             "args": serde_json::from_str::<Value>(&call.arguments)
                                 .unwrap_or_else(|_| json!({})),
-                            "session": {"id": session_id},
                         });
                         let mut guard = plug.lock().await;
                         let hook_t0 = std::time::Instant::now();
                         let hook_res = guard
-                            .trigger("tool.execute.after", hook_in, json!({"output": output}))
+                            .trigger(
+                                "tool.execute.after",
+                                hook_in,
+                                json!({"title": "", "output": output, "metadata": {}}),
+                            )
                             .await;
                         ocserve_metrics::observe(
                             "ocserve_plugin_hook_duration_seconds",
                             "hook=\"tool.execute.after\",result=\"ok\"",
                             hook_t0.elapsed().as_micros() as u64,
                         );
-                        if let Err(e) = &hook_res {
-                            ocserve_metrics::labeled_counter(
-                                "ocserve_plugin_hook_errors_total",
-                                "hook=\"tool.execute.after\"",
-                                1,
-                            );
-                            tracing::warn!("plugin tool.execute.after: {e:#}");
+                        match &hook_res {
+                            Ok(out) => {
+                                // Contract: the plugin may replace title/output and
+                                // merge metadata. Read it back or the hook is a
+                                // no-op that looks wired (2026-10-22 audit).
+                                if let Some(t) = out.get("title").and_then(|v| v.as_str())
+                                    && !t.is_empty()
+                                {
+                                    running["state"]["title"] = json!(t);
+                                }
+                                if let Some(o) = out.get("output").and_then(|v| v.as_str()) {
+                                    output = o.to_string();
+                                    running["state"]["output"] = json!(o);
+                                }
+                                if let Some(m) = out.get("metadata").and_then(|v| v.as_object())
+                                    && !m.is_empty()
+                                {
+                                    if !running["state"]["metadata"].is_object() {
+                                        running["state"]["metadata"] = json!({});
+                                    }
+                                    for (k, v) in m {
+                                        running["state"]["metadata"][k] = v.clone();
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                ocserve_metrics::labeled_counter(
+                                    "ocserve_plugin_hook_errors_total",
+                                    "hook=\"tool.execute.after\"",
+                                    1,
+                                );
+                                tracing::warn!("plugin tool.execute.after: {e:#}");
+                            }
                         }
                     }
                     // v2 Phase 3: tool.execute.after — the v2 tool-result shape

@@ -1,0 +1,11 @@
+# hook-contract allowlist — every line must name a divergence row in PLAN §17.
+# `hook-contract-check` fails on any difference not listed here.
+#
+# D-HOOK-TRANSFORM-PER-TURN: upstream fires experimental.chat.messages.transform
+# inside the request loop (prompt.ts:1255, `while(true)` at :1088); ocserve fires
+# it once per turn, because the converted message list is reused across tool
+# rounds. Measured: 1 transform per tool turn vs the reference's 2.
+order[prompt]: reference=chat.message experimental.chat.messages.transform
+order[prompt]: reference=experimental.chat.messages.transform experimental.chat.system.transform
+order[command]: reference=experimental.chat.messages.transform experimental.chat.system.transform
+order[summarize]: reference=experimental.chat.messages.transform experimental.chat.system.transform

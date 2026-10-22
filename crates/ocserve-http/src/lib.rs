@@ -5007,12 +5007,20 @@ async fn post_shell(
     // execute directly (bash executor: stderr merged, output bounded,
     // default 120s cap — ShellInput carries no timeout). Off-worker: a long
     // shell command must not pin a tokio worker (K-EFFICIENCY).
+    // shell.env (v1 parity, shell.ts:418): a user-initiated shell goes through
+    // the same plugin hook as a model-initiated one, with callID = the part id.
+    let shell_env = {
+        let plug = st.plugins.get().cloned();
+        match plug {
+            Some(sc) => ocserve_core::prompt::shell_env_hook(Some(&sc), &id, None, &dir).await,
+            None => Vec::new(),
+        }
+    };
     let exec = {
         let cmd = json!({"command": command});
         let d = dir.clone();
         tokio::task::spawn_blocking(move || {
-            // v1 shell route: no session scope, so no session env (empty).
-            ocserve_tools::execute("bash", &cmd, std::path::Path::new(&d), &[])
+            ocserve_tools::execute("bash", &cmd, std::path::Path::new(&d), &shell_env)
         })
         .await
         .map_err(|e| ApiError {

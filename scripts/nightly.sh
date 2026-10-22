@@ -165,6 +165,10 @@ size_gate() {
 # /shell route. Local-only by design - the dance needs a delegated systemd
 # tree that CI runners do not provide; `check-guards.sh` rule 45 is the CI
 # proxy (static, with a planted control).
+# Plugin hook contract (2026-10-22): captures the reference's trigger payloads,
+# replays them against ocserve, and asserts shape + order + consumption. Local
+# only — needs the vendored freeze. Guard rule 47 is the CI-side proxy.
+step "hook contract (capture + diff + effects)" bash -c './scripts/hook-contract-check.sh'
 step "child containment battery" bash -c './scripts/cgroup-battery.sh'
 step "uninstall selftest (canary battery)" bash -c './scripts/uninstall.sh --selftest'
 step "binary size ceiling" bash -c "$(declare -f size_gate); size_gate"
