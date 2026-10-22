@@ -93,6 +93,12 @@ ProtectSystem=strict
 # ocserve's own data dir is required; the opencode/plugin paths are optional
 # ("-path" = ignore when absent) so a fresh machine without opencode still boots.
 ReadWritePaths=%h/.local/share/ocserve -%h/.local/share/opencode -%h/.cache/opencode -%h/.config/opencode -%h/src/reliary8
+# Plugin logs: magic-context writes os.tmpdir()/magic-context.log. With
+# ProtectSystem=strict that path is read-only, so the plugin's own diagnostics
+# silently vanish (the 2026-10-22 audit could not tell a swallowed transform from
+# one that never ran). /tmp is shared with the legacy server, so attribution is
+# still by session id, not by file.
+ReadWritePaths=/tmp
 NoNewPrivileges=true
 PrivateTmp=false
 

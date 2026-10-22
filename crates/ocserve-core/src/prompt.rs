@@ -608,6 +608,7 @@ fn chat_message_input(
 /// optional — a plugin returning `[null]` would otherwise crash the converter.
 async fn transform_messages(
     ctx: &PromptContext,
+    session_id: &str,
     history: &[(Value, Vec<Value>)],
 ) -> Vec<(Value, Vec<Value>)> {
     let Some(_) = ctx.plugins.as_ref() else {
@@ -616,9 +617,19 @@ async fn transform_messages(
     if history.is_empty() {
         return history.to_vec();
     }
+    // The plugin's `findSessionId` requires a USER message carrying
+    // `info.sessionID`. `load_messages` merges ids from the columns, so this is
+    // normally satisfied; an imported session can carry rows whose info lacks
+    // the key, and then the transform no-ops silently (the plugin returns
+    // without logging anything). Re-stamp the session id on the graph we hand
+    // over — it is the session we are prompting, and this is request-scoped.
     let graph: Vec<Value> = history
         .iter()
-        .map(|(info, parts)| json!({"info": info, "parts": parts}))
+        .map(|(info, parts)| {
+            let mut info = info.clone();
+            info["sessionID"] = json!(session_id);
+            json!({"info": info, "parts": parts})
+        })
         .collect();
     let out = hook_mutate(
         ctx.plugins.as_ref(),
@@ -1662,7 +1673,7 @@ pub async fn run_prompt_with(
             // second look at mid-turn tool results. Making it per-request is a
             // message-rebuild refactor, tracked as a named gap rather than
             // pretended.
-            let history = transform_messages(ctx, &history).await;
+            let history = transform_messages(ctx, session_id, &history).await;
             messages.extend(to_provider_messages(&history));
         }
         let mut tools = if opts.tools_enabled {
