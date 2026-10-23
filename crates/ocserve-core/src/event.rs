@@ -68,6 +68,11 @@ pub struct EventBusInner {
     /// watch channel carrying the latest seq (one slot — never grows)
     head: tokio::sync::watch::Sender<u64>,
     receivers: AtomicUsize,
+    /// Set on graceful shutdown so SSE readers end instead of holding the
+    /// connection open forever. `axum::serve` waits for every connection, and
+    /// an SSE stream never returns on its own; without this a single tailnet
+    /// client could push every restart into systemd's 90 s SIGKILL.
+    closing: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -113,8 +118,31 @@ impl EventBus {
                 }),
                 head,
                 receivers: AtomicUsize::new(0),
+                closing: std::sync::atomic::AtomicBool::new(false),
             }),
         }
+    }
+
+    /// Ask every subscriber to end. Idempotent; new subscribers also close
+    /// immediately (they see the flag at the top of `recv`).
+    pub fn close(&self) {
+        self.inner
+            .closing
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Wake receivers parked in `changed()`.
+        let seq = self
+            .inner
+            .ring
+            .lock()
+            .expect("event ring poisoned")
+            .next_seq;
+        let _ = self.inner.head.send(seq);
+    }
+
+    pub fn is_closing(&self) -> bool {
+        self.inner
+            .closing
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Live subscriber count (SSE client gauge, SRE §2).
@@ -218,6 +246,13 @@ impl EventBusReceiver {
 
     pub async fn recv(&mut self) -> Result<String, RecvError> {
         loop {
+            if self
+                .inner
+                .closing
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(RecvError::Closed);
+            }
             if let Some(f) = self.pending.pop_front() {
                 return Ok(f);
             }
@@ -595,6 +630,28 @@ mod tests {
         let ring = bus.inner.ring.lock().unwrap();
         assert!(ring.items.len() <= BUS_CAPACITY);
         assert!(ring.total_bytes <= RING_BYTE_BUDGET);
+    }
+
+    #[tokio::test]
+    async fn close_ends_a_live_subscriber() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        assert!(!bus.is_closing());
+        // A subscriber parked waiting for the next frame must wake on close:
+        // otherwise `axum::serve` waits forever for the SSE connection and a
+        // single client can force a SIGKILL at systemd's 90 s timeout.
+        let waiter = tokio::spawn(async move { rx.recv().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        bus.close();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("recv did not wake on close")
+            .expect("join");
+        assert_eq!(out, Err(RecvError::Closed));
+        // Idempotent, and new subscribers close immediately.
+        bus.close();
+        let mut late = bus.subscribe();
+        assert_eq!(late.recv().await, Err(RecvError::Closed));
     }
 
     #[tokio::test]

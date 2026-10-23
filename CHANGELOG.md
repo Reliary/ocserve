@@ -23,6 +23,17 @@ differs is a named `D-*` row in `PLAN.md §17`.
   boot.
 - `doctor --budget` reports per-node `memory.events` and pressure, and
   distinguishes "installed but stopped" from "not installed".
+- Graceful shutdown closes the event bus, ending SSE streams. A connected
+  event-stream client used to hold `axum::serve` open, so every restart waited
+  out the drain budget (and 90 s SIGKILL before the budget existed). Verified
+  with a live SSE client: shutdown now completes in under 2 s.
+- L1 sidecar recycle default lowered 450 → 280 MB: 450 sat above the plugin
+  leaf's 320 MB cap, so the kernel always won and the graceful path was dead
+  code. Ordered invariant pinned by tests.
+- Spawns with no leaf now clear `OCSERVE_KIDS_CGROUP` instead of inheriting an
+  outer one; `OCSERVE_KIDS_MEMORY_MAX_MB` is range-checked; `doctor --budget`
+  rejects a `..` cgroup path; `install.sh --render-to` lets the guard assert
+  the rendered unit in both modes (the old rule grepped source text).
 - `soak-gate.sh` now rejects samples above the parent or kids memory max (a
   500 MB kids allocation used to pass); `soak.sh` no longer references an
   undefined `$BASE` for a metric that does not exist.

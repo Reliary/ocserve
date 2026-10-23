@@ -477,8 +477,13 @@ fn bash(input: &Value, cwd: &Path, env: &[(String, String)]) -> Result<ToolResul
             let mut wrapped = std::process::Command::new(&shape.program);
             wrapped.args(&shape.prefix);
             wrapped.args(base.get_args());
-            if let Some(p) = &shape.cgroup {
-                wrapped.env(ocserve_store::cgroup::ENV, p);
+            match &shape.cgroup {
+                Some(p) => {
+                    wrapped.env(ocserve_store::cgroup::ENV, p);
+                }
+                None => {
+                    wrapped.env_remove(ocserve_store::cgroup::ENV);
+                }
             }
             wrapped
         } else {

@@ -161,8 +161,16 @@ impl Contained {
     /// wrapper args, and exports the leaf when one exists.
     pub fn apply_std(&self, cmd: &mut std::process::Command) {
         cmd.args(&self.prefix);
-        if let Some(p) = &self.cgroup {
-            cmd.env(ENV, p);
+        match &self.cgroup {
+            Some(p) => {
+                cmd.env(ENV, p);
+            }
+            // A spawn with no leaf must NOT inherit an outer leaf path: a
+            // nested server or tool would move itself into the ancestor's
+            // tree (2026-10-23 review L3).
+            None => {
+                cmd.env_remove(ENV);
+            }
         }
     }
 }

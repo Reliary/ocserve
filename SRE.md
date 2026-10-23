@@ -193,8 +193,9 @@ other than the async worker (thread identity recorded by a test-only seam).
      tail-weighted history budget, streamed `/message`, `malloc_trim`
      cadence, `MALLOC_ARENA_MAX=1`, single catalog parse per reload.
   2. **L1 graceful sidecar recycle** (15 s sampler): RSS ≥
-     `OCSERVE_SIDECAR_RECYCLE_MB` (default 450 — above the measured 365 MB
-     warm-up peak; `0` = kill switch) × 2 consecutive samples ∧ zero
+     `OCSERVE_SIDECAR_RECYCLE_MB` (default 280 — above the ~100 MB steady
+     state and **below the 320 MB plugin leaf cap**, so recycle can actually
+     win; `0` = kill switch) × 2 consecutive samples ∧ zero
      in-flight plugin RPCs (try_lock busy ⇒ skip) ∧ uptime ≥ 300 s → kill
      the sidecar (state is disk-backed; `ensure_alive` respawns + replays
      next trigger, warm-hash normalize no-op). Never interrupts a hook,
@@ -202,9 +203,12 @@ other than the async worker (thread identity recorded by a test-only seam).
      "first node/bun child" scan could hit the browser host after any
      respawn). Metrics: `ocserve_sidecar_recycle_total{reason="rss"}`.
   3. **L2 cgroup partition** (`partition.rs`): `mkdir main kids → move self
-     into main/ → +memory +pids → kids/memory.max=700M`, then four class
-     leaves (`kids/{plugin,mcp,tools,pty}`) each with `memory.oom.group=1`
-     and `pids.max=1024` (kernel no-internal-process rule). Every child spawn
+     into main/ → +memory +pids +cpu → kids/memory.max=700M`, then four class
+     leaves (`kids/{plugin,mcp,tools,pty}`) each with `memory.oom.group=1`,
+     `pids.max=1024` (kernel no-internal-process rule) and its own
+     high/max + `cpu.weight` (plugin 288/320, mcp 160/192, tools 448/640,
+     pty 64/96; main 256/512/768 at weight 500 vs kids 100, tools 50).
+     A partially applied budget reports `result="degraded"`, never `ok`. Every child spawn
      goes through `ocserve_store::cgroup` (guard rule 45), whose wrapper
      moves the child into its leaf and sets `oom_score_adj=500` before `exec`.
      **Placement is the control; the cap is the guardrail** (2026-10-21: a
@@ -215,15 +219,16 @@ other than the async worker (thread identity recorded by a test-only seam).
      OOM at all. The cap number was never the bug). Leaves are separate
      because `kids/` holds independent services: `oom.group=1` on the
      aggregate would kill the browser host because a build spiked.
-     `main/memory.low=320M` makes main the reclaim-protected side, so
-     pressure shrinks kids first. Boot logs the budget (`kids.max + main.low`
-     vs parent `MemoryMax`, wanting 64 MB of anon+slab headroom) and WARNs
-     when it is tight. The comparison is deliberately about unreclaimable
-     memory: page cache is charged to the parent but reclaimed under
-     pressure (measured: 924 MB of 1024 MB used with 364 MB of it file
-     cache, no OOM). Current numbers are tight by that test: 700 + 320
-     against 1024 leaves 4 MB, which is the next thing to settle from a soak
-     with per-leaf peaks, not from a guess.
+     `main/memory.low=256M` plus the unit's `MemoryLow=256M` makes main the
+     reclaim-protected side (the unit setting is required: cgroup-v2 bounds a
+     child's protection by every ancestor's `memory.low`, and all ancestors
+     were 0 until 2026-10-23). Per-class caps now bound each service instead of
+     only the aggregate, and `cpu.weight` makes a build yield to the API.
+     Parent `MemoryHigh=960M` throttles before the 1024M backstop. Boot logs
+     the budget and WARNs when it is tight; the comparison is deliberately
+     about unreclaimable memory (page cache is charged to the parent but
+     reclaimed under pressure: measured 924 MB of 1024 MB used with 364 MB of
+     it file cache, no OOM).
      **Probe-first:** root-exists / owned-by-us / `memory` in controllers /
      subtree-writable probed before any mutation; any failure → metric
      `ocserve_cgroup_partition{result="unavailable"}` + today's flat shared

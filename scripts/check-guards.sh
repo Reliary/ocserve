@@ -1320,20 +1320,36 @@ fi
 rm -f "$_plant"
 
 echo "== guard: install modes differ (managed vs unmanaged memory) (rule 53b) =="
-# The unmanaged mode must actually remove the unit caps and disable the
-# partition; a flag that renders the same unit would be a lie.
-_good=$(mktemp); _bad=$(mktemp)
-python3 - scripts/install.sh <<'PY'
-import sys
-s = open(sys.argv[1]).read()
-assert "MemoryMax|MemoryHigh|MemorySwapMax" in s, "install.sh lost the cap strip"
-assert "OCSERVE_CGROUP_PARTITION=0" in s, "unmanaged mode must disable the partition"
-PY
-if [ $? -eq 0 ]; then
-  echo "ok (unmanaged mode strips unit caps and disables the partition)"
+# Render the REAL unit in both modes and assert the outcome, not the source
+# text: a grep for "MemoryMax|MemoryHigh" passes even if the strip regex is
+# broken or the mode writes nothing (2026-10-23 security review L6).
+_r_good=$(mktemp); _r_un=$(mktemp); _r_plant=$(mktemp)
+if ./scripts/install.sh --render-to "$_r_good" >/dev/null 2>&1 \
+   && ./scripts/install.sh --render-to "$_r_un" --no-resource-limits >/dev/null 2>&1; then
+  _m=1; _u=1
+  grep -q '^MemoryMax=1024M$' "$_r_good" || _m=0
+  grep -q '^MemoryHigh=960M$' "$_r_good" || _m=0
+  grep -q '^MemoryLow=256M$' "$_r_good" || _m=0
+  if grep -qE '^Memory(Max|High|Low|SwapMax)=' "$_r_un"; then _u=0; fi
+  grep -q '^Environment=OCSERVE_CGROUP_PARTITION=0$' "$_r_un" || _u=0
+  grep -q '^Environment=OCSERVE_SIDECAR_RECYCLE_MB=0$' "$_r_un" || _u=0
+  grep -q '^OOMPolicy=continue$' "$_r_un" || _u=0
+  if [ "$_m" = 1 ] && [ "$_u" = 1 ]; then
+    echo "ok (managed keeps 256/960/1024; unmanaged strips them, keeps OOMPolicy)"
+  else
+    echo "FAIL: rendered units do not differ as documented (managed=$_m unmanaged=$_u) (rule 53b)"; fail=1
+  fi
+  # Planted control: the unmanaged unit with a cap put back must be rejected by
+  # the same predicate (proves the predicate is not vacuous).
+  sed 's|^ProtectSystem=|MemoryMax=1024M\nProtectSystem=|' "$_r_un" > "$_r_plant"
+  if grep -qE '^Memory(Max|High|Low|SwapMax)=' "$_r_plant"; then
+    echo "ok (planted cap re-insertion detected)"
+  else
+    echo "FAIL: rule 53b planted control not detected"; fail=1
+  fi
 else
-  echo "FAIL: install.sh unmanaged mode incomplete (rule 53b)"; fail=1
+  echo "FAIL: install.sh --render-to failed (rule 53b)"; fail=1
 fi
-rm -f "$_good" "$_bad"
+rm -f "$_r_good" "$_r_un" "$_r_plant"
 
 exit $fail

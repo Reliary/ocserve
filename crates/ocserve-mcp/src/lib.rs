@@ -201,8 +201,13 @@ impl McpClient {
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|| ".".into());
                 let base_path = std::env::var("PATH").unwrap_or_default();
-                if let Some(p) = &shape.cgroup {
-                    cmd.env(ocserve_store::cgroup::ENV, p);
+                match &shape.cgroup {
+                    Some(p) => {
+                        cmd.env(ocserve_store::cgroup::ENV, p);
+                    }
+                    None => {
+                        cmd.env_remove(ocserve_store::cgroup::ENV);
+                    }
                 }
                 cmd.args(rest)
                     .env("PATH", mcp_child_path(&base_path, &home))

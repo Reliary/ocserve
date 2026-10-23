@@ -1005,8 +1005,13 @@ async fn serve(
     // a timeout (the first version of this fix) shut the server down 20 s after
     // every start, because the timer was already running while waiting.
     let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel::<()>();
+    let bus_for_shutdown = state.bus.clone();
     let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
         startup.wait().await;
+        // End SSE readers BEFORE waiting for connections: an SSE stream never
+        // returns on its own, so `axum::serve` would otherwise wait until the
+        // drain deadline (or forever with OCSERVE_DRAIN_SECS=0).
+        bus_for_shutdown.close();
         let _ = signalled_tx.send(());
     });
     // `WithGracefulShutdown` implements `IntoFuture`, not `Future`.
@@ -1142,6 +1147,12 @@ fn budget_report() {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
     let rel = cg.strip_prefix("ControlGroup=").unwrap_or("").trim();
+    // Only a plain absolute cgroup path is acceptable; `..` or relative
+    // components would make the join read outside /sys/fs/cgroup.
+    if !rel.starts_with('/') || rel.split('/').any(|c| c == ".." || c == ".") {
+        println!("  budget:          unexpected ControlGroup value; not inspected");
+        return;
+    }
     if rel.is_empty() {
         let unit = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
             .join(".config/systemd/user/ocserve.service");

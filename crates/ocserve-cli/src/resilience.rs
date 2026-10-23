@@ -5,13 +5,17 @@
 //! Pure functions live here so every guard has a testable seam; the sampler
 //! (ocserve main) supplies the observations.
 
-/// `OCSERVE_SIDECAR_RECYCLE_MB` parse: `0` disables, absent → default 450
-/// (warm-up peak measured 365 MB — the threshold must sit above it or every
-/// fresh spawn would be recycled again after one embed).
+/// `OCSERVE_SIDECAR_RECYCLE_MB` parse: `0` disables, absent → 280.
+///
+/// 280 sits above the measured steady state (97-101 MB) and below the plugin
+/// leaf's 320 MB `memory.max`: a sidecar that reached 450 (the old default)
+/// would already have been killed by the class cap, so recycle could never
+/// fire (2026-10-23 review M1). Recycle is the graceful path; the cap is the
+/// backstop, and they must be ordered.
 pub fn parse_threshold_mb(raw: Option<&str>) -> u64 {
     match raw {
-        None => 450,
-        Some(s) => s.parse().unwrap_or(450),
+        None => 280,
+        Some(s) => s.parse().unwrap_or(280),
     }
 }
 
@@ -83,10 +87,10 @@ mod tests {
 
     #[test]
     fn threshold_defaults_and_kill_switch() {
-        assert_eq!(parse_threshold_mb(None), 450);
+        assert_eq!(parse_threshold_mb(None), 280);
         assert_eq!(parse_threshold_mb(Some("0")), 0);
         assert_eq!(parse_threshold_mb(Some("600")), 600);
-        assert_eq!(parse_threshold_mb(Some("junk")), 450); // never panic on env
+        assert_eq!(parse_threshold_mb(Some("junk")), 280); // never panic on env
     }
 
     #[test]
@@ -128,5 +132,34 @@ mod tests {
     fn live_psi_is_readable_or_absent() {
         // cgroup v2 box: Some; either way must not panic
         let _ = psi_avg10_centi();
+    }
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    use super::*;
+
+    /// M1 (2026-10-23 security review): a threshold above the class cap is dead
+    /// control - the kernel kills the class first. The defaults must be ordered
+    /// so recycle can actually win.
+    #[test]
+    fn recycle_threshold_below_plugin_leaf_max() {
+        let threshold = parse_threshold_mb(None);
+        let policy = ocserve_store::cgroup::leaf_policy("plugin");
+        assert!(
+            threshold > 0 && threshold < policy.max_mb,
+            "recycle threshold {threshold} MB must sit between 1 and the plugin leaf cap {} MB",
+            policy.max_mb
+        );
+    }
+
+    /// And it must sit above steady state, or every healthy sidecar would be
+    /// recycled in a loop.
+    #[test]
+    fn recycle_threshold_above_steady_state() {
+        assert!(
+            parse_threshold_mb(None) > 150,
+            "measured steady state is ~100 MB; a 150 MB default would churn"
+        );
     }
 }

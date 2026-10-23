@@ -561,8 +561,13 @@ impl Sidecar {
         let shape = ocserve_store::cgroup::contained(&program, "plugin");
         let mut cmd = Command::new(&shape.program);
         cmd.args(&shape.prefix);
-        if let Some(p) = &shape.cgroup {
-            cmd.env(ocserve_store::cgroup::ENV, p);
+        match &shape.cgroup {
+            Some(p) => {
+                cmd.env(ocserve_store::cgroup::ENV, p);
+            }
+            None => {
+                cmd.env_remove(ocserve_store::cgroup::ENV);
+            }
         }
         match runtime {
             // Bun (upstream's own plugin runtime): real bun:sqlite + TS

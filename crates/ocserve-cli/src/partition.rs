@@ -240,18 +240,25 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
     let mb: u64 = std::env::var("OCSERVE_KIDS_MEMORY_MAX_MB")
         .ok()
         .and_then(|v| v.parse().ok())
+        .filter(|v| (32..=1_048_576).contains(v))
         .unwrap_or(700);
     let max_path = root.join("kids/memory.max");
     if let Err(e) = std::fs::write(&max_path, (mb * 1024 * 1024).to_string()) {
         tracing::warn!("partition: kids memory.max failed: {e}");
         return Partition::Unavailable("kids-cap");
     }
+    let mut leaf_failures = 0u32;
     // Soft ceiling on the aggregate: throttle the class at 640M instead of
     // letting it run into the 700M hard cap and die as a unit.
-    write_or_warn(
-        &root.join("kids/memory.high"),
+    if std::fs::write(
+        root.join("kids/memory.high"),
         (640u64 * 1024 * 1024).to_string(),
-    );
+    )
+    .is_err()
+    {
+        tracing::warn!("partition: write kids/memory.high failed");
+        leaf_failures += 1;
+    }
     let kids = root.join("kids");
     let _ = KIDS.set(kids.clone());
 
@@ -270,7 +277,6 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
         &kids_controllers,
     )
     .is_ok();
-    let mut leaf_failures = 0u32;
     if leaves_ok {
         for name in ocserve_store::cgroup::LEAVES {
             let leaf = kids.join(name);
@@ -286,9 +292,15 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
             sweep_stray_subdirs(&leaf, name);
             // kill the whole class together; partial death is worse for a
             // single service than total death (kernel cgroup-v2 §memory.oom.group)
-            write_or_warn(&leaf.join("memory.oom.group"), "1".to_string());
-            // fork-bomb guard: a tool call cannot outrun the class budget
-            write_or_warn(&leaf.join("pids.max"), "1024".to_string());
+            for (file, value) in [
+                ("memory.oom.group", "1".to_string()),
+                ("pids.max", "1024".to_string()),
+            ] {
+                if std::fs::write(leaf.join(file), value).is_err() {
+                    tracing::warn!("partition: write kids/{name}/{file} failed");
+                    leaf_failures += 1;
+                }
+            }
             // Per-class memory: without this every leaf inherited `max` and a
             // single build could starve the plugin host out of the shared
             // 700M pot (2026-10-23 review). `high < max` so the class is
@@ -320,22 +332,27 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
     }
     // The server's own class: a protection floor, a soft ceiling and a hard
     // backstop. Steady anon is ~200M; 512M covers import/migration bursts.
-    write_or_warn(
-        &root.join("main/memory.low"),
-        (256u64 * 1024 * 1024).to_string(),
-    );
-    write_or_warn(
-        &root.join("main/memory.high"),
-        (512u64 * 1024 * 1024).to_string(),
-    );
-    write_or_warn(
-        &root.join("main/memory.max"),
-        (768u64 * 1024 * 1024).to_string(),
-    );
+    for (path, value) in [
+        (root.join("main/memory.low"), 256u64 * 1024 * 1024),
+        (root.join("main/memory.high"), 512u64 * 1024 * 1024),
+        (root.join("main/memory.max"), 768u64 * 1024 * 1024),
+    ] {
+        if std::fs::write(&path, value.to_string()).is_err() {
+            tracing::warn!("partition: write {} failed", path.display());
+            leaf_failures += 1;
+        }
+    }
     if has_cpu {
         // 5:1 over the child classes. Only distributes when both are active.
-        write_or_warn(&root.join("main/cpu.weight"), "500".to_string());
-        write_or_warn(&kids.join("cpu.weight"), "100".to_string());
+        for (path, weight) in [
+            (root.join("main/cpu.weight"), "500"),
+            (kids.join("cpu.weight"), "100"),
+        ] {
+            if std::fs::write(&path, weight).is_err() {
+                tracing::warn!("partition: write {} failed", path.display());
+                leaf_failures += 1;
+            }
+        }
     } else {
         tracing::warn!(
             "partition: cpu controller unavailable — build contention will not be weighted"
@@ -392,12 +409,6 @@ fn enable(sc: &Path, wanted: &[&str]) -> std::io::Result<()> {
         next.push_str(w);
     }
     std::fs::write(sc, next)
-}
-
-fn write_or_warn(path: &Path, value: String) {
-    if let Err(e) = std::fs::write(path, value) {
-        tracing::warn!("partition: write {} failed: {e}", path.display());
-    }
 }
 
 /// Say the budget out loud instead of implying it in a comment. The 2026-10-21
