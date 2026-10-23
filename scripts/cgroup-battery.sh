@@ -159,8 +159,10 @@ fi
 for leaf in plugin mcp tools pty; do
   lh=$(cat "$ROOT/kids/$leaf/memory.high" 2>/dev/null)
   lm=$(cat "$ROOT/kids/$leaf/memory.max" 2>/dev/null)
+  # NOTE: `''*` is just `*` in a case pattern (quoting concatenates), so the
+  # empty-match arm must be a quoted empty string on its own.
   case "$lh:$lm" in
-    ''*|*':max') bad "kids/$leaf has no per-class memory cap (high=$lh max=$lm)" ;;
+    ""|*":max") bad "kids/$leaf has no per-class memory cap (high=$lh max=$lm)" ;;
     *) if [ "$lh" -lt "$lm" ]; then ok "kids/$leaf high<max ($lh<$lm)"; else bad "kids/$leaf high>=max ($lh/$lm)"; fi ;;
   esac
 done
