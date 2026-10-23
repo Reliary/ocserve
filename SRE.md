@@ -92,11 +92,18 @@ Single source: `ocserve.toml` (validated at boot, `deny_unknown_fields`) with en
 ### Upgrade and rollback
 
 `scripts/install.sh --release --tag vX.Y.Z` fetches that tag's checksummed
-artifact, keeps the current binary as `~/.local/bin/ocserve.prev`, installs,
-restarts and health-probes for up to 90 s. Rollback is the same command with
-the previous tag; 0.5.0 onward keep schema v15, so no downgrade step exists.
-A failed probe leaves the new binary in place but exits non-zero, so the
-operator knows to restore `.prev`.
+artifact and installs it at the one stable path the unit executes,
+`~/.local/bin/ocserve`, keeping the previous binary as `ocserve.prev` and
+writing a receipt (`~/.local/share/ocserve/install-receipt`, with the SHA256)
+so the running file can be tied to an artifact. Rollback is the same command
+with the previous tag; 0.5.0 onward keep schema v15, so no downgrade step
+exists. A failed probe leaves the new binary in place but exits non-zero, so
+the operator knows to restore `.prev`.
+
+Before 0.6.5 the unit executed `target/release/ocserve` while
+`~/.local/bin/ocserve` held the verified download: two different hashes and no
+way to tell which one was live. `install.sh` now places every install at the
+stable path and renders `ExecStart` from it.
 
 Config reload: SIGHUP re-reads safe subset (metrics, log level, ring limits); structural keys
 (store, port) require restart — declared, not guessed. External config-file edits

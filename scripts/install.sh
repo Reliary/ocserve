@@ -85,6 +85,21 @@ if [ ! -x "$SRC" ]; then
 fi
 SRC=$(readlink -f "$SRC" 2>/dev/null || echo "$SRC")
 
+# Single stable executed path (SRE review M3). The unit used to point at
+# `target/release/ocserve` while `~/.local/bin/ocserve` was the verified
+# artifact: two binaries with different hashes, and no way to tell which one
+# the service ran. Place the chosen binary at the stable path and execute that.
+if [ "$DRY" = 0 ] && [ "$SRC" != "$BIN_HOME/ocserve" ]; then
+  mkdir -p "$BIN_HOME"
+  if [ -x "$BIN_HOME/ocserve" ] && ! cmp -s "$SRC" "$BIN_HOME/ocserve"; then
+    cp -p "$BIN_HOME/ocserve" "$BIN_HOME/ocserve.prev"
+    say "kept previous binary at $BIN_HOME/ocserve.prev"
+  fi
+  install -m 0755 "$SRC" "$BIN_HOME/ocserve"
+  say "installed binary: $BIN_HOME/ocserve"
+  SRC=$BIN_HOME/ocserve
+fi
+
 # systemd %-forms for paths under $HOME
 case "$SRC" in
   "$HOME"/*) BIN_U="%h${SRC#"$HOME"}" ;;
@@ -160,7 +175,9 @@ fi
 
 # --- install ----------------------------------------------------------------
 mkdir -p "$UNIT_DIR" "$(dirname "$HOME/.local/share/ocserve/install-receipt")"
-printf 'BIN=%s\nINSTALLED=%s\n' "$SRC" "$(date -Is)" > "$HOME/.local/share/ocserve/install-receipt"
+printf 'BIN=%s\nSHA256=%s\nINSTALLED=%s\n' \
+  "$SRC" "$(sha256sum "$SRC" | cut -d' ' -f1)" "$(date -Is)" \
+  > "$HOME/.local/share/ocserve/install-receipt"
 cp "$RENDERED" "$LIVE"
 systemctl --user daemon-reload
 if systemctl --user is-active ocserve.service >/dev/null 2>&1; then

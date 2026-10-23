@@ -1362,6 +1362,7 @@ if ./scripts/install.sh --render-to "$_r_good" >/dev/null 2>&1 \
   grep -q '^MemoryMax=1024M$' "$_r_good" || _m=0
   grep -q '^MemoryHigh=960M$' "$_r_good" || _m=0
   grep -q '^MemoryLow=256M$' "$_r_good" || _m=0
+  grep -q '^ExecStart=%h/.local/bin/ocserve serve --port 4912$' "$_r_good" || _m=0
   if grep -qE '^Memory(Max|High|Low|SwapMax)=' "$_r_un"; then _u=0; fi
   grep -q '^Environment=OCSERVE_CGROUP_PARTITION=0$' "$_r_un" || _u=0
   grep -q '^Environment=OCSERVE_SIDECAR_RECYCLE_MB=0$' "$_r_un" || _u=0
