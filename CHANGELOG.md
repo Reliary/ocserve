@@ -4,6 +4,22 @@ All notable changes to ocserve. The wire contract targets the frozen
 openccode 1.18.31 release and the v2 surface the 2.0.28 client; anything that
 differs is a named `D-*` row in `PLAN.md §17`.
 
+## 0.6.4
+
+Fixes from independent SRE and security reviews of 0.6.3. No schema, wire, or
+storage change; rollback is a binary swap.
+
+### Fixed
+- Graceful shutdown closes the event bus, so an open SSE client can no longer
+  hold the server until systemd SIGKILLs it (`drain_budget.rs`).
+- SIGTERM is registered before all startup work and the drain deadline starts
+  at the signal (`OCSERVE_DRAIN_SECS`, default 20 s).
+- Partial cgroup budgets report `degraded`, never `ok`.
+- L1 recycle default 280 MB so it sits below the 320 MB plugin cap.
+- `MemoryLow=256M` on the unit makes `main/memory.low` effective.
+- Spawns without a leaf clear `OCSERVE_KIDS_CGROUP`.
+- `install.sh --render-to`; guard 53b asserts rendered units in both modes.
+
 ## 0.6.3
 
 ### Fixed
