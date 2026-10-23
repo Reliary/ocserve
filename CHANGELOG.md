@@ -7,9 +7,25 @@ differs is a named `D-*` row in `PLAN.md §17`.
 ## 0.6.3
 
 ### Fixed
-- SIGTERM is registered before the socket binds, closing the bind-to-serve
-  window where `systemctl restart` could kill the server without draining
-  (found as a one-off `ExitStatus(15)` in a full suite run).
+- SIGTERM is registered as soon as the server starts (before boot checks,
+  partition, config load, MCP probe and plugin load), and the drain deadline
+  is measured from the signal, not from startup: `OCSERVE_DRAIN_SECS` (default
+  20 s, 0 = wait forever). The 0.6.2 fix only covered the bind-to-serve
+  window; a stop during startup, or a drain with an open connection, still hit
+  systemd's 90 s timeout and SIGKILL. (The first version of this fix wrapped
+  the signal wait itself, which shut the server down 20 s after every start;
+  `drain_budget.rs` pins the correct behaviour.)
+- `MemoryLow=256M` on the unit so `main/memory.low` is actually effective:
+  kernel cgroup-v2 limits protections by the ancestors' `memory.low`, and
+  every ancestor was 0.
+- A partially applied partition (missing leaf, failed cap write, non-delegable
+  kids subtree) now reports `degraded` instead of `ok`; it still never fails
+  boot.
+- `doctor --budget` reports per-node `memory.events` and pressure, and
+  distinguishes "installed but stopped" from "not installed".
+- `soak-gate.sh` now rejects samples above the parent or kids memory max (a
+  500 MB kids allocation used to pass); `soak.sh` no longer references an
+  undefined `$BASE` for a metric that does not exist.
 
 ## 0.6.2
 

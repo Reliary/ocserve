@@ -322,9 +322,13 @@ other than the async worker (thread identity recorded by a test-only seam).
   7. **Unmanaged install.** `scripts/install.sh --no-resource-limits` renders
      the unit without `MemoryHigh`/`MemoryMax`/`MemorySwapMax` and sets
      `OCSERVE_CGROUP_PARTITION=0` and `OCSERVE_SIDECAR_RECYCLE_MB=0`; the
-     operator owns memory. Placement, OOM policy, timeouts and the rest of the
-     service are unchanged. This is for operators with their own slice policy;
-     the default install is the managed one.
+     operator owns memory. **Placement is gone in this mode**: the server and
+     every child share the unit cgroup, which now has no memory ceiling, and a
+     tool child can consume the whole machine's free memory; only
+     `oom_score_adj=500` on children remains to bias the global OOM killer
+     toward them, and the plugin host is no longer recycled. Timeouts, OOM
+     policy and the rest of the service are unchanged. This is for operators
+     with their own slice policy; the default install is the managed one.
 
 - **Install (preferred, opt-in by invocation):** `scripts/install.sh` —
   default = full (build-if-needed, binary used IN PLACE, render

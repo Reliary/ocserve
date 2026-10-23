@@ -83,10 +83,12 @@ OOMPolicy=continue
 # build kept running in main/ (no ceiling, adj=200) until the kernel OOM-killed
 # the SERVER at 321MB while the build held ~600MB. Children now move
 # themselves into per-class leaves (kids/{plugin,mcp,tools,pty}) before exec,
-# so the same build is capped and reclaimable. `kids.max + main.low` vs this
-# cap is logged at boot: 700 + 320 leaves 4 MB for anon+slab (page cache is
-# reclaimable and does not count), which is tight and is the next number to
-# settle from per-leaf soak peaks, not from a guess.
+# so the same build is capped and reclaimable. Per-class caps now exist
+# (plugin 320, mcp 192, tools 640, pty 96 max; kids 700 aggregate) and CPU is
+# weighted 500 (main) vs 50-100, so a build yields to the API. `MemoryLow`
+# here makes main/memory.low effective (kernel limits protection by ancestor
+# lows). Parent high 960M throttles before the 1024M backstop.
+MemoryLow=256M
 MemoryHigh=960M
 MemoryMax=1024M
 MemorySwapMax=0

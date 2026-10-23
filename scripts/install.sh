@@ -118,7 +118,7 @@ if limits == "0":
     # Unmanaged mode: remove the unit's memory ceiling and turn off the
     # in-process partition (which writes child caps) and the sidecar recycle.
     # Containment/placement and OOMPolicy stay; the operator owns memory.
-    s, n3 = re.subn(r'(?m)^(MemoryMax|MemoryHigh|MemorySwapMax)=.*\n', '', s)
+    s, n3 = re.subn(r'(?m)^(MemoryLow|MemoryMax|MemoryHigh|MemorySwapMax)=.*\n', '', s)
     assert n3 >= 1, "template has no memory limits to remove — update install.sh"
     env = (
         "Environment=OCSERVE_CGROUP_PARTITION=0\n"

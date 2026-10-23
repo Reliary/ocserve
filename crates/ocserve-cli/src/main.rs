@@ -322,6 +322,14 @@ async fn serve(
 ) -> Result<()> {
     use ocserve_http::{AppState, FREEZE_VERSION};
 
+    // SIGTERM/INT registration is the FIRST thing the server future does.
+    // Registering at bind left the whole startup window (boot checks, partition,
+    // config load, MCP probe, plugin load: ~5.5 s on this box) on the default
+    // disposition, so `systemctl stop` during startup was SIGKILLed (observed
+    // 2026-10-23 15:54). `Shutdown` holds the signal stream; it is consumed
+    // only at `axum::serve`.
+    let startup = install_shutdown();
+
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create data dir {}", data_dir.display()))?;
     // F4 (security review): the data dir holds the DB (provider API keys in
@@ -967,9 +975,6 @@ async fn serve(
     }
 
     let addr = format!("{hostname}:{port}");
-    // Register SIGTERM/INT BEFORE the socket exists: a signal in the bind→serve
-    // window must reach the drain path, not the default disposition.
-    let shutdown = install_shutdown();
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr} (port in use?)"))?;
@@ -996,9 +1001,37 @@ async fn serve(
     // empirically). Router::layer wraps the fully-built router including its
     // fallbacks; only short-circuits preflights, passes everything else.
     let app = app.layer(axum::middleware::from_fn(ocserve_http::ui::perimeter_cors));
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown.wait())
-        .await?;
+    // The drain deadline starts AFTER the signal. Wrapping the signal wait in
+    // a timeout (the first version of this fix) shut the server down 20 s after
+    // every start, because the timer was already running while waiting.
+    let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+        startup.wait().await;
+        let _ = signalled_tx.send(());
+    });
+    // `WithGracefulShutdown` implements `IntoFuture`, not `Future`.
+    let serve = serve.into_future();
+    tokio::pin!(serve);
+    let drain_secs: u64 = std::env::var("OCSERVE_DRAIN_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    if drain_secs == 0 {
+        serve.await?;
+    } else {
+        tokio::select! {
+            r = &mut serve => r?,
+            _ = async {
+                // Only starts counting once the shutdown future has fired.
+                let _ = signalled_rx.await;
+                tokio::time::sleep(std::time::Duration::from_secs(drain_secs)).await;
+            } => {
+                tracing::warn!(
+                    "shutdown: drain exceeded {drain_secs}s - exiting with connections open"
+                );
+            }
+        }
+    }
     if let Some(plug) = state.plugins.get() {
         plug.lock().await.shutdown().await;
         tracing::info!("plugin sidecar disposed");
@@ -1091,22 +1124,6 @@ impl Shutdown {
     }
 }
 
-#[cfg(not(unix))]
-struct Shutdown;
-
-#[cfg(not(unix))]
-fn install_shutdown() -> Shutdown {
-    Shutdown
-}
-
-#[cfg(not(unix))]
-impl Shutdown {
-    async fn wait(self) {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("shutdown: draining");
-    }
-}
-
 fn read_first(path: &str) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
@@ -1126,7 +1143,16 @@ fn budget_report() {
         .unwrap_or_default();
     let rel = cg.strip_prefix("ControlGroup=").unwrap_or("").trim();
     if rel.is_empty() {
-        println!("  budget:          service not running (no cgroup)");
+        let unit = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(".config/systemd/user/ocserve.service");
+        println!(
+            "  budget:          {}",
+            if unit.exists() {
+                "service installed but not running (no cgroup)"
+            } else {
+                "service not installed"
+            }
+        );
         return;
     }
     let root = std::path::PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
@@ -1169,15 +1195,41 @@ fn budget_report() {
             continue;
         }
         println!(
-            "    {label:<13} high={:<10} max={:<10} cur={:<10} peak={:<10} cpu.weight={}",
+            "    {label:<13} high={:<10} max={:<10} cur={:<10} peak={:<10} cpu.weight={:<5} events: {}",
             node(&p, "memory.high"),
             node(&p, "memory.max"),
             node(&p, "memory.current"),
             node(&p, "memory.peak"),
-            read_first(&p.join("cpu.weight").to_string_lossy()).unwrap_or_else(|| "-".into())
+            read_first(&p.join("cpu.weight").to_string_lossy()).unwrap_or_else(|| "-".into()),
+            events(&p)
         );
     }
-    println!("    memory.events {}", events(&root));
+    // Per-node pressure, not just the aggregate: a class hitting its high shows
+    // here even when the parent is calm.
+    for (name, label) in [
+        ("main", "server"),
+        ("kids/plugin", "plugin"),
+        ("kids/tools", "tools"),
+    ] {
+        let p = root.join(name);
+        if let Some(pr) = read_first(&p.join("memory.pressure").to_string_lossy()) {
+            println!("    {label:<13} pressure {}", pr.replace('\n', " | "));
+        }
+    }
+    let managed = read_first(&root.join("memory.max").to_string_lossy()) != Some("max".into());
+    println!(
+        "    mode          {}{}",
+        if managed {
+            "managed"
+        } else {
+            "unmanaged/host-governed"
+        },
+        if crate::partition::kids_path().is_some() {
+            ""
+        } else {
+            " (partition not active in this process)"
+        }
+    );
     if let Some(cpu) = read_first(&root.join("cpu.stat").to_string_lossy()) {
         let keep: Vec<&str> = cpu
             .lines()

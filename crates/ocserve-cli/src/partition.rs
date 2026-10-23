@@ -31,6 +31,10 @@ pub fn kids_path() -> Option<&'static Path> {
 pub enum Partition {
     Disabled,
     Unavailable(&'static str),
+    /// Hierarchy exists, but at least one class cap/weight is missing. The
+    /// service boots (never fail on a budget problem) but must not claim "ok":
+    /// children in a missing leaf would be uncontained.
+    Degraded(&'static str),
     Ok,
 }
 
@@ -59,6 +63,10 @@ fn label_and_publish(result: Partition) -> &'static str {
             tracing::debug!("cgroup partition unavailable: {why}");
             "unavailable"
         }
+        Partition::Degraded(why) => {
+            tracing::warn!("cgroup partition degraded: {why} — some child classes are uncapped");
+            "degraded"
+        }
     };
     ocserve_metrics::labeled_counter(
         "ocserve_cgroup_partition_total",
@@ -73,6 +81,7 @@ fn label_and_publish(result: Partition) -> &'static str {
                 .unwrap_or_default()
         ),
         Partition::Disabled => tracing::debug!("cgroup partition disabled"),
+        Partition::Degraded(_) => {}
         Partition::Unavailable(_) => {}
     }
     label
@@ -261,11 +270,13 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
         &kids_controllers,
     )
     .is_ok();
+    let mut leaf_failures = 0u32;
     if leaves_ok {
         for name in ocserve_store::cgroup::LEAVES {
             let leaf = kids.join(name);
             if let Err(e) = std::fs::create_dir_all(&leaf) {
                 tracing::warn!("partition: mkdir kids/{name} failed: {e}");
+                leaf_failures += 1;
                 continue;
             }
             // Sweep strays: a nested ocserve launched from a tool used to run
@@ -283,24 +294,29 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
             // 700M pot (2026-10-23 review). `high < max` so the class is
             // throttled before it is killed.
             let policy = ocserve_store::cgroup::leaf_policy(name);
-            write_or_warn(
-                &leaf.join("memory.high"),
-                (policy.high_mb * 1024 * 1024).to_string(),
-            );
-            write_or_warn(
-                &leaf.join("memory.max"),
-                (policy.max_mb * 1024 * 1024).to_string(),
-            );
+            for (file, value) in [
+                ("memory.high", (policy.high_mb * 1024 * 1024).to_string()),
+                ("memory.max", (policy.max_mb * 1024 * 1024).to_string()),
+            ] {
+                if std::fs::write(leaf.join(file), value).is_err() {
+                    tracing::warn!("partition: write kids/{name}/{file} failed");
+                    leaf_failures += 1;
+                }
+            }
             // Relative CPU priority. Weights are work-conserving: the build
             // uses idle cores and yields when the API needs one.
-            if has_cpu {
-                write_or_warn(&leaf.join("cpu.weight"), policy.cpu_weight.to_string());
+            if has_cpu
+                && std::fs::write(leaf.join("cpu.weight"), policy.cpu_weight.to_string()).is_err()
+            {
+                tracing::warn!("partition: write kids/{name}/cpu.weight failed");
+                leaf_failures += 1;
             }
         }
     } else {
         tracing::warn!(
-            "partition: kids subtree not delegable (processes present) — flat kids cap only"
+            "partition: kids subtree not delegable (processes present) — flat kids cap only;              children would be uncontained"
         );
+        return Partition::Degraded("kids-subtree-not-delegable");
     }
     // The server's own class: a protection floor, a soft ceiling and a hard
     // backstop. Steady anon is ~200M; 512M covers import/migration bursts.
@@ -328,6 +344,9 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
 
     ocserve_store::cgroup::publish(root);
     log_budget(root, &kids, mb);
+    if leaf_failures > 0 {
+        return Partition::Degraded("leaf-cap-write-failed");
+    }
     Partition::Ok
 }
 
@@ -629,6 +648,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
 
         assert_eq!(outcome(true, None), Partition::Unavailable("no-v2-cgroup"));
+    }
+
+    #[test]
+    fn partial_leaf_budget_is_degraded_not_ok() {
+        let root = fixture(true);
+        // Make kids/ a FILE so leaf creation fails after the aggregate caps
+        // succeed; the point is that the result cannot be "ok".
+        std::fs::create_dir_all(root.join("kids")).unwrap();
+        std::fs::write(root.join("kids/tools"), "not a dir").unwrap();
+        let p = setup_in(&root, false);
+        assert_eq!(p, Partition::Degraded("leaf-cap-write-failed"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
