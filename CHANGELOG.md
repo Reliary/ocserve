@@ -4,6 +4,16 @@ All notable changes to ocserve. The wire contract targets the frozen
 openccode 1.18.31 release and the v2 surface the 2.0.28 client; anything that
 differs is a named `D-*` row in `PLAN.md §17`.
 
+## 0.6.1
+
+### Fixed
+- Plugin tools advertised an **invalid JSON Schema** when the plugin's Zod was
+  v3 (resolved first) or when the schema was generated from the normalized
+  entry, where the plugin's `node_modules` is not resolvable. Every request in
+  such a session got a provider 400. The conversion now resolves `zod/v4`
+  first, uses the plugin's real entry, mirrors upstream's normalizer, and
+  never emits a raw Zod object.
+
 ## 0.6.0
 
 Both the safety work and the feature work are in this release: hook

@@ -1518,7 +1518,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1549,7 +1549,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-core"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -1572,7 +1572,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-http"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1613,7 +1613,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-importer"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "ocserve-store",
@@ -1627,7 +1627,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-llm"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1644,7 +1644,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-mcp"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "ocserve-metrics",
@@ -1660,11 +1660,11 @@ dependencies = [
 
 [[package]]
 name = "ocserve-metrics"
-version = "0.6.0"
+version = "0.6.1"
 
 [[package]]
 name = "ocserve-plugin"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "ocserve-metrics",
@@ -1683,7 +1683,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-pty"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "libc",
  "ocserve-core",
@@ -1696,7 +1696,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-store"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1718,7 +1718,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-tools"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "libc",
