@@ -333,8 +333,12 @@ async function loadPlugin({ spec, entry, input, options }) {
     if (!hooks || typeof hooks !== "object") throw new Error(`plugin ${spec}: server() did not return hooks`);
     Object.assign(merged, hooks);
   }
-  loaded.push({ spec, hooks: merged });
+  loaded.push({ spec, hooks: merged, entry });
   return { hooks: Object.keys(merged), id: mod?.PluginModule?.id ?? null };
+}
+
+function emitInfo(obj) {
+  try { process.stdout.write(JSON.stringify(obj) + "\n"); } catch {}
 }
 
 async function trigger(name, input, output) {
@@ -349,6 +353,7 @@ async function trigger(name, input, output) {
       await fn(input, output);
     } catch (e) {
       process.stderr.write(`[plugin:${plugin.spec}] ${name} hook failed: ${e?.stack ?? e}\n`);
+      emitInfo({ event: "plugin_error", plugin: plugin.spec, hook: name, error: String(e?.message ?? e) });
     }
   }
   if (matched > 0) {
@@ -374,9 +379,13 @@ async function dispatchConfig(cfg) {
       await fn(cfg);
     } catch (e) {
       process.stderr.write(`[plugin:${plugin.spec}] config hook failed: ${e?.stack ?? e}\n`);
+      emitInfo({ event: "plugin_error", plugin: plugin.spec, hook: "config", error: String(e?.message ?? e) });
     }
   }
-  return { matched };
+  // Upstream hands the SAME object to every plugin and then derives from it
+  // (config.ts). Returning only {matched} discarded every mutation — the
+  // "called and ignored" class. The mutated config travels back to Rust.
+  return { matched, config: cfg };
 }
 
 // ---- protocol loop ---------------------------------------------------
@@ -392,6 +401,94 @@ process.stdin.on("data", (chunk) => {
     handle(line).catch((e) => process.stderr.write(`[host] handler error: ${e?.stack ?? e}\n`));
   }
 });
+
+
+// ---- plugin tools (v1 `hooks.tool`) -------------------------------------
+// Upstream converts the plugin's Zod args to JSON Schema in ITS process
+// (registry.ts:125-183): `z.toJSONSchema` when every arg is Zod, else the
+// legacy plain-object shape. We do the same here, using the PLUGIN'S OWN zod
+// (resolved from its entry) — nothing is bundled or reimplemented.
+function pluginZod(entry) {
+  try {
+    const req = createRequire(pathToFileURL(entry));
+    return req("zod");
+  } catch {
+    return null;
+  }
+}
+
+function legacySchema(args) {
+  const props = {};
+  for (const [k, v] of Object.entries(args ?? {})) {
+    if (v && typeof v === "object" && !Array.isArray(v)) props[k] = v;
+  }
+  return { type: "object", properties: props, required: Object.keys(props) };
+}
+
+function toParameters(def, entry) {
+  const args = def?.args ?? {};
+  const entries = Object.entries(args);
+  const z = pluginZod(entry);
+  const allZod = entries.length > 0 && entries.every(([, v]) => v && typeof v === "object" && "_zod" in v);
+  if (allZod && z && typeof z.toJSONSchema === "function") {
+    try {
+      return z.toJSONSchema(z.object(args), { io: "input" });
+    } catch (e) {
+      process.stderr.write(`[plugin-host] z.toJSONSchema failed: ${e?.message ?? e}\n`);
+    }
+  }
+  return legacySchema(args);
+}
+
+function collectTools() {
+  const out = [];
+  for (const p of loaded) {
+    for (const [name, def] of Object.entries(p.hooks?.tool ?? {})) {
+      if (!def || typeof def !== "object" || typeof def.execute !== "function") continue;
+      out.push({
+        name,
+        description: String(def.description ?? ""),
+        parameters: toParameters(def, p.entry),
+        plugin: p.spec,
+      });
+    }
+  }
+  return out;
+}
+
+async function executeTool({ name, input, ctx }) {
+  for (const p of loaded) {
+    const def = p.hooks?.tool?.[name];
+    if (!def) continue;
+    const controller = new AbortController();
+    const toolCtx = {
+      sessionID: ctx?.sessionID ?? "",
+      messageID: ctx?.messageID ?? "",
+      agent: ctx?.agent ?? "",
+      directory: ctx?.directory ?? process.cwd(),
+      worktree: ctx?.directory ?? process.cwd(),
+      abort: controller.signal,
+      // Authority stays in ocserve: the tool call was already gated as a
+      // whole (D-HOOK-TOOL-ASK). An intra-tool ask cannot widen it.
+      ask: async () => undefined,
+      metadata: (m) => { toolCtx._meta = { ...(toolCtx._meta ?? {}), ...(m ?? {}) }; },
+    };
+    try {
+      const r = await def.execute(input ?? {}, toolCtx);
+      const value = typeof r === "string" ? { output: r } : (r ?? { output: "" });
+      return {
+        ok: true,
+        title: value.title ?? "",
+        output: value.output ?? "",
+        metadata: value.metadata ?? toolCtx._meta ?? {},
+        attachments: value.attachments ?? undefined,
+      };
+    } catch (e) {
+      return { ok: false, error: String(e?.message ?? e) };
+    }
+  }
+  return { ok: false, error: `plugin tool not found: ${name}` };
+}
 
 /** Forward one bus event to every plugin's `event` hook (v1 + v2 shapes). */
 async function deliverEvent(ev) {
@@ -486,6 +583,8 @@ async function handle(line) {
         reply(await runTransforms(v2State, msg.params.commands));
         break;
       case "config": reply(await dispatchConfig(msg.params.config)); break;
+      case "tools": reply(collectTools()); break;
+      case "tool_execute": reply(await executeTool(msg.params)); break;
       // v1 parity (plugin/index.ts:255-259): per-plugin hooks["event"]
       // called with {event:{id,type,properties}}; each failure logged and
       // skipped (upstream: void fire-and-forget, fail-open).

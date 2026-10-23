@@ -72,6 +72,9 @@ enum Cmd {
     Doctor {
         #[arg(long)]
         data_dir: Option<std::path::PathBuf>,
+        /// Include the plugin inventory (dialect, hooks, bridged/unbridged).
+        #[arg(long)]
+        plugins: bool,
     },
     /// Import last N sessions from a source opencode.db (read-only, PLAN §9)
     Import {
@@ -139,6 +142,28 @@ fn resolve_net(flag: Option<String>, env_key: &str, default: &str) -> String {
 
 /// Data directory. Delegates to `platform` so the `HOME`-unset case is a named
 /// error instead of silently landing in the process CWD (PLATFORM.md §1.2).
+/// v1 `ConfigPluginV1.Spec` parsing: a string is options=Null, `[spec, options]`
+/// is the tuple form, anything else is dropped (upstream schema rejects it).
+fn plugin_specs(config: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
+    config
+        .get("plugin")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| match e {
+                    serde_json::Value::String(s) => Some((s.clone(), serde_json::Value::Null)),
+                    serde_json::Value::Array(t) if !t.is_empty() => {
+                        let spec = t.first().and_then(|v| v.as_str())?.to_string();
+                        let opts = t.get(1).cloned().unwrap_or(serde_json::Value::Null);
+                        Some((spec, opts))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn default_data_dir() -> std::path::PathBuf {
     match platform::data_dir() {
         Ok(p) => p,
@@ -193,7 +218,9 @@ fn main() -> Result<()> {
                 data_dir,
             ))
         }
-        Cmd::Doctor { data_dir } => doctor(data_dir.unwrap_or_else(default_data_dir)),
+        Cmd::Doctor { data_dir, plugins } => {
+            rt::block_on(doctor(data_dir.unwrap_or_else(default_data_dir), plugins))
+        }
         Cmd::Backup { dest, data_dir } => {
             let dir = data_dir.unwrap_or_else(default_data_dir);
             let db = ocserve_store::writer::db_path(&dir);
@@ -321,24 +348,7 @@ async fn serve(
     // The tuple form carries per-plugin options delivered to the server
     // factory; the plain-string form is options=Null. Non-string non-tuple
     // entries are dropped (upstream schema rejects them upstream of here).
-    let plugin_specs: Vec<(String, serde_json::Value)> = rt
-        .config
-        .get("plugin")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|e| match e {
-                    serde_json::Value::String(s) => Some((s.clone(), serde_json::Value::Null)),
-                    serde_json::Value::Array(t) if !t.is_empty() => {
-                        let spec = t.first().and_then(|v| v.as_str())?.to_string();
-                        let opts = t.get(1).cloned().unwrap_or(serde_json::Value::Null);
-                        Some((spec, opts))
-                    }
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let plugin_specs = plugin_specs(&rt.config);
     let llm = rt.llm_registry()?;
     // W6: warn only about the EFFECTIVE default (what an unset prompt
     // actually resolves to — llm_registry's state→config precedence), not
@@ -500,6 +510,25 @@ async fn serve(
             Ok((rt.into_payloads(), registry)) // move, not clone (measured OOM)
         });
         *state.reloader.write() = Some(reloader);
+    }
+    // Plugin `config` hook result → the SAME swap path as a reload, but from
+    // an explicit value (a hook mutation must not be silently discarded, and
+    // must not race the files the reloader re-reads).
+    {
+        let data_dir_for_derive = data_dir.clone();
+        let deriver: std::sync::Arc<
+            dyn Fn(
+                    serde_json::Value,
+                )
+                    -> anyhow::Result<(ocserve_http::Payloads, ocserve_http::LlmRegistry)>
+                + Send
+                + Sync,
+        > = std::sync::Arc::new(move |cfg| {
+            let rt = crate::runtime::Runtime::from_config(&data_dir_for_derive, cfg)?;
+            let registry = rt.llm_registry()?;
+            Ok((rt.into_payloads(), registry))
+        });
+        *state.deriver.write() = Some(deriver);
     }
 
     // H1: external-edit hot-reload — poll the exact files Runtime reads,
@@ -828,7 +857,15 @@ async fn serve(
                 // once, errors logged + ignored). Previously never dispatched —
                 // a registered-but-never-called hook (TESTING §1.6 class).
                 match sc.config(plugin_config.clone()).await {
-                    Ok(v) => tracing::info!("plugin config hook: {v}"),
+                    Ok(v) => {
+                        tracing::info!(
+                            "plugin config hook: matched={}",
+                            v.get("matched").and_then(|m| m.as_u64()).unwrap_or(0)
+                        );
+                        if let Some(cfg) = v.get("config").filter(|c| c.is_object()) {
+                            plugin_config = cfg.clone();
+                        }
+                    }
                     Err(e) => tracing::warn!("plugin config dispatch failed: {e:#}"),
                 }
                 tracing::info!("plugin statuses: {}", sc.statuses());
@@ -851,7 +888,15 @@ async fn serve(
         // re-derive the wire cache, so `GET /command`, the skills block and
         // the precomputed bytes agree.
         let st = state.clone();
+        let cfg_after_hook = plugin_config.clone();
         tokio::spawn(async move {
+            // Apply the plugin's config mutation FIRST (if any), then the v2
+            // command/skill pull. Both go through the same window: a plugin
+            // that adds a command via `config` and one that transforms the
+            // list must not race.
+            if let Err(e) = ocserve_http::watch::apply_config_value(&st, cfg_after_hook).await {
+                tracing::warn!("plugin config apply: {e:#} (previous config kept)");
+            }
             ocserve_http::watch::reconcile(&st).await.ok();
         });
     }
@@ -970,7 +1015,7 @@ async fn shutdown_signal() {
     tracing::info!("shutdown: draining");
 }
 
-fn doctor(data_dir: std::path::PathBuf) -> Result<()> {
+async fn doctor(data_dir: std::path::PathBuf, plugins: bool) -> Result<()> {
     println!("ocserve doctor");
     println!("  sqlite version:  {}", rusqlite::version());
     match ocserve_store::pragma::assert_version_ok() {
@@ -1065,7 +1110,70 @@ fn doctor(data_dir: std::path::PathBuf) -> Result<()> {
     } else {
         println!("  database:        not created yet ({})", db.display());
     }
+    if plugins {
+        plugin_report(&data_dir).await;
+    }
     Ok(())
+}
+
+/// `doctor --plugins`: what the configured plugins register, what ocserve
+/// bridges, and the last internal failure. This is the support instrument for
+/// an install we cannot see: a configured-but-silently-broken plugin was the
+/// 2026-10-22 incident, and nothing in the server said so.
+async fn plugin_report(data_dir: &std::path::Path) {
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let rt = match crate::runtime::Runtime::load_for(data_dir) {
+        Ok(rt) => rt,
+        Err(e) => {
+            println!("  plugins:         FAIL to read config: {e:#}");
+            return;
+        }
+    };
+    let specs = crate::plugin_specs(&rt.config);
+    if specs.is_empty() {
+        println!("  plugins:         none configured");
+        return;
+    }
+    let host = match ocserve_plugin::materialize_host(&data_dir.join("plugin-host")) {
+        Ok(h) => h,
+        Err(e) => {
+            println!("  plugins:         FAIL to materialize host: {e:#}");
+            return;
+        }
+    };
+    let mut sc = match ocserve_plugin::Sidecar::spawn(&host, "http://127.0.0.1", "/").await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("  plugins:         FAIL to spawn host: {e:#}");
+            return;
+        }
+    };
+    let input = serde_json::json!({
+        "directory": std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default(),
+        "projectID": "global",
+        "worktree": "/",
+        "serverUrl": "http://127.0.0.1",
+    });
+    for (spec, options) in &specs {
+        match ocserve_plugin::resolve_entry(spec, &home) {
+            Ok(entry) => match sc.load(spec, &entry, &input, options).await {
+                Ok(hooks) => {
+                    println!("  plugin {spec}");
+                    println!("    hooks:      {}", hooks.join(", "));
+                    let inv = sc.v2_inventory().await.unwrap_or(serde_json::Value::Null);
+                    if let Some(u) = inv.get("unbridged_transforms").and_then(|v| v.as_array())
+                        && !u.is_empty()
+                    {
+                        let names: Vec<&str> = u.iter().filter_map(|v| v.as_str()).collect();
+                        println!("    unbridged:  {}", names.join(", "));
+                    }
+                }
+                Err(e) => println!("  plugin {spec}: FAIL ({e:#})"),
+            },
+            Err(e) => println!("  plugin {spec}: not found ({e})"),
+        }
+    }
+    sc.shutdown().await;
 }
 
 fn import(source: std::path::PathBuf, limit: u32, data_dir: std::path::PathBuf) -> Result<()> {

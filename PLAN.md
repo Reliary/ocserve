@@ -484,6 +484,20 @@ Named divergence:
 Guards: rule 47 (replay non-vacuity), rule 48 (corpus must invoke real hook names),
 rule 49 (no hand-written hook payload literals).
 
+### Hook liveness and plugin tools (2026-10-22)
+
+| id | what | evidence |
+|---|---|---|
+| `D-HOOK-TIMEOUT` | Every hook has a budget. Upstream has none (`Effect.promise` awaits forever). Defaults: 60 s transforms/context/compaction, 180 s tool hooks, 300 s plugin tools; `OCSERVE_HOOK_TIMEOUT_MS=0` restores parity. | measured maxima: `v2.session.context` 15.3 s, `tool.execute.after` 30.0 s over 27 real prompts |
+| `D-HOOK-TOOL-ASK` | A plugin tool's intra-call `ask` is advisory: the permission gate decided the call as a whole, and an intra-tool ask cannot widen it. | CaMeL (arXiv 2503.18813): authority stays outside the untrusted component |
+
+Dispatch no longer holds the sidecar owner lock across a hook await (upstream
+interleaves at `await` points; ocserve serialized every session behind the
+slowest plugin). Plugin-declared tools are advertised with schemas generated in
+the plugin's own runtime and executed through the sidecar; `OCSERVE_PLUGIN_TOOLS=0`
+is the kill switch. Demand for every declared hook is recorded in
+`bench/plugins/demand.json` and enforced by guard 50.
+
 ## 17. oc-remote route coverage (exhaustive client audit)
 
 Source: static extraction of all58 route templates + call graph from

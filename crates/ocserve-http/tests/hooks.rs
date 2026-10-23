@@ -703,3 +703,60 @@ async fn summarize_fires_compacting_not_chat_message() {
         "summarize must not add a chat.message-mutated part (seed=1)"
     );
 }
+
+/// A v1 plugin tool (`hooks.tool`) must be advertised to the provider with its
+/// schema generated IN THE PLUGIN'S RUNTIME, and its execution must return the
+/// plugin's output. This is the gap the corpus reported (5/20 declare a tool
+/// surface, none was ever visible to a model).
+#[tokio::test]
+async fn plugin_tool_is_advertised_and_executes() {
+    require_node();
+    // Script: step 1 calls the plugin tool, step 2 answers.
+    let tool_chunk = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_pt\",\"type\":\"function\",\"function\":{\"name\":\"plug_echo\",\"arguments\":\"{\\\"text\\\":\\\"hi\\\"}\"}}]}}]}\n\n";
+    let done = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n";
+    let step1 = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n{tool_chunk}{done}data: [DONE]\n\n"
+    );
+    let step2 = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n"
+        .to_string();
+    let (addr, rx) = spawn_provider_scripted(vec![step1, step2]);
+    let st = setup(addr, "plugtool");
+    load_plugin(&st, "plugtool", r#"export const hook = async () => ({
+  tool: {
+    plug_echo: {
+      description: "echoes its input",
+      args: { text: { type: "string" } },
+      execute: async (args) => ({ title: "echo", output: "PLUGIN_TOOL:" + args.text, metadata: { k: 1 } }),
+    },
+  },
+});"#).await;
+    // Default action for an unknown tool is "ask"; the test has no client to
+    // answer, so allow it explicitly (same pattern as tool_execute_before).
+    st.payloads.write().agent = vec![json!({
+        "name": "build",
+        "permission": [{"permission": "plug_echo", "pattern": "*", "action": "allow"}],
+    })];
+    let sid = "ses_plugtool";
+    let body = json!({"parts":[{"type":"text","text":"call the tool"}]});
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/session/{sid}/message"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let res = ocserve_http::router(st.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+    let (_, second) = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert!(
+        second.contains("\"name\":\"plug_echo\""),
+        "the plugin tool must be advertised to the provider: {second}"
+    );
+    assert!(
+        second.contains("PLUGIN_TOOL:hi"),
+        "the plugin's output must reach the next provider request: {second}"
+    );
+}

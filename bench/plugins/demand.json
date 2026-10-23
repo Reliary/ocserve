@@ -1,0 +1,286 @@
+{
+  "auth": {
+    "declared_by": [
+      "@iam-brain/opencode-codex-auth",
+      "opencode-poe-auth"
+    ],
+    "dialect": [
+      "v1"
+    ],
+    "v1_trigger": false,
+    "status": "diverged",
+    "reason": "D-HOOK-AUTH-OAUTH (provider OAuth is out of scope; loader-time)"
+  },
+  "chat.headers": {
+    "declared_by": [
+      "@iam-brain/opencode-codex-auth"
+    ],
+    "dialect": [
+      "v1"
+    ],
+    "v1_trigger": true,
+    "status": "bound"
+  },
+  "chat.message": {
+    "declared_by": [
+      "@iam-brain/opencode-codex-auth",
+      "rolebox"
+    ],
+    "dialect": [
+      "v1"
+    ],
+    "v1_trigger": true,
+    "status": "bound"
+  },
+  "chat.params": {
+    "declared_by": [
+      "@iam-brain/opencode-codex-auth"
+    ],
+    "dialect": [
+      "v1"
+    ],
+    "v1_trigger": true,
+    "status": "bound"
+  },
+  "command.execute.before": {
+    "declared_by": [
+      "opencode-pty"
+    ],
+    "dialect": [
+      "v1"
+    ],
+    "v1_trigger": true,
+    "status": "bound"
+  },
+  "config": {
+    "declared_by": [
+      "@iam-brain/opencode-codex-auth",
+      "@sjawhar/opencode-legion-envoy",
+      "opencode-pty",
+      "rolebox"
+    ],
+    "dialect": [
+      "v1"
+    ],
+    "v1_trigger": false,
+    "status": "bound"
+  },
+  "dispose": {
+    "declared_by": [
+      "@iam-brain/opencode-codex-auth",
+      "@sjawhar/opencode-legion-envoy",
+      "rolebox"
+    ],
+    "dialect": [
+      "v1"
+    ],
+    "v1_trigger": false,
+    "status": "bound"
+  },
+  "event": {
+    "declared_by": [
+      "@cortexkit/opencode-magic-context",
+      "@iam-brain/opencode-codex-auth",
+      "@mastra/opencode",
+      "@openviking/opencode-plugin",
+      "@sjawhar/opencode-legion-envoy",
+      "oh-my-opencode-slim",
+      "opencode-models-discovery",
+      "opencode-notify",
+      "opencode-pty",
+      "rolebox"
+    ],
+    "dialect": [
+      "v1",
+      "v2"
+    ],
+    "v1_trigger": false,
+    "status": "bound"
+  },
+  "experimental.chat.messages.transform": {
+    "declared_by": [
+      "@mastra/opencode"
+    ],
+    "dialect": [
+      "v1"
+    ],
+    "v1_trigger": true,
+    "status": "bound"
+  },
+  "experimental.chat.system.transform": {
+    "declared_by": [
+      "@mastra/opencode",
+      "rolebox"
+    ],
+    "dialect": [
+      "v1"
+    ],
+    "v1_trigger": true,
+    "status": "bound"
+  },
+  "experimental.session.compacting": {
+    "declared_by": [
+      "@iam-brain/opencode-codex-auth",
+      "rolebox"
+    ],
+    "dialect": [
+      "v1"
+    ],
+    "v1_trigger": true,
+    "status": "bound"
+  },
+  "experimental.text.complete": {
+    "declared_by": [
+      "@iam-brain/opencode-codex-auth"
+    ],
+    "dialect": [
+      "v1"
+    ],
+    "v1_trigger": true,
+    "status": "bound"
+  },
+  "permission.ask": {
+    "declared_by": [
+      "opencode-notify"
+    ],
+    "dialect": [
+      "v1"
+    ],
+    "v1_trigger": false,
+    "status": "diverged",
+    "reason": "D-PERM-V2-MODEL (our gate is the authority, not a plugin hook)"
+  },
+  "session.compaction": {
+    "declared_by": [
+      "@cortexkit/opencode-magic-context",
+      "@dietrichgebert/ponytail",
+      "@openviking/opencode-plugin",
+      "oh-my-opencode-slim"
+    ],
+    "dialect": [
+      "v2"
+    ],
+    "v1_trigger": false,
+    "status": "bound"
+  },
+  "session.context": {
+    "declared_by": [
+      "@cortexkit/opencode-magic-context",
+      "@dietrichgebert/ponytail",
+      "@openviking/opencode-plugin",
+      "oh-my-opencode-slim"
+    ],
+    "dialect": [
+      "v2"
+    ],
+    "v1_trigger": false,
+    "status": "bound"
+  },
+  "session.generate": {
+    "declared_by": [
+      "@cortexkit/opencode-magic-context"
+    ],
+    "dialect": [
+      "v2"
+    ],
+    "v1_trigger": false,
+    "status": "bound"
+  },
+  "session.http.response": {
+    "declared_by": [
+      "@cortexkit/opencode-magic-context"
+    ],
+    "dialect": [
+      "v2"
+    ],
+    "v1_trigger": false,
+    "status": "diverged",
+    "reason": "D-V2-SESSION-LIFECYCLE (transport-level Effect hook)"
+  },
+  "session.model.request": {
+    "declared_by": [
+      "oh-my-opencode-slim"
+    ],
+    "dialect": [
+      "v2"
+    ],
+    "v1_trigger": false,
+    "status": "diverged",
+    "reason": "D-V2-SESSION-LIFECYCLE (transport-level Effect hook)"
+  },
+  "session.prompt": {
+    "declared_by": [
+      "@openviking/opencode-plugin",
+      "oh-my-opencode-slim"
+    ],
+    "dialect": [
+      "v2"
+    ],
+    "v1_trigger": false,
+    "status": "bound"
+  },
+  "session.retry": {
+    "declared_by": [
+      "oh-my-opencode-slim"
+    ],
+    "dialect": [
+      "v2"
+    ],
+    "v1_trigger": false,
+    "status": "diverged",
+    "reason": "D-V2-SESSION-LIFECYCLE (retry policy is internal)"
+  },
+  "shell.env": {
+    "declared_by": [
+      "@sjawhar/opencode-legion-envoy"
+    ],
+    "dialect": [
+      "v1"
+    ],
+    "v1_trigger": true,
+    "status": "bound"
+  },
+  "tool": {
+    "declared_by": [
+      "@iam-brain/opencode-codex-auth",
+      "@mastra/opencode",
+      "@sjawhar/opencode-legion-envoy",
+      "opencode-pty",
+      "rolebox"
+    ],
+    "dialect": [
+      "v1"
+    ],
+    "v1_trigger": false,
+    "status": "bound"
+  },
+  "tool.execute.after": {
+    "declared_by": [
+      "@cortexkit/opencode-magic-context",
+      "@openviking/opencode-plugin",
+      "oh-my-opencode-slim",
+      "rolebox"
+    ],
+    "dialect": [
+      "v1",
+      "v2"
+    ],
+    "v1_trigger": true,
+    "status": "bound"
+  },
+  "tool.execute.before": {
+    "declared_by": [
+      "@cortexkit/opencode-magic-context",
+      "@openviking/opencode-plugin",
+      "oh-my-opencode-slim",
+      "opencode-notify",
+      "rolebox"
+    ],
+    "dialect": [
+      "v1",
+      "v2"
+    ],
+    "v1_trigger": true,
+    "status": "bound"
+  }
+}

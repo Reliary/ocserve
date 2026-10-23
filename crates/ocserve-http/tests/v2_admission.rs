@@ -1787,3 +1787,62 @@ async fn v2_websearch_validation_keyless_and_partial() {
     assert_eq!(v["service"], "firecrawl");
     // CONTROL: fabricated results for keyless → empty-results assert red.
 }
+
+/// v2 `session.prompt`: the hook runs BEFORE admission and the returned
+/// prompt is what the inbox row carries (upstream SessionPrompt.prepare reads
+/// `event.prompt`). Nothing else in the pipeline may see the unmutated text.
+#[tokio::test]
+async fn v2_prompt_hook_mutates_the_admitted_row() {
+    let st = setup_with_v2("127.0.0.1:9".parse().unwrap(), true);
+    let dir = std::env::temp_dir().join(format!(
+        "ocserve-v2prompthook-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("v2prompt.mjs");
+    std::fs::write(
+        &entry,
+        r#"export default {
+  id: "v2prompt",
+  async setup(ctx) {
+    await ctx.session.hook("prompt", (ev) => { ev.prompt.text = "MUTATED:" + ev.prompt.text; });
+  },
+};"#,
+    )
+    .unwrap();
+    let host = ocserve_plugin::materialize_host(&dir.join("host")).unwrap();
+    let mut sc = ocserve_plugin::Sidecar::spawn(&host, "http://127.0.0.1:9", "/w")
+        .await
+        .expect("sidecar");
+    sc.load("v2prompt", &entry, &json!({}), &serde_json::Value::Null)
+        .await
+        .expect("load");
+    assert!(
+        st.plugins
+            .set(Arc::new(tokio::sync::Mutex::new(sc)))
+            .is_ok(),
+        "plugins already set"
+    );
+
+    let body = json!({"text": "hello", "resume": false});
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/session/ses_v2a/prompt")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let res = ocserve_http::router(st.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let rows = ocserve_store::inbox::list(&st.db, "ses_v2a").unwrap();
+    assert_eq!(rows.len(), 1, "one admitted item");
+    assert!(
+        rows[0].2.contains("MUTATED:"),
+        "the hook's returned prompt must be what admission stores: {}",
+        rows[0].2
+    );
+}

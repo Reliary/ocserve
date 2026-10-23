@@ -3427,9 +3427,59 @@ pub async fn prompt(
     }
     // boundary decode FIRST with the v2 envelope (`_tag:InvalidRequestError`,
     // field-probes.md) — session/endpoint checks follow.
-    let input = crate::decode_v2(ocserve_core::wire::V2PromptInput::decode(&body))?;
+    let mut input = crate::decode_v2(ocserve_core::wire::V2PromptInput::decode(&body))?;
     if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
         return Err(session_not_found(&id));
+    }
+    // v2 `session.prompt` hook: upstream fires it in SessionPrompt.prepare
+    // (core/session/prompt.ts:40) AFTER decode and BEFORE admission, and the
+    // RETURNED event replaces the input (`event.prompt`). Same seam here: the
+    // mutation lands in the inbox row, which is what the turn later runs.
+    {
+        let msg_id = input.id.clone().unwrap_or_default();
+        let ev = ocserve_core::prompt::hook_v2(
+            st.plugins.get(),
+            "session",
+            "prompt",
+            json!({
+                "sessionID": id,
+                "messageID": msg_id,
+                "prompt": {
+                    "text": input.prompt_text,
+                    "files": input.prompt_files,
+                    "agents": input.prompt_agents,
+                    "skills": input.prompt_skills,
+                },
+                "metadata": input.metadata,
+                "delivery": input.delivery.clone().unwrap_or_else(|| "steer".into()),
+            }),
+        )
+        .await;
+        // `hook_v2` returns the mutated event (or the input unchanged when no
+        // plugin registered the hook), so there is no `matched` wrapper here.
+        {
+            let out = ev;
+            if let Some(p) = out.get("prompt") {
+                if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+                    input.prompt_text = t.to_string();
+                }
+                if let Some(f) = p.get("files").and_then(|v| v.as_array()) {
+                    input.prompt_files = f.clone();
+                }
+                if let Some(a) = p.get("agents").and_then(|v| v.as_array()) {
+                    input.prompt_agents = a.clone();
+                }
+                if let Some(sk) = p.get("skills").and_then(|v| v.as_array()) {
+                    input.prompt_skills = sk.clone();
+                }
+            }
+            if out.get("metadata").is_some() {
+                input.metadata = out.get("metadata").cloned();
+            }
+            if let Some(d) = out.get("delivery").and_then(|v| v.as_str()) {
+                input.delivery = Some(d.to_string());
+            }
+        }
     }
     // Revert-commit cleanup before admission (upstream session.ts:165-166:
     // staged revert commits after prepare, before admit).

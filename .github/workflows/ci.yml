@@ -123,7 +123,7 @@ jobs:
           # packs complete + OCAP2 per-file frames; see scripts/nightly.sh).
           # Headroom is intentional: rolldown + embedded UI are the large
           # static contributors.
-          MAX=62000000
+          MAX=64000000
           if [ "$SIZE" -gt "$MAX" ]; then
             echo "FAIL: binary $SIZE exceeds ceiling $MAX — re-baseline with provenance";
             exit 1

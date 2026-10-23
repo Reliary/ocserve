@@ -1198,4 +1198,15 @@ else
   echo "ok"
 fi
 
+echo "== guard: plugin demand ledger is current and classified (rule 50) =="
+# A hook the ecosystem declares must be either bound or a NAMED divergence. The
+# generator writes demand.json; this guard re-derives the classification from
+# the committed corpus report and compares, so the two cannot drift and the
+# guard is not reading what the generator just wrote.
+if python3 scripts/check-demand.py; then
+  echo "ok"
+else
+  echo "FAIL: bench/plugins/demand.json is stale or has an unclassified hook (rule 50)"; fail=1
+fi
+
 exit $fail

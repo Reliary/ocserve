@@ -588,21 +588,35 @@ impl Runtime {
         }
         let auth = load_auth(data_dir)?;
         let cache = read_catalog(&cache_path);
+        Self::from_parts(data_dir, raw_config, auth, cache)
+    }
 
+    /// Build a Runtime from an explicit config value (plugin `config` hook).
+    /// Auth + the model catalog are re-read — the same cost as a normal
+    /// reload, and it keeps ONE derivation path for both.
+    pub fn from_config(data_dir: &std::path::Path, config: Value) -> Result<Self> {
+        let auth = load_auth(data_dir)?;
+        let cache = read_catalog(&crate::models_dev::read_path());
+        Self::from_parts(data_dir, config, auth, cache)
+    }
+
+    fn from_parts(
+        data_dir: &std::path::Path,
+        raw_config: Value,
+        auth: Value,
+        cache: Value,
+    ) -> Result<Self> {
+        let (agent, api_agent) = build_agents(&raw_config);
+        let command = build_commands(&raw_config)?;
+        let (config_providers, provider) = build_providers(&raw_config, &auth, &cache);
         // Pair gate (2026-10-06): freeze's config loader ALWAYS answers
-        // agent/command/mode ({} when unset) + username (system user) —
-        // keypaths seen live under an identical minimal fixture; a raw echo
-        // of a config missing those keys diverged. insert-if-absent: real
-        // configs already carry agent/command and are untouched (keys_subset
-        // recorded ⊆ got also gains username, which real freeze always had).
-        let mut config = raw_config.clone(); // raw file until M4 plugins add agents (keys_subset)
+        // agent/command/mode ({} when unset) + username. Applied to the SERVED
+        // config only; derivations above use the raw value (unchanged order).
+        let mut config = raw_config;
         if let Some(obj) = config.as_object_mut() {
             for k in ["agent", "command", "mode"] {
                 obj.entry(k).or_insert(json!({}));
             }
-            // Windows sets USERNAME, not USER/LOGNAME. Without it the key was
-            // simply absent there, and /config diverged from freeze on every
-            // Windows machine (found by the Windows pair run).
             if !obj.contains_key("username")
                 && let Ok(u) = std::env::var("USER")
                     .or_else(|_| std::env::var("LOGNAME"))
@@ -612,9 +626,6 @@ impl Runtime {
                 obj.insert("username".into(), json!(u));
             }
         }
-        let (agent, api_agent) = build_agents(&raw_config);
-        let command = build_commands(&raw_config)?;
-        let (config_providers, provider) = build_providers(&raw_config, &auth, &cache);
 
         Ok(Self {
             data_dir: data_dir.to_path_buf(),

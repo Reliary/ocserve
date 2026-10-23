@@ -59,15 +59,20 @@ Download a release (no toolchain, checksum-verified) from
 <https://github.com/Reliary/ocserve/releases>. Linux x86_64 and aarch64
 tarballs, each with a `.sha256` and a combined `SHA256SUMS`.
 
-From source:
+From source (this is the supported path for current releases):
 
 ```sh
-cargo install ocserve          # needs Rust 1.98+
+git clone https://github.com/Reliary/ocserve && cd ocserve
+cargo build --release          # needs Rust 1.98+
 ```
 
-`cargo install ocserve` currently gives **0.3.1**. The 0.4.x crates are not on
-crates.io yet because the registry caps crate size and one crate carries the
-embedded web UI. Use a release tarball for 0.4.x.
+**crates.io is stale on purpose.** `cargo install ocserve` resolves to
+**0.3.1**; the 0.4.x and later crates are not published because `ocserve-http`
+embeds the version-matched web UI and its packed payload exceeds crates.io's
+10 MiB per-crate limit. A size-increase request is with the registry, and
+nothing is shipped that would silently drop the air-gapped web UI just to fit.
+Use a release tarball (above) or build from the tag. This note will be removed
+the release the limit is raised.
 
 From a clone, including an optional systemd user service (never installed
 implicitly):

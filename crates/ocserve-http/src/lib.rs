@@ -62,6 +62,13 @@ pub fn config_write_path() -> std::path::PathBuf {
 pub type ConfigReloader =
     std::sync::Arc<dyn Fn() -> anyhow::Result<(Payloads, LlmRegistry)> + Send + Sync>;
 
+/// Derive payloads from an explicit config value (the plugin `config` hook's
+/// returned object). Separate from `ConfigReloader`, which always re-reads
+/// files: applying a plugin mutation must not race the on-disk state.
+pub type ConfigDeriver = std::sync::Arc<
+    dyn Fn(serde_json::Value) -> anyhow::Result<(Payloads, LlmRegistry)> + Send + Sync,
+>;
+
 #[derive(Default)]
 pub struct Payloads {
     pub config: serde_json::Value,
@@ -268,6 +275,8 @@ pub struct AppState {
     /// closure avoids a crate cycle). None in tests → PATCH still writes
     /// the file, swap skipped (logged).
     pub reloader: parking_lot::RwLock<Option<ConfigReloader>>,
+    /// Plugin `config` hook result → payloads (boot; never re-reads files).
+    pub deriver: parking_lot::RwLock<Option<ConfigDeriver>>,
     /// Runtime paths for GET /path (env-derived at boot; never stored in repo).
     pub paths: serde_json::Value,
     /// Auth mode: None = off (freeze default), Some(("user","pass")) = basic.
@@ -626,6 +635,7 @@ impl AppState {
             wire: parking_lot::RwLock::new(wire_map),
             wire_off: std::sync::atomic::AtomicBool::new(wire_off),
             reloader: parking_lot::RwLock::new(None),
+            deriver: parking_lot::RwLock::new(None),
             // upstream /path shape (keys golden: home/state/config/worktree/directory)
             paths: json!({
                 "home": home,
@@ -1844,8 +1854,13 @@ pub fn start_plugin_event_pump(st: &Arc<AppState>) {
                     let Some(payload) = v.get("payload").cloned() else {
                         continue;
                     };
-                    let mut guard = plug.lock().await;
-                    if let Err(e) = guard.emit_event(payload).await {
+                    // Handle + drop: event delivery must not hold the sidecar
+                    // while a plugin hook elsewhere awaits (2026-10-22 class).
+                    let handle = { plug.lock().await.handle() };
+                    if let Err(e) = handle
+                        .emit_event_bounded(payload, ocserve_plugin::hook_budget("event"))
+                        .await
+                    {
                         tracing::debug!("plugin event pump: {e:#}");
                     }
                 }

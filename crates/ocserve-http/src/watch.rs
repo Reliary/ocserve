@@ -238,7 +238,22 @@ async fn apply_v2_transforms(st: &Arc<AppState>, payloads: &mut crate::Payloads)
 }
 
 pub async fn reconcile(st: &Arc<AppState>) -> anyhow::Result<()> {
+    reconcile_inner(st, None).await
+}
+
+/// Apply a config value produced by the plugin `config` hook (no file read):
+/// the same swap path as a reload, so there is exactly ONE derivation and ONE
+/// wire-cache rebuild. An invalid value keeps the previous state serving.
+pub async fn apply_config_value(st: &Arc<AppState>, cfg: serde_json::Value) -> anyhow::Result<()> {
+    reconcile_inner(st, Some(cfg)).await
+}
+
+async fn reconcile_inner(
+    st: &Arc<AppState>,
+    explicit: Option<serde_json::Value>,
+) -> anyhow::Result<()> {
     let _guard = st.reconcile_lock.lock().await;
+    let explicit_deriver = explicit.as_ref().and_then(|_| st.deriver.read().clone());
     let Some(reload) = st.reloader.read().clone() else {
         tracing::warn!("config reload: reloader unset (tests/boot) — restart to apply");
         return Ok(());
@@ -256,7 +271,11 @@ pub async fn reconcile(st: &Arc<AppState>) -> anyhow::Result<()> {
         .get("mcp")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let loaded = reload();
+    let loaded = match (explicit, explicit_deriver) {
+        (Some(cfg), Some(derive)) => derive(cfg),
+        (Some(_), None) => Err(anyhow::anyhow!("config deriver unset")),
+        (None, _) => reload(),
+    };
     let (mut payloads, registry) = match loaded {
         Ok(pair) => pair,
         Err(e) => {

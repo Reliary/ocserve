@@ -150,13 +150,16 @@ step "backup drill (VACUUM INTO + integrity + counts)" bash -c "$(declare -f dri
 #      from measurement (provenance rule); still ~3x smaller than upstream's
 #      185 MB ELF. NOTE: 36 MB of this is office-document-preview WASM — a
 #      candidate to drop if a leaner default is wanted (documented tradeoff).
+#      P0-P6 plugin batch: 61,746,576 B measured 2026-10-22 (hook timeouts +
+#      duplex sidecar + plugin tools + v2 prompt/dispatch/proxies; no new
+#      embedded assets) → ceiling 64,000,000 B (provenance rule).
 size_gate() {
   local bin="target/release/ocserve"
   if [ ! -x "$bin" ]; then
     echo "release binary missing — building"
     cargo build --release || return 1
   fi
-  local sz ceiling=62000000
+  local sz ceiling=64000000
   sz="$(stat -c%s "$bin")"
   echo "size=${sz} ceiling=${ceiling}"
   [ "$sz" -le "$ceiling" ] || { echo "OVER SIZE CEILING"; return 1; }

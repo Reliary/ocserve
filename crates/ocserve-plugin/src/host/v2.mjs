@@ -213,9 +213,22 @@ export function makeV2Context({
     // Domains with no ocserve backing: exposing them as honest throwing
     // proxies (named divergences) beats undefined-property crashes at setup.
     aisdk: unbridgedDomain("aisdk", state, []),
-    model: unbridgedDomain("model", state, []),
-    provider: unbridgedDomain("provider", state, []),
-    agent: unbridgedDomain("agent", state, []),
+    // Read-only domains whose routes ocserve already serves: proxying them
+    // through the verified route table beats a throwing proxy (a false
+    // divergence tells a plugin a capability is absent when it is present).
+    // Every verb listed here is backed by a bound, guarded route.
+    model: readDomain("model", state, {
+      list: async () => (await fetchJson("GET", "/api/model"))?.data,
+      get: async (id) => (await fetchJson("GET", `/api/model/${encodeURIComponent(id)}`))?.data,
+    }),
+    provider: readDomain("provider", state, {
+      list: async () => (await fetchJson("GET", "/api/provider"))?.data,
+      get: async (id) => (await fetchJson("GET", `/api/provider/${encodeURIComponent(id)}`))?.data,
+    }),
+    agent: readDomain("agent", state, {
+      list: async () => (await fetchJson("GET", "/api/agent"))?.data,
+      get: async (id) => (await fetchJson("GET", `/api/agent/${encodeURIComponent(id)}`))?.data,
+    }),
     // command: real. `transform` collects CommandEditor callbacks; Rust pulls
     // `runTransforms` on config reload and stores what the plugins return.
     command: {
@@ -247,9 +260,14 @@ export function makeV2Context({
         state.reloadRequested = true;
       },
     },
-    integration: unbridgedDomain("integration", state, []),
+    integration: readDomain("integration", state, {
+      list: async () => (await fetchJson("GET", "/api/integration"))?.data,
+      get: async (id) => (await fetchJson("GET", `/api/integration/${encodeURIComponent(id)}`))?.data,
+    }),
     mcp: unbridgedDomain("mcp", state, []),
-    reference: unbridgedDomain("reference", state, []),
+    reference: readDomain("reference", state, {
+      list: async () => (await fetchJson("GET", "/api/reference"))?.data,
+    }),
     vcs: unbridgedDomain("vcs", state, []),
     websearch: unbridgedDomain("websearch", state, []),
     worktree: unbridgedDomain("worktree", state, []),
@@ -284,6 +302,26 @@ export function makeV2Context({
  * Any *other* property is genuine use of an unbridged domain and throws the
  * named divergence, as before.
  */
+
+/**
+ * Read-only domain backed by a real route, PLUS the registration form.
+ * A transform on such a domain is recorded and reported (we cannot apply an
+ * edit to a derived list without a pull, and failing at registration would
+ * discard the hooks we DO bridge), while `reload()` resolves honestly.
+ */
+function readDomain(name, state, verbs) {
+  const pending = [];
+  const base = {};
+  for (const [verb, fn] of Object.entries(verbs)) base[verb] = fn;
+  base.transform = async (callback) => {
+    pending.push({ domain: name, callback });
+    if (Array.isArray(state.unbridgedTransforms)) state.unbridgedTransforms.push(name);
+    return registration(pending, callback);
+  };
+  base.reload = async () => {};
+  return base;
+}
+
 function unbridgedDomain(name, state, pending) {
   return new Proxy(
     {},

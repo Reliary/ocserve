@@ -165,14 +165,197 @@ struct Pending {
     tx: oneshot::Sender<Result<Value, String>>,
 }
 
-/// Sidecar handle: one Node process, NDJSON request/response, reader task.
-pub struct Sidecar {
-    stdin: ChildStdin,
+/// Everything a request needs, shareable WITHOUT the owning `Sidecar` lock.
+///
+/// Why this exists (2026-10-22): `hook_mutate` held `Arc<Mutex<Sidecar>>` for
+/// the whole hook await, so two sessions' hooks fully serialized — the
+/// reference interleaves them at `await` points. Writes are serialized by the
+/// stdin mutex and responses correlate by id, so nothing needs exclusive
+/// access to the process while a hook runs.
+pub struct Inner {
+    stdin: tokio::sync::Mutex<ChildStdin>,
+    /// SHARED with the reader task (it resolves responses by id).
     pending: Arc<parking_lot::Mutex<HashMap<i64, Pending>>>,
     next_id: std::sync::atomic::AtomicI64,
-    child: Child,
-    /// load results (spec → hooks) for status introspection
+    /// load results (spec → {hooks,…}) for introspection AND round-trip skips.
     statuses: parking_lot::Mutex<HashMap<String, Value>>,
+}
+
+/// Cheap clone handle: hook dispatch drops the owner lock and awaits this.
+#[derive(Clone)]
+pub struct Handle(Arc<Inner>);
+
+impl Handle {
+    /// Does any loaded plugin register `hook`? Lets the hot path skip the
+    /// sidecar round-trip entirely when nobody listens (most installs).
+    pub fn registers(&self, hook: &str) -> bool {
+        self.0.statuses.lock().values().any(|v| {
+            v.get("hooks")
+                .and_then(|h| h.as_array())
+                .is_some_and(|a| a.iter().any(|x| x.as_str() == Some(hook)))
+        })
+    }
+
+    pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        self.request_with_timeout(method, params, Some(RPC_TIMEOUT))
+            .await
+    }
+
+    pub async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Value> {
+        let id = self
+            .0
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.0.pending.lock().insert(id, Pending { tx });
+        let msg = json!({"id": id, "method": method, "params": params});
+        let mut line = msg.to_string();
+        line.push('\n');
+        {
+            let mut stdin = self.0.stdin.lock().await;
+            if let Err(e) = stdin.write_all(line.as_bytes()).await {
+                self.0.pending.lock().remove(&id);
+                return Err(e).context("plugin host stdin write");
+            }
+            if let Err(e) = stdin.flush().await {
+                self.0.pending.lock().remove(&id);
+                return Err(e).context("plugin host stdin flush");
+            }
+        }
+        let wait = async {
+            match rx.await {
+                Ok(res) => res.map_err(|e| anyhow!("plugin host {method}: {e}")),
+                Err(_) => Err(anyhow!("plugin host dropped response for {method}")),
+            }
+        };
+        match timeout {
+            None => wait.await,
+            Some(d) => match tokio::time::timeout(d, wait).await {
+                Ok(res) => res,
+                Err(_) => {
+                    self.0.pending.lock().remove(&id);
+                    ocserve_metrics::labeled_counter(
+                        "ocserve_plugin_hook_timeout_total",
+                        &format!("hook=\"{method}\""),
+                        1,
+                    );
+                    Err(anyhow!(
+                        "plugin host {method} timed out after {}ms (runaway hook?)",
+                        d.as_millis()
+                    ))
+                }
+            },
+        }
+    }
+}
+
+impl Handle {
+    pub async fn trigger_bounded(
+        &self,
+        name: &str,
+        input: Value,
+        mut output: Value,
+        budget: Option<std::time::Duration>,
+    ) -> Result<Value> {
+        let res = self
+            .request_with_timeout(
+                "trigger",
+                json!({"name": name, "input": input, "output": output}),
+                budget,
+            )
+            .await?;
+        if res.is_object() {
+            output = res;
+        }
+        Ok(output)
+    }
+
+    pub async fn trigger_v2_bounded(
+        &self,
+        domain: &str,
+        name: &str,
+        input: Value,
+        budget: Option<std::time::Duration>,
+    ) -> Result<Value> {
+        self.request_with_timeout(
+            "trigger_v2",
+            json!({"domain": domain, "name": name, "input": input}),
+            budget,
+        )
+        .await
+    }
+
+    pub async fn emit_event_bounded(
+        &self,
+        event: Value,
+        budget: Option<std::time::Duration>,
+    ) -> Result<Value> {
+        self.request_with_timeout("event", json!({"event": event}), budget)
+            .await
+    }
+}
+
+/// Per-hook budget. Upstream has NO hook timeout (`Effect.promise(...)` awaits
+/// forever); any bound is our safety divergence, recorded as D-HOOK-TIMEOUT.
+/// Defaults come from measured maxima on a real install (27 prompts):
+/// `v2.session.context` 15.3 s, `tool.execute.after` 30.0 s,
+/// `system.transform` 5.4 s. `OCSERVE_HOOK_TIMEOUT_MS=0` restores parity
+/// (unbounded) for an operator who needs it.
+pub fn hook_budget(hook: &str) -> Option<std::time::Duration> {
+    match std::env::var("OCSERVE_HOOK_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(ms) => Some(std::time::Duration::from_millis(ms)),
+        None => Some(std::time::Duration::from_secs(
+            if hook.starts_with("tool.execute") || hook.contains("tool.execute") {
+                180
+            } else if hook.contains("context")
+                || hook.contains("transform")
+                || hook.contains("compaction")
+            {
+                60
+            } else {
+                30
+            },
+        )),
+    }
+}
+
+impl Handle {
+    /// Plugin-declared tools (v1 `hooks.tool`), with JSON Schema generated in
+    /// the plugin's own runtime. Empty when no plugin registers one, so the
+    /// provider `tools` array is byte-identical for everyone else.
+    pub async fn tools(&self) -> Result<Vec<Value>> {
+        if !self.registers("tool") {
+            return Ok(Vec::new());
+        }
+        let res = self.request("tools", json!({})).await?;
+        Ok(res.as_array().cloned().unwrap_or_default())
+    }
+
+    /// Execute one plugin tool. `ctx` carries {sessionID, messageID, agent,
+    /// directory}. The permission gate ran already for the call as a whole.
+    pub async fn execute_tool(&self, name: &str, input: Value, ctx: Value) -> Result<Value> {
+        self.request_with_timeout(
+            "tool_execute",
+            json!({"name": name, "input": input, "ctx": ctx}),
+            Some(std::time::Duration::from_secs(300)),
+        )
+        .await
+    }
+}
+
+/// Sidecar owner: one Node process, NDJSON request/response, reader task.
+pub struct Sidecar {
+    inner: Arc<Inner>,
+    child: Child,
     /// server/directory context for loads (kept for future reloads)
     server: (String, String),
     /// spawn identity for respawn-after-death
@@ -358,6 +541,26 @@ impl Sidecar {
                             if let Some(p) = pending_task.lock().remove(&id) {
                                 let _ = p.tx.send(result);
                             }
+                        } else if v.get("event").and_then(|e| e.as_str()) == Some("plugin_error") {
+                            // Per-plugin internal failure (the class that hid a
+                            // configured plugin for weeks: the plugin caught its
+                            // own TypeError and returned the input unchanged, so
+                            // Rust saw Ok). Counted by name so silence is visible.
+                            ocserve_metrics::labeled_counter(
+                                "ocserve_plugin_internal_error_total",
+                                &format!(
+                                    "plugin=\"{}\",hook=\"{}\"",
+                                    v["plugin"].as_str().unwrap_or("?"),
+                                    v["hook"].as_str().unwrap_or("?")
+                                ),
+                                1,
+                            );
+                            tracing::warn!(
+                                "plugin internal error: {} {}: {}",
+                                v["plugin"].as_str().unwrap_or("?"),
+                                v["hook"].as_str().unwrap_or("?"),
+                                v["error"].as_str().unwrap_or("?")
+                            );
                         }
                         // no id → informational; host routes plugin chatter to stderr
                     }
@@ -373,11 +576,13 @@ impl Sidecar {
             }
         });
         Ok(Self {
-            stdin,
-            pending,
-            next_id: std::sync::atomic::AtomicI64::new(1),
+            inner: Arc::new(Inner {
+                stdin: tokio::sync::Mutex::new(stdin),
+                pending,
+                next_id: std::sync::atomic::AtomicI64::new(1),
+                statuses: parking_lot::Mutex::new(HashMap::new()),
+            }),
             child,
-            statuses: parking_lot::Mutex::new(HashMap::new()),
             server: (server_url.to_string(), directory.to_string()),
             args: SpawnArgs {
                 host_path: host_path.to_path_buf(),
@@ -394,7 +599,7 @@ impl Sidecar {
     /// RPCs currently in flight (the L1 recycle idle gate — a hook must
     /// never be interrupted mid-call).
     pub fn in_flight(&self) -> usize {
-        self.pending.lock().len()
+        self.inner.pending.lock().len()
     }
 
     /// Seconds since this sidecar instance was spawned (respawns reset it).
@@ -412,7 +617,7 @@ impl Sidecar {
             return false;
         }
         let _ = self.child.start_kill();
-        self.statuses.lock().clear();
+        self.inner.statuses.lock().clear();
         self.recycled = true;
         true
     }
@@ -476,40 +681,26 @@ impl Sidecar {
         self.child.id().unwrap_or(0)
     }
 
-    pub async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
-        self.ensure_alive().await?;
-        self.request_raw(method, params).await
+    pub fn handle(&self) -> Handle {
+        Handle(Arc::clone(&self.inner))
     }
 
-    /// Unguarded RPC (respawn replay only — the fresh child is alive).
-    async fn request_raw(&mut self, method: &str, params: Value) -> Result<Value> {
-        let id = self
-            .next_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().insert(id, Pending { tx });
-        let msg = json!({"id": id, "method": method, "params": params});
-        let mut line = msg.to_string();
-        line.push('\n');
-        // A write failure must remove the pending entry or `in_flight()` (the L1
-        // recycle idle gate) never returns to zero and the sidecar can never be
-        // recycled. Clean up before propagating.
-        if let Err(e) = self.stdin.write_all(line.as_bytes()).await {
-            self.pending.lock().remove(&id);
-            return Err(e).context("plugin host stdin write");
-        }
-        if let Err(e) = self.stdin.flush().await {
-            self.pending.lock().remove(&id);
-            return Err(e).context("plugin host stdin flush");
-        }
-        match tokio::time::timeout(RPC_TIMEOUT, rx).await {
-            Ok(Ok(res)) => res.map_err(|e| anyhow!("plugin host {method}: {e}")),
-            Ok(Err(_)) => Err(anyhow!("plugin host dropped response for {method}")),
-            Err(_) => {
-                self.pending.lock().remove(&id);
-                Err(anyhow!("plugin host {method} timed out (runaway hook?)"))
-            }
-        }
+    pub async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.ensure_alive().await?;
+        self.handle().request(method, params).await
+    }
+
+    /// Request with an explicit budget; `None` keeps the historical RPC bound.
+    pub async fn request_bounded(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Value> {
+        self.ensure_alive().await?;
+        self.handle()
+            .request_with_timeout(method, params, timeout)
+            .await
     }
 
     /// Load one plugin (v1 server-factory extraction happens host-side).
@@ -589,7 +780,7 @@ impl Sidecar {
             "input": input,
             "options": options,
         });
-        let res = self.request_raw("load", params).await?;
+        let res = self.handle().request("load", params).await?;
         let hooks: Vec<String> = res["hooks"]
             .as_array()
             .map(|a| {
@@ -598,7 +789,7 @@ impl Sidecar {
                     .collect()
             })
             .unwrap_or_default();
-        self.statuses.lock().insert(
+        self.inner.statuses.lock().insert(
             spec.to_string(),
             json!({"ok": true, "hooks": hooks, "id": res["id"]}),
         );
@@ -691,7 +882,7 @@ impl Sidecar {
 
     pub fn statuses(&self) -> Value {
         let mut out = serde_json::Map::new();
-        for (spec, v) in self.statuses.lock().iter() {
+        for (spec, v) in self.inner.statuses.lock().iter() {
             out.insert(spec.clone(), v.clone());
         }
         Value::Object(out)
@@ -1114,7 +1305,7 @@ export default PluginModule.server;
             dir.path().join("p_v2_use.mjs"),
             r#"export default {
   id: "v2use",
-  setup: async (ctx) => { await ctx.model.list(); },
+  setup: async (ctx) => { await ctx.vcs.apply({}); },
 };"#,
         )
         .unwrap();
@@ -1129,7 +1320,7 @@ export default PluginModule.server;
             .expect_err("using an unbridged domain must still fail loudly");
         let text = format!("{err:#}");
         assert!(text.contains("D-V2-DOMAIN"), "{text}");
-        assert!(text.contains("model"), "{text}");
+        assert!(text.contains("vcs"), "{text}");
 
         sc.shutdown().await;
         Ok(())

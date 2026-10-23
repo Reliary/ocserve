@@ -299,23 +299,26 @@ pub async fn hook_mutate(
     let Some(plug) = plugins else {
         return output;
     };
-    let mut guard = plug.lock().await;
+    // Take a cheap handle and DROP the owner lock before awaiting: holding it
+    // serialized every session's hooks behind the slowest plugin (2026-10-22).
+    // Round-trip skip: if no loaded plugin registers this hook, do not wake the
+    // sidecar at all (most installs register none).
+    let handle = { plug.lock().await.handle() };
+    if !handle.registers(name) {
+        return output;
+    }
+    let budget = ocserve_plugin::hook_budget(name);
     let t0 = std::time::Instant::now();
-    match guard.trigger(name, input, output.clone()).await {
+    match handle
+        .trigger_bounded(name, input, output.clone(), budget)
+        .await
+    {
         Ok(v) => {
-            ocserve_metrics::observe(
-                "ocserve_plugin_hook_duration_seconds",
-                &format!("hook=\"{name}\",result=\"ok\""),
-                t0.elapsed().as_micros() as u64,
-            );
+            observe_hook(name, "ok", t0.elapsed());
             v
         }
         Err(e) => {
-            ocserve_metrics::observe(
-                "ocserve_plugin_hook_duration_seconds",
-                &format!("hook=\"{name}\",result=\"error\""),
-                t0.elapsed().as_micros() as u64,
-            );
+            observe_hook(name, "error", t0.elapsed());
             ocserve_metrics::labeled_counter(
                 "ocserve_plugin_hook_errors_total",
                 &format!("hook=\"{name}\""),
@@ -325,6 +328,105 @@ pub async fn hook_mutate(
             output
         }
     }
+}
+
+fn observe_hook(name: &str, result: &str, dur: std::time::Duration) {
+    ocserve_metrics::observe(
+        "ocserve_plugin_hook_duration_seconds",
+        &format!("hook=\"{name}\",result=\"{result}\""),
+        dur.as_micros() as u64,
+    );
+}
+
+/// `OCSERVE_PLUGIN_TOOLS=0` disables v1 plugin-declared tools (kill switch for
+/// an operator whose plugin ships a tool they do not want exposed).
+pub fn plugin_tools_enabled() -> bool {
+    std::env::var("OCSERVE_PLUGIN_TOOLS").ok().as_deref() != Some("0")
+}
+
+/// Provider-side tool specs for plugin-declared tools. Schema is generated in
+/// the plugin's own runtime (its zod), so there is no Rust converter to keep in
+/// sync with Zod versions — the same decision as the v2 Effect dialect.
+async fn plugin_tool_schemas(ctx: &PromptContext) -> Vec<(String, Value)> {
+    let Some(plug) = ctx.plugins.as_ref() else {
+        return Vec::new();
+    };
+    let handle = { plug.lock().await.handle() };
+    match handle.tools().await {
+        Ok(list) => list
+            .into_iter()
+            .filter_map(|t| {
+                let name = t["name"].as_str()?.to_string();
+                Some((
+                    name.clone(),
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "description": t["description"].as_str().unwrap_or(""),
+                            "parameters": t["parameters"].clone(),
+                        }
+                    }),
+                ))
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!("plugin tools: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
+/// Execute a plugin-declared tool through the sidecar. Bounded (300 s), and a
+/// failure becomes an error tool result, never a dead turn.
+async fn plugin_tool_exec(
+    ctx: &PromptContext,
+    session_id: &str,
+    assistant_id: &str,
+    name: &str,
+    input: Value,
+) -> anyhow::Result<ocserve_tools::ToolResult> {
+    let Some(plug) = ctx.plugins.as_ref() else {
+        anyhow::bail!("plugin tool {name}: no plugin host");
+    };
+    let handle = { plug.lock().await.handle() };
+    let res = handle
+        .execute_tool(
+            name,
+            input,
+            json!({
+                "sessionID": session_id,
+                "messageID": assistant_id,
+                "agent": ctx.agent,
+                "directory": ctx.directory,
+            }),
+        )
+        .await?;
+    if res["ok"].as_bool() != Some(true) {
+        anyhow::bail!(
+            "plugin tool {name}: {}",
+            res["error"].as_str().unwrap_or("failed")
+        );
+    }
+    let output = res["output"].as_str().unwrap_or("").to_string();
+    let truncated = output.len() > ocserve_tools::MAX_BYTES;
+    let output = if truncated {
+        let mut cut = ocserve_tools::MAX_BYTES;
+        while cut > 0 && !output.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}…", &output[..cut])
+    } else {
+        output
+    };
+    Ok(ocserve_tools::ToolResult {
+        output,
+        truncated,
+        exit: None,
+        title: res["title"].as_str().unwrap_or(name).to_string(),
+        error: false,
+        metadata: Some(res["metadata"].clone()),
+    })
 }
 
 /// v2 domain-hook dispatch (Phase 3): the v2 shim normalizes both plugin
@@ -340,9 +442,26 @@ pub async fn hook_v2(
     let Some(plug) = plugins else {
         return input;
     };
-    let mut guard = plug.lock().await;
+    // Same lock discipline as `hook_mutate`: take a handle, drop the owner.
+    let handle = { plug.lock().await.handle() };
+    let full = if domain == "session" {
+        format!("session.{name}")
+    } else {
+        format!("{domain}.{name}")
+    };
+    if !handle.registers(&full) {
+        return input;
+    }
     let t0 = std::time::Instant::now();
-    match guard.trigger_v2(domain, name, input.clone()).await {
+    match handle
+        .trigger_v2_bounded(
+            domain,
+            name,
+            input.clone(),
+            ocserve_plugin::hook_budget(&full),
+        )
+        .await
+    {
         Ok(v) => {
             ocserve_metrics::observe(
                 "ocserve_plugin_hook_duration_seconds",
@@ -1695,6 +1814,23 @@ pub async fn run_prompt_with(
                     });
             tools.extend(mcp_tools);
         }
+        // v1 plugin tools (hooks.tool): the reference adds them to the registry
+        // (registry.ts:200-204) and the model sees them like builtins. Killed
+        // by OCSERVE_PLUGIN_TOOLS=0. With no tool-registering plugin the array
+        // is byte-identical (A4: no token/cache regression).
+        let plugin_tool_names = if opts.tools_enabled && plugin_tools_enabled() {
+            let specs = plugin_tool_schemas(ctx).await;
+            let names = specs
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect::<std::collections::HashSet<_>>();
+            for (_, spec) in specs {
+                tools.push(spec);
+            }
+            names
+        } else {
+            std::collections::HashSet::new()
+        };
         // v1 parity: tool.definition fires per tool before the schema reaches
         // the provider (registry.ts:318). Without it a plugin cannot rewrite a
         // description or parameter schema, which is how prompt-shaping plugins
@@ -2255,13 +2391,14 @@ pub async fn run_prompt_with(
                                 "args": serde_json::from_str::<Value>(&call.arguments)
                                     .unwrap_or_else(|_| json!({})),
                             });
-                            let mut guard = plug.lock().await;
                             let hook_t0 = std::time::Instant::now();
-                            let hook_res = guard
-                                .trigger(
+                            let hook_handle = { plug.lock().await.handle() };
+                            let hook_res = hook_handle
+                                .trigger_bounded(
                                     "tool.execute.after",
                                     hook_in,
                                     json!({"title": "", "output": output, "metadata": {}}),
+                                    ocserve_plugin::hook_budget("tool.execute.after"),
                                 )
                                 .await;
                             ocserve_metrics::observe(
@@ -2603,6 +2740,9 @@ pub async fn run_prompt_with(
                                 );
                                 spawn_tool(&call.name, input, &ctx.directory, &env).await
                             }
+                        } else if plugin_tool_names.contains(&call.name) {
+                            plugin_tool_exec(ctx, session_id, &assistant_id, &call.name, input)
+                                .await
                         } else if let Some(hub) = &ctx.mcp {
                             match hub.call(&call.name, input.clone()).await {
                                 Some(Ok(text)) => Ok(ocserve_tools::ToolResult {
@@ -2742,13 +2882,14 @@ pub async fn run_prompt_with(
                             "args": serde_json::from_str::<Value>(&call.arguments)
                                 .unwrap_or_else(|_| json!({})),
                         });
-                        let mut guard = plug.lock().await;
                         let hook_t0 = std::time::Instant::now();
-                        let hook_res = guard
-                            .trigger(
+                        let hook_handle = { plug.lock().await.handle() };
+                        let hook_res = hook_handle
+                            .trigger_bounded(
                                 "tool.execute.after",
                                 hook_in,
                                 json!({"title": "", "output": output, "metadata": {}}),
+                                ocserve_plugin::hook_budget("tool.execute.after"),
                             )
                             .await;
                         ocserve_metrics::observe(
