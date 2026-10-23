@@ -290,20 +290,53 @@ async fn loop_guard_ask(
 /// (possibly mutated) `output`. Fail-open by construction — no sidecar or a
 /// hook error returns `output` unchanged (a broken plugin never breaks a
 /// prompt; M4b rule). Metrics: duration + error counter per hook name.
+/// A live sidecar handle, recovering a dead/recycled/poisoned host once.
+///
+/// The 2026-10-23 review found the 0.6.0 refactor had removed every
+/// `ensure_alive()` from the traffic path: after an L1 recycle or a reader
+/// death, `registers()` said "no plugins" and every hook silently became a
+/// no-op forever. Recovery is attempted only when the generation is dead, so
+/// the healthy path is one atomic load plus a cheap mutex hand-off.
+pub async fn plugin_handle(
+    plugins: Option<&Arc<tokio::sync::Mutex<ocserve_plugin::Sidecar>>>,
+) -> Option<ocserve_plugin::Handle> {
+    let plug = plugins?;
+    let mut guard = plug.lock().await;
+    if guard.handle().is_alive() {
+        return Some(guard.handle());
+    }
+    ocserve_metrics::labeled_counter(
+        "ocserve_plugin_sidecar_recover_total",
+        "result=\"attempt\"",
+        1,
+    );
+    match guard.ensure_alive().await {
+        Ok(()) => Some(guard.handle()),
+        Err(e) => {
+            tracing::warn!("plugin sidecar recovery failed: {e:#}");
+            ocserve_metrics::labeled_counter(
+                "ocserve_plugin_sidecar_recover_total",
+                "result=\"error\"",
+                1,
+            );
+            None
+        }
+    }
+}
+
 pub async fn hook_mutate(
     plugins: Option<&Arc<tokio::sync::Mutex<ocserve_plugin::Sidecar>>>,
     name: &str,
     input: Value,
     output: Value,
 ) -> Value {
-    let Some(plug) = plugins else {
-        return output;
-    };
     // Take a cheap handle and DROP the owner lock before awaiting: holding it
     // serialized every session's hooks behind the slowest plugin (2026-10-22).
     // Round-trip skip: if no loaded plugin registers this hook, do not wake the
     // sidecar at all (most installs register none).
-    let handle = { plug.lock().await.handle() };
+    let Some(handle) = plugin_handle(plugins).await else {
+        return output;
+    };
     if !handle.registers(name) {
         return output;
     }
@@ -338,6 +371,28 @@ fn observe_hook(name: &str, result: &str, dur: std::time::Duration) {
     );
 }
 
+/// A plugin tool is an unclassified capability: the gate only ever sees its
+/// NAME, never its effects. So it may run only under an agent that already has
+/// unrestricted execution authority. In particular `plan` denies `edit` while
+/// allowing everything else, and a plugin tool that writes a file would slip
+/// through that ban (2026-10-23 review M-4). Deny-by-default is the correct
+/// fail-safe here; the operator can allow the tool explicitly by name.
+pub fn plugin_tool_allowed(ctx: &PromptContext, name: &str) -> bool {
+    // Explicit per-tool allow wins (an operator's deliberate decision).
+    let explicit = ctx
+        .rules
+        .iter()
+        .rev()
+        .find(|r| r.permission == name && r.pattern == "*");
+    if let Some(r) = explicit {
+        return r.action == "allow";
+    }
+    // Otherwise: require bash-level authority. `plan` denies edit, so a tool
+    // that can write must not be inferable as allowed there.
+    ocserve_tools::evaluate("bash", "*", &ctx.rules) == "allow"
+        && ocserve_tools::evaluate("edit", "*", &ctx.rules) == "allow"
+}
+
 /// `OCSERVE_PLUGIN_TOOLS=0` disables v1 plugin-declared tools (kill switch for
 /// an operator whose plugin ships a tool they do not want exposed).
 pub fn plugin_tools_enabled() -> bool {
@@ -348,10 +403,9 @@ pub fn plugin_tools_enabled() -> bool {
 /// the plugin's own runtime (its zod), so there is no Rust converter to keep in
 /// sync with Zod versions — the same decision as the v2 Effect dialect.
 async fn plugin_tool_schemas(ctx: &PromptContext) -> Vec<(String, Value)> {
-    let Some(plug) = ctx.plugins.as_ref() else {
+    let Some(handle) = plugin_handle(ctx.plugins.as_ref()).await else {
         return Vec::new();
     };
-    let handle = { plug.lock().await.handle() };
     match handle.tools().await {
         Ok(list) => list
             .into_iter()
@@ -386,10 +440,11 @@ async fn plugin_tool_exec(
     name: &str,
     input: Value,
 ) -> anyhow::Result<ocserve_tools::ToolResult> {
-    let Some(plug) = ctx.plugins.as_ref() else {
+    let Some(handle) = plugin_handle(ctx.plugins.as_ref()).await else {
         anyhow::bail!("plugin tool {name}: no plugin host");
     };
-    let handle = { plug.lock().await.handle() };
+    let t0 = std::time::Instant::now();
+    ocserve_metrics::labeled_counter("ocserve_plugin_tool_total", "result=\"call\"", 1);
     let res = handle
         .execute_tool(
             name,
@@ -402,12 +457,19 @@ async fn plugin_tool_exec(
             }),
         )
         .await?;
+    ocserve_metrics::observe(
+        "ocserve_plugin_tool_duration_seconds",
+        &format!("tool=\"{name}\""),
+        t0.elapsed().as_micros() as u64,
+    );
     if res["ok"].as_bool() != Some(true) {
+        ocserve_metrics::labeled_counter("ocserve_plugin_tool_total", "result=\"error\"", 1);
         anyhow::bail!(
             "plugin tool {name}: {}",
             res["error"].as_str().unwrap_or("failed")
         );
     }
+    ocserve_metrics::labeled_counter("ocserve_plugin_tool_total", "result=\"ok\"", 1);
     let output = res["output"].as_str().unwrap_or("").to_string();
     let truncated = output.len() > ocserve_tools::MAX_BYTES;
     let output = if truncated {
@@ -419,13 +481,22 @@ async fn plugin_tool_exec(
     } else {
         output
     };
+    // A plugin may return any JSON here. `IndexMut` on a non-object PANICS in
+    // serde_json, and release builds abort (review H-1: one tool returning
+    // `metadata: []` killed every live session). Only an object may enter the
+    // part state; anything else becomes {}.
+    let metadata = if res["metadata"].is_object() {
+        Some(res["metadata"].clone())
+    } else {
+        None
+    };
     Ok(ocserve_tools::ToolResult {
         output,
         truncated,
         exit: None,
         title: res["title"].as_str().unwrap_or(name).to_string(),
         error: false,
-        metadata: Some(res["metadata"].clone()),
+        metadata,
     })
 }
 
@@ -439,11 +510,10 @@ pub async fn hook_v2(
     name: &str,
     input: Value,
 ) -> Value {
-    let Some(plug) = plugins else {
+    // Same lock discipline as `hook_mutate`: take a live handle, drop the owner.
+    let Some(handle) = plugin_handle(plugins).await else {
         return input;
     };
-    // Same lock discipline as `hook_mutate`: take a handle, drop the owner.
-    let handle = { plug.lock().await.handle() };
     let full = if domain == "session" {
         format!("session.{name}")
     } else {
@@ -1820,11 +1890,38 @@ pub async fn run_prompt_with(
         // is byte-identical (A4: no token/cache regression).
         let plugin_tool_names = if opts.tools_enabled && plugin_tools_enabled() {
             let specs = plugin_tool_schemas(ctx).await;
-            let names = specs
+            let reserved: std::collections::HashSet<String> = ocserve_tools::schemas()
                 .iter()
-                .map(|(n, _)| n.clone())
-                .collect::<std::collections::HashSet<_>>();
-            for (_, spec) in specs {
+                .filter_map(|s| {
+                    s.pointer("/function/name")
+                        .and_then(|n| n.as_str())
+                        .map(String::from)
+                })
+                .collect();
+            let mut names = std::collections::HashSet::new();
+            for (name, spec) in specs {
+                // A duplicate name is a provider 400 for EVERY request in the
+                // session (review M-8), and a shadowed builtin would be a
+                // policy hole. Refuse loudly instead of shipping it.
+                if reserved.contains(&name) || !names.insert(name.clone()) {
+                    ocserve_metrics::labeled_counter(
+                        "ocserve_plugin_tool_skipped_total",
+                        "reason=\"name_collision\"",
+                        1,
+                    );
+                    tracing::warn!(
+                        "plugin tool '{name}' collides with a builtin or another plugin tool — not advertised"
+                    );
+                    continue;
+                }
+                if !plugin_tool_allowed(ctx, &name) {
+                    ocserve_metrics::labeled_counter(
+                        "ocserve_plugin_tool_skipped_total",
+                        "reason=\"policy\"",
+                        1,
+                    );
+                    continue;
+                }
                 tools.push(spec);
             }
             names
@@ -2403,7 +2500,10 @@ pub async fn run_prompt_with(
                                 .await;
                             ocserve_metrics::observe(
                                 "ocserve_plugin_hook_duration_seconds",
-                                "hook=\"tool.execute.after\",result=\"ok\"",
+                                &format!(
+                                    "hook=\"tool.execute.after\",result=\"{}\"",
+                                    if hook_res.is_ok() { "ok" } else { "error" }
+                                ),
                                 hook_t0.elapsed().as_micros() as u64,
                             );
                             match &hook_res {
@@ -2829,7 +2929,12 @@ pub async fn run_prompt_with(
                         "time": {"start": exec_start, "end": now_ms()},
                     });
                     // metadata.output mirrors output (capture fact) — except
-                    // todowrite parts, whose metadata is {todos} (v1 Output)
+                    // todowrite parts, whose metadata is {todos} (v1 Output).
+                    // Defensive: a non-object here would panic on IndexMut
+                    // (release = abort), so coerce before indexing.
+                    if !running["state"]["metadata"].is_object() {
+                        running["state"]["metadata"] = json!({});
+                    }
                     if running["state"]["metadata"].get("todos").is_none() {
                         running["state"]["metadata"]["output"] = running["state"]["output"].clone();
                     }
@@ -2894,7 +2999,10 @@ pub async fn run_prompt_with(
                             .await;
                         ocserve_metrics::observe(
                             "ocserve_plugin_hook_duration_seconds",
-                            "hook=\"tool.execute.after\",result=\"ok\"",
+                            &format!(
+                                "hook=\"tool.execute.after\",result=\"{}\"",
+                                if hook_res.is_ok() { "ok" } else { "error" }
+                            ),
                             hook_t0.elapsed().as_micros() as u64,
                         );
                         match &hook_res {
@@ -3802,5 +3910,27 @@ mod history_budget_tests {
         // unparseable string passes through (never lose the datum)
         let bad = Value::String("{not json".into());
         assert_eq!(canonical_tool_args(&bad), "{not json");
+    }
+    #[cfg(test)]
+    mod metadata_guard_tests {
+        use serde_json::json;
+
+        /// The part-state expression must survive any JSON `metadata`. Before the
+        /// guard, `IndexMut<&str>` on a non-object panicked, and release builds
+        /// abort — one plugin tool returning `metadata: []` killed every session
+        /// (2026-10-23 review H-1).
+        #[test]
+        fn non_object_metadata_cannot_panic_the_part_state() {
+            for meta in [json!([]), json!("x"), json!(1), json!(null), json!({})] {
+                let mut running = json!({"state": {"metadata": meta, "output": "o"}});
+                if !running["state"]["metadata"].is_object() {
+                    running["state"]["metadata"] = json!({});
+                }
+                if running["state"]["metadata"].get("todos").is_none() {
+                    running["state"]["metadata"]["output"] = running["state"]["output"].clone();
+                }
+                assert_eq!(running["state"]["metadata"]["output"], "o");
+            }
+        }
     }
 }

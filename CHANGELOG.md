@@ -4,6 +4,53 @@ All notable changes to ocserve. The wire contract targets the frozen
 openccode 1.18.31 release and the v2 surface the 2.0.28 client; anything that
 differs is a named `D-*` row in `PLAN.md §17`.
 
+## 0.6.2
+
+Security and reliability review of 0.6.x (two independent audits). Fixes:
+
+### Critical
+- **A dead reader left a live-but-deaf host.** One host line over 8 MiB stopped
+  the response reader while the child stayed alive, so every later hook burned
+  its full budget and failed until restart. The reader now poisons the
+  generation and the owner replaces the host; requests on a dead generation
+  fail immediately instead of waiting.
+- **The hook budget did not cover the stdin write.** A host that stopped
+  draining blocked every caller on the stdin mutex with no timer. The budget
+  now covers the write and the wait.
+
+### High
+- **A recycled or crashed sidecar silently disabled every plugin.** The 0.6.0
+  handle refactor removed `ensure_alive()` from the traffic path and
+  `recycle_child()` also cleared the loaded-plugin map, so `registers()` said
+  "no plugins" forever. Recovery now runs on the hot path, and a recycle keeps
+  the load knowledge.
+- **A plugin tool returning a non-object `metadata` aborted the process.**
+  serde_json's `IndexMut` panics on non-objects and release builds abort. The
+  value is coerced at both boundaries.
+- **The boot `config` hook result was overwritten** by a following
+  `reconcile()` that re-read the file, so a plugin that tightened permissions
+  was reverted milliseconds later. Applied once, and the follow-up only runs
+  when the apply failed.
+- **Plugin tools bypassed the `plan` agent's edit ban.** The gate sees a tool
+  name, never its effects. A plugin tool now needs explicit `allow`, or an
+  agent with bash-level authority; `ctx.ask` throws instead of silently
+  approving.
+- **Plugin tool names could collide** with builtins or each other, which is a
+  provider 400 for every request. Refused and counted.
+- **The `config` hook was serialized** behind the old mutex at three more sites;
+  all now use the handle path.
+
+### Medium
+- `plugin_origins` (an absolute home path) no longer reaches the served config.
+- Plugin tool output is bounded in the host, before it crosses the pipe.
+- Pending RPC entries are removed by a `Drop` guard, so an aborted turn cannot
+  wedge the recycle gate.
+- `compacting` now matches the 60 s budget (the substring check missed it).
+- `soak-gate.sh` no longer accepts a failed probe (`000000` coerced to 0).
+- New metrics: plugin tool calls/failures/duration, sidecar respawns,
+  config-apply failures, event-delivery failures, sidecar up/down.
+- Load failures are `ERROR` with a counter instead of a single boot warning.
+
 ## 0.6.1
 
 ### Fixed
@@ -25,13 +72,14 @@ unit.
 - Per-hook timeouts derived from measured maxima on a live install
   (`v2.session.context` 15.3 s, `tool.execute.after` 30.0 s): 60 s for
   transforms/context/compaction, 180 s for tool hooks, 300 s for plugin tools.
-  `OCSERVE_HOOK_TIMEOUT_MS` overrides; `0` restores upstream parity (unbounded).
+  `OCSERVE_HOOK_TIMEOUT_MS` overrides every hook budget; `0` restores upstream
+  parity (unbounded).
   Named divergence `D-HOOK-TIMEOUT` (upstream has no hook timeout at all).
 - **Hook dispatch no longer serializes sessions.** The sidecar is reached
   through a cloneable handle; the server mutex is released before awaiting, so
   two sessions' hooks interleave. The event pump uses the same path.
 - `ocserve_plugin_hook_timeout_total`, `ocserve_plugin_internal_error_total`,
-  `ocserve_plugin_hook_noop_total`, per-hook duration maxima.
+  per-hook duration maxima.
 - Plugin-internal hook failures (a plugin catching its own exception and
   returning the input unchanged) are counted per plugin and logged.
 
@@ -48,7 +96,7 @@ unit.
   `reference`) are proxied to the routes ocserve already serves instead of
   throwing a false `D-V2-DOMAIN`.
 - **`ocserve doctor --plugins`**: per-plugin dialect, registered hooks,
-  bridged/unbridged transforms, and the last internal error.
+  bridged/unbridged transforms.
 - Demand ledger (`bench/plugins/demand.json`) + guard 50: every hook the
   ecosystem declares is classified as bound or named-diverged.
 

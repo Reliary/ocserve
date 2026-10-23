@@ -846,10 +846,35 @@ async fn serve(
                 for (spec, options) in &plugin_specs {
                     match ocserve_plugin::resolve_entry(spec, &home) {
                         Ok(entry) => match sc.load(spec, &entry, &input, options).await {
-                            Ok(hooks) => tracing::info!("plugin {spec} loaded: {hooks:?}"),
-                            Err(e) => tracing::warn!("plugin {spec} load failed: {e:#}"),
+                            Ok(hooks) => {
+                                ocserve_metrics::labeled_counter(
+                                    "ocserve_plugin_load_total",
+                                    "result=\"ok\"",
+                                    1,
+                                );
+                                tracing::info!("plugin {spec} loaded: {hooks:?}")
+                            }
+                            Err(e) => {
+                                // A load failure used to be one boot WARN, after
+                                // which the plugin was skipped for the life of
+                                // the process with no signal (review H2). Count
+                                // it and name the spec.
+                                ocserve_metrics::labeled_counter(
+                                    "ocserve_plugin_load_total",
+                                    "result=\"error\"",
+                                    1,
+                                );
+                                tracing::error!("plugin {spec} load failed: {e:#}")
+                            }
                         },
-                        Err(e) => tracing::warn!("plugin {spec} resolve failed: {e:#}"),
+                        Err(e) => {
+                            ocserve_metrics::labeled_counter(
+                                "ocserve_plugin_load_total",
+                                "result=\"unresolved\"",
+                                1,
+                            );
+                            tracing::error!("plugin {spec} resolve failed: {e:#}")
+                        }
                     }
                 }
                 // v1 parity (plugin/index.ts:244-251): notify every loaded
@@ -894,10 +919,26 @@ async fn serve(
             // command/skill pull. Both go through the same window: a plugin
             // that adds a command via `config` and one that transforms the
             // list must not race.
-            if let Err(e) = ocserve_http::watch::apply_config_value(&st, cfg_after_hook).await {
-                tracing::warn!("plugin config apply: {e:#} (previous config kept)");
+            // `apply_config_value` already derives payloads AND pulls the v2
+            // command/skill transforms in one swap window. A following
+            // `reconcile()` would re-read the FILE and overwrite the plugin's
+            // mutation milliseconds later (review H-3), silently reverting a
+            // plugin that TIGHTENS permissions. Apply once; on failure keep
+            // the file-derived config and say so.
+            match ocserve_http::watch::apply_config_value(&st, cfg_after_hook).await {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::warn!("plugin config apply failed: {e:#} (previous config kept)");
+                    ocserve_metrics::labeled_counter(
+                        "ocserve_plugin_config_apply_total",
+                        "result=\"error\"",
+                        1,
+                    );
+                    if let Err(e) = ocserve_http::watch::reconcile(&st).await {
+                        tracing::error!("config reload after a failed plugin apply: {e:#}");
+                    }
+                }
             }
-            ocserve_http::watch::reconcile(&st).await.ok();
         });
     }
     let app = ocserve_http::router(state.clone());

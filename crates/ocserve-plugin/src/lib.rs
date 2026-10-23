@@ -165,6 +165,26 @@ struct Pending {
     tx: oneshot::Sender<Result<Value, String>>,
 }
 
+/// Removes its id from `pending` on every exit path, including a cancelled
+/// future. Without this, abort/delete cancel the awaiting task, the entry
+/// leaks, and `in_flight()` never returns 0 — the L1 recycle gate wedges.
+struct PendingGuard {
+    pending: Arc<parking_lot::Mutex<HashMap<i64, Pending>>>,
+    id: i64,
+}
+
+impl PendingGuard {
+    fn new(pending: Arc<parking_lot::Mutex<HashMap<i64, Pending>>>, id: i64) -> Self {
+        Self { pending, id }
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.pending.lock().remove(&self.id);
+    }
+}
+
 /// Everything a request needs, shareable WITHOUT the owning `Sidecar` lock.
 ///
 /// Why this exists (2026-10-22): `hook_mutate` held `Arc<Mutex<Sidecar>>` for
@@ -172,6 +192,12 @@ struct Pending {
 /// reference interleaves them at `await` points. Writes are serialized by the
 /// stdin mutex and responses correlate by id, so nothing needs exclusive
 /// access to the process while a hook runs.
+///
+/// Liveness (2026-10-23 review): a handle is tied to ONE child generation.
+/// The reader marks `alive=false` when it stops, and `poisoned=true` when the
+/// protocol is no longer trustworthy; both make requests fail fast, and the
+/// owner's `ensure_alive` replaces the generation. A stale handle can never
+/// deliver a response to the wrong waiter.
 pub struct Inner {
     stdin: tokio::sync::Mutex<ChildStdin>,
     /// SHARED with the reader task (it resolves responses by id).
@@ -179,6 +205,13 @@ pub struct Inner {
     next_id: std::sync::atomic::AtomicI64,
     /// load results (spec → {hooks,…}) for introspection AND round-trip skips.
     statuses: parking_lot::Mutex<HashMap<String, Value>>,
+    /// reader still running; false = requests must not be attempted.
+    alive: Arc<std::sync::atomic::AtomicBool>,
+    /// the child must be replaced before the next request (framing lost).
+    poisoned: Arc<std::sync::atomic::AtomicBool>,
+    /// last successfully fetched plugin-tool list. A busy host must not make
+    /// plugin tools vanish from the provider schema for a round (M6).
+    last_tools: parking_lot::Mutex<Option<Vec<Value>>>,
 }
 
 /// Cheap clone handle: hook dispatch drops the owner lock and awaits this.
@@ -186,6 +219,12 @@ pub struct Inner {
 pub struct Handle(Arc<Inner>);
 
 impl Handle {
+    /// Is this generation still able to answer? Used by callers to decide
+    /// between a fast failure and a recovery attempt.
+    pub fn is_alive(&self) -> bool {
+        self.0.alive.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Does any loaded plugin register `hook`? Lets the hot path skip the
     /// sidecar round-trip entirely when nobody listens (most installs).
     pub fn registers(&self, hook: &str) -> bool {
@@ -207,38 +246,47 @@ impl Handle {
         params: Value,
         timeout: Option<std::time::Duration>,
     ) -> Result<Value> {
+        if !self.is_alive() {
+            anyhow::bail!("plugin host is down ({method}); a respawn is required");
+        }
         let id = self
             .0
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.0.pending.lock().insert(id, Pending { tx });
+        let _guard = PendingGuard::new(Arc::clone(&self.0.pending), id);
         let msg = json!({"id": id, "method": method, "params": params});
         let mut line = msg.to_string();
         line.push('\n');
-        {
-            let mut stdin = self.0.stdin.lock().await;
-            if let Err(e) = stdin.write_all(line.as_bytes()).await {
-                self.0.pending.lock().remove(&id);
-                return Err(e).context("plugin host stdin write");
+        // The BUDGET COVERS THE WRITE (review C2). Previously only the response
+        // wait was timed, so a host that stopped draining blocked every caller
+        // on the stdin mutex with no timer. A timeout now also poisons the
+        // generation: a partially written frame makes the protocol untrustworthy.
+        let exchange = async {
+            {
+                let mut stdin = self.0.stdin.lock().await;
+                stdin.write_all(line.as_bytes()).await?;
+                stdin.flush().await?;
             }
-            if let Err(e) = stdin.flush().await {
-                self.0.pending.lock().remove(&id);
-                return Err(e).context("plugin host stdin flush");
-            }
-        }
-        let wait = async {
             match rx.await {
                 Ok(res) => res.map_err(|e| anyhow!("plugin host {method}: {e}")),
                 Err(_) => Err(anyhow!("plugin host dropped response for {method}")),
             }
         };
         match timeout {
-            None => wait.await,
-            Some(d) => match tokio::time::timeout(d, wait).await {
+            None => exchange
+                .await
+                .map_err(|e| e.context("plugin host stdin write")),
+            Some(d) => match tokio::time::timeout(d, exchange).await {
                 Ok(res) => res,
                 Err(_) => {
-                    self.0.pending.lock().remove(&id);
+                    self.0
+                        .poisoned
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    self.0
+                        .alive
+                        .store(false, std::sync::atomic::Ordering::Release);
                     ocserve_metrics::labeled_counter(
                         "ocserve_plugin_hook_timeout_total",
                         &format!("hook=\"{method}\""),
@@ -314,11 +362,13 @@ pub fn hook_budget(hook: &str) -> Option<std::time::Duration> {
         Some(0) => None,
         Some(ms) => Some(std::time::Duration::from_millis(ms)),
         None => Some(std::time::Duration::from_secs(
-            if hook.starts_with("tool.execute") || hook.contains("tool.execute") {
+            if hook.contains("tool.execute") {
                 180
-            } else if hook.contains("context")
-                || hook.contains("transform")
-                || hook.contains("compaction")
+            } else if hook.contains("transform")
+                || hook.contains("context")
+                // `experimental.session.compacting` does NOT contain
+                // "compaction" (review M1: a substring miss gave it 30 s).
+                || hook.contains("compact")
             {
                 60
             } else {
@@ -329,15 +379,66 @@ pub fn hook_budget(hook: &str) -> Option<std::time::Duration> {
 }
 
 impl Handle {
+    /// v2 RPC dispatch (see `Sidecar::rpc_call`, which delegates here).
+    pub async fn rpc_call(&self, rpc_id: &str, method: &str, input: Value) -> Result<Value> {
+        self.request(
+            "rpc_call",
+            json!({"rpcID": rpc_id, "method": method, "input": input}),
+        )
+        .await
+    }
+
+    /// v2 plugin inventory (real — id/dialect per loaded v2 plugin + the
+    /// registered RPC ids). Powers `/api/plugin` without fabricating a list.
+    pub async fn v2_inventory(&self) -> Result<Value> {
+        self.request("v2_inventory", json!({})).await
+    }
+
+    /// Pulled v2 command/skill transform (see `Sidecar::transform_commands`).
+    pub async fn transform_commands(
+        &self,
+        commands: Vec<Value>,
+    ) -> Result<(Vec<Value>, Vec<Value>)> {
+        let r = self
+            .request("v2_transform_commands", json!({ "commands": commands }))
+            .await?;
+        let out = r["commands"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let failures = r["failures"].as_array().cloned().unwrap_or_default();
+        Ok((out, failures))
+    }
+}
+
+impl Handle {
     /// Plugin-declared tools (v1 `hooks.tool`), with JSON Schema generated in
     /// the plugin's own runtime. Empty when no plugin registers one, so the
     /// provider `tools` array is byte-identical for everyone else.
+    ///
+    /// A failed fetch returns the LAST KNOWN list rather than an empty one
+    /// (review M6): dropping tools mid-session made a later call to one fall
+    /// through to "unknown tool", a worse failure than a stale schema.
     pub async fn tools(&self) -> Result<Vec<Value>> {
         if !self.registers("tool") {
             return Ok(Vec::new());
         }
-        let res = self.request("tools", json!({})).await?;
-        Ok(res.as_array().cloned().unwrap_or_default())
+        match self.request("tools", json!({})).await {
+            Ok(res) => {
+                let list = res.as_array().cloned().unwrap_or_default();
+                *self.0.last_tools.lock() = Some(list.clone());
+                Ok(list)
+            }
+            Err(e) => {
+                if let Some(cached) = self.0.last_tools.lock().clone() {
+                    tracing::warn!("plugin tools: {e:#} — serving the last known list");
+                    return Ok(cached);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Execute one plugin tool. `ctx` carries {sessionID, messageID, agent,
@@ -499,6 +600,10 @@ impl Sidecar {
         let stdout = child.stdout.take().context("host stdout")?;
         let pending = Arc::new(parking_lot::Mutex::new(HashMap::<i64, Pending>::new()));
         let pending_task = Arc::clone(&pending);
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let alive_task = Arc::clone(&alive);
+        let poisoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let poisoned_task = Arc::clone(&poisoned);
         tokio::spawn(async move {
             // Bounded line reads: a plugin that prints a giant line (no newline)
             // would otherwise grow `line` unbounded (host.mjs stdout is reserved
@@ -520,7 +625,12 @@ impl Sidecar {
                     // oversized: the rest of the line is unreadable framing —
                     // stop; in-flight RPCs fail on timeout (never hang the pump).
                     Ok(_) if line.len() > MAX_HOST_LINE => {
-                        tracing::warn!("plugin host: oversized line — reader stopped");
+                        // Framing is lost. Mark the generation dead AND poisoned
+                        // so the owner replaces the child instead of leaving a
+                        // live-but-deaf host that times out every request
+                        // (review C1/M-6).
+                        tracing::warn!("plugin host: oversized line — child marked for respawn");
+                        poisoned_task.store(true, std::sync::atomic::Ordering::Release);
                         break;
                     }
                     Ok(_) => {}
@@ -570,17 +680,24 @@ impl Sidecar {
                     }
                 }
             }
-            // host death: fail everything in flight (fail fast, AGENTS §2.4)
+            // host death (or reader death): fail everything in flight (fail
+            // fast, AGENTS §2.4) and tell every handle this generation is gone.
+            alive_task.store(false, std::sync::atomic::Ordering::Release);
             for (_, p) in pending_task.lock().drain() {
                 let _ = p.tx.send(Err("plugin host exited".into()));
             }
+            ocserve_metrics::gauge("ocserve_plugin_sidecar_up", 0);
         });
+        ocserve_metrics::gauge("ocserve_plugin_sidecar_up", 1);
         Ok(Self {
             inner: Arc::new(Inner {
                 stdin: tokio::sync::Mutex::new(stdin),
                 pending,
                 next_id: std::sync::atomic::AtomicI64::new(1),
                 statuses: parking_lot::Mutex::new(HashMap::new()),
+                alive,
+                poisoned,
+                last_tools: parking_lot::Mutex::new(None),
             }),
             child,
             server: (server_url.to_string(), directory.to_string()),
@@ -617,7 +734,15 @@ impl Sidecar {
             return false;
         }
         let _ = self.child.start_kill();
-        self.inner.statuses.lock().clear();
+        // Do NOT clear `statuses`: the loads are still known and will be
+        // replayed on respawn. Clearing them made `registers()` false, so every
+        // hook short-circuited to "no plugin" forever — the 2026-10-23 review
+        // found a recycle silently disabled every plugin (the Magic Context
+        // class again). The generation flag says "needs respawn"; the hook
+        // path now acts on it.
+        self.inner
+            .alive
+            .store(false, std::sync::atomic::Ordering::Release);
         self.recycled = true;
         true
     }
@@ -634,20 +759,41 @@ impl Sidecar {
     /// hooks broken-piped until service restart (live battery finding
     /// 2026-10-03: boot-time heap OOM, fail-open hid it in the prompt path).
     pub async fn ensure_alive(&mut self) -> Result<()> {
-        match self.child.try_wait() {
-            Ok(None) => return Ok(()),
-            Ok(Some(status)) => {
-                if std::mem::take(&mut self.recycled) {
-                    tracing::info!(
-                        "plugin sidecar recycled (L1, was {status}) — respawning + replaying hooks"
-                    );
-                } else {
-                    tracing::error!("plugin sidecar exited ({status}) — respawning");
-                }
-            }
-            Err(e) => {
-                tracing::error!("plugin sidecar try_wait failed: {e} — respawning");
-            }
+        // The reader can die while the child is alive (oversized line, lost
+        // framing). A live-but-deaf host times out every request, so treat
+        // poison as death and replace the whole generation.
+        if self
+            .inner
+            .poisoned
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let _ = self.child.start_kill();
+            self.inner
+                .alive
+                .store(false, std::sync::atomic::Ordering::Release);
+        } else if self.inner.alive.load(std::sync::atomic::Ordering::Acquire)
+            && let Ok(None) = self.child.try_wait()
+        {
+            return Ok(());
+        }
+        ocserve_metrics::labeled_counter(
+            "ocserve_plugin_sidecar_respawn_total",
+            if self.recycled {
+                "reason=\"recycle\""
+            } else {
+                "reason=\"exit\""
+            },
+            1,
+        );
+        let status = self.child.try_wait().ok().flatten();
+        if std::mem::take(&mut self.recycled) {
+            tracing::info!(
+                "plugin sidecar recycled (L1, was {status:?}) — respawning + replaying hooks"
+            );
+        } else if let Some(status) = status {
+            tracing::error!("plugin sidecar exited ({status}) — respawning");
+        } else {
+            tracing::warn!("plugin sidecar unresponsive — replacing the host");
         }
         let args = self.args.clone();
         let loads = std::mem::take(&mut self.loads);
@@ -839,17 +985,15 @@ impl Sidecar {
     /// `{output}` (success) or `{error:{type,message}}` (unavailable /
     /// method_not_found / handler_error).
     pub async fn rpc_call(&mut self, rpc_id: &str, method: &str, input: Value) -> Result<Value> {
-        self.request(
-            "rpc_call",
-            json!({"rpcID": rpc_id, "method": method, "input": input}),
-        )
-        .await
+        self.ensure_alive().await?;
+        self.handle().rpc_call(rpc_id, method, input).await
     }
 
     /// v2 plugin inventory (real — id/dialect per loaded v2 plugin + the
     /// registered RPC ids). Powers `/api/plugin` without fabricating a list.
     pub async fn v2_inventory(&mut self) -> Result<Value> {
-        self.request("v2_inventory", json!({})).await
+        self.ensure_alive().await?;
+        self.handle().v2_inventory().await
     }
 
     /// Run every registered v2 `command.transform` / `skill.transform` over
@@ -869,17 +1013,8 @@ impl Sidecar {
         &mut self,
         commands: Vec<Value>,
     ) -> Result<(Vec<Value>, Vec<Value>)> {
-        let r = self
-            .request("v2_transform_commands", json!({ "commands": commands }))
-            .await?;
-        let out = r["commands"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        let failures = r["failures"].as_array().cloned().unwrap_or_default();
-        Ok((out, failures))
+        self.ensure_alive().await?;
+        self.handle().transform_commands(commands).await
     }
 
     pub async fn config(&mut self, cfg: Value) -> Result<Value> {

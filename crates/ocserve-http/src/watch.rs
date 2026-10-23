@@ -189,8 +189,13 @@ async fn apply_v2_transforms(st: &Arc<AppState>, payloads: &mut crate::Payloads)
         return;
     };
     let before = payloads.command.len();
-    let mut guard = plugins.lock().await;
-    let pulled = guard.transform_commands(payloads.command.clone()).await;
+    // Take a handle and drop the owner lock (2026-10-23 review H3): holding it
+    // across the RPC blocked every session's hook for up to 30 s, which is the
+    // exact serialization the 0.6.0 change claimed to remove.
+    let Some(handle) = ocserve_core::prompt::plugin_handle(Some(plugins)).await else {
+        return;
+    };
+    let pulled = handle.transform_commands(payloads.command.clone()).await;
     match pulled {
         Ok((edited, failures)) => {
             ocserve_metrics::labeled_counter("ocserve_plugin_transform_total", "result=\"ok\"", 1);

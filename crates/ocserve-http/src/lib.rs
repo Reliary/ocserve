@@ -1861,7 +1861,12 @@ pub fn start_plugin_event_pump(st: &Arc<AppState>) {
                         .emit_event_bounded(payload, ocserve_plugin::hook_budget("event"))
                         .await
                     {
-                        tracing::debug!("plugin event pump: {e:#}");
+                        ocserve_metrics::labeled_counter(
+                            "ocserve_plugin_event_delivery_total",
+                            "result=\"error\"",
+                            1,
+                        );
+                        tracing::warn!("plugin event pump: {e:#}");
                     }
                 }
                 Err(ocserve_core::event::RecvError::Lagged(n)) => {

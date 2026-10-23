@@ -12,8 +12,12 @@ awk -F, '
 NR == 1 { next }
 {
   n++
-  ts = $1 + 0; rss = $2 + 0; health = $10 + 0; wal = $5 + 0
-  if (health != 200 && health != 0) { bad_health++; if (bad_ts == 0) bad_ts = ts }
+  ts = $1 + 0; rss = $2 + 0; health_raw = $10; health = $10 + 0; wal = $5 + 0
+  # A failed probe records 000000 ("000" + the `|| echo 000` fallback), which
+  # coerces to 0. The old rule accepted 0, so a timed-out probe PASSED the gate
+  # (live 2026-10-23: two `curl: (28)` rows and a green report). Only the exact
+  # literal 200 is healthy; 0 is a lost sample, not a success.
+  if (health_raw != "200") { bad_health++; if (bad_ts == 0) bad_ts = ts }
   if (n == 1) { t0 = ts }
   # anchor: first sample after t0+3600 (gate applies from hour 1)
   if (anchor_t == 0 && ts >= t0 + 3600) { anchor_t = ts; anchor_rss = rss }
@@ -30,7 +34,7 @@ END {
   if (n < 3) { print "FAIL: only " n " samples"; exit 1 }
   dur = last_t - t0
   if (dur < 7200) { print "FAIL: duration " int(dur/60) " min < 2h (gate needs data)"; exit 1 }
-  if (bad_health > 0) { print "FAIL: " bad_health " samples with health != 200 (first at " bad_ts ")"; exit 1 }
+  if (bad_health > 0) { print "FAIL: " bad_health " samples whose health probe was not exactly 200 (first at " bad_ts ")"; exit 1 }
   if (anchor_t == 0) { print "FAIL: no sample after hour 1"; exit 1 }
   span = last_t - anchor_t
   slope = (last_rss - anchor_rss) / span * 3600   # bytes/hour

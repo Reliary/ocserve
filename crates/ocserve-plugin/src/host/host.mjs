@@ -508,19 +508,44 @@ async function executeTool({ name, input, ctx }) {
       directory: ctx?.directory ?? process.cwd(),
       worktree: ctx?.directory ?? process.cwd(),
       abort: controller.signal,
-      // Authority stays in ocserve: the tool call was already gated as a
-      // whole (D-HOOK-TOOL-ASK). An intra-tool ask cannot widen it.
-      ask: async () => undefined,
+      // Authority stays in ocserve: the call was gated as a whole. A plugin
+      // that gates its OWN dangerous operation behind `await ctx.ask(...)`
+      // would otherwise proceed silently when we answer "yes" unconditionally
+      // (review M-4). Refuse instead: the plugin fails closed, visibly, and
+      // the operator sees a named error rather than an unapproved action.
+      ask: async () => {
+        throw new Error(
+          "D-HOOK-TOOL-ASK: an intra-tool ask has no channel to the permission gate; refusing rather than approving silently",
+        );
+      },
       metadata: (m) => { toolCtx._meta = { ...(toolCtx._meta ?? {}), ...(m ?? {}) }; },
     };
     try {
       const r = await def.execute(input ?? {}, toolCtx);
       const value = typeof r === "string" ? { output: r } : (r ?? { output: "" });
+      // Bound the payload HERE, before it crosses the NDJSON pipe: a 9 MiB
+      // output overruns the reader's 8 MiB line cap and killed the reader for
+      // good (review M-6). Rust truncates again for the model, but the wire
+      // bound must hold at the producer.
+      const LIMIT = 1024 * 1024;
+      let output = typeof value.output === "string" ? value.output : String(value.output ?? "");
+      let truncated = false;
+      if (output.length > LIMIT) {
+        output = output.slice(0, LIMIT);
+        truncated = true;
+      }
+      // A plugin may return anything as metadata; only an object survives to
+      // the part state (a non-object panicked the server, review H-1).
+      const metadata =
+        value.metadata && typeof value.metadata === "object" && !Array.isArray(value.metadata)
+          ? value.metadata
+          : (toolCtx._meta && typeof toolCtx._meta === "object" ? toolCtx._meta : {});
       return {
         ok: true,
-        title: value.title ?? "",
-        output: value.output ?? "",
-        metadata: value.metadata ?? toolCtx._meta ?? {},
+        title: String(value.title ?? ""),
+        output,
+        truncated,
+        metadata,
         attachments: value.attachments ?? undefined,
       };
     } catch (e) {

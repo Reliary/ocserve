@@ -57,6 +57,12 @@ if [ "$RELEASE" = 1 ]; then
   else
     fetched=$(./scripts/fetch-release.sh ${TAG:+"$TAG"}) || exit 1
     mkdir -p "$BIN_HOME"
+    # Keep the previous binary: a tag rollback is then a rename, and an
+    # operator never has to re-download during an incident (SRE review M4).
+    if [ -x "$BIN_HOME/ocserve" ]; then
+      cp -p "$BIN_HOME/ocserve" "$BIN_HOME/ocserve.prev"
+      say "kept previous binary at $BIN_HOME/ocserve.prev"
+    fi
     install -m 0755 "$fetched" "$BIN_HOME/ocserve"
     SRC=$BIN_HOME/ocserve
     say "placed release binary at $SRC"
@@ -140,7 +146,9 @@ PORT=$(grep -oE '\-\-port [0-9]+' "$LIVE" | head -1 | awk '{print $2}')
 python3 - "$PORT" <<'PY' || { echo "install: health probe FAILED on :$PORT" >&2; exit 1; }
 import sys, time, urllib.request
 port = sys.argv[1]
-for _ in range(80):
+# 90 s, not 20 s: the service loads every plugin BEFORE it binds, and a
+# plugin factory can await the network (SRE review M3).
+for _ in range(360):
     try:
         r = urllib.request.urlopen(f"http://127.0.0.1:{port}/global/health", timeout=1)
         print(f"health: {r.status} {r.read()[:60].decode(errors='replace')}")

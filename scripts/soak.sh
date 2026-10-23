@@ -37,7 +37,14 @@ while [ "$(date +%s)" -lt "$end" ]; do
       kids=$((cg - main_rss))
     fi
   fi
-  echo "$ts,$(get ocserve_rss_bytes),$(get ocserve_rss_peak_bytes),$(get ocserve_sidecar_rss_bytes),$(get ocserve_wal_bytes),$(get ocserve_sse_clients),$(get ocserve_writer_queue_depth),$(get ocserve_prompt_locks),$(get ocserve_prompt_tasks),$health,$(get ocserve_prompt_rss_delta_bytes),$(get ocserve_db_opens_total),$(getp ocserve_sync_tick_sum),$(get oc_rss),$cg,$cgp,$kids" >> "$OUT"
+  # `sync_us` used to be written from a metric that never existed (the column
+  # was empty in 246/246 rows). Read the real histogram-free counter if present;
+  # blank otherwise, never a fake zero.
+  local sync_us=""
+  if curl -s --max-time 2 "$BASE/metrics" 2>/dev/null | grep -q '^ocserve_sync_tick_seconds_count'; then
+    sync_us=$(curl -s --max-time 2 "$BASE/metrics" | awk '/^ocserve_sync_tick_seconds_sum/ {printf "%d", $2*1000000}')
+  fi
+  echo "$ts,$(get ocserve_rss_bytes),$(get ocserve_rss_peak_bytes),$(get ocserve_sidecar_rss_bytes),$(get ocserve_wal_bytes),$(get ocserve_sse_clients),$(get ocserve_writer_queue_depth),$(get ocserve_prompt_locks),$(get ocserve_prompt_tasks),$health,$(get ocserve_prompt_rss_delta_bytes),$(get ocserve_db_opens_total),$sync_us,$(get oc_rss),$cg,$cgp,$kids" >> "$OUT"
   sleep "$INTERVAL"
 done
 echo "soak done: $OUT"

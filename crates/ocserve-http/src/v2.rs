@@ -946,11 +946,13 @@ pub async fn migration_v1_status() -> impl IntoResponse {
 pub async fn plugin_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let mut data: Vec<Value> = Vec::new();
     if let Some(plug) = st.plugins.get() {
-        let (statuses, inv) = {
-            let mut guard = plug.lock().await;
-            let statuses = guard.statuses();
-            let inv = guard.v2_inventory().await.ok();
-            (statuses, inv)
+        // statuses needs the owner (it is a load-time map); the inventory RPC
+        // does not — take a handle so a slow host cannot block hook dispatch.
+        let statuses = { plug.lock().await.statuses() };
+        let handle = ocserve_core::prompt::plugin_handle(Some(plug)).await;
+        let inv = match handle {
+            Some(h) => h.v2_inventory().await.ok(),
+            None => None,
         };
         if let Some(map) = statuses.as_object() {
             for (spec, v) in map {
@@ -2271,9 +2273,9 @@ pub async fn rpc_unimplemented(
     // `rpc.unavailable` error (same behavior for the same state — parity).
     ocserve_metrics::labeled_counter("ocserve_rpc_calls_total", "result=\"dispatch\"", 1);
     if let Some(plug) = st.plugins.get() {
-        let reg = {
-            let mut guard = plug.lock().await;
-            guard.rpc_call(&rpc_id, &method, input.clone()).await
+        let reg = match ocserve_core::prompt::plugin_handle(Some(plug)).await {
+            Some(handle) => handle.rpc_call(&rpc_id, &method, input.clone()).await,
+            None => Err(anyhow::anyhow!("plugin host is down")),
         };
         match reg {
             Ok(v) => {

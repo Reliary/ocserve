@@ -613,7 +613,12 @@ impl Runtime {
         // agent/command/mode ({} when unset) + username. Applied to the SERVED
         // config only; derivations above use the raw value (unchanged order).
         let mut config = raw_config;
+        // `plugin_origins` exists ONLY in the config handed to the plugin
+        // (upstream derives it for the hook). It must never become a served
+        // payload: it carries an absolute home path and is not a wire key
+        // (review M-5).
         if let Some(obj) = config.as_object_mut() {
+            obj.remove("plugin_origins");
             for k in ["agent", "command", "mode"] {
                 obj.entry(k).or_insert(json!({}));
             }
@@ -1657,6 +1662,40 @@ mod catalog_selfheal_tests {
         // missing file: empty, no error, nothing to remove
         let missing = dir.path().join("nope.json");
         assert_eq!(read_catalog(&missing), json!({}));
+    }
+}
+
+#[cfg(test)]
+mod config_hook_tests {
+    use super::*;
+
+    /// `plugin_origins` is hook INPUT only. It carries an absolute home path
+    /// and is not a wire key; `from_config` is what turns a hook result into
+    /// served payloads, so it must strip it (2026-10-23 security review M-5).
+    #[test]
+    fn plugin_origins_is_stripped_from_served_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "ocserve-origins-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = json!({
+            "plugin_origins": [{"spec": "x", "source": "/home/user/.config/opencode", "scope": "global"}],
+            "model": "p/m",
+        });
+        let rt = Runtime::from_config(&dir, raw).expect("derive");
+        assert!(
+            rt.config.get("plugin_origins").is_none(),
+            "hook-only key leaked into the served payload: {}",
+            rt.config
+        );
+        for k in ["agent", "command", "mode"] {
+            assert!(rt.config.get(k).is_some(), "missing pair-gate key {k}");
+        }
     }
 }
 

@@ -80,13 +80,24 @@ Single source: `ocserve.toml` (validated at boot, `deny_unknown_fields`) with en
            wal_autocheckpoint_pages=1000, journal_size_limit=67108864,
            checkpoint_idle_ms=5000, freelist_vacuum_threshold=10000
 [events]   ring_max_per_session=200000, ring_retention_days=30, sse_ring_events=4096
-[plugins]  enabled=true, hook_deadline_ms=30000, isolate_heap_mb=8, sidecar_rss_limit_mb=80
+[plugins]  enabled (env OCSERVE_PLUGIN_RUNTIME=node|bun, OCSERVE_PLUGIN_HEAP_MB,
+           OCSERVE_PLUGIN_NORMALIZE, OCSERVE_PLUGIN_TOOLS; hook budgets via
+           OCSERVE_HOOK_TIMEOUT_MS; no [plugins] TOML section exists)
 [mcp]      request_timeout_s=30, oauth_refresh_skew_s=120
 [runtime]  worker_threads=8, max_blocking_threads=8, thread_stack_kb=1024,
            rayon_threads=8            # min(8, parallelism) default; env overridable
 [blob]     chunk_bytes=1048576, zstd_level=3, gc_orphan_grace_hours=72
 [metrics]  enabled=true, bind="127.0.0.1:9099"
 ```
+### Upgrade and rollback
+
+`scripts/install.sh --release --tag vX.Y.Z` fetches that tag's checksummed
+artifact, keeps the current binary as `~/.local/bin/ocserve.prev`, installs,
+restarts and health-probes for up to 90 s. Rollback is the same command with
+the previous tag; 0.5.0 onward keep schema v15, so no downgrade step exists.
+A failed probe leaves the new binary in place but exits non-zero, so the
+operator knows to restore `.prev`.
+
 Config reload: SIGHUP re-reads safe subset (metrics, log level, ring limits); structural keys
 (store, port) require restart — declared, not guessed. External config-file edits
 (opencode.json / ocserve overlay / auth.json / auth-overlay / models cache / state model)

@@ -229,24 +229,17 @@ vendored binary for the version under test. Each has its own README under
 
 ## Documentation map
 
-| Doc | Contents |
+The full, categorised index is in `docs-README.md`. The short version:
+
+| You want to | Read |
 |---|---|
-| `AGENTS.md` | binding rules, commit and branch policy, working agreement |
-| `PLAN.md` | scope, contract freeze, architecture, API surface, divergences |
-| `V2-PLAN.md` | opencode 2 engine: inbox, claims, union wire, dual events, log replay |
-| `GAPS-PLAN.md` | gap closure: what was built, what stays diverged and why |
-| `crates/ocserve-plugin/src/host/README-v2.md` | v2 plugin capability matrix |
-| `STORAGE.md` | SQLite pragmas, schema and blob rules, FTS5 design |
-| `MEMORY.md` | memory budget lines, allocator settings, allocation rules |
-| `SRE.md` | boot checks, metrics, config knobs, service and rollback |
-| `TESTING.md` | test levels, traceability, anti-theater rules |
-| `COMPACTION.md` | auto-compaction: upstream algorithm, wire surfaces, design |
-| `SNAPSHOT.md` | snapshots, revert/unrevert, session diff, `/vcs/apply` |
-| `PERF-10X.md` | performance program: target, acceptance, evidence |
-| `bench/load/`, `bench/parity/`, `bench/pair/`, `bench/capdiff/` | benchmark harnesses and their results |
-| `DIFFERENTIATION.md` | what is built differently from upstream, and what was killed |
-| `TRACEABILITY.md` | requirement to test to evidence matrix |
-| `THIRD-PARTY.md` | upstream MIT attribution and compatibility framing |
+| install, or decide whether this fits | `README.md`, `CHANGELOG.md` |
+| expose it beyond loopback | `SECURITY.md` |
+| understand the wire contract and what differs | `PLAN.md` (divergence ledger in section 17) |
+| work on storage, memory, or the service | `STORAGE.md`, `MEMORY.md`, `SRE.md` |
+| change behaviour without breaking something | `TESTING.md`, `TRACEABILITY.md`, `AGENTS.md` |
+| work on a subsystem | `COMPACTION.md`, `SNAPSHOT.md`, `PLATFORM.md`, `V2-PLAN.md` |
+| run the compatibility or load harnesses | `bench/plugins/README.md`, `bench/load/README.md` |
 
 ## Repository hygiene
 

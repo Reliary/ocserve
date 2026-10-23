@@ -4,7 +4,7 @@ Binding instructions for every agent (and human) working on this repository. The
 documents are **specification, not suggestion** — code that contradicts them is wrong even if
 tests pass.
 
-## 1. Documentation map (read before touching the area)
+## 1. Documentation map (index: `docs-README.md`; read before touching the area)
 
 | Doc | Authority |
 |---|---|
