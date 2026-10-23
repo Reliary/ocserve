@@ -4,7 +4,7 @@ All notable changes to ocserve. The wire contract targets the frozen
 openccode 1.18.31 release and the v2 surface the 2.0.28 client; anything that
 differs is a named `D-*` row in `PLAN.md §17`.
 
-## Unreleased
+## 0.6.7
 
 ### Fixed
 - v2 plugins that register `experimental.ws.handshake`/`send`/`receive` no
