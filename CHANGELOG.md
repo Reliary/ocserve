@@ -4,6 +4,18 @@ All notable changes to ocserve. The wire contract targets the frozen
 openccode 1.18.31 release and the v2 surface the 2.0.28 client; anything that
 differs is a named `D-*` row in `PLAN.md §17`.
 
+## 0.6.6
+
+Everything in 0.6.5 plus the install provenance, advisory and CI fixes that
+landed after that tag. No schema, wire, or storage change.
+
+### Fixed
+- `install.sh` installs to the one path the unit executes
+  (`~/.local/bin/ocserve`, with `.prev` and a SHA256 receipt) instead of
+  pointing `ExecStart` at the build output.
+- tokio 1.54.1 (RUSTSEC-2026-0386, `AsyncFd` I/O-safety unsoundness).
+- `--render-to` is a pure render: no build, no install.
+
 ## 0.6.5
 
 The 0.6.4 tag never produced a release: both Windows jobs failed on a missing
