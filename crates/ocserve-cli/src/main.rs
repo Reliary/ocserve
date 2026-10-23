@@ -967,9 +967,22 @@ async fn serve(
     }
 
     let addr = format!("{hostname}:{port}");
+    // Register SIGTERM/INT BEFORE the socket exists: a signal in the bind→serve
+    // window must reach the drain path, not the default disposition.
+    let shutdown = install_shutdown();
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr} (port in use?)"))?;
+    // TEST SEAM (debug builds only): hold the bind→serve window open so the
+    // at-accept SIGTERM test can hit it deterministically. Compiled out of
+    // release binaries; it never delays a real service.
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("OCSERVE_TEST_BIND_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
     tracing::info!("ocserve serving on http://{addr} (freeze {FREEZE_VERSION})");
     // Onboarding: name both client entry points the URL is good for, so a
     // first-run user knows what to do with it (the port question came up
@@ -984,7 +997,7 @@ async fn serve(
     // fallbacks; only short-circuits preflights, passes everything else.
     let app = app.layer(axum::middleware::from_fn(ocserve_http::ui::perimeter_cors));
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown.wait())
         .await?;
     if let Some(plug) = state.plugins.get() {
         plug.lock().await.shutdown().await;
@@ -1034,36 +1047,64 @@ fn sidecar_rss(ppid: u32) -> Option<i64> {
     found
 }
 
-/// Wait for the shutdown signal.
+/// Shutdown signal, installed BEFORE the listener binds.
 ///
-/// systemd sends SIGTERM, not SIGINT. The previous version waited only on
-/// `ctrl_c()`, so `systemctl restart` never reached the drain path — the journal
-/// contains zero `shutdown: draining` lines across every restart on this box.
-/// That is a live Linux bug independent of the platform work.
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        // If the handler cannot be installed, fall back to ctrl_c rather than
-        // panicking: losing graceful shutdown is bad, refusing to boot is worse.
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
+/// `shutdown_signal()` used to create the signal stream only when the returned
+/// future was first polled, which happens inside `axum::serve(...)`. That left
+/// a window between bind and poll where SIGTERM took the default disposition
+/// and killed the process without draining (observed as `ExitStatus(15)` in a
+/// full parallel suite run, 2026-10-23). Registration now happens first; the
+/// future only waits.
+#[cfg(unix)]
+struct Shutdown {
+    term: Option<tokio::signal::unix::Signal>,
+}
+
+#[cfg(unix)]
+fn install_shutdown() -> Shutdown {
+    use tokio::signal::unix::{SignalKind, signal};
+    let term = match signal(SignalKind::terminate()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("SIGTERM handler unavailable: {e}; waiting on ctrl_c only");
+            None
+        }
+    };
+    Shutdown { term }
+}
+
+#[cfg(unix)]
+impl Shutdown {
+    async fn wait(mut self) {
+        match self.term.as_mut() {
+            Some(term) => {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {}
                     _ = term.recv() => {}
                 }
             }
-            Err(e) => {
-                tracing::warn!("SIGTERM handler unavailable: {e}; waiting on ctrl_c only");
+            None => {
                 let _ = tokio::signal::ctrl_c().await;
             }
         }
+        tracing::info!("shutdown: draining");
     }
-    #[cfg(not(unix))]
-    {
+}
+
+#[cfg(not(unix))]
+struct Shutdown;
+
+#[cfg(not(unix))]
+fn install_shutdown() -> Shutdown {
+    Shutdown
+}
+
+#[cfg(not(unix))]
+impl Shutdown {
+    async fn wait(self) {
         let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutdown: draining");
     }
-    tracing::info!("shutdown: draining");
 }
 
 fn read_first(path: &str) -> Option<String> {

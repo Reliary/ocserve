@@ -63,8 +63,9 @@ fn sigterm_logs_the_drain_line() {
         .spawn()
         .expect("spawn server");
 
-    // Wait for boot (the serving line) before signalling; a SIGTERM during
-    // boot would exit before the shutdown handler is installed.
+    // Wait for boot (the serving line) before signalling. The handler is
+    // installed BEFORE bind now, so the connect->signal window is already
+    // safe; this remains the realistic systemd case (signal after startup).
     let started = Instant::now();
     let mut up = false;
     while started.elapsed() < Duration::from_secs(30) {

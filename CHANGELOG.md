@@ -6,6 +6,12 @@ differs is a named `D-*` row in `PLAN.md §17`.
 
 ## 0.6.2
 
+### Reliability
+- SIGTERM is registered **before** the socket binds. Previously the signal
+  stream was created when `axum::serve` first polled it, so a signal in the
+  bind-to-serve window killed the process without draining (seen once as
+  `ExitStatus(15)`). `shutdown_race.rs` pins it with a deterministic window.
+
 ### Resource containment
 - **Per-class memory caps and CPU weights.** Every child leaf now has its own
   `memory.high`/`memory.max` (plugin 288/320M, mcp 160/192M, tools 448/640M,
