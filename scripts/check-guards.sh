@@ -98,6 +98,17 @@
 #      (it shipped "chat.messages.transform", which exists nowhere) [suite]
 #  49. no hand-written hook payload literals in tests/bench (the {role, content}
 #      transform fixture agreed with the caller's bug) [plant: grep]
+#  50. plugin demand ledger is current and classified (every hook the
+#      ecosystem declares is bound or a NAMED divergence)
+#      [suite: generator + independent re-derivation]
+#  51. hook/RPC dispatch takes a Handle, never the owner lock (holding it
+#      across the await re-serialized every session; 2026-10-23 review H3)
+#      [plant: owner-lock trigger call]
+#  52. no raw `metadata` index-assignment (serde_json IndexMut panics on a
+#      non-object and release builds abort; one plugin tool killed the server)
+#      [plant: raw metadata write]
+#  26b. soak-gate rejects a failed health probe (000000 coerced to 0 and
+#      passed a run with timed-out probes) [plant: synthetic bad row]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -1207,6 +1218,78 @@ if python3 scripts/check-demand.py; then
   echo "ok"
 else
   echo "FAIL: bench/plugins/demand.json is stale or has an unclassified hook (rule 50)"; fail=1
+fi
+
+echo "== guard: hook dispatch takes a handle, never the owner lock (rule 51) =="
+# The 0.6.0 refactor moved hooks onto `Handle`, but the owner-lock form is
+# still easy to write (`let mut guard = plug.lock().await; guard.trigger(..)`)
+# and it re-serializes every session behind the slowest plugin for the whole
+# await - the 2026-10-23 review found exactly that at three sites. Handle
+# recovery and the lock hand-off live in `plugin_handle`; nothing else may
+# call a trigger/RPC method on the owner.
+plant="crates/ocserve-core/src/__rule51_plant.rs"
+printf '%s\n' 'fn _plant() { let _ = guard.trigger("x", y, z); }' > "$plant"
+owner_calls=$(grep -rnE '\bguard\.(trigger|trigger_v2|emit_event|emit_event_bounded|rpc_call|v2_inventory|transform_commands|tools|execute_tool|config)\(' crates/*/src 2>/dev/null \
+  | grep -v '__rule51_plant' || true)
+plant_hit=$(grep -rnE '\bguard\.(trigger|trigger_v2|emit_event|emit_event_bounded|rpc_call|v2_inventory|transform_commands|tools|execute_tool|config)\(' "$plant" 2>/dev/null || true)
+rm -f "$plant"
+if [ -z "$plant_hit" ]; then
+  echo "FAIL: rule 51 planted control not detected"
+  fail=1
+fi
+if [ -n "$owner_calls" ]; then
+  echo "$owner_calls"
+  echo "FAIL: hook/RPC dispatched through the owner lock (rule 51: use plugin_handle)"; fail=1
+else
+  echo "ok (every dispatch goes through a Handle; planted owner-lock call detected)"
+fi
+
+echo "== guard: no raw metadata index-assignment (rule 52) =="
+# serde_json's IndexMut<&str> PANICS on a non-object, and release builds abort.
+# A plugin returning `metadata: []` killed every live session (2026-10-23).
+# Every write must go through prompt::metadata_mut, which coerces first.
+plant="crates/ocserve-core/src/__rule52_plant.rs"
+printf '%s\n' 'fn _plant(v: &mut Value) { v["state"]["metadata"]["output"] = json!(1); }' > "$plant"
+meta_writes=$(grep -rnE '\["metadata"\]\[[^]]*\] *=' crates/*/src 2>/dev/null \
+  | grep -v '__rule52_plant' || true)
+plant_hit=$(grep -rnE '\["metadata"\]\[[^]]*\] *=' "$plant" 2>/dev/null || true)
+rm -f "$plant"
+if [ -z "$plant_hit" ]; then
+  echo "FAIL: rule 52 planted control not detected"
+  fail=1
+fi
+if [ -n "$meta_writes" ]; then
+  echo "$meta_writes"
+  echo "FAIL: metadata index-assignment in server code (rule 52: use metadata_mut)"; fail=1
+else
+  echo "ok (no raw metadata index-assignment; planted write detected)"
+fi
+
+echo "== guard: soak-gate rejects a failed health probe (rule 26) =="
+# A failed curl records 000000, which coerces to 0; the old gate accepted 0
+# and passed a run with two timed-out probes (2026-10-23 SRE review M2).
+_good=$(mktemp); _bad=$(mktemp)
+python3 - "$_good" "$_bad" <<'PY'
+import sys
+head = "ts,rss,peak,sidecar,wal,sse,queue,locks,tasks,health,rss_delta,db_opens,sync_us,oc_rss,cgroup,cgroup_peak,kids"
+base = 1792700000
+rows = [head]
+for i in range(200):
+    rows.append(f"{base + i*60},1000,1000,10,100,0,0,0,0,200,0,0,0,0,0,0,0")
+good = "\n".join(rows) + "\n"
+bad = good.replace(",200,", ",000000,", 1)
+open(sys.argv[1], "w").write(good)
+open(sys.argv[2], "w").write(bad)
+PY
+if bash scripts/soak-gate.sh "$_good" >/dev/null 2>&1; then _g=0; else _g=1; fi
+if bash scripts/soak-gate.sh "$_bad" >/dev/null 2>&1; then _b=0; else _b=1; fi
+rm -f "$_good" "$_bad"
+if [ "$_g" -ne 0 ]; then
+  echo "FAIL: soak-gate rejected a healthy synthetic run (rule 26)"; fail=1
+elif [ "$_b" -eq 0 ]; then
+  echo "FAIL: soak-gate accepted a failed health probe (rule 26)"; fail=1
+else
+  echo "ok (healthy passes; failed probe rejected)"
 fi
 
 exit $fail

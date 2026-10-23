@@ -138,3 +138,149 @@ async fn dead_generation_fails_fast() {
     );
     sc.shutdown().await;
 }
+
+/// A plugin tool whose output exceeds the host bound must be truncated at the
+/// producer, and the READER must survive. Before the host bound, a >8 MiB line
+/// crossed the pipe, the reader stopped permanently, and every later hook timed
+/// out (2026-10-23 review C1/M-6). 2 MiB proves the path without a huge fixture.
+#[tokio::test]
+async fn oversized_tool_output_is_bounded_and_reader_survives() {
+    if !node_present() {
+        return;
+    }
+    let mut sc = boot(
+        r#"export const hook = async () => ({
+  tool: {
+    big: {
+      description: "returns 2 MiB",
+      args: {},
+      execute: async () => ({ title: "big", output: "x".repeat(2 * 1024 * 1024) }),
+    },
+  },
+  "chat.message": async () => {},
+});"#,
+        "bigout",
+    )
+    .await;
+    let out = sc
+        .handle()
+        .execute_tool("big", json!({}), json!({"sessionID": "s"}))
+        .await
+        .expect("tool call");
+    assert_eq!(out["ok"], true);
+    assert_eq!(
+        out["truncated"], true,
+        "the host must set the truncation flag"
+    );
+    assert_eq!(
+        out["output"].as_str().unwrap().len(),
+        1024 * 1024,
+        "the wire payload must be bounded at the producer"
+    );
+    // The reader is alive: a normal RPC still answers.
+    let follow = sc
+        .request_bounded(
+            "trigger",
+            json!({"name": "chat.message", "input": {}, "output": {}}),
+            ocserve_plugin::hook_budget("chat.message"),
+        )
+        .await
+        .expect("reader survived the big payload");
+    assert!(follow.is_object());
+    sc.shutdown().await;
+}
+
+/// `ctx.ask` must fail closed. A plugin that guards a destructive action with
+/// `if (!(await ctx.ask(...))) return` used to be told "yes" unconditionally
+/// (2026-10-23 review M-4).
+#[tokio::test]
+async fn intra_tool_ask_fails_closed() {
+    if !node_present() {
+        return;
+    }
+    let sc = boot(
+        r#"export const hook = async () => ({
+  tool: {
+    guarded: {
+      description: "asks first",
+      args: {},
+      execute: async (_args, ctx) => {
+        try {
+          await ctx.ask({ permission: "write", patterns: ["*"] });
+          return "PROCEEDED";
+        } catch (e) {
+          throw new Error("REFUSED: " + e.message);
+        }
+      },
+    },
+  },
+});"#,
+        "ask",
+    )
+    .await;
+    let out = sc
+        .handle()
+        .execute_tool("guarded", json!({}), json!({"sessionID": "s"}))
+        .await
+        .expect("tool call");
+    assert_eq!(out["ok"], false, "the ask must not approve: {out}");
+    assert!(
+        out["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("D-HOOK-TOOL-ASK"),
+        "the refusal must be named: {out}"
+    );
+}
+
+/// Aborting a turn must not leak the pending entry. Without the Drop guard,
+/// `in_flight()` never returned to 0 and the L1 recycle gate wedged
+/// (2026-10-23 review M-7).
+#[tokio::test]
+async fn cancelled_request_releases_the_pending_entry() {
+    if !node_present() {
+        return;
+    }
+    let mut sc = boot(
+        r#"export const hook = async () => ({
+  "chat.message": async () => { await new Promise((r) => setTimeout(r, 30000)); },
+});"#,
+        "cancel",
+    )
+    .await;
+    let handle = sc.handle();
+    assert_eq!(sc.in_flight(), 0);
+    let task = tokio::spawn(async move {
+        handle
+            .trigger_bounded(
+                "chat.message",
+                json!({}),
+                json!({}),
+                ocserve_plugin::hook_budget("chat.message"),
+            )
+            .await
+    });
+    // Wait until the request is actually in flight.
+    for _ in 0..100 {
+        if sc.in_flight() > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(sc.in_flight(), 1, "request should be pending");
+    task.abort();
+    let _ = task.await;
+    // The Drop guard runs when the aborted future is dropped.
+    for _ in 0..100 {
+        if sc.in_flight() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        sc.in_flight(),
+        0,
+        "a cancelled request must not wedge the recycle idle gate"
+    );
+    sc.shutdown().await;
+}

@@ -5056,15 +5056,16 @@ async fn post_shell(
     let completed = now_ms_local();
     // v1 finish() shape: completed always carries {title:"", output,
     // metadata:{output}} — no exit field (capture-verified)
+    // Build the final metadata in the literal: a post-hoc index-assignment on
+    // a JSON map is the class rule 52 bans (it panics on a non-object).
     tool_part["state"] = json!({
         "status": status,
         "input": {"command": command},
         "output": output,
         "title": "",
-        "metadata": {"output": ""},
+        "metadata": {"output": output},
         "time": {"start": started, "end": completed},
     });
-    tool_part["state"]["metadata"]["output"] = tool_part["state"]["output"].clone();
     insert_message_http(
         &writer,
         &st,

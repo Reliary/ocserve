@@ -393,6 +393,21 @@ pub fn plugin_tool_allowed(ctx: &PromptContext, name: &str) -> bool {
         && ocserve_tools::evaluate("edit", "*", &ctx.rules) == "allow"
 }
 
+/// Mutable access to a tool part's `metadata`, coercing a non-object first.
+///
+/// `serde_json::Value`'s `IndexMut<&str>` PANICS on a non-object, and release
+/// builds abort, so a plugin returning `metadata: []` used to kill the whole
+/// server (2026-10-23 review H-1). Every write goes through here, and guard
+/// rule 52 rejects a direct index.
+fn metadata_mut(state: &mut Value) -> &mut serde_json::Map<String, Value> {
+    let obj = state.as_object_mut().expect("tool part state is an object");
+    let slot = obj.entry("metadata").or_insert_with(|| json!({}));
+    if !slot.is_object() {
+        *slot = json!({});
+    }
+    slot.as_object_mut().expect("coerced above")
+}
+
 /// `OCSERVE_PLUGIN_TOOLS=0` disables v1 plugin-declared tools (kill switch for
 /// an operator whose plugin ships a tool they do not want exposed).
 pub fn plugin_tools_enabled() -> bool {
@@ -2520,11 +2535,8 @@ pub async fn run_prompt_with(
                                     if let Some(m) = out.get("metadata").and_then(|v| v.as_object())
                                         && !m.is_empty()
                                     {
-                                        if !running["state"]["metadata"].is_object() {
-                                            running["state"]["metadata"] = json!({});
-                                        }
                                         for (k, v) in m {
-                                            running["state"]["metadata"][k] = v.clone();
+                                            metadata_mut(&mut running["state"])[k] = v.clone();
                                         }
                                     }
                                 }
@@ -2932,11 +2944,9 @@ pub async fn run_prompt_with(
                     // todowrite parts, whose metadata is {todos} (v1 Output).
                     // Defensive: a non-object here would panic on IndexMut
                     // (release = abort), so coerce before indexing.
-                    if !running["state"]["metadata"].is_object() {
-                        running["state"]["metadata"] = json!({});
-                    }
                     if running["state"]["metadata"].get("todos").is_none() {
-                        running["state"]["metadata"]["output"] = running["state"]["output"].clone();
+                        let out = running["state"]["output"].clone();
+                        metadata_mut(&mut running["state"]).insert("output".into(), out);
                     }
                     // todowrite: REPLACE the session todo list (v1
                     // SessionTodo.update) + emit todo.updated (durable+s twin) —
@@ -3022,11 +3032,8 @@ pub async fn run_prompt_with(
                                 if let Some(m) = out.get("metadata").and_then(|v| v.as_object())
                                     && !m.is_empty()
                                 {
-                                    if !running["state"]["metadata"].is_object() {
-                                        running["state"]["metadata"] = json!({});
-                                    }
                                     for (k, v) in m {
-                                        running["state"]["metadata"][k] = v.clone();
+                                        metadata_mut(&mut running["state"])[k] = v.clone();
                                     }
                                 }
                             }
@@ -3913,6 +3920,7 @@ mod history_budget_tests {
     }
     #[cfg(test)]
     mod metadata_guard_tests {
+        use super::metadata_mut;
         use serde_json::json;
 
         /// The part-state expression must survive any JSON `metadata`. Before the
@@ -3923,11 +3931,9 @@ mod history_budget_tests {
         fn non_object_metadata_cannot_panic_the_part_state() {
             for meta in [json!([]), json!("x"), json!(1), json!(null), json!({})] {
                 let mut running = json!({"state": {"metadata": meta, "output": "o"}});
-                if !running["state"]["metadata"].is_object() {
-                    running["state"]["metadata"] = json!({});
-                }
                 if running["state"]["metadata"].get("todos").is_none() {
-                    running["state"]["metadata"]["output"] = running["state"]["output"].clone();
+                    let out = running["state"]["output"].clone();
+                    metadata_mut(&mut running["state"]).insert("output".into(), out);
                 }
                 assert_eq!(running["state"]["metadata"]["output"], "o");
             }
