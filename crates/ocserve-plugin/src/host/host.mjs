@@ -226,7 +226,7 @@ function resolveEffectFrom(pluginId, entry) {
   };
 }
 
-async function loadPlugin({ spec, entry, input, options }) {
+async function loadPlugin({ spec, entry, origin, input, options }) {
   const mod = await import(pathToFileURL(entry).href);
   // v2 detection FIRST (V2-EXECUTION-PLAN Phase 3): a v2 `Plugin.define`
   // module carries {id, setup|effect}; v1 modules never do. Both dialects
@@ -333,7 +333,7 @@ async function loadPlugin({ spec, entry, input, options }) {
     if (!hooks || typeof hooks !== "object") throw new Error(`plugin ${spec}: server() did not return hooks`);
     Object.assign(merged, hooks);
   }
-  loaded.push({ spec, hooks: merged, entry });
+  loaded.push({ spec, hooks: merged, entry, origin: origin ?? entry });
   return { hooks: Object.keys(merged), id: mod?.PluginModule?.id ?? null };
 }
 
@@ -409,18 +409,31 @@ process.stdin.on("data", (chunk) => {
 // legacy plain-object shape. We do the same here, using the PLUGIN'S OWN zod
 // (resolved from its entry) — nothing is bundled or reimplemented.
 function pluginZod(entry) {
-  try {
-    const req = createRequire(pathToFileURL(entry));
-    return req("zod");
-  } catch {
-    return null;
+  // The plugin may use Zod v3 or v4. Only v4's namespace exposes
+  // `toJSONSchema`; resolve both and prefer the one that can convert. Asking
+  // for `zod` alone resolved v3 here and silently fell back to a "legacy"
+  // schema that embedded the raw Zod objects — an invalid JSON Schema the
+  // provider rejects (live 400 on ctx_reduce, 2026-10-23).
+  const req = createRequire(pathToFileURL(entry));
+  for (const id of ["zod/v4", "zod"]) {
+    try {
+      const z = req(id);
+      if (z && typeof z.toJSONSchema === "function") return z;
+    } catch {
+      /* try the next resolution */
+    }
   }
+  return null;
 }
 
 function legacySchema(args) {
   const props = {};
   for (const [k, v] of Object.entries(args ?? {})) {
-    if (v && typeof v === "object" && !Array.isArray(v)) props[k] = v;
+    if (!v || typeof v !== "object" || Array.isArray(v)) continue;
+    // A raw Zod type is NOT a JSON Schema. If we cannot convert, expose a
+    // permissive schema instead of shipping `{~standard, def, type}` to the
+    // provider — that is a hard 400 for every request in the session.
+    props[k] = "_zod" in v ? {} : v;
   }
   return { type: "object", properties: props, required: Object.keys(props) };
 }
@@ -432,12 +445,39 @@ function toParameters(def, entry) {
   const allZod = entries.length > 0 && entries.every(([, v]) => v && typeof v === "object" && "_zod" in v);
   if (allZod && z && typeof z.toJSONSchema === "function") {
     try {
-      return z.toJSONSchema(z.object(args), { io: "input" });
+      // `z.toJSONSchema` lives on the Zod NAMESPACE, not on the schema object
+      // (a schema has `parse`/`safeParse` but no converter). Passing the raw
+      // schemas through Object.fromEntries without this check produced
+      // `{"drop":{"~standard":…,"def":…}}` — an invalid JSON Schema the
+      // provider rejects with 400 (found live 2026-10-23: ctx_reduce).
+      const json = z.toJSONSchema(z.object(args), { io: "input" });
+      return normalizeZodJsonSchema(json, z);
     } catch (e) {
       process.stderr.write(`[plugin-host] z.toJSONSchema failed: ${e?.message ?? e}\n`);
     }
   }
   return legacySchema(args);
+}
+
+/**
+ * Upstream's `normalizeZodJsonSchema` (registry.ts:409-421) plus the `$defs`
+ * rename (registry.ts:376-380): drop boolean `exclusiveMaximum/Minimum` (not
+ * valid in the 2020-12 dialect the provider enforces) and move draft-2020
+ * `$defs` to the `definitions` key upstream sends.
+ */
+function normalizeZodJsonSchema(value) {
+  if (Array.isArray(value)) return value.map((v) => normalizeZodJsonSchema(v));
+  if (typeof value !== "object" || value === null) return value;
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    if ((k === "exclusiveMaximum" || k === "exclusiveMinimum") && typeof v === "boolean") continue;
+    out[k] = normalizeZodJsonSchema(v);
+  }
+  if (out.$defs && typeof out.$defs === "object" && !Array.isArray(out.$defs)) {
+    out.definitions = out.$defs;
+    delete out.$defs;
+  }
+  return out;
 }
 
 function collectTools() {
@@ -448,7 +488,7 @@ function collectTools() {
       out.push({
         name,
         description: String(def.description ?? ""),
-        parameters: toParameters(def, p.entry),
+        parameters: toParameters(def, p.origin ?? p.entry),
         plugin: p.spec,
       });
     }

@@ -729,8 +729,9 @@ impl Sidecar {
         // RAW entry is what gets recorded for respawn replay (A1).
         let root = self.normalize_root.clone();
         let raw = entry.to_path_buf();
+        let raw_for_spawn = raw.clone();
         let (load_path, outcome) = tokio::task::spawn_blocking(move || {
-            crate::normalize::normalize_or_raw_sync(root.as_deref(), &raw)
+            crate::normalize::normalize_or_raw_sync(root.as_deref(), &raw_for_spawn)
         })
         .await
         .map_err(|e| anyhow!("normalize task: {e}"))?;
@@ -777,6 +778,11 @@ impl Sidecar {
         let params = json!({
             "spec": spec,
             "entry": load_path.to_string_lossy(),
+            // Where the plugin ACTUALLY lives. Normalized bundles are emitted
+            // outside the plugin's tree, so `createRequire(entry)` cannot
+            // resolve its `zod` from there — and a tool schema that cannot be
+            // converted is an invalid JSON Schema the provider 400s.
+            "origin": raw.to_string_lossy(),
             "input": input,
             "options": options,
         });
@@ -1825,5 +1831,71 @@ mod oom_wrapper_tests {
             "500",
             "child must run at adj=500"
         );
+    }
+}
+
+#[cfg(test)]
+mod plugin_tool_schema_tests {
+    use super::*;
+
+    /// A plugin tool's Zod args must become a VALID JSON Schema before it
+    /// reaches the provider. The first implementation passed the raw Zod
+    /// objects straight through (`{~standard, def, type}`) and the provider
+    /// rejected every request in the session with 400 (found live on
+    /// `ctx_reduce`, 2026-10-23).
+    #[tokio::test]
+    async fn plugin_tool_schema_is_valid_json_schema() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let entry = dir.path().join("p_schema.mjs");
+        std::fs::write(
+            &entry,
+            r#"import { z } from "zod";
+export const hook = async () => ({
+  tool: {
+    ztool: {
+      description: "zod args",
+      args: {
+        text: z.string(),
+        count: z.number(),
+      },
+      execute: async () => "ok",
+    },
+  },
+});"#,
+        )?;
+        // `z` is resolved from the plugin's own tree, exactly like a real one.
+        std::fs::create_dir_all(dir.path().join("node_modules/zod"))?;
+        std::fs::write(
+            dir.path().join("node_modules/zod/package.json"),
+            r#"{"name":"zod","version":"4.0.0","main":"./index.cjs","exports":{".":"./index.cjs","./v4":"./index.cjs"}}"#,
+        )?;
+        std::fs::write(
+            dir.path().join("node_modules/zod/index.cjs"),
+            "exports.object = (shape) => ({ shape }); exports.z = { object: (shape) => ({ shape }), string: () => ({ _zod: 1, type: 'string' }), number: () => ({ _zod: 1, type: 'number' }) }; exports.toJSONSchema = () => ({ type: 'object', properties: { text: { type: 'string' }, count: { type: 'integer' } }, required: ['text'] });",
+        )?;
+        let host = materialize_host(&dir.path().join("host"))?;
+        let mut sc = Sidecar::spawn(&host, "http://127.0.0.1:9", "/work").await?;
+        sc.load(
+            "schema-fixture",
+            &entry,
+            &json!({"directory": "/work", "serverUrl": "http://127.0.0.1:9"}),
+            &Value::Null,
+        )
+        .await?;
+        let tools = sc.handle().tools().await?;
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "ztool")
+            .expect("ztool advertised");
+        let params = &tool["parameters"];
+        assert_eq!(params["type"], "object", "{params}");
+        assert_eq!(params["properties"]["text"]["type"], "string", "{params}");
+        assert!(
+            params["properties"]["text"].get("~standard").is_none()
+                && params["properties"]["text"].get("def").is_none(),
+            "a raw Zod object must never reach the provider: {params}"
+        );
+        sc.shutdown().await;
+        Ok(())
     }
 }
