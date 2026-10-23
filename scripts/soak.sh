@@ -40,7 +40,7 @@ while [ "$(date +%s)" -lt "$end" ]; do
   # `sync_us` used to be written from a metric that never existed (the column
   # was empty in 246/246 rows). Read the real histogram-free counter if present;
   # blank otherwise, never a fake zero.
-  local sync_us=""
+  sync_us=""
   if curl -s --max-time 2 "$BASE/metrics" 2>/dev/null | grep -q '^ocserve_sync_tick_seconds_count'; then
     sync_us=$(curl -s --max-time 2 "$BASE/metrics" | awk '/^ocserve_sync_tick_seconds_sum/ {printf "%d", $2*1000000}')
   fi
