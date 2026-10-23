@@ -75,6 +75,10 @@ enum Cmd {
         /// Include the plugin inventory (dialect, hooks, bridged/unbridged).
         #[arg(long)]
         plugins: bool,
+        /// Print the resolved resource budget for the running service
+        /// (unit caps, per-class caps, current/peak, memory events, CPU).
+        #[arg(long)]
+        budget: bool,
     },
     /// Import last N sessions from a source opencode.db (read-only, PLAN §9)
     Import {
@@ -218,9 +222,15 @@ fn main() -> Result<()> {
                 data_dir,
             ))
         }
-        Cmd::Doctor { data_dir, plugins } => {
-            rt::block_on(doctor(data_dir.unwrap_or_else(default_data_dir), plugins))
-        }
+        Cmd::Doctor {
+            data_dir,
+            plugins,
+            budget,
+        } => rt::block_on(doctor(
+            data_dir.unwrap_or_else(default_data_dir),
+            plugins,
+            budget,
+        )),
         Cmd::Backup { dest, data_dir } => {
             let dir = data_dir.unwrap_or_else(default_data_dir);
             let db = ocserve_store::writer::db_path(&dir);
@@ -1056,7 +1066,93 @@ async fn shutdown_signal() {
     tracing::info!("shutdown: draining");
 }
 
-async fn doctor(data_dir: std::path::PathBuf, plugins: bool) -> Result<()> {
+fn read_first(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// `doctor --budget`: what the SERVICE actually has, read from its live
+/// cgroup. The doctor process is not the service, so it asks systemd for the
+/// unit's cgroup path instead of using its own.
+fn budget_report() {
+    let mut sc = std::process::Command::new("systemctl");
+    sc.args(["--user", "show", "ocserve.service", "-p", "ControlGroup"]);
+    let cg = sc
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let rel = cg.strip_prefix("ControlGroup=").unwrap_or("").trim();
+    if rel.is_empty() {
+        println!("  budget:          service not running (no cgroup)");
+        return;
+    }
+    let root = std::path::PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
+    let mb = |v: Option<String>| {
+        v.and_then(|s| s.parse::<u64>().ok())
+            .filter(|b| *b != u64::MAX)
+            .map(|b| format!("{}M", b / 1024 / 1024))
+            .unwrap_or_else(|| "unlimited".into())
+    };
+    let node = |p: &std::path::Path, file: &str| mb(read_first(&p.join(file).to_string_lossy()));
+    let stat = |p: &std::path::Path, key: &str| {
+        read_first(&p.join("memory.stat").to_string_lossy()).and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix(&format!("{key} ")))
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|b| format!("{}M", b / 1024 / 1024))
+        })
+    };
+    let events = |p: &std::path::Path| {
+        read_first(&p.join("memory.events").to_string_lossy())
+            .map(|s| s.replace('\n', " "))
+            .unwrap_or_default()
+    };
+    println!("  budget:          {}", rel);
+    println!(
+        "    parent        high={} max={} anon={}",
+        node(&root, "memory.high"),
+        node(&root, "memory.max"),
+        stat(&root, "anon").unwrap_or_else(|| "?".into())
+    );
+    for (name, label) in [
+        ("main", "server"),
+        ("kids/plugin", "plugin"),
+        ("kids/mcp", "mcp"),
+        ("kids/tools", "tools"),
+        ("kids/pty", "pty"),
+    ] {
+        let p = root.join(name);
+        if !p.is_dir() {
+            continue;
+        }
+        println!(
+            "    {label:<13} high={:<10} max={:<10} cur={:<10} peak={:<10} cpu.weight={}",
+            node(&p, "memory.high"),
+            node(&p, "memory.max"),
+            node(&p, "memory.current"),
+            node(&p, "memory.peak"),
+            read_first(&p.join("cpu.weight").to_string_lossy()).unwrap_or_else(|| "-".into())
+        );
+    }
+    println!("    memory.events {}", events(&root));
+    if let Some(cpu) = read_first(&root.join("cpu.stat").to_string_lossy()) {
+        let keep: Vec<&str> = cpu
+            .lines()
+            .filter(|l| {
+                l.starts_with("nr_periods")
+                    || l.starts_with("nr_throttled")
+                    || l.starts_with("throttled_usec")
+            })
+            .collect();
+        if !keep.is_empty() {
+            println!("    cpu.stat      {}", keep.join(" "));
+        }
+    }
+}
+
+async fn doctor(data_dir: std::path::PathBuf, plugins: bool, budget: bool) -> Result<()> {
     println!("ocserve doctor");
     println!("  sqlite version:  {}", rusqlite::version());
     match ocserve_store::pragma::assert_version_ok() {
@@ -1150,6 +1246,9 @@ async fn doctor(data_dir: std::path::PathBuf, plugins: bool) -> Result<()> {
         }
     } else {
         println!("  database:        not created yet ({})", db.display());
+    }
+    if budget {
+        budget_report();
     }
     if plugins {
         plugin_report(&data_dir).await;

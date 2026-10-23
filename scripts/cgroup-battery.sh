@@ -140,6 +140,31 @@ else
   bad "no kids/ directory at $ROOT"
 fi
 
+# --- D2: per-class memory + CPU weights (containment, not just placement) ---
+# Before 2026-10-23 every leaf inherited `memory.max=max`, so one build could
+# consume the whole kids pot and starve the plugin host; `cpu` was not even
+# enabled, so a build competed with the API on equal terms.
+[ "$(cat "$ROOT/kids/memory.high" 2>/dev/null)" = "671088640" ] \
+  && ok "kids/ throttles at 640M before its 700M cap" \
+  || bad "kids/ memory.high != 640M (got $(cat "$ROOT/kids/memory.high" 2>/dev/null))"
+[ "$(cat "$ROOT/main/memory.max" 2>/dev/null)" = "805306368" ] \
+  && ok "main has its own 768M backstop" \
+  || bad "main memory.max != 768M (got $(cat "$ROOT/main/memory.max" 2>/dev/null))"
+[ -n "$(cat "$ROOT/main/cpu.weight" 2>/dev/null)" ] \
+  && ok "cpu controller enabled: main weight=$(cat "$ROOT/main/cpu.weight")" \
+  || bad "cpu.weight absent on main (cpu controller not enabled)"
+[ "$(cat "$ROOT/main/cpu.weight" 2>/dev/null)" -gt "$(cat "$ROOT/kids/tools/cpu.weight" 2>/dev/null)" ] 2>/dev/null \
+  && ok "server outweighs the tool class" \
+  || bad "server weight is not above kids/tools"
+for leaf in plugin mcp tools pty; do
+  lh=$(cat "$ROOT/kids/$leaf/memory.high" 2>/dev/null)
+  lm=$(cat "$ROOT/kids/$leaf/memory.max" 2>/dev/null)
+  case "$lh:$lm" in
+    ''*|*':max') bad "kids/$leaf has no per-class memory cap (high=$lh max=$lm)" ;;
+    *) if [ "$lh" -lt "$lm" ]; then ok "kids/$leaf high<max ($lh<$lm)"; else bad "kids/$leaf high>=max ($lh/$lm)"; fi ;;
+  esac
+done
+
 # --- A: a normal tool child lands in kids/tools -----------------------------
 # Fire and poll: /shell BLOCKS until the command exits, so the child only
 # exists while the request is in flight.

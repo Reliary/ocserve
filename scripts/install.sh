@@ -13,13 +13,17 @@
 #   --release    use the CI-built release artifact instead of a local build
 #                (scripts/fetch-release.sh; no Rust toolchain needed)
 #   --tag TAG    with --release, the version to fetch (default: latest)
+#   --no-resource-limits
+#                install the unit without memory limits and with the child
+#                cgroup partition disabled; the operator owns memory policy
+#                (SRE §5.6). Everything else (containment, OOM policy) stays.
 # Non-systemd hosts fall back to bin-only with a note.
 # Never sudo, never touches non-ocserve units (check-guards rule 6).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO=$PWD
 
-BIN_ONLY=0 DRY=0 SRC="" RELEASE=0 TAG=""
+BIN_ONLY=0 DRY=0 SRC="" RELEASE=0 TAG="" LIMITS=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --bin-only) BIN_ONLY=1 ;;
@@ -27,6 +31,7 @@ while [ $# -gt 0 ]; do
     --bin)      SRC=$2; shift ;;
     --release)  RELEASE=1 ;;
     --tag)      TAG=$2; shift ;;
+    --no-resource-limits|--unmanaged) LIMITS=0 ;;
     -h|--help)  sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown flag: $1" >&2; exit 2 ;;
   esac
@@ -102,13 +107,25 @@ TEMPLATE="$REPO/deploy/ocserve.service"
 LIVE="$UNIT_DIR/ocserve.service"
 RENDERED=$(mktemp "${TMPDIR:-/tmp}/ocserve-unit.XXXXXX")
 trap 'rm -f "$RENDERED"' EXIT
-python3 - "$TEMPLATE" "$RENDERED" "$BIN_U" "$CWD_U" <<'PY'
+python3 - "$TEMPLATE" "$RENDERED" "$BIN_U" "$CWD_U" "$LIMITS" <<'PY'
 import re, sys
-tpl, out, bin_u, cwd_u = sys.argv[1:5]
+tpl, out, bin_u, cwd_u, limits = sys.argv[1:6]
 s = open(tpl).read()
 s, n1 = re.subn(r'(?m)^ExecStart=.*$', f'ExecStart={bin_u} serve --port 4912', s, count=1)
 s, n2 = re.subn(r'(?m)^WorkingDirectory=.*$', f'WorkingDirectory={cwd_u}', s, count=1)
 assert n1 == 1 and n2 == 1, f"template shape changed (ExecStart={n1}, WorkingDirectory={n2}) — update install.sh"
+if limits == "0":
+    # Unmanaged mode: remove the unit's memory ceiling and turn off the
+    # in-process partition (which writes child caps) and the sidecar recycle.
+    # Containment/placement and OOMPolicy stay; the operator owns memory.
+    s, n3 = re.subn(r'(?m)^(MemoryMax|MemoryHigh|MemorySwapMax)=.*\n', '', s)
+    assert n3 >= 1, "template has no memory limits to remove — update install.sh"
+    env = (
+        "Environment=OCSERVE_CGROUP_PARTITION=0\n"
+        "Environment=OCSERVE_SIDECAR_RECYCLE_MB=0\n"
+    )
+    s, n4 = re.subn(r'(?m)^\[Service\]\n', "[Service]\n" + env, s, count=1)
+    assert n4 == 1, "template has no [Service] section — update install.sh"
 open(out, "w").write(s)
 PY
 
@@ -164,6 +181,11 @@ say "  unit:     $LIVE"
 say "  binary:   $SRC"
 say "  data:     ~/.local/share/ocserve   (sessions live here)"
 say "  overrides: systemctl --user edit ocserve   (MemoryMax, OOMPolicy…)"
+if [ "$LIMITS" = 1 ]; then
+  say "  resource limits: managed (MemoryHigh 960M / MemoryMax 1024M; per-class caps)"
+else
+  say "  resource limits: unmanaged (no unit caps; cgroup partition and sidecar recycle off)"
+fi
 say "  kill switches: OCSERVE_PLUGIN_NORMALIZE=0  OCSERVE_SIDECAR_RECYCLE_MB=0  OCSERVE_CGROUP_PARTITION=0"
 say "  optional timers (source checkout): systemctl --user enable ocserve-nightly.timer"
 say "  uninstall (keeps history): scripts/uninstall.sh   [--purge for full wipe]"

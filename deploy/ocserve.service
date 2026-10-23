@@ -87,6 +87,7 @@ OOMPolicy=continue
 # cap is logged at boot: 700 + 320 leaves 4 MB for anon+slab (page cache is
 # reclaimable and does not count), which is tight and is the next number to
 # settle from per-leaf soak peaks, not from a guess.
+MemoryHigh=960M
 MemoryMax=1024M
 MemorySwapMax=0
 ProtectSystem=strict

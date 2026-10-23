@@ -28,6 +28,52 @@ use std::sync::OnceLock;
 /// a new name here, which is the point: it forces the containment question.
 pub const LEAVES: [&str; 4] = ["plugin", "mcp", "tools", "pty"];
 
+/// Per-class memory ceiling for a leaf, in MiB.
+///
+/// These are properties of the child we spawn, not of the user's workload:
+/// - plugin: measured warm-up peak 260 MB (bundled embedding stack) + margin
+/// - mcp: live peak 122 MB + margin
+/// - pty: no measured spike, terminal buffers only
+/// - tools: the remainder of the aggregate `kids/` budget; a build may use it
+///   all, but cannot take the plugin's share with it.
+///
+/// `high` sits below `max` so the class is throttled (reclaim and slow) before
+/// the kernel kills it. The four `high` values sum to 960M, which is also the
+/// parent `MemoryHigh`, so normal concurrent peaks stay under the soft ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeafPolicy {
+    pub high_mb: u64,
+    pub max_mb: u64,
+    pub cpu_weight: u64,
+}
+
+pub fn leaf_policy(name: &str) -> LeafPolicy {
+    match name {
+        "plugin" => LeafPolicy {
+            high_mb: 288,
+            max_mb: 320,
+            cpu_weight: 100,
+        },
+        "mcp" => LeafPolicy {
+            high_mb: 160,
+            max_mb: 192,
+            cpu_weight: 100,
+        },
+        "pty" => LeafPolicy {
+            high_mb: 64,
+            max_mb: 96,
+            cpu_weight: 100,
+        },
+        // tools: the remainder of the class budget; a build may use all of it,
+        // but cannot take the plugin's share with it.
+        _ => LeafPolicy {
+            high_mb: 448,
+            max_mb: 640,
+            cpu_weight: 50,
+        },
+    }
+}
+
 /// The one copy of the child wrapper (guard rule 10 asserts exactly one).
 ///
 /// `echo 500 > oom_score_adj` makes a memcg kill prefer this child over the

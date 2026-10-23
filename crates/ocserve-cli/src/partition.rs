@@ -186,6 +186,10 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
     if !controllers.split_whitespace().any(|c| c == "memory") {
         return Partition::Unavailable("no-memory-controller");
     }
+    // CPU is optional: the containment still works without it, but the server
+    // cannot be protected from a build that saturates every core. Degrade the
+    // weight writes, never the whole dance.
+    let has_cpu = controllers.split_whitespace().any(|c| c == "cpu");
     // subtree writable? opening without writing = non-mutating probe
     if std::fs::OpenOptions::new()
         .write(true)
@@ -210,9 +214,16 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
         return Partition::Unavailable("self-move");
     }
     // now this cgroup has no processes → kernel allows enabling controllers
+    // `cpu` joins the same write: weights only work if the controller is
+    // enabled on the service cgroup AND on kids/ (2026-10-23: it was absent,
+    // so a cargo build competing with the API had no relative priority).
+    let mut controllers_wanted = vec!["memory", "pids"];
+    if has_cpu {
+        controllers_wanted.push("cpu");
+    }
     if let Err(e) = enable(
         root.join("cgroup.subtree_control").as_path(),
-        &["memory", "pids"],
+        &controllers_wanted,
     ) {
         tracing::warn!("partition: enable controllers failed: {e}");
         return Partition::Unavailable("enable-memory");
@@ -226,6 +237,12 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
         tracing::warn!("partition: kids memory.max failed: {e}");
         return Partition::Unavailable("kids-cap");
     }
+    // Soft ceiling on the aggregate: throttle the class at 640M instead of
+    // letting it run into the 700M hard cap and die as a unit.
+    write_or_warn(
+        &root.join("kids/memory.high"),
+        (640u64 * 1024 * 1024).to_string(),
+    );
     let kids = root.join("kids");
     let _ = KIDS.set(kids.clone());
 
@@ -235,9 +252,13 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
     // Enabling controllers on kids/ requires it to have no processes — true at
     // boot; if it ever is not (a stale hierarchy), degrade to the flat kids cap
     // rather than failing the service.
+    let mut kids_controllers = vec!["memory", "pids"];
+    if has_cpu {
+        kids_controllers.push("cpu");
+    }
     let leaves_ok = enable(
         kids.join("cgroup.subtree_control").as_path(),
-        &["memory", "pids"],
+        &kids_controllers,
     )
     .is_ok();
     if leaves_ok {
@@ -257,18 +278,53 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
             write_or_warn(&leaf.join("memory.oom.group"), "1".to_string());
             // fork-bomb guard: a tool call cannot outrun the class budget
             write_or_warn(&leaf.join("pids.max"), "1024".to_string());
+            // Per-class memory: without this every leaf inherited `max` and a
+            // single build could starve the plugin host out of the shared
+            // 700M pot (2026-10-23 review). `high < max` so the class is
+            // throttled before it is killed.
+            let policy = ocserve_store::cgroup::leaf_policy(name);
+            write_or_warn(
+                &leaf.join("memory.high"),
+                (policy.high_mb * 1024 * 1024).to_string(),
+            );
+            write_or_warn(
+                &leaf.join("memory.max"),
+                (policy.max_mb * 1024 * 1024).to_string(),
+            );
+            // Relative CPU priority. Weights are work-conserving: the build
+            // uses idle cores and yields when the API needs one.
+            if has_cpu {
+                write_or_warn(&leaf.join("cpu.weight"), policy.cpu_weight.to_string());
+            }
         }
     } else {
         tracing::warn!(
             "partition: kids subtree not delegable (processes present) — flat kids cap only"
         );
     }
-    // Protection, not a cap: under pressure the kernel reclaims from kids
-    // first. 320M matches main's measured 196-223MB idle envelope with margin.
+    // The server's own class: a protection floor, a soft ceiling and a hard
+    // backstop. Steady anon is ~200M; 512M covers import/migration bursts.
     write_or_warn(
         &root.join("main/memory.low"),
-        (320u64 * 1024 * 1024).to_string(),
+        (256u64 * 1024 * 1024).to_string(),
     );
+    write_or_warn(
+        &root.join("main/memory.high"),
+        (512u64 * 1024 * 1024).to_string(),
+    );
+    write_or_warn(
+        &root.join("main/memory.max"),
+        (768u64 * 1024 * 1024).to_string(),
+    );
+    if has_cpu {
+        // 5:1 over the child classes. Only distributes when both are active.
+        write_or_warn(&root.join("main/cpu.weight"), "500".to_string());
+        write_or_warn(&kids.join("cpu.weight"), "100".to_string());
+    } else {
+        tracing::warn!(
+            "partition: cpu controller unavailable — build contention will not be weighted"
+        );
+    }
 
     ocserve_store::cgroup::publish(root);
     log_budget(root, &kids, mb);
@@ -330,48 +386,62 @@ fn write_or_warn(path: &Path, value: String) {
 /// over-committed: kids 700 + main 320 exceeds the 1024 parent before slab.
 /// Reading the numbers from the kernel keeps this honest if a knob changes.
 fn log_budget(root: &Path, kids: &Path, kids_mb: u64) {
-    let parent_mb = std::fs::read_to_string(root.join("memory.max"))
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(|b| b / 1024 / 1024);
-    let main_low_mb = std::fs::read_to_string(root.join("main/memory.low"))
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(0)
-        / 1024
-        / 1024;
+    let read_mb = |p: &Path| {
+        std::fs::read_to_string(p)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|b| b / 1024 / 1024)
+    };
+    let parent_max = read_mb(&root.join("memory.max"));
+    let parent_high = read_mb(&root.join("memory.high"));
+    let main_low = read_mb(&root.join("main/memory.low")).unwrap_or(0);
+    let main_high = read_mb(&root.join("main/memory.high")).unwrap_or(0);
+    let main_max = read_mb(&root.join("main/memory.max")).unwrap_or(0);
+    let kids_high = read_mb(&kids.join("memory.high")).unwrap_or(0);
     let leaves = ocserve_store::cgroup::LEAVES
         .iter()
         .filter(|n| kids.join(n).is_dir())
         .count();
-    match parent_mb {
+    // Per-class caps are the control; the aggregate max is only the backstop.
+    // A leaf cap is a ceiling, not a reservation, so the sum may exceed the
+    // parent (limits are allowed to be over-committed, kernel cgroup-v2).
+    let class_caps: Vec<String> = ocserve_store::cgroup::LEAVES
+        .iter()
+        .map(|n| {
+            let p = ocserve_store::cgroup::leaf_policy(n);
+            format!("{n}={}M/{}M", p.high_mb, p.max_mb)
+        })
+        .collect();
+    match parent_max {
         Some(p) => {
-            // The comparison is about UNRECLAIMABLE memory: `kids.max` +
-            // `main.low` are anon+slab commitments, while page cache is
-            // charged to the parent but reclaimed on pressure (measured
-            // 2026-10-21: 924M used of 1024M, of which 364M was file cache).
-            // 64 MB is the working reserve for slab and page tables; a budget
-            // that fits only by a few MB is over-committed in practice
-            // (kids 700 + main 320 against 1024 leaves 4 MB).
+            // UNRECLAIMABLE comparison: kids.max + main.low are anon+slab
+            // commitments; page cache is charged to the parent but reclaimed
+            // first. 64 MB is the working reserve for slab and page tables.
             const HEADROOM_MB: u64 = 64;
-            let committed = kids_mb + main_low_mb;
+            let committed = kids_mb + main_low;
             if committed + HEADROOM_MB > p {
                 tracing::warn!(
                     "memory budget tight: parent {p}M, kids.max {kids_mb}M + main.low \
-                     {main_low_mb}M leaves {}M for anon+slab (want {HEADROOM_MB}M; file cache \
-                     is reclaimable) — kids is reclaimed first so main survives; SRE §5.5",
-                    p.saturating_sub(committed)
+                     {main_low}M leaves {}M for anon+slab (want {HEADROOM_MB}M) — \
+                     each class is capped, high={}M/{kids_high}M, SRE §5.5",
+                    p.saturating_sub(committed),
+                    parent_high.unwrap_or(0)
                 );
             } else {
                 tracing::info!(
-                    "memory budget: parent {p}M, kids.max {kids_mb}M + main.low {main_low_mb}M, \
-                     {}M headroom",
-                    p - committed
+                    "memory budget: parent {p}M (high {}M), main {main_low}/{main_high}/{main_max}M \
+                     low/high/max, kids {kids_mb}M (high {kids_high}M), {}M headroom; \
+                     classes {}",
+                    parent_high.unwrap_or(0),
+                    p.saturating_sub(committed),
+                    class_caps.join(" ")
                 );
             }
         }
         None => tracing::info!(
-            "memory budget: kids.max {kids_mb}M, main.low {main_low_mb}M, {leaves} class leaves"
+            "memory budget: kids.max {kids_mb}M (high {kids_high}M), main.low {main_low}M, \
+             {leaves} class leaves; classes {}",
+            class_caps.join(" ")
         ),
     }
 }
@@ -415,7 +485,8 @@ mod tests {
         std::fs::write(
             root.join("cgroup.controllers"),
             if memory {
-                "cpuset memory pids"
+                // Real delegated user trees expose cpu alongside memory.
+                "cpuset cpu memory pids"
             } else {
                 "cpuset pids"
             },
@@ -459,7 +530,48 @@ mod tests {
                 "1024",
                 "leaf {name} needs a fork-bomb bound"
             );
+            // Per-class caps are the containment primitive: without them every
+            // leaf inherits `max` and a build starves the plugin host.
+            let policy = ocserve_store::cgroup::leaf_policy(name);
+            assert_eq!(
+                std::fs::read_to_string(leaf.join("memory.max")).unwrap(),
+                (policy.max_mb * 1024 * 1024).to_string(),
+                "leaf {name} needs its own memory.max"
+            );
+            assert_eq!(
+                std::fs::read_to_string(leaf.join("memory.high")).unwrap(),
+                (policy.high_mb * 1024 * 1024).to_string(),
+                "leaf {name} needs a throttle below max"
+            );
+            assert!(
+                policy.high_mb < policy.max_mb,
+                "leaf {name}: high must be below max"
+            );
+            assert_eq!(
+                std::fs::read_to_string(leaf.join("cpu.weight")).unwrap(),
+                policy.cpu_weight.to_string(),
+                "leaf {name} needs a CPU weight"
+            );
         }
+        assert_eq!(
+            std::fs::read_to_string(root.join("main/memory.max")).unwrap(),
+            (768u64 * 1024 * 1024).to_string(),
+            "main needs its own hard backstop"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("main/cpu.weight")).unwrap(),
+            "500",
+            "the server must outweigh its children"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("kids/cpu.weight")).unwrap(),
+            "100"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("kids/memory.high")).unwrap(),
+            (640u64 * 1024 * 1024).to_string(),
+            "kids must throttle before the hard cap"
+        );
         // Aggregate must NOT carry oom.group: kids/ is a set of independent
         // services, so a build spiking must not take the browser host with it.
         assert!(
@@ -468,7 +580,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(root.join("main/memory.low")).unwrap(),
-            (320u64 * 1024 * 1024).to_string(),
+            (256u64 * 1024 * 1024).to_string(),
             "main must be the reclaim-protected side"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -488,6 +600,10 @@ mod tests {
         assert!(
             sc.contains("+memory"),
             "subtree_control must enable memory: {sc}"
+        );
+        assert!(
+            sc.contains("+cpu"),
+            "subtree_control must enable cpu for weights: {sc}"
         );
         let procs = std::fs::read_to_string(root.join("main/cgroup.procs")).unwrap();
         assert_eq!(

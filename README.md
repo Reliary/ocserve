@@ -241,6 +241,34 @@ The full, categorised index is in `docs-README.md`. The short version:
 | work on a subsystem | `COMPACTION.md`, `SNAPSHOT.md`, `PLATFORM.md`, `V2-PLAN.md` |
 | run the compatibility or load harnesses | `bench/plugins/README.md`, `bench/load/README.md` |
 
+## Heavy builds
+
+A build inside the agent is an external workload: the service contains it but
+does not schedule it. Run heavy Rust work in a scope the machine governs:
+
+```sh
+systemd-run --user --scope --collect \
+  -p MemoryHigh=4G -p MemoryMax=6G -p CPUQuota=800% -p Nice=10 \
+  --working-directory="$PWD" \
+  cargo build --release
+```
+
+That scope is outside `ocserve.service`, so it does not count against the
+service's memory and the service cannot kill it. For a standing policy, put
+those properties in `~/.config/systemd/user/ocserve-build.slice` and pass
+`--slice=ocserve-build.slice`. Do not background a build inside a tool call
+(`nohup cargo build &`): it stays in the tool class and is capped with it.
+
+The service itself weights CPU so the API wins over its child classes and
+caps each class separately (see `SRE.md` section 5.5). It does not set
+`CARGO_BUILD_JOBS`, `RAYON_NUM_THREADS` or a build CPU quota.
+
+## Unmanaged resource policy
+
+`scripts/install.sh --no-resource-limits` installs the unit without memory
+caps and turns off the child partition and sidecar recycle, leaving the
+operator to own memory policy. The default install is managed.
+
 ## Repository hygiene
 
 ```sh

@@ -23,94 +23,39 @@ that alone exceeds the entire budget. Corrected line items:
 | **Unallocated headroom** | **~146 MB** | absorbs spikes; soak asserts the *slope*, not the peak |
 | **Total** | **300 MB** | |
 
-Node plugin sidecar (PLAN §10 gate result — quickjs rejected on import audit): declared
-*outside* ocserve's 300 MB; `ocserve_sidecar_rss_bytes` scraped from the child each sample
-interval so the combined number is always visible.
+Node plugin sidecar (PLAN §10 gate result): declared *outside* ocserve's
+300 MB; `ocserve_sidecar_rss_bytes` exposes it so the combined number is
+visible. The sidecar's own ceiling is now a per-class cgroup cap (plugin
+320 MB, high 288 MB), not a number in this table.
 
-**Measured boundary (2026-10, 4 configured plugins, node v25.9.0, this host):** node
-baseline 40 MB (`--max-old-space-size=64 --max-semi-space-size=2`, isolated probes:
-context-mode 59 MB, reliary8 54 MB alone) → **146 MB combined sidecar steady-state**,
-uncapped same configuration was 148 MB (the heap cap contains growth, not baseline).
-Live cgroup series under load (release build, systemd unit): **steady 341-347 MB**
-(ocserve + sidecar together). **Orphan incident (2026-10-04): replay/gate tooling left 34
-plugin-host nodes / 717 MB orphaned when the parent ocserve exited without reaping —
-fixed in the tooling (setsid + group-kill in `replay-check.sh`, `start_new_session` +
-killpg in `run_gate.py`); service-side reap-on-exit ships with phase 1.**
-A first-run long generation burst tripped a 480M cap →
-systemd oom-kill → clean restart; the unit cap was raised to **600M** with the
-margin documented in `deploy/ocserve.service` (fail-fast worked; the cap was tight
-for allocator page retention during delta bursts).
-The original ≤80 MB target is **not achievable with these artifacts** on any single
-node process; boundary set to measured + headroom: sidecar **hard cap 160 MB** (systemd
-`MemoryMax` in the unit), combined ocserve+sidecar budget **460 MB**.
+**Measured boundaries (2026-10, 4 configured plugins, bun, this host):**
+node baseline 40 MB; steady combined sidecar 97-101 MB; bun warm-up peak
+~260 MB while the embedding stack initialises, returning to baseline.
+The original ≤80 MB target is not achievable with these artifacts; the cap
+is 320 MB max / 288 MB high, with the warm-up absorbed by the difference.
 
-**Bun runtime (2026-10-05, TI-86 pass):** the plugin host now prefers **bun**
-(`~/.bun/bin/bun --smol`; upstream's own plugin runtime — real `bun:sqlite`, native
-hash/crypto, TS plugins load without the Node loader shim). `OCSERVE_PLUGIN_RUNTIME=node`
-forces the old path (lab A/B control); Node remains the fallback when bun is absent.
-**Live A/B, same 3 plugins, same box — honest settled numbers (30 s snapshots lie):**
-steady state is a **wash** — bun and node both settle ≈97–101 MB (3–5 min). The
-difference is WARM-UP: bun peaks ~260 MB vs node ~137 MB while magic-context lazily
-initializes its embedding stack (@huggingface/transformers + onnxruntime + sharp,
-87 MB Xenova model on disk), then returns to baseline. The original short-settle
-"87 vs 138" was a mirage and is retracted. Bun remains the default on fidelity
-grounds (upstream runtime; gemini-plugin class loads without the Node TS limitation).
-Hook dispatch verified under bun end-to-end (chat.message ×2, transform ×2,
-text.complete ×2; live prompt answered). `MemoryMax` headroom absorbs the warm-up
-peak; cold-start budget note: first 3–5 min after boot may sit ~260 MB sidecar.
-Node 128 MB heap cap no longer applies under bun (`--smol` instead);
-`OCSERVE_PLUGIN_HEAP_MB` is the Node-fallback knob.
+## 1.1 Process-tree budget (2026-10-23)
 
-**OOM postmortem (2026-10-05, kernel memcg kills ×6: 10:36/11:16/12:20/14:12/15:12/16:05):**
-the *unit* cap is what binds (main + ALL children), and the measured warm daytime
-composition blew past the old budget: **main ≈ 487 MB (flat plateau) + plugin host ≈
-145 MB + browser-harness python ×2 ≈ 78 MB ≈ 680 MB against `MemoryMax=750M`** —
-~118 MB headroom, and `ocserve_sidecar_rss_bytes` counts the plugin host only (bh/shim
-invisible to the old soak). Spike classes: catalog reload (their opencode writes
-`models.json` ~hourly; write → kill +6 s — the reload parsed the 5.3 MB file **twice**,
-now once via `Runtime.catalog`) and activity-composite crossings (morning kills; node
-allocating at 16:05). Equal `oom_score` meant the kernel always killed MAIN (full
-service death) even when a child allocated — children now raise their own
-`oom_score_adj=500` at spawn (A3 wrapper) so a future kill takes a respawnable child.
-  A3 alone proved half the story (2026-10-06 11:00:16: kernel killed ONLY bun, yet
-  default `OOMPolicy=stop` bounced the whole unit) — `OOMPolicy=continue` completes
-  it: child dies → logged → unit stays up → `ensure_alive` respawns. Control A/B
-  evidence: FINDINGS "D1 executed" addendum; guard rule 9.
-Reconcile is now INFO-logged (files + duration + RSS delta), soak gained
-`cgroup`/`cgroup_peak`/`kids` columns, and journald retention was pruned to ~3 h by
-the root fs sitting at 6.8% free (< default `SystemKeepFree`10%) — retention floor
-staged at `deploy/journald-retention.conf` (500M cap, keep-free override). The
-+146 MB main-vs-341 delta is plateau-stable and attributed AFTER the A-data (Phase B).
-**Same-day outcome:** warm reload proved lethal — a forced catalog refresh OOM-killed the
-service 2 s later (kill #7, journal 17:01:33, +237 MB measured by the new A2 log) →
-(A5) `watch` now content-hashes on tuple-diff: identical-bytes rewrites (their hourly
-identical fetch) advance the tuple with `result="skipped"` and never reload (plant-proven);
-and `MemoryMax` raised **750M → 1024M** as a measured interim (predicted peak ≈951 MB =
-warm 500 + reload build 237 + children 214; both live and repo units). Phase B re-measures
-and may lower it again.
-**Phase B verdict (same night): FRAGMENTATION, not a leak** — lab A/B
-(`bench/profiling/oom_reload.py`, full-size fixtures): plain arenas step
-+220/+68/+1 to a 526 MB plateau; `MALLOC_ARENA_MAX=1` collapses it to
-+69/0/+1 at **308 MB** (bytehound: 24.3M of 25M allocs = temporary churn;
-leaked-at-exit = the live payload `build_providers` Value, by design).
-Wired as `Environment=MALLOC_ARENA_MAX=1` in the unit (zero-code; children
-inherit — reload wall-time unchanged); **cap returned to 750M** (measured:
-idle main 231 / cgroup 402 ≤460 budget; production reloads +90 cold then
-+0.2 warm). 8 kernel kills total that day (last 21:13, before the fix).
-Full evidence: `bench/profiling/OOM-RELOAD-REPORT.md`.
+The service is a tree, not one process. Every class gets its own cgroup
+ceiling so one workload cannot starve another; the unit's `MemoryMax` is only
+a backstop. These are properties of the children we spawn, not of the user's
+job (see `SRE.md §5.5`).
 
-**V8 heap cap (2026-10-03, P0 battery):** at `--max-old-space-size=64` the real
-5-plugin set OOM-killed the sidecar once at boot (observed: `FATAL ERROR: Reached
-heap limit`, child zombie, every subsequent hook `Broken pipe` — fail-open hid it
-inside prompts). Controlled re-measure (4/5 plugins loading — gemini fails
-independently —10s+ settle, trigger+event exercised): RSS **flat 144-148 MB at
-64/128/192/256** — the V8 cap never binds baseline RSS (native/WASM dominates), so
-headroom is free. Default raised to **128** (`OCSERVE_PLUGIN_HEAP_MB` overrides), and
-`Sidecar::ensure_alive` now respawns + replays all loads on the next RPC after any
-death (`sidecar_respawns_after_death_and_reloads_plugins`). The 160 MB systemd
-`MemoryMax` remains the hard boundary. Any future plugin
-addition must re-measure (gate: sidecar ≤160 MB after load, else a plugin is dropped or
-loads lazily).
+| Node | memory.low | memory.high | memory.max | cpu.weight |
+|---|---|---|---|---|
+| `main` (server) | 256M | 512M | 768M | 500 |
+| `kids/` aggregate | - | 640M | 700M | 100 |
+| `kids/plugin` | - | 288M | 320M | 100 |
+| `kids/mcp` | - | 160M | 192M | 100 |
+| `kids/tools` | - | 448M | 640M | 50 |
+| `kids/pty` | - | 64M | 96M | 100 |
+
+Leaf caps are ceilings, not reservations: the sum exceeds the parent on
+purpose (the kernel allows over-committed limits). `high < max` throttles and
+reclaims before the kernel kills. The server outweighs the child classes 5:1
+so a build yields when the API needs CPU, while still using every idle core.
+The service does **not** choose the user's build job count or CPU quota; that
+belongs to the user's own scope (`SRE.md §5.6`).
 
 ## 2. Global allocator
 

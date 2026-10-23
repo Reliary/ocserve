@@ -261,36 +261,71 @@ other than the async worker (thread identity recorded by a test-only seam).
      blocking task cannot be cancelled, so the honest remedy is to say so and
      let the operator restart the unit, which reaps the whole cgroup.
 
-  5. **Backstop:** `MemoryMax=1024M` — kids 700 + main reserve ~324 (≈ 2×
-     the measured 180 MB envelope); provenance comment chain in the unit
-     template (history: 480 → 600 → 750 → 1024, each step measured).
-     **2026-10-08:** the unit template was found carrying the stale 750M
-     while this section already said 1024M — a structural over-commit, not
-     a leak: the partition allows kids/ 700M + main runs 130-180M typical
-     (455M migration peak), so 700+130 > 750 could never fit both. Journal
-     10-07/10-08: 6+ kernel SIGKILLs of the sidecar at cold start,
-     `memory.peak` pinned at exactly 786,432,000. Template now matches this
-     section; kill-policy proof and recycle gauge unchanged. A
-     larger ceiling costs **nothing at idle** (cgroups charge on touch) —
-     leak detection is the recycle gauge + soak slope, never cap proximity.
-     Also: the dance needs a **delegated** cgroup tree. It works because the
-     user manager (`user@.service`) is delegated; the unit itself does NOT set
-     `Delegate=yes` (an earlier revision of this section claimed it did, and
-     no unit ever carried the line). `memory.low` on `main/` rather than a
-     cap is deliberate: a hard main cap kills the server during a
-     migration-class spike, while protection plus a capped kids subtree makes
-     the kernel pick a child. `OOMScoreAdjust=200` is pinned in the unit
-     because the inherited value could not be traced to any unit file on this
-     host (the manager sits at 100, every user unit at 200); pinning makes the
-     300-point gap to children a property of our config.
-     `MemorySwapMax=0` (fail-fast over swap — the reason
-     no `MemoryHigh` soft throttle ships yet: without swap it stalls
-     instead of shrinking; PSI gauge `ocserve_mem_pressure_avg10` is the
-     measure-first gate for revisiting), `Restart=on-failure`,
-     `RestartSec=5`, `RUST_LOG=ocserve=info` (MIMALLOC_* removed 2026-10-04
-     — dead without a linked allocator), hardening (`ProtectSystem=strict`,
-     `-path` optional ReadWritePaths for the opencode/plugin dirs so fresh
-     machines boot, `NoNewPrivileges`).
+  5. **Containment: per-class caps, weights, one backstop.** Placement alone
+     was never containment: until 2026-10-23 every leaf inherited
+     `memory.max=max` (one build could starve the plugin host out of the shared
+     700M pot) and the `cpu` controller was not enabled at all (a `cargo build`
+     competed with the API on equal terms). The partition now writes:
+
+     | node | memory.low | memory.high | memory.max | cpu.weight |
+     |---|---|---|---|---|
+     | `main` (server) | 256M | 512M | 768M | 500 |
+     | `kids/` aggregate | - | 640M | 700M | 100 |
+     | `kids/plugin` | - | 288M | 320M | 100 |
+     | `kids/mcp` | - | 160M | 192M | 100 |
+     | `kids/tools` | - | 448M | 640M | 50 |
+     | `kids/pty` | - | 64M | 96M | 100 |
+
+     Leaf caps are ceilings, not reservations, so they sum above the parent;
+     the kernel explicitly allows over-committed limits. `high < max` means a
+     class is throttled and reclaimed before it is killed. Weights are
+     work-conserving: a build uses every idle core and yields when the API
+     needs one. `oom.group=1` stays on leaves only.
+
+     **Backstop:** the unit carries `MemoryHigh=960M` and `MemoryMax=1024M`
+     (plus `MemorySwapMax=0`). The numbers are a documented backstop, not a
+     tuning surface: the controls are the per-class caps and weights. A
+     larger ceiling costs nothing at idle (cgroups charge on touch); leak
+     detection is the recycle gauge and soak slope, never cap proximity.
+
+     The dance needs a **delegated** cgroup tree; it works because the user
+     manager is delegated, and the unit itself does not set `Delegate=yes`.
+     `OOMScoreAdjust=200` is pinned so the 300-point gap to children is a
+     property of our config. `Restart=on-failure`, `RestartSec=5`,
+     `RUST_LOG=ocserve=info`, hardening (`ProtectSystem=strict`, optional
+     `ReadWritePaths`, `NoNewPrivileges`).
+
+  6. **Heavy work is not the service's policy.** A build inside the agent is
+     an **unbounded external workload**; the service contains it but does not
+     schedule it. Run heavy builds in a scope the machine, not the service,
+     governs:
+
+     ```sh
+     systemd-run --user --scope --collect \
+       -p MemoryHigh=4G -p MemoryMax=6G -p CPUQuota=800% -p Nice=10 \
+       --working-directory="$PWD" \
+       cargo build --release
+     ```
+
+     The scope is outside `ocserve.service`, so it does not count against the
+     service's cap and the service cannot kill it; the tradeoff is that the
+     service's tool timeout and cleanup do not govern it either. For a standing
+     policy, put those three properties in
+     `~/.config/systemd/user/ocserve-build.slice` and use
+     `systemd-run --user --slice=ocserve-build.slice`. The anti-pattern that
+     caused the 2026-10-23 kill: `nohup cargo build &` inside the agent stays
+     in `kids/tools`, inherits the class cap, and is killed as a unit.
+     **We deliberately do not set `CARGO_BUILD_JOBS`, `RAYON_NUM_THREADS` or a
+     CPU quota for tool children**: that is workload policy, invisible to the
+     user, and a divergence from upstream's shell tool.
+
+  7. **Unmanaged install.** `scripts/install.sh --no-resource-limits` renders
+     the unit without `MemoryHigh`/`MemoryMax`/`MemorySwapMax` and sets
+     `OCSERVE_CGROUP_PARTITION=0` and `OCSERVE_SIDECAR_RECYCLE_MB=0`; the
+     operator owns memory. Placement, OOM policy, timeouts and the rest of the
+     service are unchanged. This is for operators with their own slice policy;
+     the default install is the managed one.
+
 - **Install (preferred, opt-in by invocation):** `scripts/install.sh` —
   default = full (build-if-needed, binary used IN PLACE, render
   `deploy/ocserve.service` (single source of truth), `daemon-reload`,

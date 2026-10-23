@@ -6,6 +6,27 @@ differs is a named `D-*` row in `PLAN.md §17`.
 
 ## 0.6.2
 
+### Resource containment
+- **Per-class memory caps and CPU weights.** Every child leaf now has its own
+  `memory.high`/`memory.max` (plugin 288/320M, mcp 160/192M, tools 448/640M,
+  pty 64/96M) and the `cpu` controller is enabled: the server weighs 500
+  against the child classes' 50-100, so a build uses idle cores and yields
+  when the API needs one. Previously all leaves inherited `max`, one shared
+  700M pot, and no CPU priority.
+- The aggregate `kids/` throttles at 640M before its 700M cap; `main` has a
+  512M soft ceiling and a 768M backstop; the unit carries `MemoryHigh=960M`
+  under the existing `MemoryMax=1024M`.
+- `ocserve doctor --budget` prints the resolved caps, per-leaf current/peak,
+  `memory.events` and CPU throttling.
+- `scripts/install.sh --no-resource-limits` installs the unit without memory
+  caps and disables the child partition and sidecar recycle for operators who
+  own memory policy.
+- The service deliberately does **not** set build job counts or CPU quotas;
+  heavy builds belong in a `systemd-run --user --scope`, documented in README
+  and SRE section 5.6.
+
+
+
 Security and reliability review of 0.6.x (two independent audits). Fixes:
 
 ### Critical

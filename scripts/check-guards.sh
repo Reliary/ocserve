@@ -107,6 +107,10 @@
 #  52. no raw `metadata` index-assignment (serde_json IndexMut panics on a
 #      non-object and release builds abort; one plugin tool killed the server)
 #      [plant: raw metadata write]
+#  53. child classes carry per-class memory caps and CPU weights, and the
+#      installer's unmanaged mode really removes them (placement without caps
+#      let one build starve the plugin host and the API; 2026-10-23)
+#      [plant: per-leaf writes stripped]
 #  26b. soak-gate rejects a failed health probe (000000 coerced to 0 and
 #      passed a run with timed-out probes) [plant: synthetic bad row]
 set -euo pipefail
@@ -1291,5 +1295,45 @@ elif [ "$_b" -eq 0 ]; then
 else
   echo "ok (healthy passes; failed probe rejected)"
 fi
+
+
+echo "== guard: child classes carry per-class caps and CPU priority (rule 53) =="
+# Placement alone is not containment: before 2026-10-23 every leaf inherited
+# `memory.max=max` (one build could starve the plugin host) and the cpu
+# controller was never enabled (a build competed with the API as an equal).
+# Predicate: partition.rs writes memory.high, memory.max and cpu.weight for the
+# leaves. Planted control: a copy with the per-leaf writes removed must fail.
+_pred() { grep -q 'leaf.join("memory.high")' "$1" && grep -q 'leaf.join("memory.max")' "$1" && grep -q 'leaf.join("cpu.weight")' "$1"; }
+if _pred crates/ocserve-cli/src/partition.rs; then
+  echo "ok (per-leaf high/max/weight present)"
+else
+  echo "FAIL: partition.rs does not write per-class caps (rule 53)"; fail=1
+fi
+_plant="$(mktemp)"
+grep -v 'leaf.join("memory.high")' crates/ocserve-cli/src/partition.rs \
+  | grep -v 'leaf.join("memory.max")' | grep -v 'leaf.join("cpu.weight")' > "$_plant"
+if _pred "$_plant"; then
+  echo "FAIL: rule 53 planted control not detected"; fail=1
+else
+  echo "ok (planted removal detected)"
+fi
+rm -f "$_plant"
+
+echo "== guard: install modes differ (managed vs unmanaged memory) (rule 53b) =="
+# The unmanaged mode must actually remove the unit caps and disable the
+# partition; a flag that renders the same unit would be a lie.
+_good=$(mktemp); _bad=$(mktemp)
+python3 - scripts/install.sh <<'PY'
+import sys
+s = open(sys.argv[1]).read()
+assert "MemoryMax|MemoryHigh|MemorySwapMax" in s, "install.sh lost the cap strip"
+assert "OCSERVE_CGROUP_PARTITION=0" in s, "unmanaged mode must disable the partition"
+PY
+if [ $? -eq 0 ]; then
+  echo "ok (unmanaged mode strips unit caps and disables the partition)"
+else
+  echo "FAIL: install.sh unmanaged mode incomplete (rule 53b)"; fail=1
+fi
+rm -f "$_good" "$_bad"
 
 exit $fail
