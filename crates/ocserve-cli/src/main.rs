@@ -1129,6 +1129,23 @@ impl Shutdown {
     }
 }
 
+/// Windows/macOS-without-unix-signals fallback: Ctrl-C only.
+#[cfg(not(unix))]
+struct Shutdown;
+
+#[cfg(not(unix))]
+fn install_shutdown() -> Shutdown {
+    Shutdown
+}
+
+#[cfg(not(unix))]
+impl Shutdown {
+    async fn wait(self) {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutdown: draining");
+    }
+}
+
 fn read_first(path: &str) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()

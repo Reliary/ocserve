@@ -1319,6 +1319,38 @@ else
 fi
 rm -f "$_plant"
 
+echo "== guard: shutdown handler exists on every platform (rule 53c) =="
+# 0.6.4 failed the Windows release because the non-unix `Shutdown` stub was
+# deleted while the unix one remained: the host build and every Linux test
+# passed. Both variants must exist, and the serve path must call exactly one
+# installer that each cfg provides.
+_sh_pred() {
+  grep -q '#\[cfg(unix)\]$' "$1" && grep -q '#\[cfg(not(unix))\]' "$1" \
+    && [ "$(grep -c 'fn install_shutdown() -> Shutdown' "$1")" -eq 2 ] \
+    && grep -q 'let startup = install_shutdown();' "$1"
+}
+if _sh_pred crates/ocserve-cli/src/main.rs; then
+  echo "ok (unix + non-unix shutdown installers present)"
+else
+  echo "FAIL: shutdown handler missing for one platform (rule 53c)"; fail=1
+fi
+_sh_plant="$(mktemp)"
+python3 - crates/ocserve-cli/src/main.rs "$_sh_plant" <<'PY2'
+import re, sys
+s = open(sys.argv[1]).read()
+# Drop the non-unix stub exactly as 0.6.4 did (from its doc comment onward).
+i = s.find("/// Windows/macOS-without-unix-signals fallback")
+j = s.find("fn read_first(path: &str)")
+s = s[:i] + s[j:] if i != -1 else s
+open(sys.argv[2], "w").write(s)
+PY2
+if _sh_pred "$_sh_plant"; then
+  echo "FAIL: rule 53c planted control not detected"; fail=1
+else
+  echo "ok (planted removal of the non-unix stub detected)"
+fi
+rm -f "$_sh_plant"
+
 echo "== guard: install modes differ (managed vs unmanaged memory) (rule 53b) =="
 # Render the REAL unit in both modes and assert the outcome, not the source
 # text: a grep for "MemoryMax|MemoryHigh" passes even if the strip regex is

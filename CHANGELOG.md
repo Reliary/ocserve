@@ -19,6 +19,10 @@ storage change; rollback is a binary swap.
 - `MemoryLow=256M` on the unit makes `main/memory.low` effective.
 - Spawns without a leaf clear `OCSERVE_KIDS_CGROUP`.
 - `install.sh --render-to`; guard 53b asserts rendered units in both modes.
+- Restored the non-unix `Shutdown` stub: the 0.6.4 tag failed both Windows
+  release jobs with `cannot find function install_shutdown`, because the host
+  build and every Linux test exercised only the unix variant. Guard 53c now
+  requires both cfgs and a planted removal proves it bites.
 
 ## 0.6.3
 
