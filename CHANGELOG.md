@@ -4,6 +4,12 @@ All notable changes to ocserve. The wire contract targets the frozen
 openccode 1.18.31 release and the v2 surface the 2.0.28 client; anything that
 differs is a named `D-*` row in `PLAN.md §17`.
 
+## 0.6.5
+
+The 0.6.4 tag never produced a release: both Windows jobs failed on a missing
+non-unix `Shutdown` stub. 0.6.5 is 0.6.4 plus that fix. Content otherwise
+identical; no schema, wire, or storage change.
+
 ## 0.6.4
 
 Fixes from independent SRE and security reviews of 0.6.3. No schema, wire, or
