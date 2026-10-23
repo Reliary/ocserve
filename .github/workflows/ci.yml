@@ -39,8 +39,16 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # ONE test run: the output feeds both the pass/fail gate and the count.
+      # Before this, the ratchet re-ran the suite inside a pipeline, which
+      # masks cargo-test's exit status (the last pipe stage wins) and doubled
+      # CI time; on 2026-10-23 the second run reported 68 passing while the
+      # first was green, and the log could not show why because the output was
+      # captured by the command substitution.
       - name: tests
-        run: cargo test --workspace
+        run: |
+          set -o pipefail
+          cargo test --workspace 2>&1 | tee /tmp/ocserve-tests.log
 
       - name: guards (static bug-class rules)
         run: ./scripts/check-guards.sh
@@ -52,7 +60,7 @@ jobs:
       # deleted or started skipping. Ratchet: recorded floor, raised over time.
       - name: test count ratchet
         run: |
-          count=$(cargo test --workspace 2>&1 | grep "^test result:" | \
+          count=$(grep "^test result:" /tmp/ocserve-tests.log | \
             grep -oP '\d+(?= passed)' | \
             python3 -c "import sys; print(sum(int(l) for l in sys.stdin if l.strip()))")
           echo "test count: $count"
