@@ -489,6 +489,7 @@ rule 49 (no hand-written hook payload literals).
 | id | what | evidence |
 |---|---|---|
 | `D-HOOK-TIMEOUT` | Every hook has a budget. Upstream has none (`Effect.promise` awaits forever). Defaults: 60 s transforms/context/compaction, 180 s tool hooks, 300 s plugin tools; `OCSERVE_HOOK_TIMEOUT_MS=0` restores parity. | measured maxima: `v2.session.context` 15.3 s, `tool.execute.after` 30.0 s over 27 real prompts |
+| `D-V2-SESSION-GENERATE` | The transient generate path exists (`POST /api/session/{id}/generate` runs the shared executor with `persist:false`), but the v2 `session.generate` hook is not dispatched. The one corpus plugin that registers it also registers `session.context`, which IS bridged, so the loss is the hook, not the plugin. | demand ledger: 1 declared, 0 invoked |
 | `D-HOOK-TOOL-ASK` | A plugin tool's intra-call `ask` is advisory: the permission gate decided the call as a whole, and an intra-tool ask cannot widen it. | CaMeL (arXiv 2503.18813): authority stays outside the untrusted component |
 
 Dispatch no longer holds the sidecar owner lock across a hook await (upstream

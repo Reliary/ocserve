@@ -30,7 +30,7 @@ V1_BOUND = {
 }
 V2_BOUND = {
     "event", "session.context", "session.compaction", "session.prompt",
-    "session.generate", "tool.execute.before", "tool.execute.after",
+    "tool.execute.before", "tool.execute.after",
 }
 # Named divergences with a reason (README-v2.md capability matrix).
 DIVERGED = {
@@ -39,6 +39,7 @@ DIVERGED = {
     "session.http.response": "D-V2-SESSION-LIFECYCLE (transport-level Effect hook)",
     "session.model.request": "D-V2-SESSION-LIFECYCLE (transport-level Effect hook)",
     "session.retry": "D-V2-SESSION-LIFECYCLE (retry policy is internal)",
+    "session.generate": "D-V2-SESSION-GENERATE (transient generate path exists; the v2 hook is not dispatched)",
 }
 
 

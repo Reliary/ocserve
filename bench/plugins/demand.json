@@ -184,7 +184,8 @@
       "v2"
     ],
     "v1_trigger": false,
-    "status": "bound"
+    "status": "diverged",
+    "reason": "D-V2-SESSION-GENERATE (transient generate path exists; the v2 hook is not dispatched)"
   },
   "session.http.response": {
     "declared_by": [
