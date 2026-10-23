@@ -98,6 +98,20 @@
 #      (it shipped "chat.messages.transform", which exists nowhere) [suite]
 #  49. no hand-written hook payload literals in tests/bench (the {role, content}
 #      transform fixture agreed with the caller's bug) [plant: grep]
+#  51. hook/RPC dispatch goes through a Handle, never the owner lock
+#      (cross-session serialization behind the slowest plugin; also silences
+#      the dead-generation recovery) [plant: owner-lock call]
+#  52. no raw `metadata` index-assignment (serde_json IndexMut panics on a
+#      non-object and release builds abort; one plugin tool call would kill
+#      every session) [plant: raw write]
+#  53. every child class carries per-leaf memory caps + CPU weight, and the
+#      unmanaged install mode really strips the unit ceiling
+#      [plant: leaf writes removed / cap re-inserted]
+#  53c. the shutdown handler exists for BOTH cfg(unix) and cfg(not(unix))
+#      (the 0.6.4 Windows release failed on a missing stub) [plant: stub removed]
+#  54. plugin tools cannot shadow a builtin (upstream `tools[id] =` replaces it
+#      silently; our gate keys on the name -> confused deputy)
+#      [plant: reserved-name check removed]
 #  50. plugin demand ledger is current and classified (every hook the
 #      ecosystem declares is bound or a NAMED divergence)
 #      [suite: generator + independent re-derivation]
@@ -1318,6 +1332,36 @@ else
   echo "ok (planted removal detected)"
 fi
 rm -f "$_plant"
+
+echo "== guard: plugin tools cannot shadow a builtin (rule 54) =="
+# Upstream assigns tools[id] over a [builtin, custom] list, so a plugin tool
+# named `bash` replaces the builtin; our permission gate keys on the NAME, so
+# the shadow would inherit bash's authority (confused deputy). Predicate: the
+# tool merge filters against the builtin set before advertising.
+_shadow_pred() {
+  grep -q 'let reserved: std::collections::HashSet<String>' "$1" \
+    && grep -q 'reserved.contains(&name)' "$1" \
+    && grep -q 'name_collision' "$1"
+}
+if _shadow_pred crates/ocserve-core/src/prompt.rs; then
+  echo "ok (plugin tools filter builtin names before advertising)"
+else
+  echo "FAIL: plugin tool merge does not refuse builtin names (rule 54)"; fail=1
+fi
+_shadow_plant="$(mktemp)"
+python3 - crates/ocserve-core/src/prompt.rs "$_shadow_plant" <<'PY2'
+import sys
+s = open(sys.argv[1]).read()
+s = s.replace("if reserved.contains(&name) || !names.insert(name.clone()) {",
+              "if !names.insert(name.clone()) {", 1)
+open(sys.argv[2], "w").write(s)
+PY2
+if _shadow_pred "$_shadow_plant"; then
+  echo "FAIL: rule 54 planted control not detected"; fail=1
+else
+  echo "ok (planted removal of the reserved-name check detected)"
+fi
+rm -f "$_shadow_plant"
 
 echo "== guard: shutdown handler exists on every platform (rule 53c) =="
 # 0.6.4 failed the Windows release because the non-unix `Shutdown` stub was
