@@ -4,6 +4,13 @@ All notable changes to ocserve. The wire contract targets the frozen
 openccode 1.18.31 release and the v2 surface the 2.0.28 client; anything that
 differs is a named `D-*` row in `PLAN.md §17`.
 
+## 0.6.3
+
+### Fixed
+- SIGTERM is registered before the socket binds, closing the bind-to-serve
+  window where `systemctl restart` could kill the server without draining
+  (found as a one-off `ExitStatus(15)` in a full suite run).
+
 ## 0.6.2
 
 ### Reliability
