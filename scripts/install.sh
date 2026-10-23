@@ -41,6 +41,42 @@ done
 
 say() { printf '%s\n' "$*"; }
 
+# --- pure render (test seam; the guard asserts both install modes) ----------
+# Renders the unit exactly as an install would, writes ONLY the requested path,
+# and exits before any binary resolution, build, or systemd work. The earlier
+# version sat after install and therefore built a release binary and mutated
+# ~/.local/bin on the CI runner (macOS job: 14 minutes, then a confusing 53b
+# failure).
+if [ -n "$RENDER_TO" ]; then
+  BIN_HOME="$HOME/.local/bin"
+  RENDERED="$RENDER_TO"
+  # Same %-form rule as the install path: a checkout outside $HOME stays absolute.
+  case "$REPO" in
+    "$HOME"/*) RENDER_CWD="%h${REPO#"$HOME"}" ;;
+    *)         RENDER_CWD="$REPO" ;;
+  esac
+  python3 - "$REPO/deploy/ocserve.service" "$RENDERED" "%h/.local/bin/ocserve" "$RENDER_CWD" "$LIMITS" <<'PY_RENDER'
+import re, sys
+tpl, out, bin_u, cwd_u, limits = sys.argv[1:6]
+s = open(tpl).read()
+s, n1 = re.subn(r'(?m)^ExecStart=.*$', lambda _: f'ExecStart={bin_u} serve --port 4912', s, count=1)
+s, n2 = re.subn(r'(?m)^WorkingDirectory=.*$', lambda _: f'WorkingDirectory={cwd_u}', s, count=1)
+assert n1 == 1 and n2 == 1, "template shape changed"
+if limits == "0":
+    s, n3 = re.subn(r'(?m)^(MemoryLow|MemoryMax|MemoryHigh|MemorySwapMax)=.*\n', '', s)
+    assert n3 >= 1, "template has no memory limits to remove"
+    env = (
+        "Environment=OCSERVE_CGROUP_PARTITION=0\n"
+        "Environment=OCSERVE_SIDECAR_RECYCLE_MB=0\n"
+    )
+    s, n4 = re.subn(r'(?m)^\[Service\]\n', "[Service]\n" + env, s, count=1)
+    assert n4 == 1, "template has no [Service] section"
+open(out, "w").write(s)
+PY_RENDER
+  say "rendered: $RENDERED (limits=$LIMITS)"
+  exit 0
+fi
+
 # --- systemd user session? (read-only probe) --------------------------------
 SD=1
 command -v systemctl >/dev/null 2>&1 || SD=0
@@ -158,13 +194,6 @@ if [ -f "$LIVE" ]; then
   fi
 else
   say "unit: $LIVE (new)"
-fi
-
-if [ -n "$RENDER_TO" ]; then
-  [ "$BIN_ONLY" = 1 ] && { echo "install.sh: --render-to needs the unit path (not --bin-only)" >&2; exit 2; }
-  cp "$RENDERED" "$RENDER_TO"
-  say "rendered: $RENDER_TO"
-  exit 0
 fi
 
 if [ "$DRY" = 1 ]; then
