@@ -25,6 +25,8 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 HOOKS = ROOT / "bench/v2/hooks.json"
 MATRIX = ROOT / "crates/ocserve-plugin/src/host/README-v2.md"
+SHIM = ROOT / "crates/ocserve-plugin/src/host/v2.mjs"
+FIXTURE = ROOT / "crates/ocserve-plugin/tests/fixtures/v2-hooks.json"
 
 
 def cited(hook: str, matrix: str) -> bool:
@@ -50,6 +52,25 @@ def scan(surface: dict, matrix: str) -> list[str]:
     return missing
 
 
+def registrable(surface: dict, shim: str) -> list[str]:
+    """Hooks upstream declares must be ACCEPTED by the shim's registrar, not
+    merely documented. The `experimental.ws.*` trio was documented as a
+    divergence but absent from V2_HOOK_NAMES, so registering it threw
+    `unknown session hook` and failed the whole plugin (2026-10-23)."""
+    block = re.search(r"const V2_HOOK_NAMES = \{(.*?)\n\};", shim, re.S)
+    if not block:
+        return ["<V2_HOOK_NAMES not found in v2.mjs>"]
+    text = block.group(1)
+    missing = []
+    for domain, hooks in surface.items():
+        m = re.search(rf"\b{re.escape(domain)}:\s*\[(.*?)\]", text, re.S)
+        accepted = set(re.findall(r'"([^"]+)"', m.group(1))) if m else set()
+        for hook in hooks:
+            if hook not in accepted:
+                missing.append(f"{domain}.{hook}")
+    return missing
+
+
 def selftest() -> bool:
     """Planted control (guard rule 36 non-vacuity): a hook that is NOT quoted
     in a matrix must be flagged. Proves the matcher bites (not vacuous)."""
@@ -71,6 +92,24 @@ def main() -> int:
         return 3
     missing = scan(surface, matrix)
     total = sum(len(v) for v in surface.values())
+    # The in-crate copy exists because rule 30 forbids compiled-in assets
+    # outside the crate root (the 0.3.0 packaging defect). A drift here would
+    # make the acceptance test test the wrong surface.
+    if not FIXTURE.exists() or json.loads(FIXTURE.read_text()) != surface:
+        print(
+            "FAIL: crates/ocserve-plugin/tests/fixtures/v2-hooks.json is stale; "
+            "copy bench/v2/hooks.json after extraction",
+            file=sys.stderr,
+        )
+        return 1
+    unregistrable = registrable(surface, SHIM.read_text())
+    if unregistrable:
+        print(
+            "FAIL: v2 hooks declared upstream but NOT accepted by the shim "
+            f"(registration would fail the plugin): {', '.join(unregistrable)}",
+            file=sys.stderr,
+        )
+        return 1
     if missing:
         print(
             "FAIL: v2 hooks absent from the capability matrix "
@@ -78,7 +117,9 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"ok: all {total} extracted v2 hooks are accounted for in the matrix")
+    print(
+        f"ok: all {total} extracted v2 hooks are documented and registrable"
+    )
     return 0
 
 

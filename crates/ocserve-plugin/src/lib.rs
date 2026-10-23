@@ -561,6 +561,10 @@ impl Sidecar {
         let shape = ocserve_store::cgroup::contained(&program, "plugin");
         let mut cmd = Command::new(&shape.program);
         cmd.args(&shape.prefix);
+        // `ctx.app.version` must match the running server, not a literal in the
+        // shim (it said 0.3.1 through 0.6.x). Env keeps the host script
+        // version-agnostic.
+        cmd.env("OCSERVE_VERSION", env!("CARGO_PKG_VERSION"));
         match &shape.cgroup {
             Some(p) => {
                 cmd.env(ocserve_store::cgroup::ENV, p);
@@ -1366,6 +1370,56 @@ export default PluginModule.server;
                 .any(|r| r == "sample")
         );
 
+        sc.shutdown().await;
+        Ok(())
+    }
+
+    /// Every hook upstream declares must be REGISTRABLE. Registering
+    /// `experimental.ws.handshake` used to throw `unknown session hook`, which
+    /// failed the plugin's whole setup and discarded the hooks ocserve does
+    /// dispatch (found 2026-10-23 by diffing bench/v2/hooks.json against the
+    /// shim table).
+    #[tokio::test]
+    async fn v2_accepts_every_declared_hook_at_registration() -> anyhow::Result<()> {
+        if !runtime_available() {
+            panic!(
+                "plugin-runtime binary ({}) required for plugin-host tests",
+                crate::plugin_runtime().program()
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // One plugin registers every hook the extracted surface declares.
+        let surface: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/v2-hooks.json"))?;
+        let mut body =
+            String::from("export default {\n  id: \"v2allhooks\",\n  setup: async (ctx) => {\n");
+        for (domain, hooks) in surface.as_object().unwrap() {
+            for hook in hooks.as_array().unwrap() {
+                let hook = hook.as_str().unwrap();
+                body.push_str(&format!(
+                    "    await ctx.{domain}.hook(\"{hook}\", () => {{}});\n"
+                ));
+            }
+        }
+        body.push_str("    await ctx.event.subscribe(() => {});\n  },\n};\n");
+        std::fs::write(dir.path().join("all_hooks.mjs"), body).unwrap();
+        let host = materialize_host(&dir.path().join("host"))?;
+        let mut sc = Sidecar::spawn(&host, "http://127.0.0.1:9", "/work").await?;
+        let h = sc
+            .load(
+                "v2allhooks",
+                &dir.path().join("all_hooks.mjs"),
+                &json!({"directory": "/work", "serverUrl": "http://127.0.0.1:9"}),
+                &Value::Null,
+            )
+            .await
+            .expect("every declared hook must register without failing setup");
+        for d in ["session", "tool", "permission", "shell"] {
+            assert!(
+                h.iter().any(|x| x == d || x.starts_with(&format!("{d}."))),
+                "no {d} hook registered: {h:?}"
+            );
+        }
         sc.shutdown().await;
         Ok(())
     }

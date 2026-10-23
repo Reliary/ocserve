@@ -16,6 +16,20 @@
  */
 
 /** v2 hook names we dispatch, grouped by domain (mirrors promise/*.ts). */
+/**
+ * Every hook name upstream DECLARES (bench/v2/hooks.json, extracted from the
+ * vendored 2.0.28 tree). Registration must accept all of them: a v2 plugin
+ * registers hooks during `setup`, and a throw here discards the hooks ocserve
+ * DOES dispatch. That is the same rule the domain proxies follow: a divergence
+ * costs one capability, never the plugin.
+ *
+ * Accepted is not dispatched. `session.context`, `session.compaction`,
+ * `session.prompt`, `tool.execute.before`, `tool.execute.after` and
+ * `event.subscribe` reach a dispatch site; the rest are recorded and never
+ * invoked (named divergences in README-v2.md). Before 2026-10-23 the
+ * `experimental.ws.*` trio was missing here, so a plugin registering it failed
+ * to load entirely (proven: registration threw `unknown session hook`).
+ */
 const V2_HOOK_NAMES = {
   session: [
     "prompt",
@@ -27,6 +41,9 @@ const V2_HOOK_NAMES = {
     "http.request",
     "http.response",
     "retry",
+    "experimental.ws.handshake",
+    "experimental.ws.send",
+    "experimental.ws.receive",
   ],
   tool: ["execute.before", "execute.after"],
   permission: ["evaluate"],
@@ -157,7 +174,14 @@ export function makeV2Context({
     },
   });
   return {
-    app: app || { name: "ocserve", version: "0.3.1", channel: "local" },
+    // Version comes from the server process (`OCSERVE_VERSION`, set by
+    // Sidecar::spawn). It used to be hardcoded to 0.3.1 and stayed there
+    // through 0.6.x, so a plugin inspecting ctx.app saw a stale version.
+    app: app || {
+      name: "ocserve",
+      version: process.env.OCSERVE_VERSION || "0.0.0-unknown",
+      channel: "local",
+    },
     location,
     options: options ?? {},
     // hook registrar + the bound REST half (see REST_METHODS).

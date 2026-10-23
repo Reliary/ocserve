@@ -29,9 +29,9 @@ identity, so this is exact.
 | `tool.hook("execute.before")` | **bridged** | mutates tool `input`; runs before the widened-args guard so v2 mutations get the same re-evaluation as v1 |
 | `tool.hook("execute.after")` | **bridged** | mutates the tool `result` string (status union mapped: `completed`→result) |
 | `event.subscribe` | **bridged** | same bus → sidecar delivery as v1 `hooks["event"]` |
-| `session.hook("prompt")` | **diverged** `D-V2-SESSION-PROMPT` | not dispatched; the v1 `chat.message` site covers prompt mutation and no v2 plugin in the wild depends on the v2-only `prompt` hook shape |
-| `session.hook("model.request"/"http.request"/"http.response"/"retry"/"title"/"generate")` | **diverged** `D-V2-SESSION-LIFECYCLE` | the transport-level hooks bind to upstream's Effect HTTP/WebSocket driver, which ocserve does not have (a different, non-Effect client); retry/title/generate policy is internal |
-| `session.hook("experimental.ws.handshake")` / `"experimental.ws.send"` / `"experimental.ws.receive"` | **diverged** `D-V2-WS` | ocserve drives no websocket provider transport |
+| `session.hook("prompt")` | **bridged** | runs after decode and before admission; the returned `event.prompt` is what the inbox row carries (`v2.rs` prompt route). Never fires for v1 requests. |
+| `session.hook("model.request"/"http.request"/"http.response"/"retry"/"title"/"generate")` | **diverged** `D-V2-SESSION-LIFECYCLE` | the transport-level hooks bind to upstream's Effect HTTP/WebSocket driver, which ocserve does not have (a different, non-Effect client); retry/title/generate policy is internal. `generate` has its own row (`D-V2-SESSION-GENERATE`). |
+| `session.hook("experimental.ws.handshake")` / `"experimental.ws.send"` / `"experimental.ws.receive"` | **diverged** `D-V2-WS` | ocserve drives no websocket provider transport. Registration is ACCEPTED (a throw at setup would discard the hooks we do bridge); the callbacks are recorded and never invoked. |
 | `permission.hook("evaluate")` | **diverged** `D-V2-PERM-EVAL` | ocserve's gate is `ocserve_core::permission` (rule-based, upstream-equivalent, unit-tested); a v2 evaluate hook is not on the dispatch path |
 | `shell.hook("create.before")` | **diverged** `D-V2-SHELL` | the v1 `tool.execute.before` path covers shell spawn; the v2 shell domain binds upstream's shell service, absent here |
 | `aisdk.hook` | **diverged** `D-V2-AISDK` | upstream's AI-SDK adapter is Effect-specific; ocserve has its own provider client |
@@ -50,7 +50,7 @@ domains are reported in the plugin inventory as `unbridged_transforms`.
 |---|---|
 | `storage` (get/set/remove/scan) | **bridged** — in-memory per-plugin KV. Named divergence `D-V2-STORAGE-MEM`: upstream is disk-backed; ocserve's store is process-lifetime (cleared on restart). |
 | `rpc` (register/call/events) | **partially bridged** — `register` + handler dispatch + `/api/rpc/{id}/{method}` are real. `Registration.events.emit` → `D-V2-RPC-EVENTS` (upstream emits over the RPC socket; not bridged). |
-| `tool.transform/list/reload` | **partially bridged** — `transform` REGISTERS (the callback is recorded, never invoked: the tool registry is static, `D-V2-TOOL-EDITOR`) and `list` returns `[]`; `reload` is a no-op. Registration must not throw: v2 plugins register transforms during `setup`, and failing there would discard the hooks we do bridge (found by the real-plugin corpus, 2026-10-21). |
+| `tool.transform/list/reload` | **partially bridged** — `transform` REGISTERS (the callback is recorded, never invoked: the tool registry is static, `D-V2-TOOL-EDITOR`) and `list` returns `[]` (v2 tool definitions are not exposed through this domain; the v1 `tool` registry is what the model sees); `reload` is a no-op. Registration must not throw: v2 plugins register transforms during `setup`, and failing there would discard the hooks we do bridge (found by the real-plugin corpus, 2026-10-21). |
 | `client` (REST proxy) | **bridged** — method-path proxy over the local HTTP API (same as v1's `client`) |
 | `event.subscribe` | **bridged** |
 | `plugin.list` | **bridged** — real inventory (`GET /api/plugin`) |
@@ -58,7 +58,8 @@ domains are reported in the plugin inventory as `unbridged_transforms`.
 | `command.list` / `skill.list` / `skill.get` | **bridged** — read the last pulled list |
 | `command.reload` / `skill.reload` | **bridged** — marks a reload; the next reconcile (or the boot-time pass) re-runs the pull |
 | `session`/`permission` (REST half) | **bridged** — each verb bound to the route that exists (`/api/session/{id}`, `/message`, `/context`, `/history`, `/inbox`, `/diff`; `/api/permission/saved`, `/request`). Unbound verbs throw `D-V2-DOMAIN`. |
-| `agent`/`integration`/`mcp`/`model`/`provider`/`reference`/`vcs`/`websearch`/`worktree`/`generate`/`aisdk`/`experimental` | **diverged** `D-V2-DOMAIN` — exposed as honest throwing proxies: a plugin that calls one gets a named error at the call site, never a crash at setup and never a fabricated success. `agent`/`model`/`provider` stay unbridged deliberately: their payloads feed registries and system-prompt assembly, so editing only the served list would be shape-without-mutation (A1 rule). |
+| `model` / `provider` / `agent` / `integration` / `reference` | **read half bridged** | `list`/`get` proxy the bound `/api/*` route through the verified table. The EDIT half (`transform`) is recorded and reported (`D-V2-TOOL-EDITOR` class, `unbridged_transforms`): these payloads feed registries and system-prompt assembly, so editing only the served list would be shape-without-mutation (A1 rule). |
+| `mcp` / `vcs` / `websearch` / `worktree` / `generate` / `aisdk` / `experimental` | **diverged** `D-V2-DOMAIN` — honest throwing proxies: a plugin that calls one gets a named error at the call site, never a crash at setup and never a fabricated success. `transform`/`reload` are still accepted and recorded so one gap cannot fail the whole plugin. |
 
 ## RPC dispatch
 

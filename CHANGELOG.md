@@ -4,6 +4,22 @@ All notable changes to ocserve. The wire contract targets the frozen
 openccode 1.18.31 release and the v2 surface the 2.0.28 client; anything that
 differs is a named `D-*` row in `PLAN.md §17`.
 
+## Unreleased
+
+### Fixed
+- v2 plugins that register `experimental.ws.handshake`/`send`/`receive` no
+  longer fail to load. Upstream declares those hooks, but the shim's accepted
+  list omitted them, so registration threw `unknown session hook` and the
+  plugin's whole `setup` failed (losing every hook we do dispatch). All 16
+  declared hooks are now accepted; the six with a dispatch site still run, the
+  rest stay named divergences.
+- `ctx.app.version` reports the running server version instead of a hardcoded
+  `0.3.1` left over from Phase 3.
+- The v2 capability matrix said `session.prompt` was diverged (it has been
+  dispatched since 0.6.0) and listed five read domains as throwing proxies (they
+  are proxied). Corrected; rule 36 now also requires every extracted hook to be
+  *registrable*, with a planted removal as the control.
+
 ## 0.6.6
 
 Everything in 0.6.5 plus the install provenance, advisory and CI fixes that
