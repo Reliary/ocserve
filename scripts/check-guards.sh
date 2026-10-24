@@ -131,6 +131,10 @@
 #      [plant: per-leaf writes stripped]
 #  26b. soak-gate rejects a failed health probe (000000 coerced to 0 and
 #      passed a run with timed-out probes) [plant: synthetic bad row]
+#  56. the tool-level ask-sequence oracle has a non-vacuous committed recording
+#      (the 2026-10-24 audit found six ask-shape divergences — read/todowrite
+#      metadata, webfetch pattern, missing write/edit diff — that rule 18's
+#      `evaluate()` vectors structurally cannot see) [plant: empty recording]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -395,6 +399,27 @@ PY
   fi
 else
   echo "ok (no permission vectors)"
+fi
+
+echo "== guard: tool-level ask-sequence recording is non-vacuous (rule 56) =="
+# The v2 permission oracle (rule 18) evaluates `evaluate()` only. The TOOL-LEVEL
+# ask contract (which asks a tool emits, in order, with which patterns, always
+# grants and metadata) is invisible over HTTP, so the 2026-10-24 audit found six
+# ask-shape divergences every existing gate passed: read/todowrite sent the raw
+# arguments as metadata, webfetch sent `*` instead of the URL, write/edit sent no
+# diff. bench/permission/tool-oracle.py records the reference's asks and diffs
+# ocserve against them; this keeps the committed recording honest so that diff
+# can never pass while testing nothing.
+# Planted control: an empty recording must be rejected.
+if out=$(python3 bench/permission/check-recording.py 2>&1); then
+  if ! printf '{"cases":{}}' > /var/tmp/ocserve-rule56-empty.json \
+      || python3 bench/permission/check-recording.py /var/tmp/ocserve-rule56-empty.json >/dev/null 2>&1; then
+    echo "FAIL: rule 56 planted vacuous recording not detected"; fail=1
+  else
+    echo "$out"
+  fi
+else
+  echo "$out"; echo "FAIL: tool-level ask recording missing/vacuous (rule 56)"; fail=1
 fi
 
 echo "== guard: event-payload validator is non-vacuous (rule 19) =="

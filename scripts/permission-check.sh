@@ -13,12 +13,11 @@
 # The vectors are generated from freeze by `gen-vectors.py` and committed; a
 # mismatch means ocserve's evaluate/ruleset-derivation drifted.
 #
-# Note on scope: the oracle covers `evaluate(action, resource, ruleset)` and
-# ruleset derivation. The TOOL-LEVEL ask sequence (arity prefixes, external
-# directories) is not reachable without a model turn; it is covered by the
-# pinned-arity property tests in `ocserve-tools` (bash_patterns) and the
-# `permission_asks` behaviour tests. A live tool-level differential needs the
-# stub-model turn harness (parked, PLAN §15).
+# Note on scope: this script covers `evaluate(action, resource, ruleset)` and
+# ruleset derivation. The TOOL-LEVEL ask sequence (which asks a tool emits, in
+# order, with which patterns/always/metadata) is covered by
+# `bench/permission/tool-oracle.py`, which drives a real tool turn against a
+# stub provider and diffs the `permission.asked` events both arms emit.
 #
 # Usage: scripts/permission-check.sh [--self-test]
 # Exit 0 = ocserve matches freeze on every vector; 1 = divergence.
@@ -97,6 +96,12 @@ fi
 
 python3 bench/permission/permission-replay.py "$VECTORS" "http://127.0.0.1:$PORT_R"
 rc=$?
+
+# Tool-level ask sequence (same harness, committed reference recording).
+if [ "${PERM_TOOL_ORACLE:-1}" = "1" ]; then
+  echo "== tool-level ask sequence =="
+  OCSERVE_BIN="$OCSERVE_BIN" python3 bench/permission/tool-oracle.py || rc=1
+fi
 if curl -s --max-time 2 http://127.0.0.1:4901/global/health >/dev/null 2>&1; then
   echo "live opencode :4901 still healthy"
 fi

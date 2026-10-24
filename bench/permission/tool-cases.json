@@ -1,0 +1,107 @@
+{
+  "_comment": "Tool calls whose ASK SEQUENCE must match the reference. Each case is one tool_call the stub model emits; the probe records every permission.asked (permission, patterns, always) in order. Side-effect free: every command is an echo, every path is under the fixture worktree or /tmp.",
+  "cases": [
+    {
+      "name": "bash_inside",
+      "tool": "bash",
+      "arguments": {
+        "command": "echo inside-tree"
+      }
+    },
+    {
+      "name": "bash_chain",
+      "tool": "bash",
+      "arguments": {
+        "command": "git status && echo done"
+      }
+    },
+    {
+      "name": "bash_pipe",
+      "tool": "bash",
+      "arguments": {
+        "command": "ls | grep src"
+      }
+    },
+    {
+      "name": "bash_external_dir",
+      "tool": "bash",
+      "arguments": {
+        "command": "ls /etc"
+      }
+    },
+    {
+      "name": "read_inside",
+      "tool": "read",
+      "arguments": {
+        "filePath": "Cargo.toml"
+      }
+    },
+    {
+      "name": "read_external",
+      "tool": "read",
+      "arguments": {
+        "filePath": "/etc/hostname"
+      }
+    },
+    {
+      "name": "write_inside",
+      "tool": "write",
+      "arguments": {
+        "filePath": "perm-oracle-write.txt",
+        "content": "hello\nworld\n"
+      }
+    },
+    {
+      "name": "edit_inside",
+      "tool": "edit",
+      "arguments": {
+        "filePath": "perm-oracle-edit.txt",
+        "oldString": "",
+        "newString": "created-by-edit\n"
+      }
+    },
+    {
+      "name": "glob_tree",
+      "tool": "glob",
+      "arguments": {
+        "pattern": "**/*.toml",
+        "path": "$WORK"
+      }
+    },
+    {
+      "name": "grep_tree",
+      "tool": "grep",
+      "arguments": {
+        "pattern": "workspace",
+        "path": "$WORK"
+      }
+    },
+    {
+      "name": "todowrite",
+      "tool": "todowrite",
+      "arguments": {
+        "todos": [
+          {
+            "content": "probe",
+            "status": "pending",
+            "priority": "low"
+          }
+        ]
+      }
+    },
+    {
+      "name": "webfetch",
+      "tool": "webfetch",
+      "arguments": {
+        "url": "https://example.com"
+      }
+    },
+    {
+      "name": "skill",
+      "tool": "skill",
+      "arguments": {
+        "name": "customize-opencode"
+      }
+    }
+  ]
+}

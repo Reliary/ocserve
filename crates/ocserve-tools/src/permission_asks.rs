@@ -66,7 +66,7 @@ pub fn asks_for(tool: &str, args: &Value, cwd: &Path) -> Vec<Ask> {
         "edit" => fs_asks("edit", args, cwd, "filePath"),
         "glob" => single("glob", str_arg(args, "pattern"), args, cwd),
         "grep" => single("grep", str_arg(args, "pattern"), args, cwd),
-        "webfetch" => single_always("webfetch", args),
+        "webfetch" => webfetch_ask(args),
         // v1 skill tool: ctx.ask({permission:"skill", patterns:[name],
         // always:[name]}) — pattern is the skill name, not "*".
         "skill" => vec![Ask {
@@ -75,8 +75,8 @@ pub fn asks_for(tool: &str, args: &Value, cwd: &Path) -> Vec<Ask> {
             always: vec![str_arg(args, "name")],
             metadata: Value::Null,
         }],
-        "websearch" => single_always("websearch", args),
-        "todowrite" => single_always("todowrite", args),
+        "websearch" => single_always("websearch"),
+        "todowrite" => single_always("todowrite"),
         // v1 task tool: ctx.ask({permission:"task", patterns:[subagent_type],
         // always:["*"]}) — pattern is the subagent type, not "*".
         "task" => vec![Ask {
@@ -105,31 +105,102 @@ fn str_arg(args: &Value, key: &str) -> String {
         .to_string()
 }
 
+/// `glob` / `grep`: upstream metadata is the tool's own named fields, and both
+/// emit `{pattern, path?, include?}` — NOT the raw arguments object. Sending
+/// the raw args leaked the caller's keys (measured: ours had
+/// `{"path":null,"pattern":"workspace"}`, reference had the same three keys
+/// with nulls omitted). Ask metadata is client-visible, so it is wire.
 fn single(permission: &str, pattern: String, args: &Value, cwd: &Path) -> Vec<Ask> {
     let mut asks = Vec::new();
     if let Some(a) = external_dir_ask(cwd, &pattern) {
         asks.push(a);
     }
+    // Upstream builds these objects with `path: params.path` where the value
+    // is `undefined` when absent, and JSON.stringify DROPS undefined keys. So
+    // the wire carries only the keys the model actually supplied (measured:
+    // reference `{pattern}` vs ours `{path:null,pattern}`). Absent keys must be
+    // omitted, not nulled.
+    let metadata = match permission {
+        "glob" => present(&[
+            ("pattern", Some(json!(pattern))),
+            ("path", args.get("path").cloned()),
+        ]),
+        "grep" => present(&[
+            ("pattern", Some(json!(pattern))),
+            ("path", args.get("path").cloned()),
+            ("include", args.get("include").cloned()),
+        ]),
+        _ => serde_json::json!({}),
+    };
     asks.push(Ask {
         permission: permission.to_string(),
         patterns: vec![pattern],
         always: vec!["*".to_string()],
-        metadata: args.clone(),
+        metadata,
     });
     asks
 }
 
-fn single_always(permission: &str, args: &Value) -> Vec<Ask> {
+/// Build a JSON object the way `JSON.stringify` does: keys whose value is
+/// absent (`undefined` upstream) are omitted entirely rather than sent as null.
+fn present(pairs: &[(&str, Option<Value>)]) -> Value {
+    let mut obj = serde_json::Map::new();
+    for (k, v) in pairs {
+        if let Some(v) = v {
+            obj.insert((*k).to_string(), v.clone());
+        }
+    }
+    Value::Object(obj)
+}
+
+/// `todowrite` / `websearch`: a fixed `*` pattern and EMPTY metadata upstream
+/// (`todo.ts:27`, `websearch.ts:122`). `webfetch` is different and is built
+/// separately below.
+fn single_always(permission: &str) -> Vec<Ask> {
     vec![Ask {
         permission: permission.to_string(),
         patterns: vec!["*".to_string()],
         always: vec!["*".to_string()],
-        metadata: args.clone(),
+        metadata: serde_json::json!({}),
+    }]
+}
+
+/// `webfetch` (`webfetch.ts:42`): pattern is the URL itself, always `*`, and
+/// the metadata carries url/format/timeout.
+fn webfetch_ask(args: &Value) -> Vec<Ask> {
+    vec![Ask {
+        permission: "webfetch".to_string(),
+        patterns: vec![str_arg(args, "url")],
+        always: vec!["*".to_string()],
+        // `format` has a decoding default upstream (webfetch.ts:16), so the
+        // ask metadata always carries it even when the model omitted it.
+        // `timeout` is genuinely optional and omitted when absent.
+        metadata: present(&[
+            ("url", args.get("url").cloned()),
+            (
+                "format",
+                Some(
+                    args.get("format")
+                        .cloned()
+                        .unwrap_or_else(|| json!("markdown")),
+                ),
+            ),
+            ("timeout", args.get("timeout").cloned()),
+        ]),
     }]
 }
 
 /// read/edit/write: check the path against the worktree, then ask the tool's
 /// permission with the worktree-relative path (upstream paths are relative).
+///
+/// Metadata is tool-specific and client-visible, so it is part of the wire
+/// contract, not an implementation detail (measured divergence 2026-10-24):
+///   - `read`   → `{}` (read.ts:257)
+///   - `edit`   → `{filepath, diff}` (edit.ts:106)
+///   - `write`  → `{filepath, diff}` (write.ts:57)
+///
+/// ocserve previously forwarded the raw model arguments, which meant clients
+/// saw `oldString`/`content` where the reference sends a rendered diff.
 fn fs_asks(permission: &str, args: &Value, cwd: &Path, key: &str) -> Vec<Ask> {
     let raw = args.get(key).and_then(|v| v.as_str()).unwrap_or("*");
     let mut asks = Vec::new();
@@ -138,13 +209,170 @@ fn fs_asks(permission: &str, args: &Value, cwd: &Path, key: &str) -> Vec<Ask> {
     }
     // relative to worktree when possible (upstream path.relative)
     let rel = relative_to(cwd, raw);
+    let metadata = match permission {
+        "read" => serde_json::json!({}),
+        "edit" => serde_json::json!({
+            "filepath": raw,
+            "diff": ask_diff(args, cwd),
+        }),
+        _ => serde_json::json!({}),
+    };
     asks.push(Ask {
         permission: permission.to_string(),
         patterns: vec![rel],
         always: vec!["*".to_string()],
-        metadata: args.clone(),
+        metadata,
     });
     asks
+}
+
+/// The `diff` the reference includes in edit/write ask metadata.
+///
+/// Upstream renders a full two-file patch with the `diff` npm package and then
+/// trims shared indentation (`edit.ts:646 trimDiff`, min-indent across content
+/// lines). We render the same header, hunk arithmetic and content with
+/// `similar`'s line diff and port trimDiff verbatim, so the text matches for
+/// every case the oracle covers; the one structural difference is that
+/// upstream's Myers output can choose a different equally-valid alignment than
+/// `similar`'s, which is recorded as D-PERM-ASK-DIFF and compared as a key set
+/// by the oracle rather than byte-equality.
+fn render_patch(path: &str, old: &str, new: &str) -> String {
+    use similar::{ChangeTag, TextDiff};
+    const CONTEXT: usize = 3;
+    let diff = TextDiff::from_lines(old, new);
+    let mut body = String::new();
+    for group in diff.grouped_ops(CONTEXT) {
+        let first = group.first().expect("group is non-empty");
+        let old_range = first.old_range();
+        let new_range = first.new_range();
+        // Unified-diff line numbering: a NON-EMPTY range starts at
+        // start+1, an EMPTY range names the line before it (so a pure
+        // insertion at the top is "@@ -0,0 +1,N @@" — the reference's
+        // exact output for the create-via-edit path).
+        let old_start = if old_range.is_empty() {
+            old_range.start
+        } else {
+            old_range.start + 1
+        };
+        let new_start = if new_range.is_empty() {
+            new_range.start
+        } else {
+            new_range.start + 1
+        };
+        body.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            old_start,
+            old_range.len(),
+            new_start,
+            new_range.len()
+        ));
+        for op in &group {
+            for change in diff.iter_changes(op) {
+                body.push(match change.tag() {
+                    ChangeTag::Delete => '-',
+                    ChangeTag::Insert => '+',
+                    ChangeTag::Equal => ' ',
+                });
+                body.push_str(change.value());
+                if change.missing_newline() {
+                    body.push('\n');
+                    body.push_str("\\ No newline at end of file\n");
+                }
+            }
+        }
+    }
+    let untrimmed = format!(
+        "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n{body}"
+    );
+    trim_diff(&untrimmed)
+}
+
+/// Upstream `trimDiff` (edit.ts:646): strip the smallest shared indentation
+/// from every content line so a nested edit does not render as a wall of
+/// leading spaces. Header and hunk lines are left untouched.
+fn trim_diff(diff: &str) -> String {
+    let mut min: Option<usize> = None;
+    for line in diff.split('\n') {
+        let is_content = (line.starts_with('+') || line.starts_with('-') || line.starts_with(' '))
+            && !line.starts_with("---")
+            && !line.starts_with("+++");
+        if !is_content {
+            continue;
+        }
+        let content = &line[1..];
+        if content.trim().is_empty() {
+            continue;
+        }
+        let indent = content.len() - content.trim_start().len();
+        min = Some(min.map_or(indent, |m: usize| m.min(indent)));
+    }
+    let Some(min) = min else {
+        return diff.to_string();
+    };
+    if min == 0 {
+        return diff.to_string();
+    }
+    let mut out = String::with_capacity(diff.len());
+    for (i, line) in diff.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let is_content = (line.starts_with('+') || line.starts_with('-') || line.starts_with(' '))
+            && !line.starts_with("---")
+            && !line.starts_with("+++");
+        if is_content && line.len() > 1 + min {
+            out.push_str(&line[..1]);
+            out.push_str(&line[1 + min..]);
+        } else if is_content {
+            out.push_str(&line[..1]);
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// `write` passes `content` and no `oldString`; `edit` passes `oldString`.
+fn permission_is_write(args: &Value) -> bool {
+    args.get("oldString").is_none() && args.get("content").is_some()
+}
+
+/// The diff an edit/write ask carries: current file content vs the intended
+/// result, exactly what the reference computes before it asks.
+fn ask_diff(args: &Value, cwd: &Path) -> String {
+    let fp = args.get("filePath").and_then(|v| v.as_str()).unwrap_or("");
+    let full = resolve(cwd, fp);
+    let path = full.to_string_lossy().to_string();
+    let current = std::fs::read_to_string(&full).unwrap_or_default();
+    let updated = if permission_is_write(args) {
+        args.get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    } else {
+        let old = args
+            .get("oldString")
+            .or_else(|| args.get("oldText"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let new = args
+            .get("newString")
+            .or_else(|| args.get("newText"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if old.is_empty() {
+            new.to_string()
+        } else if args
+            .get("replaceAll")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            current.replace(old, new)
+        } else {
+            current.replacen(old, new, 1)
+        }
+    };
+    render_patch(&path, &current, &updated)
 }
 
 /// `external_directory` ask when `target` resolves outside the worktree.
@@ -318,6 +546,92 @@ mod tests {
         let asks = asks_for("bash", &json!({"command": "cat /etc/hosts"}), &cwd());
         assert_eq!(asks[0].permission, "external_directory");
         assert_eq!(asks[0].patterns, vec!["/etc/*"]);
+    }
+
+    #[test]
+    fn read_ask_metadata_is_empty_object() {
+        // Upstream read.ts:257 sends `metadata: {}`; forwarding the raw
+        // arguments (the pre-2026-10-24 behaviour) leaked `filePath` to the
+        // client and diverged from the reference.
+        let asks = asks_for("read", &json!({"filePath": "src/x.rs"}), &cwd());
+        assert_eq!(asks[0].metadata, json!({}));
+    }
+
+    #[test]
+    fn todowrite_ask_metadata_is_empty_object() {
+        let asks = asks_for("todowrite", &json!({"todos": []}), &cwd());
+        assert_eq!(asks[0].permission, "todowrite");
+        assert_eq!(asks[0].patterns, vec!["*"]);
+        assert_eq!(asks[0].metadata, json!({}));
+    }
+
+    #[test]
+    fn webfetch_pattern_is_the_url() {
+        // Upstream webfetch.ts:42 asks with the URL as the pattern, not `*`.
+        let asks = asks_for(
+            "webfetch",
+            &json!({"url": "https://example.com", "format": "markdown"}),
+            &cwd(),
+        );
+        assert_eq!(asks[0].patterns, vec!["https://example.com"]);
+        let meta = asks[0].metadata.as_object().unwrap();
+        assert!(meta.contains_key("url"));
+        assert!(meta.contains_key("format"));
+        // `format` is defaulted upstream, `timeout` is genuinely optional and
+        // must be OMITTED (JSON.stringify drops undefined) rather than nulled.
+        assert_eq!(
+            meta.get("format").and_then(|v| v.as_str()),
+            Some("markdown")
+        );
+        assert!(
+            !meta.contains_key("timeout"),
+            "absent optional key must be omitted, got {meta:?}"
+        );
+    }
+
+    #[test]
+    fn glob_metadata_omits_absent_path() {
+        // Measured reference: `{pattern}` only. Sending `path: null` diverged.
+        let asks = asks_for("glob", &json!({"pattern": "**/*.rs"}), &cwd());
+        let meta = asks[0].metadata.as_object().unwrap();
+        assert_eq!(meta.len(), 1, "only pattern, got {meta:?}");
+        assert!(meta.contains_key("pattern"));
+    }
+
+    #[test]
+    fn write_ask_carries_filepath_and_diff() {
+        let asks = asks_for(
+            "write",
+            &json!({"filePath": "src/new.rs", "content": "hello\n"}),
+            &cwd(),
+        );
+        let meta = asks[0].metadata.as_object().unwrap();
+        assert!(meta.contains_key("filepath"));
+        assert!(meta.contains_key("diff"));
+    }
+
+    #[test]
+    fn create_via_empty_oldstring_renders_add_hunk() {
+        // The reference's create path (edit.ts:88) produces a
+        // "@@ -0,0 +1,N @@" add-only hunk. This pins the hunk arithmetic.
+        let asks = asks_for(
+            "edit",
+            &json!({"filePath": "src/new.rs", "oldString": "", "newString": "hello\nworld\n"}),
+            &cwd(),
+        );
+        let diff = asks[0].metadata["diff"].as_str().unwrap();
+        assert!(diff.contains("@@ -0,0 +1,2 @@"), "diff was: {diff}");
+        assert!(diff.contains("+hello"));
+    }
+
+    #[test]
+    fn trim_diff_strips_shared_indent() {
+        let untrimmed = "@@ -1,1 +1,1 @@\n     alpha\n-    beta\n+    BETA\n";
+        let trimmed = trim_diff(untrimmed);
+        assert!(
+            trimmed.contains("\n alpha\n-beta\n+BETA\n"),
+            "got: {trimmed}"
+        );
     }
 
     #[test]

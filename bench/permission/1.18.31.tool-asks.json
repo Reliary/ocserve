@@ -1,0 +1,241 @@
+{
+  "note": "recorded from the reference binary; never hand-edit",
+  "source": "1.18.31 vendor, 13 cases",
+  "cases": {
+    "bash_inside": {
+      "asks": [
+        {
+          "permission": "bash",
+          "patterns": [
+            "echo inside-tree"
+          ],
+          "always": [
+            "echo *"
+          ],
+          "metadata_keys": [
+            "command"
+          ],
+          "diff": null,
+          "has_tool": true
+        }
+      ]
+    },
+    "bash_chain": {
+      "asks": [
+        {
+          "permission": "bash",
+          "patterns": [
+            "git status",
+            "echo done"
+          ],
+          "always": [
+            "git status *",
+            "echo *"
+          ],
+          "metadata_keys": [
+            "command"
+          ],
+          "diff": null,
+          "has_tool": true
+        }
+      ]
+    },
+    "bash_pipe": {
+      "asks": [
+        {
+          "permission": "bash",
+          "patterns": [
+            "ls",
+            "grep src"
+          ],
+          "always": [
+            "ls *",
+            "grep *"
+          ],
+          "metadata_keys": [
+            "command"
+          ],
+          "diff": null,
+          "has_tool": true
+        }
+      ]
+    },
+    "bash_external_dir": {
+      "asks": [
+        {
+          "permission": "bash",
+          "patterns": [
+            "ls /etc"
+          ],
+          "always": [
+            "ls *"
+          ],
+          "metadata_keys": [
+            "command"
+          ],
+          "diff": null,
+          "has_tool": true
+        }
+      ]
+    },
+    "read_inside": {
+      "asks": [
+        {
+          "permission": "read",
+          "patterns": [
+            "Cargo.toml"
+          ],
+          "always": [
+            "*"
+          ],
+          "metadata_keys": [],
+          "diff": null,
+          "has_tool": true
+        }
+      ]
+    },
+    "read_external": {
+      "asks": [
+        {
+          "permission": "read",
+          "patterns": [
+            "etc/hostname"
+          ],
+          "always": [
+            "*"
+          ],
+          "metadata_keys": [],
+          "diff": null,
+          "has_tool": true
+        }
+      ]
+    },
+    "write_inside": {
+      "asks": [
+        {
+          "permission": "edit",
+          "patterns": [
+            "perm-oracle-write.txt"
+          ],
+          "always": [
+            "*"
+          ],
+          "metadata_keys": [
+            "diff",
+            "filepath"
+          ],
+          "diff": "Index: /perm-oracle-write.txt\n===================================================================\n--- /perm-oracle-write.txt\n+++ /perm-oracle-write.txt\n@@ -0,0 +1,2 @@\n+hello\n+world\n",
+          "has_tool": true
+        }
+      ]
+    },
+    "edit_inside": {
+      "asks": [
+        {
+          "permission": "edit",
+          "patterns": [
+            "perm-oracle-edit.txt"
+          ],
+          "always": [
+            "*"
+          ],
+          "metadata_keys": [
+            "diff",
+            "filepath"
+          ],
+          "diff": "Index: /perm-oracle-edit.txt\n===================================================================\n--- /perm-oracle-edit.txt\n+++ /perm-oracle-edit.txt\n@@ -0,0 +1,1 @@\n+created-by-edit\n",
+          "has_tool": true
+        }
+      ]
+    },
+    "glob_tree": {
+      "asks": [
+        {
+          "permission": "glob",
+          "patterns": [
+            "**/*.toml"
+          ],
+          "always": [
+            "*"
+          ],
+          "metadata_keys": [
+            "path",
+            "pattern"
+          ],
+          "diff": null,
+          "has_tool": true
+        }
+      ]
+    },
+    "grep_tree": {
+      "asks": [
+        {
+          "permission": "grep",
+          "patterns": [
+            "workspace"
+          ],
+          "always": [
+            "*"
+          ],
+          "metadata_keys": [
+            "path",
+            "pattern"
+          ],
+          "diff": null,
+          "has_tool": true
+        }
+      ]
+    },
+    "todowrite": {
+      "asks": [
+        {
+          "permission": "todowrite",
+          "patterns": [
+            "*"
+          ],
+          "always": [
+            "*"
+          ],
+          "metadata_keys": [],
+          "diff": null,
+          "has_tool": true
+        }
+      ]
+    },
+    "webfetch": {
+      "asks": [
+        {
+          "permission": "webfetch",
+          "patterns": [
+            "https://example.com"
+          ],
+          "always": [
+            "*"
+          ],
+          "metadata_keys": [
+            "format",
+            "url"
+          ],
+          "diff": null,
+          "has_tool": true
+        }
+      ]
+    },
+    "skill": {
+      "asks": [
+        {
+          "permission": "skill",
+          "patterns": [
+            "customize-opencode"
+          ],
+          "always": [
+            "customize-opencode"
+          ],
+          "metadata_keys": [],
+          "diff": null,
+          "has_tool": true
+        }
+      ]
+    }
+  }
+}

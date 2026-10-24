@@ -13,7 +13,8 @@
 //! - returned bytes MUST be non-empty (compress_unified can return "" on
 //!   degenerate input — observed) and STRICTLY smaller than raw;
 //! - marker line only when it still fits under raw (never inflate);
-//! - subprocess timeout (2s) / spawn failure / missing binary => raw.
+//! - subprocess timeout (2s, `OCSERVE_SIFT_TIMEOUT_MS`) / spawn failure /
+//!   missing binary => raw.
 //!
 //! Bounded memo cache (64 entries) so repeated history rebuilds do not
 //! spawn per turn.
@@ -24,6 +25,20 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 const MIN_BYTES: usize = 4096;
 const TIMEOUT_MS: u64 = 2_000;
+
+/// Wall-clock budget for the compressor subprocess. Production keeps 2 s; the
+/// unit tests raise it because a full `cargo test --workspace` run saturates
+/// the machine and a shell spawn can exceed 2 s, which made
+/// `fake_compressor_shrinks_with_marker_never_inflating` fail as a fallback to
+/// raw (measured 2026-10-24: 20780 == 20780). A flaky test is a defect
+/// (TESTING.md), and the honest fix is a tunable budget rather than a retry.
+fn timeout_ms() -> u64 {
+    std::env::var("OCSERVE_SIFT_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v >= 50)
+        .unwrap_or(TIMEOUT_MS)
+}
 const CACHE_CAP: usize = 64;
 const WHITELIST: &[&str] = &["bash"];
 
@@ -114,7 +129,7 @@ fn run_sift(cmd: &[String], raw: &str) -> Option<String> {
         let gate = gate.clone();
         std::thread::spawn(move || ocserve_tools::drain_until(Some(stdout), usize::MAX, &gate))
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(TIMEOUT_MS);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms());
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -257,6 +272,8 @@ mod tests {
 
     fn set_sift(v: &str) {
         unsafe { std::env::set_var("OCSERVE_SIFT", v) }
+        // Headroom for a saturated machine (see timeout_ms docs).
+        unsafe { std::env::set_var("OCSERVE_SIFT_TIMEOUT_MS", "60000") }
     }
 
     /// shared lock (crate-level) — env is process-global across lib tests
@@ -276,6 +293,7 @@ mod tests {
         // threshold: tiny output never spawns
         assert_eq!(maybe_sift("bash", "short").as_ref(), "short");
         unsafe { std::env::remove_var("OCSERVE_SIFT") };
+        unsafe { std::env::remove_var("OCSERVE_SIFT_TIMEOUT_MS") };
     }
 
     #[test]
@@ -303,6 +321,7 @@ mod tests {
         let out2 = maybe_sift("bash", &raw);
         assert_eq!(out.as_ref(), out2.as_ref(), "cache must be byte-identical");
         unsafe { std::env::remove_var("OCSERVE_SIFT") };
+        unsafe { std::env::remove_var("OCSERVE_SIFT_TIMEOUT_MS") };
     }
 
     #[test]
@@ -319,6 +338,7 @@ mod tests {
             "empty compressed output must fall back to raw"
         );
         unsafe { std::env::remove_var("OCSERVE_SIFT") };
+        unsafe { std::env::remove_var("OCSERVE_SIFT_TIMEOUT_MS") };
     }
 
     #[test]
@@ -329,6 +349,7 @@ mod tests {
         let out = maybe_sift("bash", &raw);
         assert_eq!(out.as_ref(), raw, "missing binary must fall back");
         unsafe { std::env::remove_var("OCSERVE_SIFT") };
+        unsafe { std::env::remove_var("OCSERVE_SIFT_TIMEOUT_MS") };
     }
 
     #[test]
@@ -344,5 +365,6 @@ mod tests {
         let out = maybe_sift("bash", &raw);
         assert_eq!(out.as_ref(), raw, "inflated output must fall back to raw");
         unsafe { std::env::remove_var("OCSERVE_SIFT") };
+        unsafe { std::env::remove_var("OCSERVE_SIFT_TIMEOUT_MS") };
     }
 }
