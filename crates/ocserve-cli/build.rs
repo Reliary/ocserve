@@ -6,6 +6,14 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=../../.git/HEAD");
+    // CI and release builds pass the exact revision, so a packaged artifact
+    // never depends on the state of the build machine's worktree.
+    if let Ok(v) = std::env::var("OCSERVE_BUILD_COMMIT")
+        && !v.trim().is_empty()
+    {
+        println!("cargo:rustc-env=OCSERVE_BUILD_COMMIT={}", v.trim());
+        return;
+    }
     let commit = Command::new("git")
         .args(["rev-parse", "--short=7", "HEAD"])
         .output()
