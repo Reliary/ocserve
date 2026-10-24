@@ -215,6 +215,15 @@ else
   systemctl --user enable --now ocserve.service
 fi
 
+# The tailnet forwarder is a separate optional unit. Restarting ocserve used
+# to stop it via PartOf/Requires and nothing started it again, so every deploy
+# silently cut tailnet access (2026-10-24 review, critical). The unit no longer
+# propagates stop; this also restores it for an install that already has it.
+if [ -f "$UNIT_DIR/ocserve-tailscale-forward.service" ]; then
+  systemctl --user enable --now ocserve-tailscale-forward.service \
+    && say "tailnet forwarder: enabled and running"
+fi
+
 # --- health probe -----------------------------------------------------------
 PORT=4912
 PORT=$(grep -oE '\-\-port [0-9]+' "$LIVE" | head -1 | awk '{print $2}')

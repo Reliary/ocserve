@@ -1905,7 +1905,11 @@ pub async fn run_prompt_with(
         // is byte-identical (A4: no token/cache regression).
         let plugin_tool_names = if opts.tools_enabled && plugin_tools_enabled() {
             let specs = plugin_tool_schemas(ctx).await;
-            let reserved: std::collections::HashSet<String> = ocserve_tools::schemas()
+            // EVERY name already on the wire, not just builtins: an MCP tool
+            // and a plugin tool with the same name would be a duplicate
+            // (provider 400) and the plugin branch is checked before the MCP
+            // branch, so the plugin would win dispatch (2026-10-24 review).
+            let reserved: std::collections::HashSet<String> = tools
                 .iter()
                 .filter_map(|s| {
                     s.pointer("/function/name")
@@ -1918,7 +1922,7 @@ pub async fn run_prompt_with(
                 // A duplicate name is a provider 400 for EVERY request in the
                 // session (review M-8), and a shadowed builtin would be a
                 // policy hole. Refuse loudly instead of shipping it.
-                if reserved.contains(&name) || !names.insert(name.clone()) {
+                if reserved.contains(&name) || names.contains(&name) {
                     ocserve_metrics::labeled_counter(
                         "ocserve_plugin_tool_skipped_total",
                         "reason=\"name_collision\"",
@@ -1929,14 +1933,23 @@ pub async fn run_prompt_with(
                     );
                     continue;
                 }
+                // INSERT ONLY WHEN ADVERTISED. This set is also the execution
+                // allow-list (`plugin_tool_names.contains`), so inserting
+                // before the policy check left a plan-mode-denied tool
+                // unadvertised but still callable by name, gated as a wildcard
+                // write instead of `edit` (2026-10-24 security review H1).
                 if !plugin_tool_allowed(ctx, &name) {
                     ocserve_metrics::labeled_counter(
                         "ocserve_plugin_tool_skipped_total",
                         "reason=\"policy\"",
                         1,
                     );
+                    tracing::warn!(
+                        "plugin tool '{name}' denied by policy — not advertised or executable"
+                    );
                     continue;
                 }
+                names.insert(name);
                 tools.push(spec);
             }
             names

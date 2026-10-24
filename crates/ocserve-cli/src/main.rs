@@ -1312,7 +1312,15 @@ async fn doctor(data_dir: std::path::PathBuf, plugins: bool, budget: bool) -> Re
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
-        println!("  tailnet fwd:    {state} ({enabled}; 100.x:4912 -> 127.0.0.1:4912)");
+        // A dead-but-enabled forwarder is the 2026-10-24 incident (every
+        // install restarted ocserve, PartOf stopped socat, nothing started it
+        // again). Make it a visible defect, not a neutral status line.
+        let warn = if state != "active" {
+            "  <-- TAILNET IS DOWN"
+        } else {
+            ""
+        };
+        println!("  tailnet fwd:    {state} ({enabled}; 100.x:4912 -> 127.0.0.1:4912){warn}");
     }
     let db = ocserve_store::writer::db_path(&data_dir);
     if db.exists() {

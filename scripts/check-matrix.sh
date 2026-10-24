@@ -44,7 +44,12 @@ if cargo test --workspace --no-run -q >/dev/null 2>&1; then
     fi
   done < <(grep -oE '`(golden|pragma|blob|writer|schema|fts_m0|crash_fuzz|cache_fixture)::[a-z_0-9]+(::[a-z_0-9]+)?`' TRACEABILITY.md | tr -d '`')
 else
-  echo "WARN: workspace did not build; skipping test-existence check"
+  # A workspace that will not build means the whole traceability check proved
+  # nothing; the old WARN exited 0 (2026-10-24 SRE review, proven by planting a
+  # syntax error). CI runs this after `cargo test`, so a build failure here is
+  # always a real failure, never an environment quirk.
+  echo "FAIL: workspace did not build; traceability test-existence check could not run" >&2
+  fail=1
 fi
 
 if [ "$fail" -eq 0 ]; then

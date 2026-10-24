@@ -6,16 +6,20 @@
 #   && systemctl --user daemon-reload && systemctl --user enable --now ocserve-tailscale-forward
 [Unit]
 Description=ocserve Tailscale forwarder
+# Wants+After, NOT Requires/PartOf: both propagate STOP, so restarting
+# ocserve.service (which install.sh does on every install) left this unit
+# dead while its socat listener was gone and tailnet clients got ECONNREFUSED
+# (2026-10-24 review, critical). The forwarder tolerates ocserve being down:
+# socat still listens, connections fail until the backend returns.
 After=network.target ocserve.service
-Requires=ocserve.service
-PartOf=ocserve.service
+Wants=ocserve.service
 
 [Service]
 Type=simple
 # wait for ocserve to accept connections (upstream pattern: 30 x 1s)
 ExecStartPre=/usr/bin/bash -c 'for _ in {1..30}; do timeout 1 bash -c "</dev/tcp/127.0.0.1/4912" && exit 0; sleep 1; done; exit 1'
 ExecStart=/usr/bin/socat TCP-LISTEN:4912,bind=100.68.229.86,fork,reuseaddr TCP:127.0.0.1:4912
-Restart=on-failure
+Restart=always
 RestartSec=5
 SuccessExitStatus=143
 

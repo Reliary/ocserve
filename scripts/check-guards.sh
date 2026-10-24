@@ -109,9 +109,13 @@
 #      [plant: leaf writes removed / cap re-inserted]
 #  53c. the shutdown handler exists for BOTH cfg(unix) and cfg(not(unix))
 #      (the 0.6.4 Windows release failed on a missing stub) [plant: stub removed]
-#  54. plugin tools cannot shadow a builtin (upstream `tools[id] =` replaces it
-#      silently; our gate keys on the name -> confused deputy)
-#      [plant: reserved-name check removed]
+#  54. plugin tools cannot shadow a builtin or an MCP tool, and a policy-denied
+#      tool is not executable (the advertised set is the execution allow-list;
+#      inserting before the policy check left plan-mode denies callable)
+#      [plant: reserved narrowed to builtins / insert moved before policy]
+#  55. the tailnet forwarder survives an ocserve restart (PartOf propagated
+#      STOP but not start, and install restarts ocserve on every deploy)
+#      [plant: PartOf edge re-added + install start removed]
 #  50. plugin demand ledger is current and classified (every hook the
 #      ecosystem declares is bound or a NAMED divergence)
 #      [suite: generator + independent re-derivation]
@@ -1333,35 +1337,103 @@ else
 fi
 rm -f "$_plant"
 
-echo "== guard: plugin tools cannot shadow a builtin (rule 54) =="
-# Upstream assigns tools[id] over a [builtin, custom] list, so a plugin tool
-# named `bash` replaces the builtin; our permission gate keys on the NAME, so
-# the shadow would inherit bash's authority (confused deputy). Predicate: the
-# tool merge filters against the builtin set before advertising.
+echo "== guard: tailnet forwarder survives an ocserve restart (rule 55) =="
+# 2026-10-24: PartOf=ocserve.service propagated STOP but not start, and
+# install.sh restarts ocserve on every deploy, so tailnet access died silently
+# (enabled, inactive, ECONNREFUSED). Predicate: no PartOf/Requires edge from
+# ocserve in the unit, Restart=always, and install.sh starts it when present.
+_fwd_pred() {
+  [ -f "$1" ] || return 1
+  ! grep -qE '^(PartOf|Requires|BindsTo)=.*ocserve\.service' "$1" \
+    && grep -q '^Restart=always$' "$1" \
+    && grep -q 'ocserve-tailscale-forward.service' "$2" \
+    && grep -q 'enable --now ocserve-tailscale-forward.service' "$2"
+}
+if _fwd_pred deploy/ocserve-tailscale-forward.service scripts/install.sh; then
+  echo "ok (forwarder is independent and install restores it)"
+else
+  echo "FAIL: tailnet forwarder can die on an ocserve restart (rule 55)"; fail=1
+fi
+_fwd_plant="$(mktemp)"; _fwd_inst="$(mktemp)"
+cp deploy/ocserve-tailscale-forward.service "$_fwd_plant"
+cp scripts/install.sh "$_fwd_inst"
+python3 - "$_fwd_plant" "$_fwd_inst" <<'PY2'
+import sys
+u = open(sys.argv[1]).read().replace("Wants=ocserve.service", "PartOf=ocserve.service")
+open(sys.argv[1], "w").write(u)
+i = open(sys.argv[2]).read().replace("enable --now ocserve-tailscale-forward.service", "")
+open(sys.argv[2], "w").write(i)
+PY2
+if _fwd_pred "$_fwd_plant" "$_fwd_inst"; then
+  echo "FAIL: rule 55 planted PartOf edge not detected"; fail=1
+else
+  echo "ok (planted PartOf edge + missing install start detected)"
+fi
+rm -f "$_fwd_plant" "$_fwd_inst"
+
+echo "== guard: plugin tools cannot shadow a builtin or bypass policy (rule 54) =="
+# Two properties, both behavioral in the test suite and pinned statically here:
+#   (1) `reserved` is built from the FULL advertised list (builtin + MCP), so a
+#       plugin tool cannot duplicate/shadow an MCP name either;
+#   (2) the policy check runs BEFORE the name enters the execution allow-list,
+#       so a suppressed tool is not callable (2026-10-24 review H1).
+# The previous version only grepped three strings and passed an emptied
+# `reserved` or a short-circuited check (proven). This one requires the
+# ordered shape and a planted control for EACH property.
 _shadow_pred() {
-  grep -q 'let reserved: std::collections::HashSet<String>' "$1" \
-    && grep -q 'reserved.contains(&name)' "$1" \
-    && grep -q 'name_collision' "$1"
+  python3 - "$1" <<'PY2'
+import re, sys
+s = open(sys.argv[1]).read()
+# (1) reserved comes from `tools`, not from ocserve_tools::schemas()
+if not re.search(r"let reserved: std::collections::HashSet<String> = tools\b", s):
+    sys.exit(1)
+# (2) policy check appears before `names.insert(name)` and only on the push path
+i_policy = s.find("if !plugin_tool_allowed(ctx, &name)")
+i_insert = s.find("names.insert(name);")
+i_push = s.find("tools.push(spec);")
+if not (0 <= i_policy < i_insert <= i_push):
+    sys.exit(1)
+# (3) the insert must not be unconditional before the policy check
+if "names.insert(name.clone())" in s:
+    sys.exit(1)
+sys.exit(0)
+PY2
 }
 if _shadow_pred crates/ocserve-core/src/prompt.rs; then
-  echo "ok (plugin tools filter builtin names before advertising)"
+  echo "ok (reserved = full wire; policy precedes the execution allow-list)"
 else
-  echo "FAIL: plugin tool merge does not refuse builtin names (rule 54)"; fail=1
+  echo "FAIL: plugin tool merge can shadow or bypass policy (rule 54)"; fail=1
 fi
 _shadow_plant="$(mktemp)"
 python3 - crates/ocserve-core/src/prompt.rs "$_shadow_plant" <<'PY2'
 import sys
 s = open(sys.argv[1]).read()
-s = s.replace("if reserved.contains(&name) || !names.insert(name.clone()) {",
-              "if !names.insert(name.clone()) {", 1)
+# revert to the pre-fix shape: insert before the policy check
+s = s.replace("if !plugin_tool_allowed(ctx, &name) {",
+              "names.insert(name.clone());\n                if !plugin_tool_allowed(ctx, &name) {", 1)
+s = s.replace("names.insert(name);\n                tools.push(spec);", "tools.push(spec);", 1)
 open(sys.argv[2], "w").write(s)
 PY2
 if _shadow_pred "$_shadow_plant"; then
-  echo "FAIL: rule 54 planted control not detected"; fail=1
+  echo "FAIL: rule 54 planted bypass not detected"; fail=1
 else
-  echo "ok (planted removal of the reserved-name check detected)"
+  echo "ok (planted pre-policy insert detected)"
 fi
-rm -f "$_shadow_plant"
+_shadow_plant2="$(mktemp)"
+python3 - crates/ocserve-core/src/prompt.rs "$_shadow_plant2" <<'PY2'
+import sys
+s = open(sys.argv[1]).read()
+# reserved narrowed back to builtins only
+s = s.replace("let reserved: std::collections::HashSet<String> = tools",
+              "let reserved: std::collections::HashSet<String> = ocserve_tools::schemas()", 1)
+open(sys.argv[2], "w").write(s)
+PY2
+if _shadow_pred "$_shadow_plant2"; then
+  echo "FAIL: rule 54 planted builtin-only reservation not detected"; fail=1
+else
+  echo "ok (planted builtin-only reservation detected)"
+fi
+rm -f "$_shadow_plant" "$_shadow_plant2"
 
 echo "== guard: shutdown handler exists on every platform (rule 53c) =="
 # 0.6.4 failed the Windows release because the non-unix `Shutdown` stub was
@@ -1369,9 +1441,22 @@ echo "== guard: shutdown handler exists on every platform (rule 53c) =="
 # passed. Both variants must exist, and the serve path must call exactly one
 # installer that each cfg provides.
 _sh_pred() {
-  grep -q '#\[cfg(unix)\]$' "$1" && grep -q '#\[cfg(not(unix))\]' "$1" \
-    && [ "$(grep -c 'fn install_shutdown() -> Shutdown' "$1")" -eq 2 ] \
-    && grep -q 'let startup = install_shutdown();' "$1"
+  [ "$(grep -c 'fn install_shutdown() -> Shutdown' "$1")" -eq 2 ] \
+    && grep -q 'let startup = install_shutdown();' "$1" \
+    && ! grep -q 'unimplemented!\|todo!' "$1" \
+    && python3 - "$1" <<'PY2'
+import re, sys
+s = open(sys.argv[1]).read()
+# Both cfgs must be followed by a real `impl Shutdown` with a `wait` that has a
+# body (a `panic!` stub is not a handler).
+for cfg in ("unix", "not(unix)"):
+    m = re.search(rf"#\[cfg\({re.escape(cfg)}\)\]\s*impl Shutdown \{{(.*?)\n\}}", s, re.S)
+    if not m or "async fn wait" not in m.group(1):
+        sys.exit(1)
+    if "panic!" in m.group(1):
+        sys.exit(1)
+sys.exit(0)
+PY2
 }
 if _sh_pred crates/ocserve-cli/src/main.rs; then
   echo "ok (unix + non-unix shutdown installers present)"

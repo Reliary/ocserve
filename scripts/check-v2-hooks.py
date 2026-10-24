@@ -56,11 +56,23 @@ def registrable(surface: dict, shim: str) -> list[str]:
     """Hooks upstream declares must be ACCEPTED by the shim's registrar, not
     merely documented. The `experimental.ws.*` trio was documented as a
     divergence but absent from V2_HOOK_NAMES, so registering it threw
-    `unknown session hook` and failed the whole plugin (2026-10-23)."""
+    `unknown session hook` and failed the whole plugin (2026-10-23).
+
+    Fail-closed: an empty surface, an empty/absent const, or a reformatted
+    literal is a failure, not a pass (2026-10-24 review proved the old version
+    accepted a commented-out hook and an empty `{}` surface)."""
+    if not surface:
+        return ["<extracted hook surface is empty>"]
     block = re.search(r"const V2_HOOK_NAMES = \{(.*?)\n\};", shim, re.S)
     if not block:
-        return ["<V2_HOOK_NAMES not found in v2.mjs>"]
-    text = block.group(1)
+        return ["<V2_HOOK_NAMES not found or not a literal object in v2.mjs>"]
+    # A commented-out entry must not count: strip line comments before parsing.
+    body = "\n".join(
+        line for line in block.group(1).splitlines() if not line.strip().startswith("//")
+    )
+    if not re.search(r"\b(session|tool|permission|shell):\s*\[", body):
+        return ["<V2_HOOK_NAMES has no domain arrays>"]
+    text = body
     missing = []
     for domain, hooks in surface.items():
         m = re.search(rf"\b{re.escape(domain)}:\s*\[(.*?)\]", text, re.S)
@@ -95,6 +107,9 @@ def main() -> int:
     # The in-crate copy exists because rule 30 forbids compiled-in assets
     # outside the crate root (the 0.3.0 packaging defect). A drift here would
     # make the acceptance test test the wrong surface.
+    if not surface or not any(surface.values()):
+        print("FAIL: bench/v2/hooks.json is empty; extraction produced nothing", file=sys.stderr)
+        return 1
     if not FIXTURE.exists() or json.loads(FIXTURE.read_text()) != surface:
         print(
             "FAIL: crates/ocserve-plugin/tests/fixtures/v2-hooks.json is stale; "

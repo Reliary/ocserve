@@ -4,6 +4,29 @@ All notable changes to ocserve. The wire contract targets the frozen
 openccode 1.18.31 release and the v2 surface the 2.0.28 client; anything that
 differs is a named `D-*` row in `PLAN.md §17`.
 
+## Unreleased (after 0.6.7)
+
+### Fixed
+- **Tailnet access died on every deploy.** The forwarder unit used
+  `PartOf=ocserve.service`, which propagates stop but not start, and
+  `install.sh` restarts ocserve on every install. It is now independent
+  (`Wants`+`After`, `Restart=always`), install restarts it when present, and
+  `doctor` prints `TAILNET IS DOWN` instead of a neutral line. Guard 55.
+- **A policy-denied plugin tool was still executable.** The advertised set is
+  also the execution allow-list, and the name was inserted before the policy
+  check, so a plan-mode-denied tool could be called by name and was gated as a
+  wildcard write rather than `edit`. Insert now happens only on the advertised
+  path.
+- **Plugin tools could duplicate an MCP tool name.** The reserved set now
+  covers every advertised name (builtin + MCP), not just builtins; a duplicate
+  is a provider 400 and the plugin branch wins dispatch over MCP.
+- `check-matrix.sh` failed open when the workspace did not build (it printed a
+  WARN and exited 0); it now fails, since CI runs it after a successful build.
+- `check-v2-hooks.py` no longer passes on an empty surface, an empty or
+  commented-out hook const, or a stale fixture on both sides.
+- Guard 54 is semantic (reserved source + policy-before-insert) with a planted
+  control for each half; guard 53c rejects a `panic!` stub.
+
 ## 0.6.7
 
 ### Fixed
