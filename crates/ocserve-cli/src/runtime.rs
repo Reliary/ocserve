@@ -960,6 +960,29 @@ fn build_agents(cfg: &Value) -> (Vec<Value>, Vec<Value>) {
 fn merge_agent(item: &mut Value, value: &Value) {
     let Some(v) = value.as_object() else { return };
     // permission handled after the object borrow ends (borrowck)
+    // PER-AGENT `tools` map: upstream normalizes it into permission rules
+    // (core/v1/config/agent.ts normalize: `tools:{bash:false}` → `bash:deny`,
+    // and write/edit/patch fold into `edit`). ocserve dropped the map entirely,
+    // so a config agent's `tools` had no effect (2026-10-24 review R8).
+    // Tools folded BEFORE the explicit permission map, which upstream applies
+    // last (Object.assign(permission, agent.permission)).
+    let tools_perm = v.get("tools").and_then(|t| t.as_object()).map(|tools| {
+        let mut out = serde_json::Map::new();
+        for (name, enabled) in tools {
+            let action = if enabled.as_bool().unwrap_or(false) {
+                "allow"
+            } else {
+                "deny"
+            };
+            let key = if name == "write" || name == "edit" || name == "patch" {
+                "edit"
+            } else {
+                name.as_str()
+            };
+            out.insert(key.to_string(), json!(action));
+        }
+        Value::Object(out)
+    });
     let extra_perm = v.get("permission").cloned();
     let obj = item.as_object_mut().expect("agent object");
     for (k, val) in v {
@@ -1001,7 +1024,19 @@ fn merge_agent(item: &mut Value, value: &Value) {
             .and_then(|p| p.as_array())
             .cloned()
             .unwrap_or_default();
+        // tools first, then explicit permission (upstream order: permission wins)
+        if let Some(tp) = &tools_perm {
+            rules.extend(perm_from_config(tp));
+        }
         rules.extend(perm_from_config(&perm));
+        obj.insert("permission".into(), Value::Array(rules));
+    } else if let Some(tp) = &tools_perm {
+        let mut rules = obj
+            .get("permission")
+            .and_then(|p| p.as_array())
+            .cloned()
+            .unwrap_or_default();
+        rules.extend(perm_from_config(tp));
         obj.insert("permission".into(), Value::Array(rules));
     }
 }
@@ -1270,6 +1305,49 @@ mod tests {
         assert!(
             a.get("tools").is_none(),
             "tools must not appear in the Agent response"
+        );
+    }
+
+    /// R8 (2026-10-24): per-agent `tools:{bash:false}` must become a deny rule,
+    /// exactly as upstream normalizes it (core/v1/config/agent.ts). The old
+    /// code dropped the map, so the setting silently did nothing.
+    #[test]
+    fn config_agent_tools_map_becomes_permission_rules() {
+        let cfg = serde_json::json!({
+            "agent": {
+                "readonly": {
+                    "mode": "primary",
+                    "tools": {"bash": false, "write": false, "read": true},
+                    "permission": {"bash": "allow"}
+                }
+            }
+        });
+        let (agents, _) = build_agents(&cfg);
+        let a = agents.iter().find(|a| a["name"] == "readonly").unwrap();
+        let rules = a["permission"].as_array().unwrap();
+        let bash: Vec<&Value> = rules
+            .iter()
+            .filter(|r| r["permission"] == "bash" && r["pattern"] == "*")
+            .collect();
+        assert!(
+            bash.iter().any(|r| r["action"] == "deny"),
+            "tools.bash=false must contribute a deny rule: {rules:?}"
+        );
+        // Explicit `permission: {bash: "allow"}` is applied after tools, so it
+        // wins (upstream Object.assign order). The LAST matching rule decides.
+        let last_bash = bash
+            .iter()
+            .rev()
+            .find(|r| r["action"].is_string())
+            .map(|r| r["action"].as_str().unwrap().to_string())
+            .unwrap();
+        assert_eq!(last_bash, "allow", "explicit permission must win");
+        // write folds into edit.
+        assert!(
+            rules
+                .iter()
+                .any(|r| r["permission"] == "edit" && r["action"] == "deny"),
+            "tools.write=false must fold into edit:deny: {rules:?}"
         );
     }
 
@@ -1684,7 +1762,7 @@ mod config_hook_tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let raw = json!({
-            "plugin_origins": [{"spec": "x", "source": "/home/user/.config/opencode", "scope": "global"}],
+            "plugin_origins": [{"spec": "x", "source": "/var/tmp/opencode/.config/opencode", "scope": "global"}],
             "model": "p/m",
         });
         let rt = Runtime::from_config(&dir, raw).expect("derive");

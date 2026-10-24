@@ -446,6 +446,26 @@ async fn plugin_tool_schemas(ctx: &PromptContext) -> Vec<(String, Value)> {
     }
 }
 
+/// Keep only names that are actually on the wire.
+///
+/// `plugin_tool_names` is the execution allow-list, `tools` is what the model
+/// sees. They must be identical by construction: `retain` (deny rules) runs
+/// after the plugin merge, so a name accepted by `plugin_tool_allowed` can
+/// still be dropped from the wire. Pure so it is unit-tested without a prompt.
+fn advertised_allow_list(
+    names: std::collections::HashSet<String>,
+    tools: &[Value],
+) -> std::collections::HashSet<String> {
+    names
+        .into_iter()
+        .filter(|name| {
+            tools
+                .iter()
+                .any(|spec| spec.pointer("/function/name").and_then(|n| n.as_str()) == Some(name))
+        })
+        .collect()
+}
+
 /// Execute a plugin-declared tool through the sidecar. Bounded (300 s), and a
 /// failure becomes an error tool result, never a dead turn.
 async fn plugin_tool_exec(
@@ -1880,6 +1900,12 @@ pub async fn run_prompt_with(
             let history = transform_messages(ctx, session_id, &history).await;
             messages.extend(to_provider_messages(&history));
         }
+        // NOTE: `tools_enabled=false` removes the tool SCHEMAS from the
+        // request; it is not an execution boundary. A provider that emits an
+        // unsolicited tool call still reaches the builtin/MCP dispatch below
+        // (pre-existing, documented D-TOOLS-DISABLED-EXECUTION). Plugin tools
+        // are the exception: their allow-list is empty when schemas are off,
+        // so a plugin tool cannot execute in a tools-disabled run.
         let mut tools = if opts.tools_enabled {
             ocserve_tools::schemas()
         } else {
@@ -1969,6 +1995,13 @@ pub async fn run_prompt_with(
                 .map(|n| ocserve_tools::evaluate(n, "*", &ctx.rules) != "deny")
                 .unwrap_or(true)
         });
+        // The advertised set IS the execution allow-list. `retain` can drop a
+        // tool that `plugin_tool_allowed` accepted (its ask checks bash+edit,
+        // not the tool-name rule), so intersect after the retain: an
+        // unadvertised plugin tool must not be executable (2026-10-24 review
+        // H1). Today the tool-name ask also denies it, but that is a second
+        // mechanism; this keeps the two sets identical by construction.
+        let plugin_tool_names = advertised_allow_list(plugin_tool_names, &tools);
 
         let client = Client::new(ctx.endpoint.base_url.clone(), ctx.endpoint.api_key.clone());
         // leading system messages in `messages` (starts with the single
@@ -3951,5 +3984,35 @@ mod history_budget_tests {
                 assert_eq!(running["state"]["metadata"]["output"], "o");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod advertised_allow_list_tests {
+    use super::advertised_allow_list;
+    use serde_json::json;
+    use std::collections::HashSet;
+
+    /// An unadvertised plugin tool must not remain executable. This is the
+    /// H1 remainder: `retain` can drop a name after the policy check.
+    #[test]
+    fn drops_names_not_on_the_wire() {
+        let names: HashSet<String> = ["advertised", "dropped"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let tools = vec![json!({"function": {"name": "advertised"}})];
+        let out = advertised_allow_list(names, &tools);
+        assert!(out.contains("advertised"));
+        assert!(
+            !out.contains("dropped"),
+            "unadvertised tool stayed executable"
+        );
+    }
+
+    #[test]
+    fn empty_wire_allows_nothing() {
+        let names: HashSet<String> = ["x"].iter().map(|s| s.to_string()).collect();
+        assert!(advertised_allow_list(names, &[]).is_empty());
     }
 }

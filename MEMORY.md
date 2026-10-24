@@ -43,7 +43,7 @@ job (see `SRE.md §5.5`).
 
 | Node | memory.low | memory.high | memory.max | cpu.weight |
 |---|---|---|---|---|
-| `main` (server) | 256M | 512M | 768M | 500 |
+| `main` (server) | 256M | `max` (disabled) | 768M | 500 |
 | `kids/` aggregate | - | 640M | 700M | 100 |
 | `kids/plugin` | - | 288M | 320M | 100 |
 | `kids/mcp` | - | 160M | 192M | 100 |
@@ -52,7 +52,9 @@ job (see `SRE.md §5.5`).
 
 Leaf caps are ceilings, not reservations: the sum exceeds the parent on
 purpose (the kernel allows over-committed limits). `high < max` throttles and
-reclaims before the kernel kills. The server outweighs the child classes 5:1
+reclaims before the kernel kills. `main` has no `memory.high` on purpose: a
+single non-reclaimable process is livelocked by direct reclaim rather than
+helped (2026-10-24 hang), so the parent high and `max` are its only bounds. The server outweighs the child classes 5:1
 so a build yields when the API needs CPU, while still using every idle core.
 The service does **not** choose the user's build job count or CPU quota; that
 belongs to the user's own scope (`SRE.md §5.6`).

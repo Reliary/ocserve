@@ -16,6 +16,12 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[command(
     name = "ocserve",
     version,
+    long_version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("OCSERVE_BUILD_COMMIT"),
+        ")"
+    ),
     about = "Rust drop-in server for opencode v1"
 )]
 struct Cli {

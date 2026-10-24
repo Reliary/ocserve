@@ -47,9 +47,14 @@ else
   # A workspace that will not build means the whole traceability check proved
   # nothing; the old WARN exited 0 (2026-10-24 SRE review, proven by planting a
   # syntax error). CI runs this after `cargo test`, so a build failure here is
-  # always a real failure, never an environment quirk.
-  echo "FAIL: workspace did not build; traceability test-existence check could not run" >&2
-  fail=1
+  # always a real failure. The opt-out exists for docs-only local work and
+  # prints a loud banner; gates never pass it.
+  if [ "${OCSERVE_MATRIX_ALLOW_NO_BUILD:-0}" = "1" ]; then
+    echo "WARN (allowed by OCSERVE_MATRIX_ALLOW_NO_BUILD=1): workspace did not build; test-existence check skipped" >&2
+  else
+    echo "FAIL: workspace did not build; traceability test-existence check could not run" >&2
+    fail=1
+  fi
 fi
 
 if [ "$fail" -eq 0 ]; then

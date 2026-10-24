@@ -1321,7 +1321,8 @@ echo "== guard: child classes carry per-class caps and CPU priority (rule 53) ==
 # controller was never enabled (a build competed with the API as an equal).
 # Predicate: partition.rs writes memory.high, memory.max and cpu.weight for the
 # leaves. Planted control: a copy with the per-leaf writes removed must fail.
-_pred() { grep -q 'leaf.join("memory.high")' "$1" && grep -q 'leaf.join("memory.max")' "$1" && grep -q 'leaf.join("cpu.weight")' "$1"; }
+_pred() { grep -q 'leaf.join("memory.high")' "$1" && grep -q 'leaf.join("memory.max")' "$1" && grep -q 'leaf.join("cpu.weight")' "$1" \
+  && grep -q 'main/memory.high"), "max"' "$1"; }
 if _pred crates/ocserve-cli/src/partition.rs; then
   echo "ok (per-leaf high/max/weight present)"
 else
@@ -1336,6 +1337,18 @@ else
   echo "ok (planted removal detected)"
 fi
 rm -f "$_plant"
+# Second plant, targeted at the newest clause: if `main/memory.high` is not
+# explicitly reset to `max`, a hierarchy from an older binary keeps the 512M
+# throttle and re-creates the 2026-10-24 livelock on the next restart. That
+# clause must therefore be load-bearing on its own.
+_plant2="$(mktemp)"
+grep -v 'root.join("main/memory.high"), "max"' crates/ocserve-cli/src/partition.rs > "$_plant2"
+if _pred "$_plant2"; then
+  echo "FAIL: rule 53 does not catch a missing main/memory.high=max reset"; fail=1
+else
+  echo "ok (planted main.memory.high regression detected)"
+fi
+rm -f "$_plant2"
 
 echo "== guard: tailnet forwarder survives an ocserve restart (rule 55) =="
 # 2026-10-24: PartOf=ocserve.service propagated STOP but not start, and
@@ -1347,7 +1360,7 @@ _fwd_pred() {
   ! grep -qE '^(PartOf|Requires|BindsTo)=.*ocserve\.service' "$1" \
     && grep -q '^Restart=always$' "$1" \
     && grep -q 'ocserve-tailscale-forward.service' "$2" \
-    && grep -q 'enable --now ocserve-tailscale-forward.service' "$2"
+    && grep -q 'systemctl --user start ocserve-tailscale-forward.service' "$2"
 }
 if _fwd_pred deploy/ocserve-tailscale-forward.service scripts/install.sh; then
   echo "ok (forwarder is independent and install restores it)"
@@ -1361,7 +1374,7 @@ python3 - "$_fwd_plant" "$_fwd_inst" <<'PY2'
 import sys
 u = open(sys.argv[1]).read().replace("Wants=ocserve.service", "PartOf=ocserve.service")
 open(sys.argv[1], "w").write(u)
-i = open(sys.argv[2]).read().replace("enable --now ocserve-tailscale-forward.service", "")
+i = open(sys.argv[2]).read().replace("systemctl --user start ocserve-tailscale-forward.service", "")
 open(sys.argv[2], "w").write(i)
 PY2
 if _fwd_pred "$_fwd_plant" "$_fwd_inst"; then

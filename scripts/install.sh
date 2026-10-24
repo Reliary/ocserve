@@ -204,8 +204,10 @@ fi
 
 # --- install ----------------------------------------------------------------
 mkdir -p "$UNIT_DIR" "$(dirname "$HOME/.local/share/ocserve/install-receipt")"
-printf 'BIN=%s\nSHA256=%s\nINSTALLED=%s\n' \
-  "$SRC" "$(sha256sum "$SRC" | cut -d' ' -f1)" "$(date -Is)" \
+printf 'BIN=%s\nSHA256=%s\nCOMMIT=%s\nINSTALLED=%s\n' \
+  "$SRC" "$(sha256sum "$SRC" | cut -d' ' -f1)" \
+  "$("$SRC" --version 2>/dev/null | sed -n 's/.*(\(.*\)).*/\1/p')" \
+  "$(date -Is)" \
   > "$HOME/.local/share/ocserve/install-receipt"
 cp "$RENDERED" "$LIVE"
 systemctl --user daemon-reload
@@ -220,8 +222,12 @@ fi
 # silently cut tailnet access (2026-10-24 review, critical). The unit no longer
 # propagates stop; this also restores it for an install that already has it.
 if [ -f "$UNIT_DIR/ocserve-tailscale-forward.service" ]; then
-  systemctl --user enable --now ocserve-tailscale-forward.service \
-    && say "tailnet forwarder: enabled and running"
+  if [ "$(systemctl --user is-enabled ocserve-tailscale-forward.service 2>/dev/null)" = "enabled" ]; then
+    systemctl --user start ocserve-tailscale-forward.service \
+      && say "tailnet forwarder: running"
+  else
+    say "tailnet forwarder: installed but disabled (left alone)"
+  fi
 fi
 
 # --- health probe -----------------------------------------------------------

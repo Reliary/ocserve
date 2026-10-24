@@ -6,6 +6,31 @@ differs is a named `D-*` row in `PLAN.md §17`.
 
 ## Unreleased (after 0.6.7)
 
+### Fixed (second review pass)
+- **The server hung under `memory.high`.** `main/memory.high=512M` throttled the
+  single server process into direct reclaim it could never satisfy (no swap,
+  almost all anon): on 2026-10-24 it sat at 601 MiB with 325,225 high events,
+  four threads parked in `mem_cgroup_handle_over_high`, and served nothing for
+  over an hour while the unit stayed `active`. `main` no longer gets
+  `memory.high`; the parent `MemoryHigh=960M` still throttles, `max` is the
+  backstop. Regression test pins the absence.
+- `--version` now reports the build commit (`ocserve 0.6.7 (e1a54dd)`), and the
+  install receipt records `COMMIT=`, so a local build is distinguishable from a
+  released artifact.
+- Per-agent `tools:{bash:false}` in config now becomes permission rules, as
+  upstream normalizes it; it was silently ignored.
+- The forwarder retries forever (`StartLimitIntervalSec=0`) so a boot with
+  Tailscale down cannot leave it permanently failed.
+- `install.sh` no longer re-enables a forwarder the operator deliberately
+  disabled; it only starts an already-enabled one.
+- Plugin-tool execution allow-list is intersected with the retained wire set,
+  so a name dropped by a deny rule cannot execute.
+- `check-matrix.sh` has an explicit docs-only opt-out; the default stays
+  fail-closed.
+
+### Fixed (first review pass)
+
+
 ### Fixed
 - **Tailnet access died on every deploy.** The forwarder unit used
   `PartOf=ocserve.service`, which propagates stop but not start, and

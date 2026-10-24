@@ -330,14 +330,33 @@ pub fn setup_in(root: &Path, disabled: bool) -> Partition {
         );
         return Partition::Degraded("kids-subtree-not-delegable");
     }
-    // The server's own class: a protection floor, a soft ceiling and a hard
-    // backstop. Steady anon is ~200M; 512M covers import/migration bursts.
+    // The server's own class: a protection floor and a hard backstop.
+    //
+    // NO `main/memory.high`. `main` contains exactly one process, and
+    // `memory.high` throttles allocations by putting the allocating task into
+    // direct reclaim. With MemorySwapMax=0 and almost all anon pages, that
+    // reclaim cannot make progress: on 2026-10-24 main sat at 601 MiB against
+    // a 512 MiB high with 325,225 high events, 4 threads parked in
+    // mem_cgroup_handle_over_high, and the server answered nothing while the
+    // unit stayed "active" for over an hour. `high` is a throttle for elastic
+    // classes (page cache, children), not for the single process that must
+    // serve. The parent `MemoryHigh=960M` still throttles the whole service,
+    // and `max` remains the backstop.
+    // `memory.high` is written as `max` (i.e. disabled) rather than skipped:
+    // an existing hierarchy from an older binary still carries the 512M value,
+    // and a restart must clear it, not inherit it.
     for (path, value) in [
-        (root.join("main/memory.low"), 256u64 * 1024 * 1024),
-        (root.join("main/memory.high"), 512u64 * 1024 * 1024),
-        (root.join("main/memory.max"), 768u64 * 1024 * 1024),
+        (
+            root.join("main/memory.low"),
+            (256u64 * 1024 * 1024).to_string(),
+        ),
+        (root.join("main/memory.high"), "max".to_string()),
+        (
+            root.join("main/memory.max"),
+            (768u64 * 1024 * 1024).to_string(),
+        ),
     ] {
-        if std::fs::write(&path, value.to_string()).is_err() {
+        if std::fs::write(&path, value).is_err() {
             tracing::warn!("partition: write {} failed", path.display());
             leaf_failures += 1;
         }
@@ -425,7 +444,6 @@ fn log_budget(root: &Path, kids: &Path, kids_mb: u64) {
     let parent_max = read_mb(&root.join("memory.max"));
     let parent_high = read_mb(&root.join("memory.high"));
     let main_low = read_mb(&root.join("main/memory.low")).unwrap_or(0);
-    let main_high = read_mb(&root.join("main/memory.high")).unwrap_or(0);
     let main_max = read_mb(&root.join("main/memory.max")).unwrap_or(0);
     let kids_high = read_mb(&kids.join("memory.high")).unwrap_or(0);
     let leaves = ocserve_store::cgroup::LEAVES
@@ -435,6 +453,8 @@ fn log_budget(root: &Path, kids: &Path, kids_mb: u64) {
     // Per-class caps are the control; the aggregate max is only the backstop.
     // A leaf cap is a ceiling, not a reservation, so the sum may exceed the
     // parent (limits are allowed to be over-committed, kernel cgroup-v2).
+    // The PARENT max is the real ceiling: `main.max + kids.max` is deliberately
+    // larger, and the parent `MemoryHigh` throttles across classes.
     let class_caps: Vec<String> = ocserve_store::cgroup::LEAVES
         .iter()
         .map(|n| {
@@ -459,9 +479,8 @@ fn log_budget(root: &Path, kids: &Path, kids_mb: u64) {
                 );
             } else {
                 tracing::info!(
-                    "memory budget: parent {p}M (high {}M), main {main_low}/{main_high}/{main_max}M \
-                     low/high/max, kids {kids_mb}M (high {kids_high}M), {}M headroom; \
-                     classes {}",
+                    "memory budget: parent {p}M (high {}M), main {main_low}M low / {main_max}M max, \
+                     kids {kids_mb}M (high {kids_high}M), {}M headroom; classes {}",
                     parent_high.unwrap_or(0),
                     p.saturating_sub(committed),
                     class_caps.join(" ")
@@ -583,6 +602,12 @@ mod tests {
                 "leaf {name} needs a CPU weight"
             );
         }
+        assert_eq!(
+            std::fs::read_to_string(root.join("main/memory.high")).unwrap(),
+            "max",
+            "main must NOT have an effective memory.high: a single non-reclaimable \
+             process is throttled into a livelock rather than reclaimed (2026-10-24 hang)"
+        );
         assert_eq!(
             std::fs::read_to_string(root.join("main/memory.max")).unwrap(),
             (768u64 * 1024 * 1024).to_string(),

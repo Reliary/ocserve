@@ -6,6 +6,11 @@
 #   && systemctl --user daemon-reload && systemctl --user enable --now ocserve-tailscale-forward
 [Unit]
 Description=ocserve Tailscale forwarder
+# Retry forever: when tailscaled is down the bind address 100.x does not
+# exist, and the default 5-starts/10-s limit would land this unit in `failed`
+# permanently (tailnet access stays down until someone runs reset-failed).
+# Explicit because systemd ignores StartLimit* in [Service] (SRE §5 lesson).
+StartLimitIntervalSec=0
 # Wants+After, NOT Requires/PartOf: both propagate STOP, so restarting
 # ocserve.service (which install.sh does on every install) left this unit
 # dead while its socat listener was gone and tailnet clients got ECONNREFUSED

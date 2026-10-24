@@ -281,7 +281,7 @@ other than the async worker (thread identity recorded by a test-only seam).
 
      | node | memory.low | memory.high | memory.max | cpu.weight |
      |---|---|---|---|---|
-     | `main` (server) | 256M | 512M | 768M | 500 |
+     | `main` (server) | 256M | `max` (disabled) | 768M | 500 |
      | `kids/` aggregate | - | 640M | 700M | 100 |
      | `kids/plugin` | - | 288M | 320M | 100 |
      | `kids/mcp` | - | 160M | 192M | 100 |
@@ -290,7 +290,15 @@ other than the async worker (thread identity recorded by a test-only seam).
 
      Leaf caps are ceilings, not reservations, so they sum above the parent;
      the kernel explicitly allows over-committed limits. `high < max` means a
-     class is throttled and reclaimed before it is killed. Weights are
+     class is throttled and reclaimed before it is killed.
+
+     **`main` deliberately has NO `memory.high`** (2026-10-24): it holds exactly
+     one process, and `high` throttles by putting the allocating task into
+     direct reclaim. With no swap and almost all anon pages that reclaim cannot
+     make progress, so the server spent 325,225 high events at 601 MiB against
+     a 512 MiB high and answered nothing for over an hour while the unit stayed
+     `active`. `high` is for elastic classes; the parent `MemoryHigh` still
+     throttles the service as a whole and `max` remains the backstop. Weights are
      work-conserving: a build uses every idle core and yields when the API
      needs one. `oom.group=1` stays on leaves only.
 
