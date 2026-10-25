@@ -192,7 +192,12 @@ uncontracted_reads() {
   # reads the environment (`env::var`/`var_os`), it is still a runtime knob and
   # the check below flags it.
   local test_only=" OCSERVE_PTY_ENV_TEST OCSERVE_PTY_OK OCSERVE_PTY_OVERRIDE OCSERVE_UNIT_PROBE OCSERVE_PORTX "
-  names=$(rg -o --no-filename '"OCSERVE_[A-Z0-9_]+"' "$@" 2>/dev/null \
+  # `rg` is not installed on the GitHub macOS runner and is not guaranteed on
+  # any dev box; a missing binary makes this predicate return EMPTY, which is
+  # exactly what "no uncontracted reads" looks like — the guard then reported
+  # its own planted control as passing (CI caught it 2026-10-25). grep -rhoE
+  # is the portable equivalent for this extraction and is already used below.
+  names=$(grep -rhoE '"OCSERVE_[A-Z0-9_]+"' "$@" 2>/dev/null \
           | tr -d '"' | sort -u)
   local name missing=""
   for name in $names; do
@@ -206,7 +211,7 @@ uncontracted_reads() {
     case "$test_only" in
       *" $name "*) 
         # Allowlisted as test-only, but only while no runtime read names it.
-        if rg -n --no-heading "env::var|var_os" "$@" 2>/dev/null | grep -q "\"$name\""; then
+        if grep -rnE 'env::var|var_os' "$@" 2>/dev/null | grep -q "\"$name\""; then
           missing="$missing $name(runtime-read)"
         fi
         ;;
@@ -220,6 +225,9 @@ if ! printf 'fn planted() { let _ = std::env::var("OCSERVE_PLANTED_UNCONTRACTED"
   echo "FAIL: rule 58 could not write its planted control"; fail=1
 elif [ -z "$(uncontracted_reads "$planted")" ]; then
   echo "FAIL: rule 58 planted uncontracted read not detected (vacuous predicate)"; fail=1
+elif ! printf 'fn planted() { let _ = std::env::var("OCSERVE_PTY_OK"); }\n' > "$planted" \
+     || [ -z "$(uncontracted_reads "$planted")" ]; then
+  echo "FAIL: rule 58 allowlisted test name used at runtime not detected"; fail=1
 else
   missing=$(uncontracted_reads crates/*/src 2>/dev/null)
   if [ -n "$missing" ]; then
