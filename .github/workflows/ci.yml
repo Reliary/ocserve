@@ -128,10 +128,12 @@ jobs:
           # provenance rule): 9,279,528 (2026-10-03) -> 30,000,000 (web-UI
           # embedded bundle, v2 surface) -> 34,000,000 (second embedded web
           # pack, Phase E) -> 62,000,000 (K-SECREV full web-UI closure: both
-          # packs complete + OCAP2 per-file frames; see scripts/nightly.sh).
-          # Headroom is intentional: rolldown + embedded UI are the large
-          # static contributors.
-          MAX=64000000
+          # packs complete + OCAP2 per-file frames) -> 66,000,000
+          # (D-ZEN-TLS: BoringSSL/hyper-boring for the opencode.ai
+          # fingerprint gate; 64,330,256 measured 2026-10-25; see
+          # scripts/nightly.sh). Headroom is intentional: rolldown +
+          # embedded UI + BoringSSL are the large static contributors.
+          MAX=66000000
           if [ "$SIZE" -gt "$MAX" ]; then
             echo "FAIL: binary $SIZE exceeds ceiling $MAX — re-baseline with provenance";
             exit 1

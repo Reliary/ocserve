@@ -1548,30 +1548,70 @@ fn merge_columns(
     v
 }
 
+/// Which contiguous suffix of a session to load, in `seq` order.
+enum MsgSelector {
+    All,
+    Last(usize),
+    Since(i64),
+}
+
 pub fn load_messages(
     db: &std::path::Path,
     session_id: &str,
     limit: Option<usize>,
 ) -> anyhow::Result<Vec<(serde_json::Value, Vec<serde_json::Value>)>> {
+    load_messages_selector(
+        db,
+        session_id,
+        limit.map_or(MsgSelector::All, MsgSelector::Last),
+    )
+}
+
+/// Load the session suffix whose `msg.seq >= min_seq`.
+///
+/// Prompt-path bounded load (perf: a 56k-message session is 85 MB of parts but
+/// the model sees at most the 8 MB budget). Ordering is `seq`, exactly like
+/// [`load_messages`], so a late-inserted legacy-sync row stays ordered by
+/// insertion — never by timestamp.
+pub fn load_messages_since(
+    db: &std::path::Path,
+    session_id: &str,
+    min_seq: i64,
+) -> anyhow::Result<Vec<(serde_json::Value, Vec<serde_json::Value>)>> {
+    load_messages_selector(db, session_id, MsgSelector::Since(min_seq))
+}
+
+fn load_messages_selector(
+    db: &std::path::Path,
+    session_id: &str,
+    sel: MsgSelector,
+) -> anyhow::Result<Vec<(serde_json::Value, Vec<serde_json::Value>)>> {
     let conn = pragma::open_reader(db)?;
-    let mut stmt = match limit {
-        Some(_) => conn.prepare_cached(
-            "SELECT id, info FROM (SELECT id, info, seq FROM msg WHERE session_id = ?1 \
-             ORDER BY seq DESC LIMIT ?2) ORDER BY seq",
-        )?,
-        None => {
-            conn.prepare_cached("SELECT id, info FROM msg WHERE session_id = ?1 ORDER BY seq")?
+    let msgs: Vec<(String, String)> = match sel {
+        MsgSelector::Last(n) => {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, info FROM (SELECT id, info, seq FROM msg WHERE session_id = ?1 \
+                 ORDER BY seq DESC LIMIT ?2) ORDER BY seq",
+            )?;
+            stmt.query_map((session_id, n as i64), |r| Ok((r.get(0)?, r.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect()
         }
-    };
-    let msgs: Vec<(String, String)> = match limit {
-        Some(n) => stmt
-            .query_map((session_id, n as i64), |r| Ok((r.get(0)?, r.get(1)?)))?
-            .filter_map(|r| r.ok())
-            .collect(),
-        None => stmt
-            .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .filter_map(|r| r.ok())
-            .collect(),
+        MsgSelector::Since(s) => {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, info FROM msg WHERE session_id = ?1 AND seq >= ?2 ORDER BY seq",
+            )?;
+            stmt.query_map((session_id, s), |r| Ok((r.get(0)?, r.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect()
+        }
+        MsgSelector::All => {
+            let mut stmt =
+                conn.prepare_cached("SELECT id, info FROM msg WHERE session_id = ?1 ORDER BY seq")?;
+            stmt.query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect()
+        }
     };
     let mut out = Vec::new();
     // Blob-resolving reader: parts above INLINE_PART_MAX live in the blob
@@ -1645,6 +1685,20 @@ pub fn load_messages(
     Ok(out)
 }
 
+/// `seq` of one message, or `None` when it does not exist.
+pub fn message_seq(
+    db: &std::path::Path,
+    session_id: &str,
+    message_id: &str,
+) -> anyhow::Result<Option<i64>> {
+    let conn = pragma::open_reader(db)?;
+    let seq = conn
+        .prepare_cached("SELECT seq FROM msg WHERE session_id = ?1 AND id = ?2")?
+        .query_row((session_id, message_id), |r| r.get::<_, i64>(0))
+        .optional()?;
+    Ok(seq)
+}
+
 /// Per-session event sequence (sync twin numbering; capture showed 1..N per session).
 pub fn next_event_seq(db: &std::path::Path, session_id: &str) -> anyhow::Result<i64> {
     let conn = pragma::open_reader(db)?;
@@ -1654,6 +1708,185 @@ pub fn next_event_seq(db: &std::path::Path, session_id: &str) -> anyhow::Result<
         |r| r.get(0),
     )?;
     Ok(seq)
+}
+
+/// Bounded prompt-load plan: `(min_seq, authoritative)`.
+///
+/// `min_seq == 0` means "load the whole session". `authoritative == true`
+/// means the window contains every message `filter_compacted` can select, so
+/// filtering the window is identical to filtering the whole session — the
+/// byte budget may then trim freely, because it trims the same suffix.
+///
+/// The compaction branch mirrors `filter_compacted` exactly: the newest
+/// completed summary (finished, error-free assistant with `parentID`) resolves
+/// its anchor; the window starts at the verbatim tail, which is the filter's
+/// own stop point. Cases the filter resolves differently (missing anchor,
+/// dangling tail, blob-only compaction part, tail after the anchor) degrade to
+/// the full load instead of guessing.
+///
+/// Ordering is `seq`, never `time_created`: legacy-sync rows are inserted late
+/// with old timestamps and must stay ordered by insertion.
+pub fn prompt_window(
+    db: &std::path::Path,
+    session_id: &str,
+    budget_bytes: usize,
+) -> anyhow::Result<(i64, bool)> {
+    let conn = pragma::open_reader(db)?;
+
+    let mut seq_of =
+        conn.prepare_cached("SELECT seq FROM msg WHERE session_id = ?1 AND id = ?2")?;
+    let mut info_of =
+        conn.prepare_cached("SELECT info FROM msg WHERE session_id = ?1 AND id = ?2")?;
+    let mut part_of = conn.prepare_cached(
+        "SELECT inline FROM msg_part \
+         WHERE message_id = ?1 AND type = 'compaction' ORDER BY seq ASC LIMIT 1",
+    )?;
+
+    // The boundary `filter_compacted` resolves is the completed ANCHOR with the
+    // greatest message order (it walks newest→oldest and stops at the first
+    // anchor whose summary it has already passed), NOT the compaction with the
+    // newest summary. Those differ after a late legacy-sync insert: an older
+    // anchor can gain a newer summary. Keying on the summary seq made the
+    // window start at the wrong compaction and then claim `authoritative`,
+    // silently dropping the messages between the two anchors. `time_ms` is
+    // equally unreliable, so both are resolved from `msg.seq`.
+    //
+    // A summary only participates when it comes AFTER its anchor in message
+    // order (`is_completed_summary` + the reverse walk's `completed` set).
+    let mut best: Option<(i64, (i64, String))> = None; // anchor_seq -> (anchor_seq, anchor_id)
+    for row in compaction_rows(&conn, session_id)?.iter() {
+        let Some(summary_id) = row.summary_msg_id.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some(summary_txt) = info_of
+            .query_row((session_id, summary_id), |r| r.get::<_, String>(0))
+            .optional()?
+        else {
+            continue;
+        };
+        let Ok(summary) = serde_json::from_str::<serde_json::Value>(&summary_txt) else {
+            continue;
+        };
+        // `is_completed_summary` (compact.rs / message-v2): only a finished,
+        // error-free summary participates in the reverse walk.
+        if summary["role"] != "assistant"
+            || summary["summary"] != serde_json::Value::Bool(true)
+            || !summary["finish"].is_string()
+            || !summary["error"].is_null()
+        {
+            continue;
+        }
+        let Some(anchor_id) = summary["parentID"].as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let (Some(anchor_seq), Some(summary_seq)) = (
+            seq_of
+                .query_row((session_id, anchor_id), |r| r.get::<_, i64>(0))
+                .optional()?,
+            seq_of
+                .query_row((session_id, summary_id), |r| r.get::<_, i64>(0))
+                .optional()?,
+        ) else {
+            // A summary whose anchor is gone cannot be resolved by the
+            // filter either; only the full load is safe.
+            return Ok((0, false));
+        };
+        // The reverse walk has already seen this summary when it reaches the
+        // anchor only if the summary's seq is greater. Anything else cannot
+        // become the stop point.
+        if summary_seq > anchor_seq && best.as_ref().is_none_or(|(a, _)| anchor_seq > *a) {
+            best = Some((anchor_seq, (anchor_seq, anchor_id.to_string())));
+        }
+    }
+
+    if let Some((_, (anchor_seq, anchor_id))) = best {
+        // `compaction_tail` reads the PART, not the projection.
+        let tail_id = match part_of
+            .query_row([anchor_id.as_str()], |r| r.get::<_, Option<String>>(0))
+            .optional()?
+        {
+            Some(Some(inline)) => serde_json::from_str::<serde_json::Value>(&inline)
+                .ok()
+                .and_then(|p| p["tail_start_id"].as_str().map(str::to_string)),
+            // Blob-only part: not expected (compaction parts are tiny), but a
+            // wrong guess would silently change the prompt. Full load.
+            Some(None) => return Ok((0, false)),
+            None => None,
+        };
+        let Some(tail_id) = tail_id else {
+            // No tail: the filter breaks at the anchor and keeps [anchor..].
+            return Ok((anchor_seq, true));
+        };
+        match seq_of
+            .query_row((session_id, tail_id.as_str()), |r| r.get::<_, i64>(0))
+            .optional()?
+        {
+            // The filter's reverse walk keeps everything from the tail onward
+            // (it stops the moment it reaches the tail), so starting the window
+            // there is authoritative. Only valid when the tail precedes the
+            // anchor: a tail AFTER the anchor is never reached before the walk
+            // exhausts the session, and `filter_compacted` then returns EVERY
+            // message (its `tail_index < anchor_index` reassembly check fails).
+            // A budget suffix would silently drop history in that shape, so it
+            // must force the full load, not fall through.
+            Some(tail_seq) if tail_seq <= anchor_seq => return Ok((tail_seq, true)),
+            Some(_) => return Ok((0, false)),
+            // Tail message gone: the filter cannot stop, so it keeps every
+            // message. Only the full load reproduces that.
+            None => return Ok((0, false)),
+        }
+    }
+
+    // No COMPLETED compaction boundary was found. That does not mean the
+    // filter is the identity: `filter_compacted`'s reassembly triggers on an
+    // anchor carrying a tail plus ANY assistant with `summary:true` and a
+    // matching `parentID` — it does not require `finish` (compact.rs). An
+    // imported summary without `finish` therefore reorders history under the
+    // full load. If any compaction row exists at all, only the full load is
+    // provably equivalent. (2026-10-25 review M1.)
+    if !compaction_rows(&conn, session_id)?.is_empty() {
+        return Ok((0, false));
+    }
+
+    // No compaction: the filter is the identity, so a suffix that the exact
+    // budget demonstrably trims is equivalent. `budget_bytes` is the
+    // exact-estimator budget; stored `byte_len` is the whole part JSON and
+    // overstates `history_message_bytes` (which counts only text/arguments/
+    // output) on part-heavy sessions, so aim at 3×. The caller verifies and
+    // widens on a miss, so this is a performance knob, not a correctness one.
+    // Small sessions overshoot to `0` (whole load), which is also correct and
+    // cheaper than a second round-trip.
+    let limit = (budget_bytes as i64).saturating_mul(3);
+    let mut total: i64 = 0;
+    let mut cursor: i64 = i64::MAX;
+    // 2048 measured at the same per-query cost as 512 (fixed overhead
+    // dominates); 8192 trips a scan. Fewer round-trips, same bytes.
+    const CHUNK: i64 = 2048;
+    loop {
+        let mut stmt = conn.prepare_cached(
+            "SELECT m.seq, length(m.info), \
+                    COALESCE((SELECT SUM(96 + p.byte_len) FROM msg_part p \
+                              WHERE p.message_id = m.id), 0) \
+             FROM msg m WHERE m.session_id = ?1 AND m.seq < ?2 \
+             ORDER BY m.seq DESC LIMIT ?3",
+        )?;
+        let chunk: Vec<(i64, i64, i64)> = stmt
+            .query_map((session_id, cursor, CHUNK), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        if chunk.is_empty() {
+            return Ok((0, false)); // walked the whole session
+        }
+        cursor = chunk.last().map(|r| r.0).unwrap_or(0);
+        for (seq, info_len, parts_bytes) in chunk {
+            total = total.saturating_add(64 + info_len.min(2048) + parts_bytes);
+            if total >= limit {
+                return Ok((seq, false));
+            }
+        }
+    }
 }
 
 /// v2 inbox engine (V2-PLAN.md P3). Server-owned pending-work queue mirroring
@@ -3161,8 +3394,15 @@ pub fn backup_to(conn: &rusqlite::Connection, dest: &std::path::Path) -> anyhow:
     if dest.exists() {
         anyhow::bail!("backup destination exists: {}", dest.display());
     }
-    let sql = format!("VACUUM INTO '{}'", dest.display());
-    conn.execute_batch(&sql)?;
+    // Parameterised: the destination is operator-supplied (`--dest`,
+    // `--data-dir`), and interpolating it into SQL broke on a quote in the
+    // path (and was an injection surface for a value that should never be SQL).
+    let dest = dest
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("backup destination is not valid UTF-8"))?
+        .to_string();
+    conn.execute("VACUUM INTO ?1", [dest.as_str()])
+        .map_err(|e| anyhow::anyhow!("VACUUM INTO {dest}: {e}"))?;
     Ok(())
 }
 
@@ -3755,13 +3995,17 @@ pub fn backfill_part_search(
             r.get(0)
         })
         .unwrap_or(-1);
-    if let Some(n) = stamped
-        && trigger == 1
-        && fts_docs >= 0
-        && fts_docs as i64 == n
-    {
-        drop(conn);
-        return Ok((0, 0, t0.elapsed().as_millis() as u64));
+    // The stamp is written from `count(part_search)`, so the early return must
+    // also confirm the INDEX still matches the rows. Comparing the stamp to
+    // the docsize alone let a lost index row look healthy forever (the 2026-10-25
+    // review: a row committed while the bulk trigger was dropped was stamped as
+    // indexed and never repaired).
+    if stamped.is_some() && trigger == 1 && fts_docs >= 0 {
+        let rows: i64 = conn.query_row("SELECT count(*) FROM part_search", [], |r| r.get(0))?;
+        if fts_docs as i64 == stamped.unwrap_or(-1) && fts_docs == rows {
+            drop(conn);
+            return Ok((0, 0, t0.elapsed().as_millis() as u64));
+        }
     }
     let total: i64 = conn.query_row("SELECT count(*) FROM msg_part", [], |r| r.get(0))?;
     let have: i64 = conn.query_row("SELECT count(*) FROM part_search", [], |r| r.get(0))?;
@@ -3900,6 +4144,10 @@ static LIST_MEMO_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 pub const SEARCH_MEMO_CAP: usize = 64;
 
 /// Live write epoch (Acquire).
+///
+/// This only moves when THIS process's writer commits. A commit by another
+/// process (the importer) is picked up by [`import_stamp`], which the serve
+/// sampler polls and turns into a `bump_write_epoch()` — see `StampWatcher`.
 pub fn write_epoch() -> u64 {
     WRITE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -3915,6 +4163,95 @@ pub fn bump_write_epoch() {
     l.bytes = None;
     l.epoch = 0;
     l.db = None;
+}
+
+/// Watches for commits made by ANOTHER process into this database.
+///
+/// `PRAGMA data_version` is per-connection and increments when a different
+/// connection commits. A long-lived read-only connection therefore sees the
+/// importer's commits even though our writer never ran. Re-opening a
+/// connection per poll would reset the counter to its baseline and see
+/// nothing, so the connection is kept for the process lifetime.
+///
+/// Returns `true` when external commits were observed since the previous
+/// poll. The first poll only establishes the baseline (returns `false`).
+pub fn poll_external_commits(db: &std::path::Path) -> anyhow::Result<bool> {
+    struct Watcher {
+        /// (device, inode) of the file this connection reads.
+        ident: Option<(u64, u64)>,
+        conn: pragma::Reader,
+        version: i64,
+    }
+
+    #[cfg(unix)]
+    fn file_identity(db: &std::path::Path) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(db).ok().map(|m| (m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    fn file_identity(db: &std::path::Path) -> Option<(u64, u64)> {
+        // mtime in place of an inode: replacement on Windows is still visible.
+        std::fs::metadata(db)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| (0, d.as_nanos() as u64))
+    }
+
+    /// Per-database watcher state. Keyed by path rather than a single slot:
+    /// the harness opens many temporary databases in one process, and a shared
+    /// slot made each poll look like the file had been replaced. Bounded so a
+    /// pathological caller cannot grow it forever.
+    const MAX_WATCHED: usize = 8;
+    static W: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<std::path::PathBuf, Watcher>>,
+    > = std::sync::OnceLock::new();
+    let slot = W.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let mut map = slot.lock();
+
+    // `data_version` is per-connection and blind to the file being REPLACED
+    // (the documented backup/restore drill: restore onto the same path). The
+    // old connection keeps reading the unlinked inode forever. Identity is
+    // therefore checked every poll, and a changed inode forces a reopen.
+    let ident = file_identity(db);
+    match map.get_mut(db) {
+        Some(w) if w.ident == ident => {
+            let version: i64 = w.conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+            if version == w.version {
+                return Ok(false);
+            }
+            w.version = version;
+            Ok(true)
+        }
+        Some(w) => {
+            // Same path, different file: every cached value came from the old
+            // inode, so this is a real change.
+            let conn = pragma::open_reader(db)?;
+            let version: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+            *w = Watcher {
+                ident,
+                conn,
+                version,
+            };
+            Ok(true)
+        }
+        None => {
+            if map.len() >= MAX_WATCHED {
+                map.clear();
+            }
+            let conn = pragma::open_reader(db)?;
+            let version: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+            map.insert(
+                db.to_path_buf(),
+                Watcher {
+                    ident,
+                    conn,
+                    version,
+                },
+            );
+            Ok(false) // baseline
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]

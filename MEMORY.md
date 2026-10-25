@@ -158,6 +158,14 @@ building). Ordered by measured impact:
    `ocserve_history_truncated_total{dropped}` + warn log; under-budget =
    byte-identical. Tests: `history_budget_tests` ×3. Divergence: TESTING §1.6
    D-PROMPT-BUDGET.
+   **Load bound (2026-10-24):** the budget is also the READ bound —
+   `load_prompt_history` parses a proven `seq` suffix instead of the whole
+   session (deep session: 85 MB of parts, 4.6-5.2 s → 1.45-1.59 s interleaved;
+   compacted session 117 ms → 22 ms), with a full-load fallback whenever
+   equivalence cannot be shown and `OCSERVE_PROMPT_HISTORY_UNBOUNDED=1` as the
+   kill switch. Metric `ocserve_prompt_history_load_total{mode}`. Tests:
+   `prompt_window.rs` ×9, `bounded_prompt_load_tests` ×10, corpus probe
+   `bounded_prompt_load_matches_real_corpus`. Guard rule 57.
 4. **Service-side plugin-host reap** — re-verified COVERED without new code:
    `kill_on_drop(true)` already set at spawn; systemd cgroup covers OOM/stop;
    non-systemd exits swept by the tooling fixes. Residual = SIGKILL-embedded

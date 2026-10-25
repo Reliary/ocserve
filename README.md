@@ -109,6 +109,50 @@ read-only, and never writes to them. To bring history across:
 ocserve import --source ~/.local/share/opencode/opencode.db
 ```
 
+That takes the 20 most recent sessions. To adopt named sessions into a data dir
+that already has history (safe while `ocserve serve` is running: the import
+keeps the search trigger and uses short write transactions):
+
+```sh
+ocserve import --source ~/.local/share/opencode/opencode.db \
+  --session ses_abc123 --session ses_def456
+```
+
+Add `--force` to replace a session that is already there (`--force` requires at
+least one `--session`, so a destructive import is never implicit).
+
+Stopping the server does not by itself make an import fast: the index strategy
+is chosen from the target's contents, not from whether a server is running. A
+populated data dir always takes the per-row trigger path unless you ask for
+`--bulk`:
+
+```sh
+# stop the service first (the forwarder is independent and may stay up)
+systemctl --user stop ocserve.service
+ocserve import --source ~/.local/share/opencode/opencode.db \
+  --session ses_abc123 --bulk
+systemctl --user start ocserve.service
+```
+
+`--force` takes a restorable `VACUUM INTO` copy in the data dir before it
+deletes anything, so a failed re-import never leaves you without the old
+session.
+
+`--bulk` replaces per-row indexing with one index rebuild. It is clearly faster
+for large sessions and can be slower for small ones (the rebuild has a fixed
+cost), so it is a choice, not a default. Above 10,000 source parts the import
+refuses before writing anything and asks you to pick `--bulk` (server stopped)
+or `--allow-slow-live` (server keeps running).
+
+## Configuration
+
+`ocserve doctor --env` prints every `OCSERVE_*` variable, its default, and the
+values set in your shell. `ocserve env-reference` prints the same table as
+[`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md), which is generated from the code
+so it cannot go stale. Most installations need no environment variables at all:
+the defaults are the documented behaviour, and only kill switches (`=0`) and
+tuning knobs are there when you need them.
+
 ## Compatibility
 
 ### v1 (frozen at 1.18.31)

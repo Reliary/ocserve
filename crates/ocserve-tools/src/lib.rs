@@ -211,6 +211,14 @@ fn frozen_tools() -> Vec<Value> {
     raw.as_array().cloned().unwrap_or_default()
 }
 
+/// True when `name` is a builtin we execute.
+///
+/// The per-tool-call permission path used to call [`schemas`] (a 26 KB JSON
+/// parse per call) just to answer this. This is the same set, zero parse.
+pub fn is_builtin(name: &str) -> bool {
+    IMPLEMENTED.contains(&name)
+}
+
 /// Provider tool schemas, filtered to IMPLEMENTED (deny filtering happens in
 /// the caller). Order matches the frozen capture.
 pub fn schemas() -> Vec<Value> {

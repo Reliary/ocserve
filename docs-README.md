@@ -23,6 +23,7 @@ references and stale divergences on every commit.
 | `STORAGE.md` | SQLite pragmas, schema and blob protocol, FTS5 design, storage gates |
 | `MEMORY.md` | memory budget lines, allocator rules, allocation gates |
 | `SRE.md` | boot checks, metric-per-KPI table, config knobs, CPU policy, CI/CD, systemd, runbook |
+| `docs/ENVIRONMENT.md` | every `OCSERVE_*` variable, generated from the code contract (rule 58) |
 | `TESTING.md` | test levels and techniques, traceability, anti-theater rules, adversarial program, exit criteria |
 | `TRACEABILITY.md` | requirement to test to evidence matrix |
 
@@ -49,6 +50,7 @@ references and stale divergences on every commit.
 | `bench/BUMP-MACHINERY-TEST.md` | upgrade-machinery shakedown against 2.0.32 (report only) |
 | `bench/load/BASELINE.md` | performance baseline and withdrawn/corrected figures |
 | `bench/perf/PHASE1-ATTRIBUTION.md` | where the read-path time actually went |
+| `bench/prompt-window/REPORT.md` | bounded prompt-load equivalence proof, timings, and the negative controls (K-BOUNDED-PROMPT-LOAD) |
 | `bench/load/README.md` | k6 load suite: methodology, pinning, thresholds |
 
 ## Conventions

@@ -13,29 +13,38 @@
 
 use futures_util::StreamExt;
 use ocserve_llm::{ChatMessage, ChatOpts, Client};
-use serde_json::{Value, json};
+use serde_json::Value;
 
-/// The eight builtin tool NAMES ocserve actually sends (ocserve-tools
-/// schemas()) — B6 proved this shape completes; B7 proved ≥2 known names
-/// is the real threshold (1 known fails, arbitrary names fail regardless
-/// of count). Descriptions are abbreviated: prose was never observed to
-/// matter (B1's simplified schemas passed).
+/// The REAL advertised tool set. The gate tightened on 2026-10-25: a
+/// hand-built 8-tool fixture that used to pass now 429s, while the production
+/// wire (real base prompt + real tool schemas) still passes. Using the
+/// production functions here is the only way this fixture cannot drift from
+/// what the server sends.
 fn gate_tools() -> Vec<Value> {
-    [
-        "bash", "read", "write", "edit", "glob", "grep", "todowrite", "question",
-    ]
-    .iter()
-    .map(|n| {
-        json!({
-            "type": "function",
-            "function": {
-                "name": n,
-                "description": "builtin tool",
-                "parameters": {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]}
-            }
-        })
-    })
-    .collect()
+    ocserve_tools::schemas()
+}
+
+/// The production system prompt (vendored base + env + skills; ~10 KB).
+/// A short stand-in is rejected by the gate (3-round bisect), so the fixture
+/// uses the same function the server does.
+fn gate_system() -> ChatMessage {
+    let base = ocserve_core::system_prompt::base_prompt(None, "big-pickle", "opencode");
+    let env = ocserve_core::system_prompt::environment_block(
+        "big-pickle",
+        "opencode",
+        "/probe",
+        "/probe",
+        false,
+        "linux",
+        "2026-10-25T00:00:00.000Z",
+    );
+    let skills = ocserve_core::system_prompt::skills_block(&[(
+        "demo".to_string(),
+        "A demo skill entry so the block renders like production.".to_string(),
+        "/probe/skills/demo/SKILL.md".to_string(),
+    )]);
+    let composed = ocserve_core::system_prompt::compose(&base, &[Some(env), skills], None);
+    ChatMessage::text("system", composed)
 }
 
 /// ocserve ids.rs shape: `ses_` + 26 hex chars (proven accepted, P5).
@@ -43,7 +52,13 @@ const NATIVE_SID: &str = "ses_0123456789abcdef0123456789";
 
 async fn first_event(opts: ChatOpts, label: &str) -> Result<(), anyhow::Error> {
     let client = Client::new("https://opencode.ai/zen/v1", "public");
-    let msgs = vec![ChatMessage::text("user", "Reply with exactly: ZEN_OK")];
+    // The gate also requires a system message (verified 2026-10-25 across 3
+    // rounds: 0 system messages => 429, 1 or 2 => 200, byte-identical
+    // otherwise). Production always sends one; this fixture now matches it.
+    let msgs = vec![
+        gate_system(),
+        ChatMessage::text("user", "Reply with exactly: ZEN_OK"),
+    ];
     let mut stream = client
         .chat_stream(
             "big-pickle",
@@ -89,7 +104,7 @@ async fn zen_text_only_summary_shape_succeeds() {
 #[ignore = "live zen gate negative control (nightly; 1 request)"]
 async fn zen_gate_still_rejects_malformed_session() {
     let client = Client::new("https://opencode.ai/zen/v1", "public");
-    let msgs = vec![ChatMessage::text("user", "say ok")];
+    let msgs = vec![gate_system(), ChatMessage::text("user", "say ok")];
     let malformed = format!("ses_{}", "a".repeat(64));
     let err = client
         .chat_stream(
@@ -105,8 +120,12 @@ async fn zen_gate_still_rejects_malformed_session() {
         Ok(_) => panic!("64-hex session id must still trip the gate (E9/E4)"),
         Err(e) => e,
     };
+    // The wall has been renamed over time (`FreeTierError` -> 2026-10-25
+    // `FreeUsageLimitError`); the invariant is that a malformed session id is
+    // REJECTED, and the body names a free-tier wall.
+    let msg = format!("{e:#}");
     assert!(
-        format!("{e:#}").contains("FreeTierError"),
-        "expected FreeTierError rejection, got: {e:#}"
+        msg.contains("FreeTierError") || msg.contains("FreeUsageLimitError"),
+        "expected a free-tier wall rejection, got: {msg}"
     );
 }

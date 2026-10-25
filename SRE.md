@@ -58,6 +58,10 @@ behind the same auth as the rest:
 | `ocserve_sync_tick` | duration | legacy-sync tick cost (the idle-jump suspect until measured — 11 msgs total says likely tiny) |
 | `ocserve_db_bytes` | gauge | DB file growth (MEMORY §7.6 KPI; policy trigger at ≥5 GB / ≥1k sessions) |
 | `ocserve_history_truncated_total{dropped}` | counter | prompt-history budget trips (8 MB, tail-weighted) — silent context loss made measurable |
+| `ocserve_prompt_history_load_total{mode}` | counter | bounded prompt load: `full` / `window_budget` / `window_compaction`. A sustained `full` on a large session means the window could not be proven equivalent and the pre-change cost is back (the corpus probe is the byte-identity gate) |
+| `ocserve_provider_prefix_changed_total{part}` | counter | KV/prefix cache invalidation attribution: `part="system"` (system prompt changed) or `part="tools"` (tool schema array changed) between two requests on the same session. A rising count on a stable config is a cache-busting regression worth a look |
+| `ocserve_external_commit_total{source}` | counter | commits made by ANOTHER process into the data dir (the importer), observed as `PRAGMA data_version` changes on one long-lived reader; each observation bumps the write epoch, invalidating list/page/search caches. A persistent zero while importing means the server is not seeing the new rows |
+| `ocserve_external_commit_poll_errors_total{source}` | counter | the watcher could not read `PRAGMA data_version`; caches silently stop invalidating while this rises |
 | soak CSV `oc_rss` column | sample | native opencode RSS = the future-usage ceiling model (MEMORY §7.6) |
 | `ocserve_prompt_rounds_total{bucket,finish}` | counter | uncensored rounds-per-turn distribution: `bucket` = 0-9/10-19/20-39/40-79/80-159/160+, `finish` = `done`/`error`/`capped` — the K-AUTONOMY telemetry the old flat cap made unmeasurable (right-censored at 25) |
 | `ocserve_plugin_normalize_total{result}` | counter | plugin normalizer health (D1): sustained `error` = builds failing → raw fallback; `warm` on every load after first boot; `disabled` only when kill-switched |
@@ -119,6 +123,17 @@ hard cap only — failure is surfaced, never silent) and `OCSERVE_PROMPT_MAX_COS
 have kill-criteria tests (`autonomy.rs`) and the bound lives on dollars/visibility,
 not on a magic round count.
 
+History-load knob — `OCSERVE_PROMPT_HISTORY_UNBOUNDED=1` (default unset) forces the
+pre-change whole-session prompt load; read once at boot. It changes only how much is
+READ: the `filter_compacted` selection and the 8 MB trim still apply, so the provider
+request is identical. Unset (default) loads a proven `seq` suffix via
+`ocserve_store::prompt_window` + `load_prompt_history`, falling back to the full load
+whenever equivalence cannot be shown. Proof and negative controls:
+`crates/ocserve-store/tests/prompt_window.rs`, `prompt.rs::bounded_prompt_load_tests`,
+and the real-corpus probe `bounded_prompt_load_matches_real_corpus` (ignored by
+default; run with `OCSERVE_CORPUS_DB` + `OCSERVE_CORPUS_SESSION`). Guard rule 57 keeps
+every other prompt-path read on the bounded loader.
+
 Plugin normalization knob — `OCSERVE_PLUGIN_NORMALIZE` (default **on**): content-hash-cached
 rolldown normalization of plugin entries at load (D1 — decision record
 `bench/normalizer-spike/D1-PLAN.md`). `=0` skips **before rolldown is constructed** (the
@@ -132,9 +147,27 @@ endpoint (`Bearer public` + the proven discriminator wire — composite UA,
 native session id, ≥2 known tool names; evidence ledger
 `bench/zen-probe/FINDINGS.md` P5/P7/P8 + B1–B7). `OCSERVE_ZEN_KEYLESS=0`
 restores the pre-port behavior (no keyless endpoint → deepseek fallback
-default). Gate flips increment `ocserve_zen_freetier_total` and are checked
-nightly by the live trio (`crates/ocserve-llm/tests/zen_live.rs`: positive /
-text-only / negative — the negative proves the wall still exists).
+default). Gate flips increment `ocserve_zen_freetier_total`
+(`result="gate"` for a 403 tier rejection, `result="usage_limit"` for a spent
+free allowance) and are checked nightly by the live trio
+(`crates/ocserve-core/tests/zen_live.rs`: positive / text-only / negative — the
+negative proves the wall still exists). A spent allowance surfaces upstream's
+fixed upsell ("Free usage exceeded, subscribe to Go") as a typed
+`APIError{statusCode:429,isRetryable:false}`, not a raw provider body: it is
+terminal, so retrying only produces silent failures.
+
+opencode.ai requests are sent over BoringSSL (hyper-boring), not rustls: their
+free-tier gate fingerprints the TLS ClientHello, so a byte-identical request
+passes from Bun's stack and returns 429 from rustls/OpenSSL/curl (5-stack
+replay, 2026-10-25). Only that host uses the lane; all other providers keep
+rustls. Named divergence `D-ZEN-TLS` in PLAN §17.
+
+Retired models are not served. The catalog marks models `status:"deprecated"`
+(48 entries, 37 of them free models under `opencode` on 2026-10-25); freeze
+deletes those, plus `alpha` ones unless `OPENCODE_ENABLE_EXPERIMENTAL_MODELS`
+is set (`provider.ts:1744-1745`). ocserve applies the same rule in
+`build_providers` and when choosing the effective default, so the picker and
+the default can never disagree.
 
 Model catalog (K-MODELS) — same-as-upstream refresh, no operator action
 needed: honors `OPENCODE_MODELS_URL` / `OPENCODE_MODELS_PATH` /
@@ -197,8 +230,10 @@ other than the async worker (thread identity recorded by a test-only seam).
   nor a knife-edge cap).** Every layer degrades to the one below on failure;
   the cap is the BACKSTOP, not the control:
   1. **L0 bounded-by-construction (always on):** 32 MB event ring, 8 MB
-     tail-weighted history budget, streamed `/message`, `malloc_trim`
-     cadence, `MALLOC_ARENA_MAX=1`, single catalog parse per reload.
+     tail-weighted history budget applied to a provably-equivalent `seq`
+     suffix (the kill switch disables only the suffix read), streamed
+     `/message`, `malloc_trim` cadence, `MALLOC_ARENA_MAX=1`, single catalog
+     parse per reload.
   2. **L1 graceful sidecar recycle** (15 s sampler): RSS ≥
      `OCSERVE_SIDECAR_RECYCLE_MB` (default 280 — above the ~100 MB steady
      state and **below the 320 MB plugin leaf cap**, so recycle can actually

@@ -389,10 +389,11 @@ pub(crate) fn pick_default_model(
             }
         }
     }
-    if let Some(hit) = candidates
-        .iter()
-        .find(|(p, m)| endpoints.contains_key(p) && catalog_contains(config_providers, cfg, p, m))
-    {
+    if let Some(hit) = candidates.iter().find(|(p, m)| {
+        endpoints.contains_key(p)
+            && catalog_contains(config_providers, cfg, p, m)
+            && !catalog_model_deprecated(config_providers, p, m)
+    }) {
         return hit.clone();
     }
     let Some(pid) = endpoints.keys().min() else {
@@ -474,6 +475,22 @@ pub(crate) fn apply_public_tier_filter(
                 == Some(0)
         });
     }
+}
+
+/// True when the provider's served model entry is marked `deprecated`.
+/// Reads the same `config_providers.providers` list the route serves, so the
+/// default can never pick a model the picker no longer offers.
+fn catalog_model_deprecated(config_providers: &Value, pid: &str, mid: &str) -> bool {
+    config_providers
+        .pointer("/providers")
+        .and_then(|v| v.as_array())
+        .and_then(|list| {
+            list.iter()
+                .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(pid))
+        })
+        .and_then(|e| e.pointer(&format!("/models/{mid}/status")))
+        .and_then(|v| v.as_str())
+        == Some("deprecated")
 }
 
 /// Provider catalog membership (W6's `known` rule, factored shared):
@@ -647,6 +664,34 @@ impl Runtime {
     }
 }
 
+/// `OPENCODE_ENABLE_EXPERIMENTAL_MODELS` (upstream runtime-flags.ts:40,
+/// parsed as an Effect boolean: `true`/`1` are truthy). Read through a
+/// OnceLock: process-wide, like the other runtime flags.
+pub(crate) fn experimental_models() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("OPENCODE_ENABLE_EXPERIMENTAL_MODELS")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
+/// Upstream `provider.ts:1744-1745`: a served model must be neither
+/// `deprecated` nor (`alpha` while experimental models are off). Unknown or
+/// missing status counts as active.
+pub(crate) fn model_is_offered(model: &Value, experimental: bool) -> bool {
+    match model.get("status").and_then(|v| v.as_str()) {
+        Some("deprecated") => false,
+        Some("alpha") => experimental,
+        _ => true,
+    }
+}
+
 fn build_providers(cfg: &Value, auth: &Value, cache: &Value) -> (Value, Value) {
     let cfg_providers = cfg.get("provider").and_then(|v| v.as_object());
     let auth_obj = auth.as_object();
@@ -711,6 +756,13 @@ fn build_providers(cfg: &Value, auth: &Value, cache: &Value) -> (Value, Value) {
                 models.insert(mid.clone(), transform_config_model(pid, mid, mval));
             }
         }
+        // Freeze `provider.ts:1744-1745`: models marked `deprecated` and
+        // `alpha` (unless OPENCODE_ENABLE_EXPERIMENTAL_MODELS) are DELETED
+        // from the served model map, not merely hidden in one projection.
+        // The catalog carried 37 retired free models for `opencode`; serving
+        // them meant the picker offered models that no longer answer (and the
+        // retired ones failed with provider errors rather than a clean 404).
+        models.retain(|_, m| model_is_offered(m, experimental_models()));
         // B2: single site covers /config/providers + /provider routes.
         let has_key = std::env::var("OPENCODE_API_KEY").is_ok_and(|v| !v.is_empty())
             || auth_obj
@@ -1391,6 +1443,94 @@ mod tests {
         ids.iter()
             .map(|i| (i.to_string(), ("http://x".into(), "k".into())))
             .collect()
+    }
+
+    #[test]
+    fn served_models_exclude_deprecated_and_alpha() {
+        // Freeze provider.ts:1744-1745. The catalog carried 37 retired free
+        // models for `opencode`; they must not reach the picker.
+        let cache = serde_json::json!({
+            "p": {
+                "api": "http://x", "npm": "@ai-sdk/openai-compatible", "name": "P",
+                "models": {
+                    "live": {"id": "live", "name": "Live", "cost": {"input": 0}},
+                    "retired": {"id": "retired", "name": "Retired", "status": "deprecated",
+                                "cost": {"input": 0}},
+                    "alpha-one": {"id": "alpha-one", "name": "A", "status": "alpha",
+                                  "cost": {"input": 0}},
+                }
+            }
+        });
+        let (_cp, provider) =
+            build_providers(&serde_json::json!({}), &serde_json::json!({}), &cache);
+        let p = provider["all"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["id"] == "p")
+            .unwrap();
+        let ids: Vec<&str> = p["models"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["live"],
+            "deprecated/alpha models must not be served"
+        );
+        // The provider default must not be a model we no longer offer.
+        assert_eq!(provider["default"]["p"], "live");
+    }
+
+    #[test]
+    fn experimental_flag_admits_alpha_but_never_deprecated() {
+        // Deprecated is unconditional (upstream deletes it before the alpha
+        // check); the experimental flag can only revive alpha.
+        assert!(!super::model_is_offered(
+            &serde_json::json!({"status": "deprecated"}),
+            true
+        ));
+        assert!(!super::model_is_offered(
+            &serde_json::json!({"status": "deprecated"}),
+            false
+        ));
+        assert!(super::model_is_offered(
+            &serde_json::json!({"status": "alpha"}),
+            true
+        ));
+        assert!(!super::model_is_offered(
+            &serde_json::json!({"status": "alpha"}),
+            false
+        ));
+        assert!(super::model_is_offered(&serde_json::json!({}), false));
+    }
+
+    #[test]
+    fn default_model_skips_a_deprecated_state_entry() {
+        let state = serde_json::json!({
+            "recent": [
+                {"providerID": "p", "modelID": "retired"},
+                {"providerID": "p", "modelID": "live"},
+            ]
+        });
+        let config_providers = serde_json::json!({
+            "providers": [{
+                "id": "p",
+                "models": {
+                    "retired": {"id": "retired", "status": "deprecated"},
+                    "live": {"id": "live", "status": "active"},
+                }
+            }]
+        });
+        let (p, m) = pick_default_model(
+            &state,
+            &serde_json::json!({}),
+            &config_providers,
+            &endpoints(&["p"]),
+        );
+        assert_eq!((p.as_str(), m.as_str()), ("p", "live"));
     }
 
     #[test]

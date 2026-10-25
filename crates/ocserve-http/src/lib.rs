@@ -4021,6 +4021,7 @@ async fn delete_session_route(
     // RAM audit 2026-10-11: release per-session gate state (always-grants +
     // hydrated marker) — it otherwise accumulates for every session ever seen.
     st.gate.forget_session(&id);
+    ocserve_core::prefix::forget(&id);
     // P0e: magic-context consumes session.deleted (live publish — the
     // durable rows cascade away with the session).
     st.bus.publish(ocserve_core::event::frame(

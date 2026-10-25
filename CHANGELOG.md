@@ -4,9 +4,107 @@ All notable changes to ocserve. The wire contract targets the frozen
 openccode 1.18.31 release and the v2 surface the 2.0.28 client; anything that
 differs is a named `D-*` row in `PLAN.md §17`.
 
-## Unreleased (after 0.6.7)
+## 0.6.8
 
-### Fixed (second review pass)
+### Fixed
+- **Free-tier models returned 429 for every request.** Two gates, both fixed.
+  The transport gate now fingerprints the TLS stack: the same body and headers
+  that opencode sends pass from Bun's BoringSSL and are rejected from rustls,
+  OpenSSL and curl (verified with a 5-stack replay), so opencode.ai goes
+  through a BoringSSL-backed lane while other providers keep rustls
+  (`D-ZEN-TLS`). The request gate also tightened: a short system prompt or a
+  small hand-built tool array is rejected, while the real production prompt
+  (~10 KB base + env + skills) and the real advertised tool set pass. The
+  nightly live trio now sends exactly what the server sends, so the gate
+  cannot silently drift again.
+- **A final chunk carrying both content and `finish_reason` lost the text.**
+  opencode's free tier sends `{"finish_reason":"stop","delta":{"content":"…"}}`
+  in one chunk; the parser returned Done and dropped the content, so the turn
+  completed with `finish=stop` and an empty reply. Content and terminal events
+  are now emitted in order from one payload.
+- **A spent opencode free allowance failed silently.** Three consecutive
+  attempts on 2026-10-25 died with the raw provider body (429
+  `FreeUsageLimitError`) and only a log line; the client showed nothing
+  actionable and the user retried blindly. It is now classified as terminal
+  and surfaced with upstream's exact upsell ("Free usage exceeded, subscribe
+  to Go") as a typed `APIError{statusCode:429,isRetryable:false}`, plus
+  `ocserve_zen_freetier_total{result="usage_limit"}`. The keyless/free tier is
+  not free at scale: the allowance is shared and finite.
+- **Retired models were still listed.** The served model map included every
+  catalog entry, so `opencode` showed 46 models, 37 of them `deprecated`
+  (upstream shows 9). Freeze deletes `status:"deprecated"` and, unless
+  `OPENCODE_ENABLE_EXPERIMENTAL_MODELS` is set, `status:"alpha"`
+  (`provider.ts:1744-1745`); ocserve now does the same in `build_providers`
+  and when picking the effective default, so the picker and the default agree.
+
+### Added
+- `ocserve import --session <id>` (repeatable) and `--force` are now reachable
+  from the CLI, matching the documented behaviour: adopt named sessions into a
+  data dir that already has history (the search trigger is kept, transactions
+  stay short, so a running server is safe), refuse a session that is already
+  present unless `--force`, and require `--force` to name at least one
+  session so a destructive import is never implicit. Session task lists are
+  adopted too.
+- `ocserve import --bulk` gives a populated data dir the fast index path while
+  the server is stopped. Before this, stopping the server changed nothing: the
+  strategy was chosen from the target's contents (`existing == 0`), so an
+  existing data dir always took the per-row trigger path. `--bulk` drops the
+  trigger, streams the parts and rebuilds the index once; on the measured
+  5,722-part session that was 26-32 s versus 40-47 s incremental (warm), and
+  the warning states that a server must not be writing.
+- A live import above 10,000 source parts is refused before writing anything
+  unless `--allow-slow-live` or `--bulk`: per-row indexing was measured at
+  ~140 parts/s on a small populated target, and a 21k-message / 80k-part
+  adoption exceeded 15 minutes with no progress output.
+- `--force` snapshots the target with `VACUUM INTO` before deleting anything,
+  and applies in every mode (a bulk re-import used to bypass the gate and let
+  `INSERT OR REPLACE` cascade the old session away).
+- The bulk index rebuild and trigger recreation are one transaction, and the
+  parity stamp records `count(part_search)`; the boot gate now compares the
+  index to the rows, so a row committed during the old gap is repaired instead
+  of being recorded as healthy.
+- The external-commit watcher survives a backup restore (per-path state keyed
+  by device+inode, reopen on replacement), runs on the blocking pool, and
+  counts poll failures.
+- The bounded prompt load is conservative whenever ANY compaction row exists:
+  an unfinished imported summary reorders history under the full filter, so a
+  suffix is only used when the session has no compaction rows or the boundary
+  resolves exactly.
+- Source parts are size-checked before the target is created, and source paths
+  are URI-encoded (`#`/`?`/`%` no longer open a different file).
+- Nullable upstream columns no longer abort the import. `session.path` is
+  nullable in the opencode schema; reading it as a `String` failed the whole
+  import with `Invalid column type Null` on a real row.
+- `ocserve doctor --env` and `ocserve env-reference` expose every `OCSERVE_*`
+  variable with its default and accepted values. `docs/ENVIRONMENT.md` is
+  generated from that contract, and guard rule 58 fails the build if a runtime
+  read is undocumented or the committed reference is stale.
+- The server notices commits made by another process into its data dir
+  (`PRAGMA data_version` on one long-lived reader, folded into the write epoch
+  by the 15 s sampler), so an importer's rows cannot leave the list, page or
+  search caches stale.
+
+### Changed
+- **Prompt history is read as a proven suffix instead of the whole session.** A
+  56k-message session stores ~85 MB of parts while the 8 MB history budget keeps
+  only the tail. `prompt_window` proposes a `seq` suffix mirroring
+  `filter_compacted`'s stop condition; `load_prompt_history` accepts it only when
+  the exact byte trim proves it, or the compaction boundary sits at its start.
+  Every other shape falls back to the full load. Interleaved, warm-up discarded:
+  deep session 4.6-5.2 s -> 1.45-1.59 s, compacted session 117 ms -> 22 ms, a
+  dense mid-size session 2.89 s -> 2.56 s; emitted provider messages are
+  byte-identical in every case. Kill switch
+  `OCSERVE_PROMPT_HISTORY_UNBOUNDED=1`; metric
+  `ocserve_prompt_history_load_total{mode}`; guard rule 57.
+- **Prefix-cache changes are observable.**
+  `ocserve_provider_prefix_changed_total{part="system"|"tools"}` counts
+  per-session changes of the system prompt and tool-schema array between
+  requests, so a silent KV-prefix invalidation is visible instead of merely
+  expensive.
+- The per-tool-call permission path no longer re-parses the 26 KB provider tool
+  schema JSON to answer "is this a builtin" (`ocserve_tools::is_builtin`).
+
+### Fixed (review pass)
 - **The server hung under `memory.high`.** `main/memory.high=512M` throttled the
   single server process into direct reclaim it could never satisfy (no swap,
   almost all anon): on 2026-10-24 it sat at 601 MiB with 325,225 high events,
@@ -14,7 +112,7 @@ differs is a named `D-*` row in `PLAN.md §17`.
   over an hour while the unit stayed `active`. `main` no longer gets
   `memory.high`; the parent `MemoryHigh=960M` still throttles, `max` is the
   backstop. Regression test pins the absence.
-- `--version` now reports the build commit (`ocserve 0.6.7 (e1a54dd)`), and the
+- `--version` now reports the build commit (`ocserve 0.6.8 (e1a54dd)`), and the
   install receipt records `COMMIT=`, so a local build is distinguishable from a
   released artifact.
 - Per-agent `tools:{bash:false}` in config now becomes permission rules, as

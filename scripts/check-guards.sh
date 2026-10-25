@@ -119,6 +119,15 @@
 #  50. plugin demand ledger is current and classified (every hook the
 #      ecosystem declares is bound or a NAMED divergence)
 #      [suite: generator + independent re-derivation]
+#  56. the tool-level ask-sequence recording is non-vacuous (the v2
+#      permission oracle only exercises evaluate(), so six ask-shape
+#      divergences shipped behind every green gate) [plant: empty recording]
+#  57. prompt history is read through the bounded loader (a direct
+#      whole-session `load_messages` restores the O(session) read and can
+#      bypass the exact filter+budget proof) [plant: unmarked call appended]
+#  58. every runtime `OCSERVE_*` read is in the env contract, and the committed
+#      env reference matches the contract exactly (an undocumented knob is
+#      undiscoverable; a stale reference lies) [plant: bogus read + stale doc]
 #  51. hook/RPC dispatch takes a Handle, never the owner lock (holding it
 #      across the await re-serialized every session; 2026-10-23 review H3)
 #      [plant: owner-lock trigger call]
@@ -163,6 +172,103 @@ if out=$(grep -rn --include='*.rs' 'load_messages(' crates/ocserve-http/src 2>/d
   echo "$out"; echo "FAIL: load_messages in HTTP materializes whole sessions (OOM class) — use for_each_message_json"; fail=1
 else
   echo "ok"
+fi
+
+echo "== guard: environment-variable contract and generated reference (rule 58) =="
+# Every runtime `env::var("OCSERVE_*")` read must be declared in the contract,
+# and docs/ENVIRONMENT.md must be byte-identical to what the contract
+# generates. Without this a new knob ships undiscoverable, or the committed
+# reference drifts from the code and lies.
+# The predicate takes the files to scan, so the planted control runs the SAME
+# code over a sabotaged file rather than asserting its own setup.
+uncontracted_reads() {
+  local names
+  # Match every OCSERVE_* string literal, not just direct env::var calls: the
+  # code also reads through a key loop (`for key in ["OCSERVE_HOME", …]`) and a
+  # const alias (`OCSERVE_KIDS_CGROUP`), which a call-site regex missed.
+  #
+  # Names used ONLY inside #[cfg(test)] modules are listed here. The allowlist
+  # is narrow on purpose: if an allowlisted name ever appears on a line that
+  # reads the environment (`env::var`/`var_os`), it is still a runtime knob and
+  # the check below flags it.
+  local test_only=" OCSERVE_PTY_ENV_TEST OCSERVE_PTY_OK OCSERVE_PTY_OVERRIDE OCSERVE_UNIT_PROBE OCSERVE_PORTX "
+  # `rg` is not installed on the GitHub macOS runner and is not guaranteed on
+  # any dev box; a missing binary makes this predicate return EMPTY, which is
+  # exactly what "no uncontracted reads" looks like — the guard then reported
+  # its own planted control as passing (CI caught it 2026-10-25). grep -rhoE
+  # is the portable equivalent for this extraction and is already used below.
+  names=$(grep -rhoE '"OCSERVE_[A-Z0-9_]+"' "$@" 2>/dev/null \
+          | tr -d '"' | sort -u)
+  local name missing=""
+  for name in $names; do
+    # Only the table counts: a name in a doc comment or a unit test does not
+    # declare it for operators. Operator rows are a bare `"NAME",` line;
+    # harness rows go through the `internal("NAME", …)` helper.
+    if grep -qE "^[[:space:]]*\"$name\"," crates/ocserve-core/src/env_contract.rs \
+       || grep -qE "^[[:space:]]*internal\(\"$name\"," crates/ocserve-core/src/env_contract.rs; then
+      continue
+    fi
+    case "$test_only" in
+      *" $name "*) 
+        # Allowlisted as test-only, but only while no runtime read names it.
+        if grep -rnE 'env::var|var_os' "$@" 2>/dev/null | grep -q "\"$name\""; then
+          missing="$missing $name(runtime-read)"
+        fi
+        ;;
+      *) missing="$missing $name" ;;
+    esac
+  done
+  printf '%s' "$missing"
+}
+planted=/var/tmp/ocserve-rule58-planted.rs
+if ! printf 'fn planted() { let _ = std::env::var("OCSERVE_PLANTED_UNCONTRACTED"); }\n' > "$planted"; then
+  echo "FAIL: rule 58 could not write its planted control"; fail=1
+elif [ -z "$(uncontracted_reads "$planted")" ]; then
+  echo "FAIL: rule 58 planted uncontracted read not detected (vacuous predicate)"; fail=1
+elif ! printf 'fn planted() { let _ = std::env::var("OCSERVE_PTY_OK"); }\n' > "$planted" \
+     || [ -z "$(uncontracted_reads "$planted")" ]; then
+  echo "FAIL: rule 58 allowlisted test name used at runtime not detected"; fail=1
+else
+  missing=$(uncontracted_reads crates/*/src 2>/dev/null)
+  if [ -n "$missing" ]; then
+    echo "uncontracted runtime env var(s):$missing"
+    echo "FAIL: runtime env var missing from the contract (rule 58)"; fail=1
+  else
+    if ! TMPDIR="${TMPDIR:-/var/tmp}" cargo run -q -p ocserve -- env-reference > /var/tmp/ocserve-env-reference.md 2>/dev/null; then
+      echo "FAIL: rule 58 could not generate the env reference"; fail=1
+    elif ! cmp -s /var/tmp/ocserve-env-reference.md docs/ENVIRONMENT.md; then
+      diff -u docs/ENVIRONMENT.md /var/tmp/ocserve-env-reference.md | head -40
+      echo "FAIL: docs/ENVIRONMENT.md is stale (regenerate: cargo run -q -p ocserve -- env-reference > docs/ENVIRONMENT.md)"; fail=1
+    else
+      echo "ok (planted uncontracted read detected; contract complete; reference current)"
+    fi
+  fi
+fi
+
+echo "== guard: prompt history read goes through the bounded loader (rule 57) =="
+# The bounded prompt load is only safe because `load_prompt_history_budget`
+# proves the window against the exact filter+budget. A direct whole-session
+# `load_messages` anywhere else in the prompt path silently restores the
+# O(whole-session) read and can bypass that proof. Named exception marker:
+# allow:prompt_full_load (the documented fallback inside the helper).
+# Planted control: an unmarked call in a copy of the file must be flagged.
+check_prompt_load() {
+  local f="$1"
+  grep -n 'ocserve_store::load_messages(' "$f" 2>/dev/null | grep -v 'allow:prompt_full_load' || true
+}
+planted=/var/tmp/ocserve-rule57-planted.rs
+if cp crates/ocserve-core/src/prompt.rs "$planted" 2>/dev/null &&
+   printf '\nfn planted() { let _ = ocserve_store::load_messages(db, sid, None); }\n' >> "$planted"; then
+  if [ -z "$(check_prompt_load "$planted")" ]; then
+    echo "FAIL: rule 57 planted unmarked full load not detected"; fail=1
+  elif [ -n "$(check_prompt_load crates/ocserve-core/src/prompt.rs)" ]; then
+    check_prompt_load crates/ocserve-core/src/prompt.rs
+    echo "FAIL: prompt path reads the whole session outside the bounded loader (rule 57)"; fail=1
+  else
+    echo "ok (planted unmarked full load detected)"
+  fi
+else
+  echo "FAIL: rule 57 could not build its planted control"; fail=1
 fi
 
 echo "== guard: msg_part writes only in ocserve-store =="
