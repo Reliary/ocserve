@@ -4,7 +4,7 @@ All notable changes to ocserve. The wire contract targets the frozen
 openccode 1.18.31 release and the v2 surface the 2.0.28 client; anything that
 differs is a named `D-*` row in `PLAN.md §17`.
 
-## Unreleased (after 0.6.7)
+## 0.6.8
 
 ### Fixed
 - **Free-tier models returned 429 for every request.** Two gates, both fixed.
@@ -104,7 +104,7 @@ differs is a named `D-*` row in `PLAN.md §17`.
 - The per-tool-call permission path no longer re-parses the 26 KB provider tool
   schema JSON to answer "is this a builtin" (`ocserve_tools::is_builtin`).
 
-### Fixed (second review pass)
+### Fixed (review pass)
 - **The server hung under `memory.high`.** `main/memory.high=512M` throttled the
   single server process into direct reclaim it could never satisfy (no swap,
   almost all anon): on 2026-10-24 it sat at 601 MiB with 325,225 high events,
@@ -112,7 +112,7 @@ differs is a named `D-*` row in `PLAN.md §17`.
   over an hour while the unit stayed `active`. `main` no longer gets
   `memory.high`; the parent `MemoryHigh=960M` still throttles, `max` is the
   backstop. Regression test pins the absence.
-- `--version` now reports the build commit (`ocserve 0.6.7 (e1a54dd)`), and the
+- `--version` now reports the build commit (`ocserve 0.6.8 (e1a54dd)`), and the
   install receipt records `COMMIT=`, so a local build is distinguishable from a
   released artifact.
 - Per-agent `tools:{bash:false}` in config now becomes permission rules, as
