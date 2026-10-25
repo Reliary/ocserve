@@ -109,6 +109,33 @@ read-only, and never writes to them. To bring history across:
 ocserve import --source ~/.local/share/opencode/opencode.db
 ```
 
+That takes the 20 most recent sessions. To adopt named sessions into a data dir
+that already has history (safe while `ocserve serve` is running: the import
+keeps the search trigger and uses short write transactions):
+
+```sh
+ocserve import --source ~/.local/share/opencode/opencode.db \
+  --session ses_abc123 --session ses_def456
+```
+
+Add `--force` to replace a session that is already there (`--force` requires at
+least one `--session`, so a destructive import is never implicit).
+
+A live import indexes each part through the search trigger as it lands, so it
+is safe but slower, and its cost grows with the corpus. Above 20,000 parts the
+command refuses and asks you to choose: stop the server (the bulk build is much
+faster) or pass `--allow-slow-live`. The refusal happens before anything is
+written.
+
+## Configuration
+
+`ocserve doctor --env` prints every `OCSERVE_*` variable, its default, and the
+values set in your shell. `ocserve env-reference` prints the same table as
+[`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md), which is generated from the code
+so it cannot go stale. Most installations need no environment variables at all:
+the defaults are the documented behaviour, and only kill switches (`=0`) and
+tuning knobs are there when you need them.
+
 ## Compatibility
 
 ### v1 (frozen at 1.18.31)

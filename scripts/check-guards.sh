@@ -125,6 +125,9 @@
 #  57. prompt history is read through the bounded loader (a direct
 #      whole-session `load_messages` restores the O(session) read and can
 #      bypass the exact filter+budget proof) [plant: unmarked call appended]
+#  58. every runtime `OCSERVE_*` read is in the env contract, and the committed
+#      env reference matches the contract exactly (an undocumented knob is
+#      undiscoverable; a stale reference lies) [plant: bogus read + stale doc]
 #  51. hook/RPC dispatch takes a Handle, never the owner lock (holding it
 #      across the await re-serialized every session; 2026-10-23 review H3)
 #      [plant: owner-lock trigger call]
@@ -169,6 +172,53 @@ if out=$(grep -rn --include='*.rs' 'load_messages(' crates/ocserve-http/src 2>/d
   echo "$out"; echo "FAIL: load_messages in HTTP materializes whole sessions (OOM class) — use for_each_message_json"; fail=1
 else
   echo "ok"
+fi
+
+echo "== guard: environment-variable contract and generated reference (rule 58) =="
+# Every runtime `env::var("OCSERVE_*")` read must be declared in the contract,
+# and docs/ENVIRONMENT.md must be byte-identical to what the contract
+# generates. Without this a new knob ships undiscoverable, or the committed
+# reference drifts from the code and lies.
+# The predicate takes the files to scan, so the planted control runs the SAME
+# code over a sabotaged file rather than asserting its own setup.
+uncontracted_reads() {
+  local names
+  names=$(rg -o --no-filename 'env::var(?:_os)?\("(OCSERVE_[A-Z0-9_]+)"\)' "$@" 2>/dev/null \
+          | sed -E 's/.*"(OCSERVE_[A-Z0-9_]+)".*/\1/' | sort -u)
+  local name missing=""
+  for name in $names; do
+    # Only the table counts: a name in a doc comment or a unit test does not
+    # declare it for operators. Operator rows are a bare `"NAME",` line;
+    # harness rows go through the `internal("NAME", …)` helper.
+    if grep -qE "^[[:space:]]*\"$name\"," crates/ocserve-core/src/env_contract.rs \
+       || grep -qE "^[[:space:]]*internal\(\"$name\"," crates/ocserve-core/src/env_contract.rs; then
+      :
+    else
+      missing="$missing $name"
+    fi
+  done
+  printf '%s' "$missing"
+}
+planted=/var/tmp/ocserve-rule58-planted.rs
+if ! printf 'fn planted() { let _ = std::env::var("OCSERVE_PLANTED_UNCONTRACTED"); }\n' > "$planted"; then
+  echo "FAIL: rule 58 could not write its planted control"; fail=1
+elif [ -z "$(uncontracted_reads "$planted")" ]; then
+  echo "FAIL: rule 58 planted uncontracted read not detected (vacuous predicate)"; fail=1
+else
+  missing=$(uncontracted_reads crates/*/src 2>/dev/null)
+  if [ -n "$missing" ]; then
+    echo "uncontracted runtime env var(s):$missing"
+    echo "FAIL: runtime env var missing from the contract (rule 58)"; fail=1
+  else
+    if ! TMPDIR="${TMPDIR:-/var/tmp}" cargo run -q -p ocserve -- env-reference > /var/tmp/ocserve-env-reference.md 2>/dev/null; then
+      echo "FAIL: rule 58 could not generate the env reference"; fail=1
+    elif ! cmp -s /var/tmp/ocserve-env-reference.md docs/ENVIRONMENT.md; then
+      diff -u docs/ENVIRONMENT.md /var/tmp/ocserve-env-reference.md | head -40
+      echo "FAIL: docs/ENVIRONMENT.md is stale (regenerate: cargo run -q -p ocserve -- env-reference > docs/ENVIRONMENT.md)"; fail=1
+    else
+      echo "ok (planted uncontracted read detected; contract complete; reference current)"
+    fi
+  fi
 fi
 
 echo "== guard: prompt history read goes through the bounded loader (rule 57) =="

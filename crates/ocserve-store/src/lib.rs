@@ -4122,6 +4122,10 @@ static LIST_MEMO_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 pub const SEARCH_MEMO_CAP: usize = 64;
 
 /// Live write epoch (Acquire).
+///
+/// This only moves when THIS process's writer commits. A commit by another
+/// process (the importer) is picked up by [`import_stamp`], which the serve
+/// sampler polls and turns into a `bump_write_epoch()` — see `StampWatcher`.
 pub fn write_epoch() -> u64 {
     WRITE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -4137,6 +4141,44 @@ pub fn bump_write_epoch() {
     l.bytes = None;
     l.epoch = 0;
     l.db = None;
+}
+
+/// Watches for commits made by ANOTHER process into this database.
+///
+/// `PRAGMA data_version` is per-connection and increments when a different
+/// connection commits. A long-lived read-only connection therefore sees the
+/// importer's commits even though our writer never ran. Re-opening a
+/// connection per poll would reset the counter to its baseline and see
+/// nothing, so the connection is kept for the process lifetime.
+///
+/// Returns `true` when external commits were observed since the previous
+/// poll. The first poll only establishes the baseline (returns `false`).
+pub fn poll_external_commits(db: &std::path::Path) -> anyhow::Result<bool> {
+    struct Watcher {
+        db: std::path::PathBuf,
+        conn: pragma::Reader,
+        version: i64,
+    }
+    static W: std::sync::OnceLock<parking_lot::Mutex<Option<Watcher>>> = std::sync::OnceLock::new();
+    let slot = W.get_or_init(|| parking_lot::Mutex::new(None));
+    let mut guard = slot.lock();
+    if guard.as_ref().is_none_or(|w| w.db != db) {
+        let conn = pragma::open_reader(db)?;
+        let version: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+        *guard = Some(Watcher {
+            db: db.to_path_buf(),
+            conn,
+            version,
+        });
+        return Ok(false);
+    }
+    let w = guard.as_mut().expect("watcher present");
+    let version: i64 = w.conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+    if version == w.version {
+        return Ok(false);
+    }
+    w.version = version;
+    Ok(true)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]

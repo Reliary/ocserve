@@ -316,3 +316,34 @@ fn newest_anchor_wins_even_when_a_late_summary_lands_on_an_older_anchor() {
         "the wrong boundary would drop msg_keep (history loss)"
     );
 }
+
+/// Cross-process visibility: a commit from ANOTHER connection must be
+/// observable through one long-lived read-only connection, because that is how
+/// the server notices an importer writing into its data dir.
+#[test]
+fn external_commit_is_observable_through_a_long_lived_reader() {
+    let fx = fixture("ext_commit");
+    msg(&fx, "msg_a", "user", "before");
+
+    // First poll establishes the baseline.
+    assert!(
+        !ocserve_store::poll_external_commits(&fx.db).unwrap(),
+        "baseline poll must not report a change"
+    );
+    assert!(
+        !ocserve_store::poll_external_commits(&fx.db).unwrap(),
+        "an idle database must not report a change"
+    );
+
+    // A different connection writes (this is the importer process).
+    msg(&fx, "msg_b", "user", "written by another process");
+
+    assert!(
+        ocserve_store::poll_external_commits(&fx.db).unwrap(),
+        "another connection's commit must be visible"
+    );
+    assert!(
+        !ocserve_store::poll_external_commits(&fx.db).unwrap(),
+        "the same change must not be reported twice"
+    );
+}

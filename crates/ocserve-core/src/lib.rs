@@ -10,6 +10,7 @@ pub mod attempt;
 pub mod compact;
 pub mod compaction;
 pub mod coordinator;
+pub mod env_contract;
 pub mod event;
 pub mod form;
 pub mod ids;

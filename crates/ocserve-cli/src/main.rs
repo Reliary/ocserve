@@ -85,13 +85,31 @@ enum Cmd {
         /// (unit caps, per-class caps, current/peak, memory events, CPU).
         #[arg(long)]
         budget: bool,
+        /// Print every OCSERVE_* variable with its default and the value
+        /// currently set in this shell.
+        #[arg(long)]
+        env: bool,
     },
-    /// Import last N sessions from a source opencode.db (read-only, PLAN §9)
+    /// Import sessions from a source opencode.db (read-only, PLAN §9).
+    /// Default: the N most recent. Repeat `--session` to adopt named sessions
+    /// into a data dir that already has history (safe while `ocserve serve`
+    /// runs: the search trigger is kept and write transactions stay short).
     Import {
         #[arg(long)]
         source: std::path::PathBuf,
+        /// Number of most-recent sessions (ignored when --session is given)
         #[arg(long, default_value_t = 20)]
         limit: u32,
+        /// Adopt this session id (repeatable)
+        #[arg(long = "session")]
+        sessions: Vec<String>,
+        /// Replace a session already present in the target
+        #[arg(long)]
+        force: bool,
+        /// Accept a live import whose incremental search indexing may take a
+        /// long time (large session into a populated data dir)
+        #[arg(long)]
+        allow_slow_live: bool,
         #[arg(long)]
         data_dir: Option<std::path::PathBuf>,
     },
@@ -115,6 +133,9 @@ enum Cmd {
         #[command(subcommand)]
         action: ModelsCmd,
     },
+    /// Print the generated environment-variable reference (the same text as
+    /// `docs/ENVIRONMENT.md`, so the docs can be regenerated, never hand-edited)
+    EnvReference,
 }
 
 #[derive(Subcommand)]
@@ -232,10 +253,12 @@ fn main() -> Result<()> {
             data_dir,
             plugins,
             budget,
+            env,
         } => rt::block_on(doctor(
             data_dir.unwrap_or_else(default_data_dir),
             plugins,
             budget,
+            env,
         )),
         Cmd::Backup { dest, data_dir } => {
             let dir = data_dir.unwrap_or_else(default_data_dir);
@@ -250,8 +273,26 @@ fn main() -> Result<()> {
         Cmd::Import {
             source,
             limit,
+            sessions,
+            force,
+            allow_slow_live,
             data_dir,
-        } => import(source, limit, data_dir.unwrap_or_else(default_data_dir)),
+        } => {
+            // `--force` without `--session` would silently mean "re-import the
+            // last N and replace whatever is there"; require the explicit id
+            // form so the destructive intent is never implicit.
+            if force && sessions.is_empty() {
+                anyhow::bail!("--force requires at least one --session <id>");
+            }
+            import(
+                source,
+                limit,
+                sessions,
+                force,
+                allow_slow_live,
+                data_dir.unwrap_or_else(default_data_dir),
+            )
+        }
         Cmd::Replay {
             target,
             allow_missing,
@@ -290,6 +331,10 @@ fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Cmd::EnvReference => {
+            print!("{}", ocserve_core::env_contract::reference_markdown());
+            Ok(())
+        }
     }
 }
 
@@ -686,6 +731,25 @@ async fn serve(
             loop {
                 tick.tick().await;
                 n += 1;
+                // Cross-process commits (the importer writing into this data
+                // dir) must invalidate the epoch-keyed caches even though OUR
+                // writer never ran. `PRAGMA data_version` on one long-lived
+                // reader sees exactly those commits.
+                match ocserve_store::poll_external_commits(&st.db) {
+                    Ok(true) => {
+                        ocserve_store::bump_write_epoch();
+                        ocserve_metrics::labeled_counter(
+                            "ocserve_external_commit_total",
+                            "source=\"sampler\"",
+                            1,
+                        );
+                        tracing::info!(
+                            "external commit observed on the data dir — caches invalidated"
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(e) => tracing::debug!("external-commit poll: {e:#}"),
+                }
                 ocserve_metrics::sample_rss();
                 ocserve_metrics::gauge("ocserve_writer_queue_depth", writer_m.queue_depth());
                 let wal = std::fs::metadata(&wal_path)
@@ -1279,7 +1343,12 @@ fn budget_report() {
     }
 }
 
-async fn doctor(data_dir: std::path::PathBuf, plugins: bool, budget: bool) -> Result<()> {
+async fn doctor(
+    data_dir: std::path::PathBuf,
+    plugins: bool,
+    budget: bool,
+    env: bool,
+) -> Result<()> {
     println!("ocserve doctor");
     println!("  sqlite version:  {}", rusqlite::version());
     match ocserve_store::pragma::assert_version_ok() {
@@ -1385,10 +1454,43 @@ async fn doctor(data_dir: std::path::PathBuf, plugins: bool, budget: bool) -> Re
     if budget {
         budget_report();
     }
+    if env {
+        env_report();
+    }
     if plugins {
         plugin_report(&data_dir).await;
     }
     Ok(())
+}
+
+/// `doctor --env`: every OCSERVE_* variable the server reads, its default,
+/// and whether it is set in THIS shell. The contract lives in
+/// `ocserve_core::env_contract`, which also generates `docs/ENVIRONMENT.md`,
+/// so the two cannot drift.
+fn env_report() {
+    let rows = ocserve_core::env_contract::rows();
+    let operator = rows
+        .iter()
+        .filter(|r| r.var.scope == ocserve_core::env_contract::Scope::Operator)
+        .count();
+    let set = rows.iter().filter(|r| r.is_set()).count();
+    println!("  environment:     {operator} operator variables; {set} set in this shell");
+    let mut current: &str = "";
+    for r in rows.iter().filter(|r| r.is_set()) {
+        if r.var.group != current {
+            current = r.var.group;
+            println!("    [{current}]");
+        }
+        println!(
+            "      {} = {}   (default: {})",
+            r.var.name,
+            r.value.as_deref().unwrap_or(""),
+            r.var.default
+        );
+    }
+    println!(
+        "  (unset variables use their default; `ocserve env-reference` prints the full table)"
+    );
 }
 
 /// `doctor --plugins`: what the configured plugins register, what ocserve
@@ -1451,12 +1553,30 @@ async fn plugin_report(data_dir: &std::path::Path) {
     sc.shutdown().await;
 }
 
-fn import(source: std::path::PathBuf, limit: u32, data_dir: std::path::PathBuf) -> Result<()> {
-    println!(
-        "import {limit} sessions from {} into {}",
-        source.display(),
-        data_dir.display()
-    );
-    ocserve_importer::import_last_n(&source, &data_dir, limit)?;
+fn import(
+    source: std::path::PathBuf,
+    limit: u32,
+    sessions: Vec<String>,
+    force: bool,
+    allow_slow_live: bool,
+    data_dir: std::path::PathBuf,
+) -> Result<()> {
+    if sessions.is_empty() {
+        println!(
+            "import {limit} sessions from {} into {}",
+            source.display(),
+            data_dir.display()
+        );
+        ocserve_importer::import_last_n(&source, &data_dir, limit)?;
+    } else {
+        println!(
+            "import {} named session(s) from {} into {}{}",
+            sessions.len(),
+            source.display(),
+            data_dir.display(),
+            if force { " (replacing existing)" } else { "" }
+        );
+        ocserve_importer::import_sessions(&source, &data_dir, &sessions, force, allow_slow_live)?;
+    }
     Ok(())
 }

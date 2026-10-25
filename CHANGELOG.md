@@ -6,6 +6,27 @@ differs is a named `D-*` row in `PLAN.md §17`.
 
 ## Unreleased (after 0.6.7)
 
+### Added
+- `ocserve import --session <id>` (repeatable) and `--force` are now reachable
+  from the CLI, matching the documented behaviour: adopt named sessions into a
+  data dir that already has history (the search trigger is kept, transactions
+  stay short, so a running server is safe), refuse a session that is already
+  present unless `--force`, and require `--force` to name at least one
+  session so a destructive import is never implicit. Session task lists are
+  adopted too.
+- A live import above 20,000 source parts is refused before writing anything
+  unless `--allow-slow-live`: incremental search indexing was measured at
+  ~2,100 parts/s on an empty target and degrades with corpus size, and a
+  21k-part adoption ran for over 15 minutes with no progress output.
+- `ocserve doctor --env` and `ocserve env-reference` expose every `OCSERVE_*`
+  variable with its default and accepted values. `docs/ENVIRONMENT.md` is
+  generated from that contract, and guard rule 58 fails the build if a runtime
+  read is undocumented or the committed reference is stale.
+- The server notices commits made by another process into its data dir
+  (`PRAGMA data_version` on one long-lived reader, folded into the write epoch
+  by the 15 s sampler), so an importer's rows cannot leave the list, page or
+  search caches stale.
+
 ### Changed
 - **Prompt history is read as a proven suffix instead of the whole session.** A
   56k-message session stores ~85 MB of parts while the 8 MB history budget keeps

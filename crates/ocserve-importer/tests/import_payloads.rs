@@ -77,7 +77,7 @@ fn import_counts_byte_parity_and_blob_spill() {
             [],
         ).unwrap();
     }
-    let stats = import_payloads(&src, &target, &["ses_1".to_string()]).unwrap();
+    let stats = import_payloads(&src, &target, &["ses_1".to_string()], true).unwrap();
     assert_eq!(stats.messages, 2, "two source messages");
     assert_eq!(stats.parts, 2, "two source parts");
     assert_eq!(stats.parts_blobbed, 1, "only the >8KB part spills to blobs");
