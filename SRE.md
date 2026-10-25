@@ -121,6 +121,17 @@ hard cap only — failure is surfaced, never silent) and `OCSERVE_PROMPT_MAX_COS
 have kill-criteria tests (`autonomy.rs`) and the bound lives on dollars/visibility,
 not on a magic round count.
 
+History-load knob — `OCSERVE_PROMPT_HISTORY_UNBOUNDED=1` (default unset) forces the
+pre-change whole-session prompt load; read once at boot. It changes only how much is
+READ: the `filter_compacted` selection and the 8 MB trim still apply, so the provider
+request is identical. Unset (default) loads a proven `seq` suffix via
+`ocserve_store::prompt_window` + `load_prompt_history`, falling back to the full load
+whenever equivalence cannot be shown. Proof and negative controls:
+`crates/ocserve-store/tests/prompt_window.rs`, `prompt.rs::bounded_prompt_load_tests`,
+and the real-corpus probe `bounded_prompt_load_matches_real_corpus` (ignored by
+default; run with `OCSERVE_CORPUS_DB` + `OCSERVE_CORPUS_SESSION`). Guard rule 57 keeps
+every other prompt-path read on the bounded loader.
+
 Plugin normalization knob — `OCSERVE_PLUGIN_NORMALIZE` (default **on**): content-hash-cached
 rolldown normalization of plugin entries at load (D1 — decision record
 `bench/normalizer-spike/D1-PLAN.md`). `=0` skips **before rolldown is constructed** (the
@@ -199,8 +210,10 @@ other than the async worker (thread identity recorded by a test-only seam).
   nor a knife-edge cap).** Every layer degrades to the one below on failure;
   the cap is the BACKSTOP, not the control:
   1. **L0 bounded-by-construction (always on):** 32 MB event ring, 8 MB
-     tail-weighted history budget, streamed `/message`, `malloc_trim`
-     cadence, `MALLOC_ARENA_MAX=1`, single catalog parse per reload.
+     tail-weighted history budget applied to a provably-equivalent `seq`
+     suffix (the kill switch disables only the suffix read), streamed
+     `/message`, `malloc_trim` cadence, `MALLOC_ARENA_MAX=1`, single catalog
+     parse per reload.
   2. **L1 graceful sidecar recycle** (15 s sampler): RSS ≥
      `OCSERVE_SIDECAR_RECYCLE_MB` (default 280 — above the ~100 MB steady
      state and **below the 320 MB plugin leaf cap**, so recycle can actually

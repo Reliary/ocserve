@@ -119,6 +119,12 @@
 #  50. plugin demand ledger is current and classified (every hook the
 #      ecosystem declares is bound or a NAMED divergence)
 #      [suite: generator + independent re-derivation]
+#  56. the tool-level ask-sequence recording is non-vacuous (the v2
+#      permission oracle only exercises evaluate(), so six ask-shape
+#      divergences shipped behind every green gate) [plant: empty recording]
+#  57. prompt history is read through the bounded loader (a direct
+#      whole-session `load_messages` restores the O(session) read and can
+#      bypass the exact filter+budget proof) [plant: unmarked call appended]
 #  51. hook/RPC dispatch takes a Handle, never the owner lock (holding it
 #      across the await re-serialized every session; 2026-10-23 review H3)
 #      [plant: owner-lock trigger call]
@@ -163,6 +169,32 @@ if out=$(grep -rn --include='*.rs' 'load_messages(' crates/ocserve-http/src 2>/d
   echo "$out"; echo "FAIL: load_messages in HTTP materializes whole sessions (OOM class) — use for_each_message_json"; fail=1
 else
   echo "ok"
+fi
+
+echo "== guard: prompt history read goes through the bounded loader (rule 57) =="
+# The bounded prompt load is only safe because `load_prompt_history_budget`
+# proves the window against the exact filter+budget. A direct whole-session
+# `load_messages` anywhere else in the prompt path silently restores the
+# O(whole-session) read and can bypass that proof. Named exception marker:
+# allow:prompt_full_load (the documented fallback inside the helper).
+# Planted control: an unmarked call in a copy of the file must be flagged.
+check_prompt_load() {
+  local f="$1"
+  grep -n 'ocserve_store::load_messages(' "$f" 2>/dev/null | grep -v 'allow:prompt_full_load' || true
+}
+planted=/var/tmp/ocserve-rule57-planted.rs
+if cp crates/ocserve-core/src/prompt.rs "$planted" 2>/dev/null &&
+   printf '\nfn planted() { let _ = ocserve_store::load_messages(db, sid, None); }\n' >> "$planted"; then
+  if [ -z "$(check_prompt_load "$planted")" ]; then
+    echo "FAIL: rule 57 planted unmarked full load not detected"; fail=1
+  elif [ -n "$(check_prompt_load crates/ocserve-core/src/prompt.rs)" ]; then
+    check_prompt_load crates/ocserve-core/src/prompt.rs
+    echo "FAIL: prompt path reads the whole session outside the bounded loader (rule 57)"; fail=1
+  else
+    echo "ok (planted unmarked full load detected)"
+  fi
+else
+  echo "FAIL: rule 57 could not build its planted control"; fail=1
 fi
 
 echo "== guard: msg_part writes only in ocserve-store =="

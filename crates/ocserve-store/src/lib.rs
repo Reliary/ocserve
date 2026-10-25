@@ -1742,11 +1742,18 @@ pub fn prompt_window(
          WHERE message_id = ?1 AND type = 'compaction' ORDER BY seq ASC LIMIT 1",
     )?;
 
-    // Newest *completed* compaction in message order. `filter_compacted` walks
-    // newest→oldest and stops at the first anchor whose summary it has already
-    // seen, i.e. the completed anchor with the greatest `seq` — `time_ms` order
-    // can disagree after a late legacy-sync insert, so resolve seq explicitly.
-    let mut best: Option<(i64, (i64, String))> = None; // summary_seq -> (anchor_seq, anchor_id)
+    // The boundary `filter_compacted` resolves is the completed ANCHOR with the
+    // greatest message order (it walks newest→oldest and stops at the first
+    // anchor whose summary it has already passed), NOT the compaction with the
+    // newest summary. Those differ after a late legacy-sync insert: an older
+    // anchor can gain a newer summary. Keying on the summary seq made the
+    // window start at the wrong compaction and then claim `authoritative`,
+    // silently dropping the messages between the two anchors. `time_ms` is
+    // equally unreliable, so both are resolved from `msg.seq`.
+    //
+    // A summary only participates when it comes AFTER its anchor in message
+    // order (`is_completed_summary` + the reverse walk's `completed` set).
+    let mut best: Option<(i64, (i64, String))> = None; // anchor_seq -> (anchor_seq, anchor_id)
     for row in compaction_rows(&conn, session_id)?.iter() {
         let Some(summary_id) = row.summary_msg_id.as_deref().filter(|s| !s.is_empty()) else {
             continue;
@@ -1784,8 +1791,11 @@ pub fn prompt_window(
             // filter either; only the full load is safe.
             return Ok((0, false));
         };
-        if best.as_ref().is_none_or(|(s, _)| summary_seq > *s) {
-            best = Some((summary_seq, (anchor_seq, anchor_id.to_string())));
+        // The reverse walk has already seen this summary when it reaches the
+        // anchor only if the summary's seq is greater. Anything else cannot
+        // become the stop point.
+        if summary_seq > anchor_seq && best.as_ref().is_none_or(|(a, _)| anchor_seq > *a) {
+            best = Some((anchor_seq, (anchor_seq, anchor_id.to_string())));
         }
     }
 

@@ -9,10 +9,12 @@
 //!    the anchor when no tail was recorded), and every shape the filter cannot
 //!    resolve degrades to the full load instead of guessing.
 //!
-//! Negative control (run during development): return `anchor_seq` instead of
-//! `tail_seq` and `compaction_window_starts_at_tail` fails; return `(seq,
-//! false)` for the no-tail case and `compaction_without_tail_keeps_anchor`
-//! fails.
+//! Negative controls (run during development, each red then restored):
+//! returning `anchor_seq` instead of `tail_seq` reds
+//! `compaction_window_starts_at_tail`; returning `(seq, false)` for the no-tail
+//! case reds `compaction_without_tail_keeps_anchor`; keying the boundary on the
+//! newest SUMMARY seq (instead of the newest ANCHOR seq) reds
+//! `newest_anchor_wins_even_when_a_late_summary_lands_on_an_older_anchor`.
 
 use ocserve_store::{BlobStore, Writer};
 use serde_json::json;
@@ -272,5 +274,45 @@ fn tail_after_anchor_is_not_treated_as_authoritative() {
         (min_seq, authoritative),
         (0, false),
         "a forward tail makes the filter keep everything; only the full load is safe"
+    );
+}
+
+#[test]
+fn newest_anchor_wins_even_when_a_late_summary_lands_on_an_older_anchor() {
+    // `filter_compacted` stops at the completed ANCHOR with the greatest
+    // message order. A late insert can give an OLDER anchor a NEWER summary,
+    // so selecting the compaction by summary seq picks the wrong boundary and
+    // then claims `authoritative`. Tails are not monotonic, so the wrong
+    // boundary can be LATER and silently drop history.
+    //
+    // Layout by seq: keep(newer tail) · old_tail · anc_old · anc_new ·
+    // sum_new · sum_old(late, highest seq). The correct filter starts at
+    // `keep`; the summary-seq rule would start at `old_tail` and drop `keep`.
+    let fx = fixture("multi_comp");
+    msg(&fx, "msg_keep", "user", "tail of the newer compaction");
+    msg(&fx, "msg_old_tail", "user", "tail of the older compaction");
+    anchor(&fx, "msg_anc_old");
+    anchor(&fx, "msg_anc_new");
+    summary(&fx, "msg_sum_new", "msg_anc_new");
+    summary(&fx, "msg_sum_old", "msg_anc_old"); // late insert: highest seq
+    msg(&fx, "msg_end", "user", "newest");
+    set_tail(&fx, "msg_anc_old", "msg_old_tail");
+    set_tail(&fx, "msg_anc_new", "msg_keep");
+
+    assert!(
+        seq_of(&fx, "msg_sum_old") > seq_of(&fx, "msg_sum_new"),
+        "fixture must give the older anchor the newer summary"
+    );
+
+    let (min_seq, authoritative) = ocserve_store::prompt_window(&fx.db, &fx.sid, 8 << 20).unwrap();
+    assert!(authoritative, "the newest anchor is a completed boundary");
+    assert_eq!(
+        min_seq,
+        seq_of(&fx, "msg_keep"),
+        "must start at the NEWEST anchor's tail, not the older compaction's"
+    );
+    assert!(
+        min_seq < seq_of(&fx, "msg_old_tail"),
+        "the wrong boundary would drop msg_keep (history loss)"
     );
 }

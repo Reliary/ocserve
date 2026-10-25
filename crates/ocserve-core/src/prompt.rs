@@ -1050,66 +1050,75 @@ fn load_prompt_history_budget(
     force_full: bool,
     transform_listener: bool,
 ) -> anyhow::Result<Vec<(Value, Vec<Value>)>> {
-    let (mut min_seq, authoritative) = if force_full {
-        (0, false)
-    } else {
-        ocserve_store::prompt_window(db, session_id, budget)?
-    };
-
-    // A `messages.transform` plugin receives the graph BEFORE the byte budget,
-    // so in a session with no compaction it may inspect every message. A
-    // compaction window stays valid even for such a plugin: the filter already
-    // removed everything older than the tail before the transform runs, so the
-    // graph is identical.
-    if min_seq != 0 && !authoritative && transform_listener {
-        min_seq = 0;
-    }
-
     let load = |seq: i64| -> anyhow::Result<Vec<(Value, Vec<Value>)>> {
         if seq == 0 {
-            ocserve_store::load_messages(db, session_id, None)
+            // The documented full-load fallback; every other prompt-path read
+            // is windowed (guard rule 57).
+            ocserve_store::load_messages(db, session_id, None) // allow:prompt_full_load
         } else {
             ocserve_store::load_messages_since(db, session_id, seq)
         }
     };
 
+    type Loaded = (Vec<(Value, Vec<Value>)>, Vec<usize>);
+    let full = || -> anyhow::Result<Loaded> {
+        let all = load(0)?;
+        let idx = crate::compact::filter_compacted(&all);
+        Ok((all, idx))
+    };
+
+    // Kill switch: the pre-change behaviour is the whole session, filtered the
+    // same way. The 8 MB trim still runs downstream, so this changes only how
+    // much is read, never what is sent.
+    if force_full {
+        let (history, filtered_idx) = full()?;
+        ocserve_metrics::labeled_counter("ocserve_prompt_history_load_total", "mode=\"full\"", 1);
+        return Ok(filtered_idx.iter().map(|&i| history[i].clone()).collect());
+    }
+
     // A candidate window is accepted only when the EXACT budget trims at least
-    // one message from it (or the compaction boundary inside it makes the
-    // filter authoritative). Otherwise the window is indistinguishable from a
-    // session that fits the budget, and the correct answer is the full session.
-    // The raw estimate is deliberately conservative, so widen by doubling the
-    // target instead of jumping to the full load; that keeps the common case
-    // bounded while still terminating (each miss doubles, and the walk returns
-    // 0 once it consumes the session).
-    // Bounded retries: each miss quadruples the raw target, and the store
-    // returns 0 (whole session) once the target exceeds the payload, so this
-    // terminates in at most a handful of iterations. The explicit budget is
-    // belt-and-braces for AGENTS §2.3 (no unbounded loop).
+    // one message from it, or the compaction boundary the filter resolves lies
+    // at its start. Otherwise the window is indistinguishable from a session
+    // that fits the budget, and the correct answer is the full session.
+    //
+    // Each miss quadruples the raw target; `prompt_window` returns 0 (whole
+    // session) once the target exceeds the payload, so this terminates. The
+    // explicit attempt bound is belt-and-braces for AGENTS §2.3.
     let mut target = budget;
     let mut mode = "full";
     let mut attempts = 0u8;
     let (history, filtered_idx) = loop {
+        // Re-derived every attempt: a concurrent append can invalidate the
+        // previous plan's `authoritative` flag, and trusting a stale flag would
+        // skip the trim check against the wrong boundary.
+        let (min_seq, authoritative) = ocserve_store::prompt_window(db, session_id, target)?;
+
+        // A `messages.transform` plugin receives the graph BEFORE the byte
+        // budget, so without a compaction it may inspect every message. With a
+        // compaction the filter has already removed everything older than the
+        // boundary, so the graph is identical either way.
+        if transform_listener && !authoritative {
+            break full()?;
+        }
+
         let window = load(min_seq)?;
-        let filtered_idx = crate::compact::filter_compacted(&window);
+        let idx = crate::compact::filter_compacted(&window);
         if min_seq == 0 {
-            break (window, filtered_idx); // already the whole session
+            break (window, idx); // already the whole session
         }
         if authoritative {
             mode = "window_compaction";
-            break (window, filtered_idx);
+            break (window, idx);
         }
-        if trim_start_idx(&window, &filtered_idx, budget).0 > 0 {
+        if trim_start_idx(&window, &idx, budget).0 > 0 {
             mode = "window_budget";
-            break (window, filtered_idx);
+            break (window, idx);
         }
         attempts += 1;
         if attempts >= 6 {
-            let all = load(0)?;
-            let idx = crate::compact::filter_compacted(&all);
-            break (all, idx);
+            break full()?;
         }
         target = target.saturating_mul(4);
-        min_seq = ocserve_store::prompt_window(db, session_id, target)?.0;
     };
     ocserve_metrics::labeled_counter(
         "ocserve_prompt_history_load_total",
@@ -2009,7 +2018,9 @@ pub async fn run_prompt_with(
             ));
         } else {
             // Perf (bounded prompt load): a 56k-message session is 85 MB of
-            // stored parts, but the model never sees more than the 8 MB budget.
+            // stored parts while the 8 MB history budget keeps only the tail
+            // (plus the newest message, which is kept even when it alone
+            // exceeds the budget).
             // `load_prompt_history` returns the already-filtered graph for a
             // suffix it can prove equivalent to the whole session, and falls
             // back to the full load otherwise.

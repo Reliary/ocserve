@@ -180,9 +180,11 @@ Differential testing (McKeeman 1998; Roseau ICSME 2025):
 | Binary size | ≤ established ceiling | size.yml (reliary8 pattern) |
 
 Token-layer optimizations (verified literature): byte-stable system+tool prefix for provider
-prompt caches; attention-sink-stable session head across compaction; critical context at
-prompt edges; tool-output compression before compaction; durable event log + checkpoints for
-recovery. **No savings percentages are claimed until the benchmark harness measures them.**
+prompt caches (now measurable: `ocserve_provider_prefix_changed_total{part="system"|"tools"}`
+counts per-session prefix changes, so an accidental cache bust is visible instead of silent);
+attention-sink-stable session head across compaction; critical context at prompt edges;
+tool-output compression before compaction; durable event log + checkpoints for recovery.
+**No savings percentages are claimed until the benchmark harness measures them.**
 
 ## 8. Low-maintenance pipeline
 

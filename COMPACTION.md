@@ -129,9 +129,15 @@ Both servers read the same config file → **zero new config surface for ocserve
   `part_search` (guards rule 4 extends to compaction parts). Purpose: assembly needs the
   *last* compaction anchor + tail **before** a forward streaming pass; without it every
   prompt pays a full `msg_part` type scan. Rows: rare (one per compaction) → tiny.
-- **Assembly**: single forward `for_each_message_json` pass implementing §2.5's output
-  permutation as a 3-range state machine seeded by the projection row — **never**
-  materializes the session (guards rule 3), filters `time.compacted` tool parts inline.
+- **Assembly (prompt path, updated 2026-10-24):** `ocserve_store::prompt_window`
+  proposes a `seq` suffix mirroring this section's stop condition (newest completed
+  anchor → its verbatim tail), `load_messages_since` reads it, and `filter_compacted`
+  selects. The window is accepted only when the exact byte trim proves it, or the
+  compaction boundary sits at its start; otherwise `load_prompt_history` falls back to
+  the full `load_messages` (guard rule 57). It does materialize the accepted window
+  (85 MB session → ~8 MB window); the pre-change path materialized the whole session.
+  The REST `/message` route keeps the streaming `for_each_message_json` pass and its
+  3-range state machine, seeded by the same projection row.
 - **Engine**: `post_summarize` (lib.rs:1001) and the auto path share one
   `create_compaction(session, auto, overflow)`:
   serialize conversation (§2.4 format) → compacting-hook request (existing machinery,
@@ -230,6 +236,12 @@ byte invalidates from that block onward):
   this is the plugin's responsibility (magic-context appends live memory; if
   it ever timestamps, every request busts its own prefix). Divergence risk
   documented, not suppressible from core.
+- **Observable since 2026-10-24:** `ocserve_provider_prefix_changed_total{part}`
+  counts per-session changes of the system prompt (`part="system"`) and the tool
+  schema array (`part="tools"`) between consecutive requests (first request is a
+  silent baseline; state is bounded at 1024 sessions and cleared on overflow;
+  `prefix::forget` on session delete). A rising count on a stable config is a
+  cache-busting regression, not noise.
 - `ocserve_llm_cache_tokens_total{provider,dir="read"}` exposes cache-read
   token accrual per request (Usage.parsed `prompt_tokens_details.cached_tokens`).
   Session rows already carried `tokens_cache_read` (finalize) — metrics close
@@ -242,8 +254,11 @@ mmap off untouched). Compaction table rows are tiny/inline; prune marks
 
 **Hot-path rule:** `compaction_preflight` = ONE reader per prompt answering
 seq+state (`Ready|Pending|SummaryExit`); the newest-message query runs only
-when projection rows exist. Round-1 opens = preflight + `load_messages` =
-**2 (pre-M6 parity)**. Engine rounds add their own readers (rare, bounded).
+when projection rows exist. Round-1 fresh opens = preflight + window read =
+**2 (pre-M6 parity; the parked reader reuses its connection)**. A window that
+cannot be proven equivalent widens up to 6 times — extra queries, not extra
+fresh opens — then falls back to the full load. Engine rounds add their own
+readers (rare, bounded).
 Regression net: `ocserve-store` `preflight.rs` 4 tests incl. the row-gate
 control (a summary with no projection rows must stay `Ready`).
 

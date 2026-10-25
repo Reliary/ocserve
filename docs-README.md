@@ -49,6 +49,7 @@ references and stale divergences on every commit.
 | `bench/BUMP-MACHINERY-TEST.md` | upgrade-machinery shakedown against 2.0.32 (report only) |
 | `bench/load/BASELINE.md` | performance baseline and withdrawn/corrected figures |
 | `bench/perf/PHASE1-ATTRIBUTION.md` | where the read-path time actually went |
+| `bench/prompt-window/REPORT.md` | bounded prompt-load equivalence proof, timings, and the negative controls (K-BOUNDED-PROMPT-LOAD) |
 | `bench/load/README.md` | k6 load suite: methodology, pinning, thresholds |
 
 ## Conventions

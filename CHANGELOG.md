@@ -6,6 +6,26 @@ differs is a named `D-*` row in `PLAN.md §17`.
 
 ## Unreleased (after 0.6.7)
 
+### Changed
+- **Prompt history is read as a proven suffix instead of the whole session.** A
+  56k-message session stores ~85 MB of parts while the 8 MB history budget keeps
+  only the tail. `prompt_window` proposes a `seq` suffix mirroring
+  `filter_compacted`'s stop condition; `load_prompt_history` accepts it only when
+  the exact byte trim proves it, or the compaction boundary sits at its start.
+  Every other shape falls back to the full load. Interleaved, warm-up discarded:
+  deep session 4.6-5.2 s -> 1.45-1.59 s, compacted session 117 ms -> 22 ms, a
+  dense mid-size session 2.89 s -> 2.56 s; emitted provider messages are
+  byte-identical in every case. Kill switch
+  `OCSERVE_PROMPT_HISTORY_UNBOUNDED=1`; metric
+  `ocserve_prompt_history_load_total{mode}`; guard rule 57.
+- **Prefix-cache changes are observable.**
+  `ocserve_provider_prefix_changed_total{part="system"|"tools"}` counts
+  per-session changes of the system prompt and tool-schema array between
+  requests, so a silent KV-prefix invalidation is visible instead of merely
+  expensive.
+- The per-tool-call permission path no longer re-parses the 26 KB provider tool
+  schema JSON to answer "is this a builtin" (`ocserve_tools::is_builtin`).
+
 ### Fixed (second review pass)
 - **The server hung under `memory.high`.** `main/memory.high=512M` throttled the
   single server process into direct reclaim it could never satisfy (no swap,
