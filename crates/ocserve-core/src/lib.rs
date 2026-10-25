@@ -15,6 +15,7 @@ pub mod form;
 pub mod ids;
 pub mod loop_guard;
 pub mod permission;
+pub mod prefix;
 pub mod prompt;
 pub mod question;
 pub mod revert;

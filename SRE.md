@@ -58,6 +58,8 @@ behind the same auth as the rest:
 | `ocserve_sync_tick` | duration | legacy-sync tick cost (the idle-jump suspect until measured — 11 msgs total says likely tiny) |
 | `ocserve_db_bytes` | gauge | DB file growth (MEMORY §7.6 KPI; policy trigger at ≥5 GB / ≥1k sessions) |
 | `ocserve_history_truncated_total{dropped}` | counter | prompt-history budget trips (8 MB, tail-weighted) — silent context loss made measurable |
+| `ocserve_prompt_history_load_total{mode}` | counter | bounded prompt load: `full` / `window_budget` / `window_compaction`. A sustained `full` on a large session means the window could not be proven equivalent and the pre-change cost is back (the corpus probe is the byte-identity gate) |
+| `ocserve_provider_prefix_changed_total{part}` | counter | KV/prefix cache invalidation attribution: `part="system"` (system prompt changed) or `part="tools"` (tool schema array changed) between two requests on the same session. A rising count on a stable config is a cache-busting regression worth a look |
 | soak CSV `oc_rss` column | sample | native opencode RSS = the future-usage ceiling model (MEMORY §7.6) |
 | `ocserve_prompt_rounds_total{bucket,finish}` | counter | uncensored rounds-per-turn distribution: `bucket` = 0-9/10-19/20-39/40-79/80-159/160+, `finish` = `done`/`error`/`capped` — the K-AUTONOMY telemetry the old flat cap made unmeasurable (right-censored at 25) |
 | `ocserve_plugin_normalize_total{result}` | counter | plugin normalizer health (D1): sustained `error` = builds failing → raw fallback; `warm` on every load after first boot; `disabled` only when kill-switched |

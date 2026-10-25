@@ -880,17 +880,45 @@ async fn transform_messages(
 }
 
 pub(crate) fn to_provider_messages(history: &[(Value, Vec<Value>)]) -> Vec<ChatMessage> {
-    // tail-weighted budget: find the oldest message we can afford to keep
-    let mut total: usize = history
+    to_provider_messages_budget(history, PROMPT_HISTORY_MAX_BYTES)
+}
+
+/// Index of the oldest message the byte budget keeps.
+///
+/// The single trim rule: drop from the front until the total fits, always
+/// keeping at least the newest message. Split out so the bounded-load
+/// equivalence check tests the SAME rule that shapes the request (a second
+/// implementation here would be a silent divergence).
+pub(crate) fn trim_start(history: &[(Value, Vec<Value>)], budget: usize) -> usize {
+    let idx: Vec<usize> = (0..history.len()).collect();
+    trim_start_idx(history, &idx, budget).0
+}
+
+/// `trim_start` over a selected sub-sequence (indices into `history`), without
+/// cloning the messages. Returns `(start, total_bytes)`.
+fn trim_start_idx(history: &[(Value, Vec<Value>)], idx: &[usize], budget: usize) -> (usize, usize) {
+    let mut total: usize = idx
         .iter()
-        .map(|(i, p)| history_message_bytes(i, p))
+        .map(|&i| history_message_bytes(&history[i].0, &history[i].1))
         .sum();
     let mut start = 0usize;
-    while total > PROMPT_HISTORY_MAX_BYTES && start + 1 < history.len() {
-        let (i, p) = &history[start];
+    while total > budget && start + 1 < idx.len() {
+        let (i, p) = &history[idx[start]];
         total -= history_message_bytes(i, p);
         start += 1;
     }
+    (start, total)
+}
+
+/// Tail-weighted budget over an already-filtered history.
+///
+/// Kept as its own function so the bounded-load equivalence test can exercise
+/// the exact trim with a small budget (the production const is 8 MiB).
+pub(crate) fn to_provider_messages_budget(
+    history: &[(Value, Vec<Value>)],
+    budget: usize,
+) -> Vec<ChatMessage> {
+    let start = trim_start(history, budget);
     if start > 0 {
         ocserve_metrics::labeled_counter(
             "ocserve_history_truncated_total",
@@ -900,7 +928,7 @@ pub(crate) fn to_provider_messages(history: &[(Value, Vec<Value>)]) -> Vec<ChatM
         tracing::warn!(
             "prompt history budget: dropped {start}/{} oldest message(s) (>{} bytes)",
             history.len(),
-            PROMPT_HISTORY_MAX_BYTES
+            budget
         );
     }
     let mut out = Vec::new();
@@ -964,6 +992,131 @@ pub(crate) fn to_provider_messages(history: &[(Value, Vec<Value>)]) -> Vec<ChatM
         }
     }
     out
+}
+
+/// Bounded prompt load: the same `(info, parts)` list the whole-session load
+/// would produce, without parsing a session's entire part corpus.
+///
+/// A 56k-message session stores ~85 MB of parts; the model can only ever emit
+/// `PROMPT_HISTORY_MAX_BYTES` of history. The store proposes a `seq` suffix
+/// (`ocserve_store::prompt_window`) and this function decides whether the
+/// suffix is provably equivalent before trusting it:
+///
+/// * `authoritative` (a completed compaction boundary lies inside the window):
+///   `filter_compacted` cannot select anything older, so the filter result is
+///   identical by construction.
+/// * otherwise: accept only when the exact byte trim drops at least one
+///   message from the filtered window. The kept set is then the longest suffix
+///   whose bytes fit, and because the window is itself a suffix of the session,
+///   that is the same suffix the full load keeps.
+///
+/// Any other outcome widens to the full load. The window is therefore never a
+/// source of different provider bytes; it is only a way to skip discarded
+/// history. A larger window is always correct, so the fallback is cheap and
+/// one-directional.
+///
+/// Callers must pass the live write view: the load and the filter run on one
+/// blocking-pool hop, and `PROMPT_HISTORY_MAX_BYTES` is read here so tests can
+/// exercise the equivalence with a small budget.
+pub(crate) fn load_prompt_history(
+    db: &Path,
+    session_id: &str,
+    transform_listener: bool,
+) -> anyhow::Result<Vec<(Value, Vec<Value>)>> {
+    load_prompt_history_budget(
+        db,
+        session_id,
+        PROMPT_HISTORY_MAX_BYTES,
+        history_load_disabled(),
+        transform_listener,
+    )
+}
+
+/// Kill switch: `OCSERVE_PROMPT_HISTORY_UNBOUNDED=1` restores the pre-change
+/// behaviour (load the whole session, then trim). Read once; changing it needs
+/// a restart, like every other process-wide knob.
+fn history_load_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| match std::env::var("OCSERVE_PROMPT_HISTORY_UNBOUNDED") {
+        Ok(v) => v == "1",
+        Err(_) => false,
+    })
+}
+
+fn load_prompt_history_budget(
+    db: &Path,
+    session_id: &str,
+    budget: usize,
+    force_full: bool,
+    transform_listener: bool,
+) -> anyhow::Result<Vec<(Value, Vec<Value>)>> {
+    let (mut min_seq, authoritative) = if force_full {
+        (0, false)
+    } else {
+        ocserve_store::prompt_window(db, session_id, budget)?
+    };
+
+    // A `messages.transform` plugin receives the graph BEFORE the byte budget,
+    // so in a session with no compaction it may inspect every message. A
+    // compaction window stays valid even for such a plugin: the filter already
+    // removed everything older than the tail before the transform runs, so the
+    // graph is identical.
+    if min_seq != 0 && !authoritative && transform_listener {
+        min_seq = 0;
+    }
+
+    let load = |seq: i64| -> anyhow::Result<Vec<(Value, Vec<Value>)>> {
+        if seq == 0 {
+            ocserve_store::load_messages(db, session_id, None)
+        } else {
+            ocserve_store::load_messages_since(db, session_id, seq)
+        }
+    };
+
+    // A candidate window is accepted only when the EXACT budget trims at least
+    // one message from it (or the compaction boundary inside it makes the
+    // filter authoritative). Otherwise the window is indistinguishable from a
+    // session that fits the budget, and the correct answer is the full session.
+    // The raw estimate is deliberately conservative, so widen by doubling the
+    // target instead of jumping to the full load; that keeps the common case
+    // bounded while still terminating (each miss doubles, and the walk returns
+    // 0 once it consumes the session).
+    // Bounded retries: each miss quadruples the raw target, and the store
+    // returns 0 (whole session) once the target exceeds the payload, so this
+    // terminates in at most a handful of iterations. The explicit budget is
+    // belt-and-braces for AGENTS §2.3 (no unbounded loop).
+    let mut target = budget;
+    let mut mode = "full";
+    let mut attempts = 0u8;
+    let (history, filtered_idx) = loop {
+        let window = load(min_seq)?;
+        let filtered_idx = crate::compact::filter_compacted(&window);
+        if min_seq == 0 {
+            break (window, filtered_idx); // already the whole session
+        }
+        if authoritative {
+            mode = "window_compaction";
+            break (window, filtered_idx);
+        }
+        if trim_start_idx(&window, &filtered_idx, budget).0 > 0 {
+            mode = "window_budget";
+            break (window, filtered_idx);
+        }
+        attempts += 1;
+        if attempts >= 6 {
+            let all = load(0)?;
+            let idx = crate::compact::filter_compacted(&all);
+            break (all, idx);
+        }
+        target = target.saturating_mul(4);
+        min_seq = ocserve_store::prompt_window(db, session_id, target)?.0;
+    };
+    ocserve_metrics::labeled_counter(
+        "ocserve_prompt_history_load_total",
+        &format!("mode=\"{mode}\""),
+        1,
+    );
+    Ok(filtered_idx.iter().map(|&i| history[i].clone()).collect())
 }
 
 /// Run one prompt to completion (possibly multi-step via tools).
@@ -1855,16 +2008,28 @@ pub async fn run_prompt_with(
                 opts.prelude.clone().unwrap_or_default(),
             ));
         } else {
-            // Perf dive 2026-10-11: load_messages is a multi-MB DOM parse +
-            // blob reads (historically 93 MB response / 400 MB as Values on
-            // the deep session) — run it on the blocking pool, never on a
-            // tokio worker (the F1 convoy class).
+            // Perf (bounded prompt load): a 56k-message session is 85 MB of
+            // stored parts, but the model never sees more than the 8 MB budget.
+            // `load_prompt_history` returns the already-filtered graph for a
+            // suffix it can prove equivalent to the whole session, and falls
+            // back to the full load otherwise.
+            //
+            // A registered `experimental.chat.messages.transform` disables the
+            // window: the plugin is allowed to inspect any message, so a
+            // partial graph would change its output.
+            //
+            // Runs on the blocking pool (F1 convoy class): blobs + DOM parse.
             let db = ctx.db.clone();
             let sid = session_id.to_string();
-            let history =
-                tokio::task::spawn_blocking(move || ocserve_store::load_messages(&db, &sid, None))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("history load join: {e}"))??;
+            let transform_listener = match plugin_handle(ctx.plugins.as_ref()).await {
+                Some(h) => h.registers("experimental.chat.messages.transform"),
+                None => false,
+            };
+            let history = tokio::task::spawn_blocking(move || {
+                load_prompt_history(&db, &sid, transform_listener)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("history load join: {e}"))??;
             // v1 parity, the WHOLE-REQUEST view (prompt.ts:1093): upstream
             // builds every model request from filterCompacted(msgs) — once a
             // compaction completes, only [last tail-carrying anchor, summary]
@@ -1873,9 +2038,7 @@ pub async fn run_prompt_with(
             // nothing: the 2026-10-12 stuck session kept shipping ~6.5 MB per
             // turn (the 5 MB tool part from 10-11) at 90-190 s first-token and
             // died at the watchdog — the "still isn't doing anything" report.
-            let filtered = crate::compact::filter_compacted(&history);
-            let history: Vec<(Value, Vec<Value>)> =
-                filtered.iter().map(|&i| history[i].clone()).collect();
+            // (`load_prompt_history` applies the same filter.)
             // v1 parity: experimental.chat.messages.transform (prompt.ts:1255).
             // Upstream transforms the session-shaped graph and only then
             // converts to model messages; ocserve used to hand the plugin
@@ -2176,6 +2339,11 @@ pub async fn run_prompt_with(
             } else {
                 zen_fallback_tools.as_deref()
             };
+            // Prefix-cache attribution: the system prompt and tool schemas are
+            // the bytes before the conversation tail. A change there invalidates
+            // the provider's cached prefix for this session; report it rather
+            // than letting it cost money silently.
+            crate::prefix::observe(session_id, &sys_vec, tools_arg);
             let mut llm_ttft: Option<std::time::Duration> = None;
             let mut text = String::new();
             let mut reasoning = String::new();
@@ -2615,9 +2783,7 @@ pub async fn run_prompt_with(
                     // plus this session's "always" grants. deny → blocked;
                     // ask → emit + await reply (once/always/reject); always →
                     // grant the ask's `always` patterns as wildcard rules.
-                    let builtin = ocserve_tools::schemas()
-                        .iter()
-                        .any(|s| s["function"]["name"] == call.name);
+                    let builtin = ocserve_tools::is_builtin(&call.name);
                     let input_value: serde_json::Value =
                         serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
                     let asks = ocserve_tools::permission_asks::asks_for(
@@ -3988,6 +4154,302 @@ mod history_budget_tests {
 }
 
 #[cfg(test)]
+mod bounded_prompt_load_tests {
+    use super::*;
+    use ocserve_store::{BlobStore, Writer};
+    use serde_json::json;
+
+    struct Fx {
+        _dir: tempfile::TempDir,
+        db: std::path::PathBuf,
+        blobs: std::sync::Arc<BlobStore>,
+        writer: std::sync::Arc<Writer>,
+        sid: String,
+    }
+
+    fn fixture(tag: &str) -> Fx {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ocserve_store::writer::db_path(dir.path());
+        let writer = std::sync::Arc::new(Writer::spawn(db.clone()).unwrap());
+        let blobs = std::sync::Arc::new(BlobStore::new(dir.path().join("blobs")).unwrap());
+        let sid = format!("ses_{tag}");
+        ocserve_store::insert_session(
+            &writer,
+            &json!({
+                "id": sid, "projectID": "global", "directory": "/w",
+                "path": sid, "slug": sid, "title": tag, "version": "1",
+                "time": {"created": 1, "updated": 2},
+            }),
+        )
+        .unwrap();
+        Fx {
+            _dir: dir,
+            db,
+            blobs,
+            writer,
+            sid,
+        }
+    }
+
+    fn push(fx: &Fx, id: &str, role: &str, text: &str) {
+        ocserve_store::insert_message(
+            &fx.writer,
+            Some(&fx.blobs),
+            &fx.sid,
+            &json!({
+                "id": id, "sessionID": fx.sid, "role": role, "agent": "build",
+                "time": {"created": 10},
+            }),
+            &[json!({"id": format!("{id}_p"), "type": "text", "text": text})],
+        )
+        .unwrap();
+    }
+
+    fn anchor(fx: &Fx, id: &str) {
+        ocserve_store::insert_message(
+            &fx.writer,
+            Some(&fx.blobs),
+            &fx.sid,
+            &json!({
+                "id": id, "sessionID": fx.sid, "role": "user", "agent": "build",
+                "time": {"created": 10},
+            }),
+            &[json!({
+                "id": format!("{id}_p"), "type": "compaction",
+                "auto": true, "overflow": false,
+            })],
+        )
+        .unwrap();
+    }
+
+    fn summary(fx: &Fx, id: &str, anchor: &str) {
+        ocserve_store::insert_message(
+            &fx.writer,
+            Some(&fx.blobs),
+            &fx.sid,
+            &json!({
+                "id": id, "sessionID": fx.sid, "role": "assistant",
+                "summary": true, "parentID": anchor, "finish": "stop",
+                "time": {"created": 10},
+            }),
+            &[json!({"id": format!("{id}_p"), "type": "text", "text": "summary"})],
+        )
+        .unwrap();
+    }
+
+    fn set_tail(fx: &Fx, anchor: &str, tail: &str) {
+        let part_id = format!("{anchor}_p");
+        ocserve_store::update_part(
+            &fx.writer,
+            &fx.blobs,
+            &fx.sid,
+            anchor,
+            &part_id,
+            &json!({
+                "id": part_id, "type": "compaction", "auto": true,
+                "overflow": false, "tail_start_id": tail,
+            }),
+        )
+        .unwrap();
+    }
+
+    /// The assertion that matters: the bounded path's emitted messages equal
+    /// the full path's, for every budget and every session shape.
+    fn assert_equivalent(fx: &Fx, budget: usize, transform: bool) -> &'static str {
+        let full = load_prompt_history_budget(&fx.db, &fx.sid, budget, true, false).unwrap();
+        let bounded =
+            load_prompt_history_budget(&fx.db, &fx.sid, budget, false, transform).unwrap();
+        let full_msgs = to_provider_messages_budget(&full, budget);
+        let bounded_msgs = to_provider_messages_budget(&bounded, budget);
+        assert_eq!(
+            serde_json::to_string(&full_msgs).unwrap(),
+            serde_json::to_string(&bounded_msgs).unwrap(),
+            "bounded load changed the provider messages (budget={budget}, transform={transform})"
+        );
+        // Report the mode the bounded path actually used.
+        let (min_seq, authoritative) =
+            ocserve_store::prompt_window(&fx.db, &fx.sid, budget).unwrap();
+        let _ = full;
+        if min_seq == 0 || (transform && !authoritative) {
+            "full"
+        } else if authoritative {
+            "window_compaction"
+        } else {
+            "window_budget"
+        }
+    }
+
+    #[test]
+    fn no_compaction_small_session_is_equivalent() {
+        let fx = fixture("bp_small");
+        push(&fx, "msg_a", "user", "hi");
+        push(&fx, "msg_b", "assistant", "hello");
+        assert_eq!(assert_equivalent(&fx, 8 << 20, false), "full");
+    }
+
+    #[test]
+    fn no_compaction_over_budget_is_equivalent() {
+        let fx = fixture("bp_big");
+        for i in 0..16 {
+            push(&fx, &format!("msg_{i}"), "user", &"x".repeat(8192));
+        }
+        for budget in [2048usize, 8192, 32 * 1024, 8 << 20] {
+            let mode = assert_equivalent(&fx, budget, false);
+            if budget < 16 * 8192 {
+                assert_ne!(mode, "full", "expected a real window at {budget}");
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_window_is_equivalent() {
+        let fx = fixture("bp_comp");
+        for i in 0..8 {
+            push(&fx, &format!("old_{i}"), "user", &"o".repeat(8192));
+        }
+        push(&fx, "msg_tail", "user", "tail question");
+        anchor(&fx, "msg_anc");
+        summary(&fx, "msg_sum", "msg_anc");
+        set_tail(&fx, "msg_anc", "msg_tail");
+        push(&fx, "msg_after", "assistant", "after");
+        for budget in [4096usize, 32 * 1024, 8 << 20] {
+            assert_eq!(assert_equivalent(&fx, budget, false), "window_compaction");
+        }
+    }
+
+    #[test]
+    fn compaction_without_tail_is_equivalent() {
+        let fx = fixture("bp_notail");
+        for i in 0..6 {
+            push(&fx, &format!("old_{i}"), "user", &"o".repeat(4096));
+        }
+        anchor(&fx, "msg_anc");
+        summary(&fx, "msg_sum", "msg_anc");
+        push(&fx, "msg_after", "assistant", "after");
+        for budget in [4096usize, 16 * 1024, 8 << 20] {
+            assert_eq!(assert_equivalent(&fx, budget, false), "window_compaction");
+        }
+    }
+
+    #[test]
+    fn dangling_tail_falls_back_to_full_and_is_equivalent() {
+        let fx = fixture("bp_dangling");
+        for i in 0..6 {
+            push(&fx, &format!("old_{i}"), "user", &"o".repeat(4096));
+        }
+        anchor(&fx, "msg_anc");
+        summary(&fx, "msg_sum", "msg_anc");
+        set_tail(&fx, "msg_anc", "msg_deleted");
+        push(&fx, "msg_after", "assistant", "after");
+        for budget in [4096usize, 8 << 20] {
+            // Only the full load can reproduce a dangling-tail selection.
+            assert_eq!(assert_equivalent(&fx, budget, false), "full");
+        }
+    }
+
+    #[test]
+    fn unfinished_summary_falls_back_to_full_and_is_equivalent() {
+        let fx = fixture("bp_unfinished");
+        for i in 0..6 {
+            push(&fx, &format!("old_{i}"), "user", &"o".repeat(4096));
+        }
+        anchor(&fx, "msg_anc");
+        ocserve_store::insert_message(
+            &fx.writer,
+            Some(&fx.blobs),
+            &fx.sid,
+            &json!({
+                "id": "msg_sum", "sessionID": fx.sid, "role": "assistant",
+                "summary": true, "parentID": "msg_anc",
+                "time": {"created": 10},
+            }),
+            &[json!({"id": "msg_sum_p", "type": "text", "text": "partial"})],
+        )
+        .unwrap();
+        set_tail(&fx, "msg_anc", "old_5");
+        assert_eq!(assert_equivalent(&fx, 8 << 20, false), "full");
+    }
+
+    #[test]
+    fn forward_tail_falls_back_to_full_and_is_equivalent() {
+        // A tail after the anchor is never reached by the reverse walk, so the
+        // filter returns everything. A budget suffix would be wrong here.
+        let fx = fixture("bp_forward_tail");
+        for i in 0..6 {
+            push(&fx, &format!("old_{i}"), "user", &"o".repeat(4096));
+        }
+        anchor(&fx, "msg_anc");
+        summary(&fx, "msg_sum", "msg_anc");
+        push(&fx, "msg_late", "assistant", "after the anchor");
+        set_tail(&fx, "msg_anc", "msg_late");
+        for budget in [4096usize, 16 * 1024, 8 << 20] {
+            assert_eq!(assert_equivalent(&fx, budget, false), "full");
+        }
+    }
+
+    #[test]
+    fn transform_listener_forces_full_load_without_compaction() {
+        let fx = fixture("bp_tx_no_comp");
+        for i in 0..16 {
+            push(&fx, &format!("msg_{i}"), "user", &"x".repeat(8192));
+        }
+        // The same session with and without a listener must still emit the
+        // same messages; with a listener the window is refused.
+        assert_eq!(assert_equivalent(&fx, 4096, false), "window_budget");
+        assert_eq!(assert_equivalent(&fx, 4096, true), "full");
+    }
+
+    #[test]
+    fn transform_listener_keeps_compaction_window() {
+        let fx = fixture("bp_tx_comp");
+        for i in 0..8 {
+            push(&fx, &format!("old_{i}"), "user", &"o".repeat(8192));
+        }
+        push(&fx, "msg_tail", "user", "tail question");
+        anchor(&fx, "msg_anc");
+        summary(&fx, "msg_sum", "msg_anc");
+        set_tail(&fx, "msg_anc", "msg_tail");
+        push(&fx, "msg_after", "assistant", "after");
+        // The filter removes everything before the tail, so a transform sees
+        // the same graph either way and the window stays valid.
+        assert_eq!(assert_equivalent(&fx, 32 * 1024, true), "window_compaction");
+    }
+
+    /// Negative control: shrink the window to the message *after* the tail and
+    /// the equivalence assertion must fail (the tail would be dropped).
+    #[test]
+    fn negative_control_shrunken_window_diverges() {
+        let fx = fixture("bp_neg");
+        for i in 0..6 {
+            push(&fx, &format!("old_{i}"), "user", &"o".repeat(4096));
+        }
+        push(&fx, "msg_tail", "user", "tail question");
+        anchor(&fx, "msg_anc");
+        summary(&fx, "msg_sum", "msg_anc");
+        set_tail(&fx, "msg_anc", "msg_tail");
+        push(&fx, "msg_after", "assistant", "after");
+
+        let budget = 8 << 20;
+        let full = to_provider_messages_budget(
+            &load_prompt_history_budget(&fx.db, &fx.sid, budget, true, false).unwrap(),
+            budget,
+        );
+        // A window that starts AFTER the tail is exactly the bug this design
+        // must refuse to trust; simulate it directly.
+        let tail_seq = ocserve_store::message_seq(&fx.db, &fx.sid, "msg_tail")
+            .unwrap()
+            .expect("tail message");
+        let bad = ocserve_store::load_messages_since(&fx.db, &fx.sid, tail_seq + 1).unwrap();
+        let bad_msgs = to_provider_messages_budget(&bad, budget);
+        assert_ne!(
+            serde_json::to_string(&full).unwrap(),
+            serde_json::to_string(&bad_msgs).unwrap(),
+            "control is vacuous: the shrunken window produced the same messages"
+        );
+    }
+}
+
+#[cfg(test)]
 mod advertised_allow_list_tests {
     use super::advertised_allow_list;
     use serde_json::json;
@@ -4014,5 +4476,77 @@ mod advertised_allow_list_tests {
     fn empty_wire_allows_nothing() {
         let names: HashSet<String> = ["x"].iter().map(|s| s.to_string()).collect();
         assert!(advertised_allow_list(names, &[]).is_empty());
+    }
+}
+
+/// Real-corpus equivalence + timing probe (not part of the default suite).
+///
+/// Run against a read-only copy or the live DB:
+/// `OCSERVE_CORPUS_DB=~/.local/share/ocserve/ocserve.db \
+///  OCSERVE_CORPUS_SESSION=ses_… cargo test -p ocserve-core \
+///  bounded_prompt_load_matches_real_corpus -- --ignored --nocapture`
+///
+/// It loads every message (the pre-change behaviour) and the bounded window,
+/// asserts the emitted `ChatMessage` lists are byte-identical, and prints the
+/// wall-clock cost of each. This is the gate the window must pass before it is
+/// allowed to replace the full load for a session.
+#[cfg(test)]
+mod bounded_prompt_load_corpus {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs OCSERVE_CORPUS_DB + OCSERVE_CORPUS_SESSION (real session)"]
+    fn bounded_prompt_load_matches_real_corpus() {
+        let db = std::env::var("OCSERVE_CORPUS_DB").expect("OCSERVE_CORPUS_DB");
+        let sid = std::env::var("OCSERVE_CORPUS_SESSION").expect("OCSERVE_CORPUS_SESSION");
+        let db = PathBuf::from(db);
+
+        // Interleaved A/B/A/B, warm-up discarded: the full load warms the page
+        // cache, so measuring it first would flatter the bounded path.
+        let _ =
+            load_prompt_history_budget(&db, &sid, PROMPT_HISTORY_MAX_BYTES, true, false).unwrap();
+        let _ =
+            load_prompt_history_budget(&db, &sid, PROMPT_HISTORY_MAX_BYTES, false, false).unwrap();
+        let mut full_best = std::time::Duration::MAX;
+        let mut bounded_best = std::time::Duration::MAX;
+        let mut full = Vec::new();
+        let mut bounded = Vec::new();
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            full = load_prompt_history_budget(&db, &sid, PROMPT_HISTORY_MAX_BYTES, true, false)
+                .unwrap();
+            full_best = full_best.min(t0.elapsed());
+            let t1 = Instant::now();
+            bounded = load_prompt_history_budget(&db, &sid, PROMPT_HISTORY_MAX_BYTES, false, false)
+                .unwrap();
+            bounded_best = bounded_best.min(t1.elapsed());
+        }
+        let (min_seq, authoritative) =
+            ocserve_store::prompt_window(&db, &sid, PROMPT_HISTORY_MAX_BYTES).unwrap();
+        let t2 = Instant::now();
+        let bounded_with_tx =
+            load_prompt_history_budget(&db, &sid, PROMPT_HISTORY_MAX_BYTES, false, true).unwrap();
+        let tx_ms = t2.elapsed();
+        let (full_ms, bounded_ms) = (full_best, bounded_best);
+
+        let full_out = to_provider_messages_budget(&full, PROMPT_HISTORY_MAX_BYTES);
+        for (label, other) in [
+            ("bounded", &bounded),
+            ("bounded+transform", &bounded_with_tx),
+        ] {
+            let out = to_provider_messages_budget(other, PROMPT_HISTORY_MAX_BYTES);
+            assert_eq!(
+                serde_json::to_string(&full_out).unwrap(),
+                serde_json::to_string(&out).unwrap(),
+                "{label} changed the provider messages for {sid}"
+            );
+        }
+        println!(
+            "session={sid} messages={} full={:?} bounded={:?} (tx-forced {:?}) window_min_seq={min_seq} authoritative={authoritative}",
+            full.len(),
+            full_ms,
+            bounded_ms,
+            tx_ms
+        );
     }
 }

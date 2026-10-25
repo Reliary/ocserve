@@ -1548,30 +1548,70 @@ fn merge_columns(
     v
 }
 
+/// Which contiguous suffix of a session to load, in `seq` order.
+enum MsgSelector {
+    All,
+    Last(usize),
+    Since(i64),
+}
+
 pub fn load_messages(
     db: &std::path::Path,
     session_id: &str,
     limit: Option<usize>,
 ) -> anyhow::Result<Vec<(serde_json::Value, Vec<serde_json::Value>)>> {
+    load_messages_selector(
+        db,
+        session_id,
+        limit.map_or(MsgSelector::All, MsgSelector::Last),
+    )
+}
+
+/// Load the session suffix whose `msg.seq >= min_seq`.
+///
+/// Prompt-path bounded load (perf: a 56k-message session is 85 MB of parts but
+/// the model sees at most the 8 MB budget). Ordering is `seq`, exactly like
+/// [`load_messages`], so a late-inserted legacy-sync row stays ordered by
+/// insertion — never by timestamp.
+pub fn load_messages_since(
+    db: &std::path::Path,
+    session_id: &str,
+    min_seq: i64,
+) -> anyhow::Result<Vec<(serde_json::Value, Vec<serde_json::Value>)>> {
+    load_messages_selector(db, session_id, MsgSelector::Since(min_seq))
+}
+
+fn load_messages_selector(
+    db: &std::path::Path,
+    session_id: &str,
+    sel: MsgSelector,
+) -> anyhow::Result<Vec<(serde_json::Value, Vec<serde_json::Value>)>> {
     let conn = pragma::open_reader(db)?;
-    let mut stmt = match limit {
-        Some(_) => conn.prepare_cached(
-            "SELECT id, info FROM (SELECT id, info, seq FROM msg WHERE session_id = ?1 \
-             ORDER BY seq DESC LIMIT ?2) ORDER BY seq",
-        )?,
-        None => {
-            conn.prepare_cached("SELECT id, info FROM msg WHERE session_id = ?1 ORDER BY seq")?
+    let msgs: Vec<(String, String)> = match sel {
+        MsgSelector::Last(n) => {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, info FROM (SELECT id, info, seq FROM msg WHERE session_id = ?1 \
+                 ORDER BY seq DESC LIMIT ?2) ORDER BY seq",
+            )?;
+            stmt.query_map((session_id, n as i64), |r| Ok((r.get(0)?, r.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect()
         }
-    };
-    let msgs: Vec<(String, String)> = match limit {
-        Some(n) => stmt
-            .query_map((session_id, n as i64), |r| Ok((r.get(0)?, r.get(1)?)))?
-            .filter_map(|r| r.ok())
-            .collect(),
-        None => stmt
-            .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .filter_map(|r| r.ok())
-            .collect(),
+        MsgSelector::Since(s) => {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, info FROM msg WHERE session_id = ?1 AND seq >= ?2 ORDER BY seq",
+            )?;
+            stmt.query_map((session_id, s), |r| Ok((r.get(0)?, r.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect()
+        }
+        MsgSelector::All => {
+            let mut stmt =
+                conn.prepare_cached("SELECT id, info FROM msg WHERE session_id = ?1 ORDER BY seq")?;
+            stmt.query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect()
+        }
     };
     let mut out = Vec::new();
     // Blob-resolving reader: parts above INLINE_PART_MAX live in the blob
@@ -1645,6 +1685,20 @@ pub fn load_messages(
     Ok(out)
 }
 
+/// `seq` of one message, or `None` when it does not exist.
+pub fn message_seq(
+    db: &std::path::Path,
+    session_id: &str,
+    message_id: &str,
+) -> anyhow::Result<Option<i64>> {
+    let conn = pragma::open_reader(db)?;
+    let seq = conn
+        .prepare_cached("SELECT seq FROM msg WHERE session_id = ?1 AND id = ?2")?
+        .query_row((session_id, message_id), |r| r.get::<_, i64>(0))
+        .optional()?;
+    Ok(seq)
+}
+
 /// Per-session event sequence (sync twin numbering; capture showed 1..N per session).
 pub fn next_event_seq(db: &std::path::Path, session_id: &str) -> anyhow::Result<i64> {
     let conn = pragma::open_reader(db)?;
@@ -1654,6 +1708,164 @@ pub fn next_event_seq(db: &std::path::Path, session_id: &str) -> anyhow::Result<
         |r| r.get(0),
     )?;
     Ok(seq)
+}
+
+/// Bounded prompt-load plan: `(min_seq, authoritative)`.
+///
+/// `min_seq == 0` means "load the whole session". `authoritative == true`
+/// means the window contains every message `filter_compacted` can select, so
+/// filtering the window is identical to filtering the whole session — the
+/// byte budget may then trim freely, because it trims the same suffix.
+///
+/// The compaction branch mirrors `filter_compacted` exactly: the newest
+/// completed summary (finished, error-free assistant with `parentID`) resolves
+/// its anchor; the window starts at the verbatim tail, which is the filter's
+/// own stop point. Cases the filter resolves differently (missing anchor,
+/// dangling tail, blob-only compaction part, tail after the anchor) degrade to
+/// the full load instead of guessing.
+///
+/// Ordering is `seq`, never `time_created`: legacy-sync rows are inserted late
+/// with old timestamps and must stay ordered by insertion.
+pub fn prompt_window(
+    db: &std::path::Path,
+    session_id: &str,
+    budget_bytes: usize,
+) -> anyhow::Result<(i64, bool)> {
+    let conn = pragma::open_reader(db)?;
+
+    let mut seq_of =
+        conn.prepare_cached("SELECT seq FROM msg WHERE session_id = ?1 AND id = ?2")?;
+    let mut info_of =
+        conn.prepare_cached("SELECT info FROM msg WHERE session_id = ?1 AND id = ?2")?;
+    let mut part_of = conn.prepare_cached(
+        "SELECT inline FROM msg_part \
+         WHERE message_id = ?1 AND type = 'compaction' ORDER BY seq ASC LIMIT 1",
+    )?;
+
+    // Newest *completed* compaction in message order. `filter_compacted` walks
+    // newest→oldest and stops at the first anchor whose summary it has already
+    // seen, i.e. the completed anchor with the greatest `seq` — `time_ms` order
+    // can disagree after a late legacy-sync insert, so resolve seq explicitly.
+    let mut best: Option<(i64, (i64, String))> = None; // summary_seq -> (anchor_seq, anchor_id)
+    for row in compaction_rows(&conn, session_id)?.iter() {
+        let Some(summary_id) = row.summary_msg_id.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some(summary_txt) = info_of
+            .query_row((session_id, summary_id), |r| r.get::<_, String>(0))
+            .optional()?
+        else {
+            continue;
+        };
+        let Ok(summary) = serde_json::from_str::<serde_json::Value>(&summary_txt) else {
+            continue;
+        };
+        // `is_completed_summary` (compact.rs / message-v2): only a finished,
+        // error-free summary participates in the reverse walk.
+        if summary["role"] != "assistant"
+            || summary["summary"] != serde_json::Value::Bool(true)
+            || !summary["finish"].is_string()
+            || !summary["error"].is_null()
+        {
+            continue;
+        }
+        let Some(anchor_id) = summary["parentID"].as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let (Some(anchor_seq), Some(summary_seq)) = (
+            seq_of
+                .query_row((session_id, anchor_id), |r| r.get::<_, i64>(0))
+                .optional()?,
+            seq_of
+                .query_row((session_id, summary_id), |r| r.get::<_, i64>(0))
+                .optional()?,
+        ) else {
+            // A summary whose anchor is gone cannot be resolved by the
+            // filter either; only the full load is safe.
+            return Ok((0, false));
+        };
+        if best.as_ref().is_none_or(|(s, _)| summary_seq > *s) {
+            best = Some((summary_seq, (anchor_seq, anchor_id.to_string())));
+        }
+    }
+
+    if let Some((_, (anchor_seq, anchor_id))) = best {
+        // `compaction_tail` reads the PART, not the projection.
+        let tail_id = match part_of
+            .query_row([anchor_id.as_str()], |r| r.get::<_, Option<String>>(0))
+            .optional()?
+        {
+            Some(Some(inline)) => serde_json::from_str::<serde_json::Value>(&inline)
+                .ok()
+                .and_then(|p| p["tail_start_id"].as_str().map(str::to_string)),
+            // Blob-only part: not expected (compaction parts are tiny), but a
+            // wrong guess would silently change the prompt. Full load.
+            Some(None) => return Ok((0, false)),
+            None => None,
+        };
+        let Some(tail_id) = tail_id else {
+            // No tail: the filter breaks at the anchor and keeps [anchor..].
+            return Ok((anchor_seq, true));
+        };
+        match seq_of
+            .query_row((session_id, tail_id.as_str()), |r| r.get::<_, i64>(0))
+            .optional()?
+        {
+            // The filter's reverse walk keeps everything from the tail onward
+            // (it stops the moment it reaches the tail), so starting the window
+            // there is authoritative. Only valid when the tail precedes the
+            // anchor: a tail AFTER the anchor is never reached before the walk
+            // exhausts the session, and `filter_compacted` then returns EVERY
+            // message (its `tail_index < anchor_index` reassembly check fails).
+            // A budget suffix would silently drop history in that shape, so it
+            // must force the full load, not fall through.
+            Some(tail_seq) if tail_seq <= anchor_seq => return Ok((tail_seq, true)),
+            Some(_) => return Ok((0, false)),
+            // Tail message gone: the filter cannot stop, so it keeps every
+            // message. Only the full load reproduces that.
+            None => return Ok((0, false)),
+        }
+    }
+
+    // No applicable compaction: the filter is the identity, so a suffix that
+    // the exact budget demonstrably trims is equivalent. `budget_bytes` is the
+    // exact-estimator budget; stored `byte_len` is the whole part JSON and
+    // overstates `history_message_bytes` (which counts only text/arguments/
+    // output) on part-heavy sessions, so aim at 3×. The caller verifies and
+    // widens on a miss, so this is a performance knob, not a correctness one.
+    // Small sessions overshoot to `0` (whole load), which is also correct and
+    // cheaper than a second round-trip.
+    let limit = (budget_bytes as i64).saturating_mul(3);
+    let mut total: i64 = 0;
+    let mut cursor: i64 = i64::MAX;
+    // 2048 measured at the same per-query cost as 512 (fixed overhead
+    // dominates); 8192 trips a scan. Fewer round-trips, same bytes.
+    const CHUNK: i64 = 2048;
+    loop {
+        let mut stmt = conn.prepare_cached(
+            "SELECT m.seq, length(m.info), \
+                    COALESCE((SELECT SUM(96 + p.byte_len) FROM msg_part p \
+                              WHERE p.message_id = m.id), 0) \
+             FROM msg m WHERE m.session_id = ?1 AND m.seq < ?2 \
+             ORDER BY m.seq DESC LIMIT ?3",
+        )?;
+        let chunk: Vec<(i64, i64, i64)> = stmt
+            .query_map((session_id, cursor, CHUNK), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        if chunk.is_empty() {
+            return Ok((0, false)); // walked the whole session
+        }
+        cursor = chunk.last().map(|r| r.0).unwrap_or(0);
+        for (seq, info_len, parts_bytes) in chunk {
+            total = total.saturating_add(64 + info_len.min(2048) + parts_bytes);
+            if total >= limit {
+                return Ok((seq, false));
+            }
+        }
+    }
 }
 
 /// v2 inbox engine (V2-PLAN.md P3). Server-owned pending-work queue mirroring
