@@ -25,6 +25,22 @@ differs is a named `D-*` row in `PLAN.md §17`.
   unless `--allow-slow-live` or `--bulk`: per-row indexing was measured at
   ~140 parts/s on a small populated target, and a 21k-message / 80k-part
   adoption exceeded 15 minutes with no progress output.
+- `--force` snapshots the target with `VACUUM INTO` before deleting anything,
+  and applies in every mode (a bulk re-import used to bypass the gate and let
+  `INSERT OR REPLACE` cascade the old session away).
+- The bulk index rebuild and trigger recreation are one transaction, and the
+  parity stamp records `count(part_search)`; the boot gate now compares the
+  index to the rows, so a row committed during the old gap is repaired instead
+  of being recorded as healthy.
+- The external-commit watcher survives a backup restore (per-path state keyed
+  by device+inode, reopen on replacement), runs on the blocking pool, and
+  counts poll failures.
+- The bounded prompt load is conservative whenever ANY compaction row exists:
+  an unfinished imported summary reorders history under the full filter, so a
+  suffix is only used when the session has no compaction rows or the boundary
+  resolves exactly.
+- Source parts are size-checked before the target is created, and source paths
+  are URI-encoded (`#`/`?`/`%` no longer open a different file).
 - Nullable upstream columns no longer abort the import. `session.path` is
   nullable in the opencode schema; reading it as a `String` failed the whole
   import with `Invalid column type Null` on a real row.

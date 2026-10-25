@@ -1837,8 +1837,19 @@ pub fn prompt_window(
         }
     }
 
-    // No applicable compaction: the filter is the identity, so a suffix that
-    // the exact budget demonstrably trims is equivalent. `budget_bytes` is the
+    // No COMPLETED compaction boundary was found. That does not mean the
+    // filter is the identity: `filter_compacted`'s reassembly triggers on an
+    // anchor carrying a tail plus ANY assistant with `summary:true` and a
+    // matching `parentID` — it does not require `finish` (compact.rs). An
+    // imported summary without `finish` therefore reorders history under the
+    // full load. If any compaction row exists at all, only the full load is
+    // provably equivalent. (2026-10-25 review M1.)
+    if !compaction_rows(&conn, session_id)?.is_empty() {
+        return Ok((0, false));
+    }
+
+    // No compaction: the filter is the identity, so a suffix that the exact
+    // budget demonstrably trims is equivalent. `budget_bytes` is the
     // exact-estimator budget; stored `byte_len` is the whole part JSON and
     // overstates `history_message_bytes` (which counts only text/arguments/
     // output) on part-heavy sessions, so aim at 3×. The caller verifies and
@@ -3383,8 +3394,15 @@ pub fn backup_to(conn: &rusqlite::Connection, dest: &std::path::Path) -> anyhow:
     if dest.exists() {
         anyhow::bail!("backup destination exists: {}", dest.display());
     }
-    let sql = format!("VACUUM INTO '{}'", dest.display());
-    conn.execute_batch(&sql)?;
+    // Parameterised: the destination is operator-supplied (`--dest`,
+    // `--data-dir`), and interpolating it into SQL broke on a quote in the
+    // path (and was an injection surface for a value that should never be SQL).
+    let dest = dest
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("backup destination is not valid UTF-8"))?
+        .to_string();
+    conn.execute("VACUUM INTO ?1", [dest.as_str()])
+        .map_err(|e| anyhow::anyhow!("VACUUM INTO {dest}: {e}"))?;
     Ok(())
 }
 
@@ -3977,13 +3995,17 @@ pub fn backfill_part_search(
             r.get(0)
         })
         .unwrap_or(-1);
-    if let Some(n) = stamped
-        && trigger == 1
-        && fts_docs >= 0
-        && fts_docs as i64 == n
-    {
-        drop(conn);
-        return Ok((0, 0, t0.elapsed().as_millis() as u64));
+    // The stamp is written from `count(part_search)`, so the early return must
+    // also confirm the INDEX still matches the rows. Comparing the stamp to
+    // the docsize alone let a lost index row look healthy forever (the 2026-10-25
+    // review: a row committed while the bulk trigger was dropped was stamped as
+    // indexed and never repaired).
+    if stamped.is_some() && trigger == 1 && fts_docs >= 0 {
+        let rows: i64 = conn.query_row("SELECT count(*) FROM part_search", [], |r| r.get(0))?;
+        if fts_docs as i64 == stamped.unwrap_or(-1) && fts_docs == rows {
+            drop(conn);
+            return Ok((0, 0, t0.elapsed().as_millis() as u64));
+        }
     }
     let total: i64 = conn.query_row("SELECT count(*) FROM msg_part", [], |r| r.get(0))?;
     let have: i64 = conn.query_row("SELECT count(*) FROM part_search", [], |r| r.get(0))?;
@@ -4155,30 +4177,81 @@ pub fn bump_write_epoch() {
 /// poll. The first poll only establishes the baseline (returns `false`).
 pub fn poll_external_commits(db: &std::path::Path) -> anyhow::Result<bool> {
     struct Watcher {
-        db: std::path::PathBuf,
+        /// (device, inode) of the file this connection reads.
+        ident: Option<(u64, u64)>,
         conn: pragma::Reader,
         version: i64,
     }
-    static W: std::sync::OnceLock<parking_lot::Mutex<Option<Watcher>>> = std::sync::OnceLock::new();
-    let slot = W.get_or_init(|| parking_lot::Mutex::new(None));
-    let mut guard = slot.lock();
-    if guard.as_ref().is_none_or(|w| w.db != db) {
-        let conn = pragma::open_reader(db)?;
-        let version: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
-        *guard = Some(Watcher {
-            db: db.to_path_buf(),
-            conn,
-            version,
-        });
-        return Ok(false);
+
+    #[cfg(unix)]
+    fn file_identity(db: &std::path::Path) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(db).ok().map(|m| (m.dev(), m.ino()))
     }
-    let w = guard.as_mut().expect("watcher present");
-    let version: i64 = w.conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
-    if version == w.version {
-        return Ok(false);
+    #[cfg(not(unix))]
+    fn file_identity(db: &std::path::Path) -> Option<(u64, u64)> {
+        // mtime in place of an inode: replacement on Windows is still visible.
+        std::fs::metadata(db)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| (0, d.as_nanos() as u64))
     }
-    w.version = version;
-    Ok(true)
+
+    /// Per-database watcher state. Keyed by path rather than a single slot:
+    /// the harness opens many temporary databases in one process, and a shared
+    /// slot made each poll look like the file had been replaced. Bounded so a
+    /// pathological caller cannot grow it forever.
+    const MAX_WATCHED: usize = 8;
+    static W: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<std::path::PathBuf, Watcher>>,
+    > = std::sync::OnceLock::new();
+    let slot = W.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let mut map = slot.lock();
+
+    // `data_version` is per-connection and blind to the file being REPLACED
+    // (the documented backup/restore drill: restore onto the same path). The
+    // old connection keeps reading the unlinked inode forever. Identity is
+    // therefore checked every poll, and a changed inode forces a reopen.
+    let ident = file_identity(db);
+    match map.get_mut(db) {
+        Some(w) if w.ident == ident => {
+            let version: i64 = w.conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+            if version == w.version {
+                return Ok(false);
+            }
+            w.version = version;
+            Ok(true)
+        }
+        Some(w) => {
+            // Same path, different file: every cached value came from the old
+            // inode, so this is a real change.
+            let conn = pragma::open_reader(db)?;
+            let version: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+            *w = Watcher {
+                ident,
+                conn,
+                version,
+            };
+            Ok(true)
+        }
+        None => {
+            if map.len() >= MAX_WATCHED {
+                map.clear();
+            }
+            let conn = pragma::open_reader(db)?;
+            let version: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+            map.insert(
+                db.to_path_buf(),
+                Watcher {
+                    ident,
+                    conn,
+                    version,
+                },
+            );
+            Ok(false) // baseline
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]

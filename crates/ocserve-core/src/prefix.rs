@@ -24,9 +24,15 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// Hard cap on tracked sessions. A busy server with many sessions would
-/// otherwise grow without bound (AGENTS §2.3). On overflow the table is
-/// cleared: attribution is advisory, so losing history beats unbounded memory.
+/// otherwise grow without bound (AGENTS §2.3).
 const MAX_TRACKED: usize = 1024;
+
+/// Hard cap on the total bytes of session-id keys. Session ids are
+/// client/import-supplied strings, so an entry count alone is not a bound:
+/// 1024 ids of 1 MiB would be 1 GiB. On overflow the OLDEST entries are
+/// dropped (rather than the whole table, which used to disable attribution
+/// globally on a busy box).
+const MAX_KEY_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Fingerprint {
@@ -68,9 +74,30 @@ fn tools_fp(tools: Option<&[serde_json::Value]>) -> [u8; 16] {
     }
 }
 
-fn table() -> &'static Mutex<HashMap<String, Fingerprint>> {
-    static T: OnceLock<Mutex<HashMap<String, Fingerprint>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+struct State {
+    map: HashMap<String, Fingerprint>,
+    /// Insertion order, oldest first (bounded by MAX_TRACKED).
+    order: std::collections::VecDeque<String>,
+    key_bytes: usize,
+}
+
+fn table() -> &'static Mutex<State> {
+    static T: OnceLock<Mutex<State>> = OnceLock::new();
+    T.get_or_init(|| {
+        Mutex::new(State {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            key_bytes: 0,
+        })
+    })
+}
+
+fn evict_oldest(st: &mut State) {
+    if let Some(old) = st.order.pop_front()
+        && st.map.remove(&old).is_some()
+    {
+        st.key_bytes = st.key_bytes.saturating_sub(old.len());
+    }
 }
 
 /// Compare this request's prefix with the session's previous one and count
@@ -85,11 +112,19 @@ pub(crate) fn observe(
         system: system_fp(system),
         tools: tools_fp(tools),
     };
-    let mut map = table().lock();
-    if map.len() >= MAX_TRACKED && !map.contains_key(session_id) {
-        map.clear();
+    let mut st = table().lock();
+    let previous = st.map.get(session_id).copied();
+    if previous.is_none() {
+        while !st.order.is_empty()
+            && (st.map.len() >= MAX_TRACKED
+                || st.key_bytes.saturating_add(session_id.len()) > MAX_KEY_BYTES)
+        {
+            evict_oldest(&mut st);
+        }
+        st.order.push_back(session_id.to_string());
+        st.key_bytes = st.key_bytes.saturating_add(session_id.len());
     }
-    let previous = map.insert(session_id.to_string(), now);
+    st.map.insert(session_id.to_string(), now);
     let prev = previous?;
     let system_changed = prev.system != now.system;
     let tools_changed = prev.tools != now.tools;
@@ -112,13 +147,20 @@ pub(crate) fn observe(
 
 /// Forget a session (session delete / test isolation).
 pub fn forget(session_id: &str) {
-    table().lock().remove(session_id);
+    let mut st = table().lock();
+    if st.map.remove(session_id).is_some() {
+        st.key_bytes = st.key_bytes.saturating_sub(session_id.len());
+        st.order.retain(|k| k != session_id);
+    }
 }
 
 /// Test-only: make the tracker empty so counters are deterministic.
 #[cfg(test)]
 pub(crate) fn clear() {
-    table().lock().clear();
+    let mut st = table().lock();
+    st.map.clear();
+    st.order.clear();
+    st.key_bytes = 0;
 }
 
 #[cfg(test)]
@@ -213,10 +255,35 @@ mod tests {
         for i in 0..(MAX_TRACKED + 10) {
             observe(&format!("cap{i}"), &sys("a"), None);
         }
-        assert!(
-            table().lock().len() <= MAX_TRACKED,
-            "prefix tracker must stay bounded"
-        );
+        let st = table().lock();
+        assert!(st.map.len() <= MAX_TRACKED, "entry cap");
+        assert!(st.key_bytes <= MAX_KEY_BYTES, "key bytes cap");
+    }
+
+    #[test]
+    fn huge_session_ids_cannot_grow_the_table_without_bound() {
+        let _g = guard();
+        clear();
+        let big = "s".repeat(100_000);
+        for i in 0..20 {
+            observe(&format!("{big}{i}"), &sys("a"), None);
+        }
+        let st = table().lock();
+        assert!(st.key_bytes <= MAX_KEY_BYTES, "key bytes: {}", st.key_bytes);
+    }
+
+    #[test]
+    fn overflow_evicts_oldest_not_everything() {
+        let _g = guard();
+        clear();
+        observe("keep", &sys("a"), None);
+        for i in 0..(MAX_TRACKED + 5) {
+            observe(&format!("cap{i}"), &sys("a"), None);
+        }
+        // The newest observations are tracked; the first one may be evicted.
+        let st = table().lock();
+        assert!(st.map.contains_key(&format!("cap{}", MAX_TRACKED + 4)));
+        assert!(st.map.len() <= MAX_TRACKED);
     }
 
     #[test]

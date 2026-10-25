@@ -33,6 +33,10 @@ pub struct Var {
     /// Accepted values, for a reader who wants to know what to type.
     pub values: &'static str,
     pub scope: Scope,
+    /// Value must never be echoed (password/token). Redaction is driven by
+    /// this flag, not by the name, so a new secret cannot leak by being
+    /// called something unexpected.
+    pub secret: bool,
     pub summary: &'static str,
 }
 
@@ -49,6 +53,25 @@ const fn op(
         default,
         values,
         scope: Scope::Operator,
+        secret: false,
+        summary,
+    }
+}
+
+const fn secret(
+    group: &'static str,
+    name: &'static str,
+    default: &'static str,
+    values: &'static str,
+    summary: &'static str,
+) -> Var {
+    Var {
+        name,
+        group,
+        default,
+        values,
+        scope: Scope::Operator,
+        secret: true,
         summary,
     }
 }
@@ -60,6 +83,7 @@ const fn internal(name: &'static str, default: &'static str, summary: &'static s
         default,
         values: "(harness)",
         scope: Scope::Internal,
+        secret: false,
         summary,
     }
 }
@@ -80,6 +104,13 @@ pub const CONTRACT: &[Var] = &[
         "127.0.0.1",
         "an address",
         "Bind address. Precedence: --hostname, then ocserve.toml, then this.",
+    ),
+    op(
+        "Network and files",
+        "OCSERVE_HOME",
+        "HOME, then USERPROFILE",
+        "a directory",
+        "Overrides the home directory used for config/cache lookups (harnesses set it).",
     ),
     op(
         "Network and files",
@@ -117,7 +148,7 @@ pub const CONTRACT: &[Var] = &[
         "a file path",
         "File holding the basic-auth password. Preferred over the env var.",
     ),
-    op(
+    secret(
         "Authentication",
         "OCSERVE_SERVER_PASSWORD",
         "(none)",
@@ -298,6 +329,13 @@ pub const CONTRACT: &[Var] = &[
     ),
     op(
         "Cgroups and lifecycle",
+        "OCSERVE_KIDS_CGROUP",
+        "(internal)",
+        "a cgroup directory",
+        "Set by the partition dance for child processes; do not set it yourself.",
+    ),
+    op(
+        "Cgroups and lifecycle",
         "OCSERVE_KIDS_MEMORY_MAX_MB",
         "700",
         "32-1048576",
@@ -459,6 +497,11 @@ pub const CONTRACT: &[Var] = &[
         "Debug-build bind delay for shutdown-race tests.",
     ),
     internal(
+        "OCSERVE_VERSION",
+        "the crate version",
+        "Set by the server for the plugin host (`ctx.app.version`).",
+    ),
+    internal(
         "OCSERVE_BUILD_COMMIT",
         "build.rs",
         "Embedded revision stamp for release builds.",
@@ -502,16 +545,17 @@ pub fn rows() -> Vec<Row> {
         .iter()
         .map(|var| {
             let value = std::env::var(var.name).ok();
-            let value = match var.name {
-                "OCSERVE_SERVER_PASSWORD" => value.map(|v| {
+            let value = value.map(|v| {
+                if var.secret {
                     if v.is_empty() {
                         "(empty)".to_string()
                     } else {
                         "(set, redacted)".to_string()
                     }
-                }),
-                _ => value,
-            };
+                } else {
+                    v
+                }
+            });
             Row { var, value }
         })
         .collect()
@@ -596,6 +640,27 @@ mod tests {
         assert!(find("OCSERVE_PORT").is_some());
         assert!(find("OCSERVE_PORTX").is_none());
         assert!(find("PORT").is_none());
+    }
+
+    #[test]
+    fn secret_named_vars_are_flagged() {
+        for v in CONTRACT {
+            let upper = v.name.to_ascii_uppercase();
+            // `*_FILE` holds a path, not a secret; `*_PASSWORD`,
+            // `*_KEY`, `*_TOKEN`, `*_SECRET` hold values.
+            let looks_secret = !upper.ends_with("_FILE")
+                && (upper.contains("PASSWORD")
+                    || upper.ends_with("_KEY")
+                    || upper.contains("TOKEN")
+                    || upper.contains("SECRET"));
+            if looks_secret {
+                assert!(v.secret, "{} looks secret but is not flagged", v.name);
+            }
+        }
+        assert!(
+            find("OCSERVE_SERVER_PASSWORD").is_some_and(|v| v.secret),
+            "the server password must be redacted"
+        );
     }
 
     #[test]

@@ -347,3 +347,98 @@ fn external_commit_is_observable_through_a_long_lived_reader() {
         "the same change must not be reported twice"
     );
 }
+
+/// A restored backup replaces the file at the same path. The old watcher
+/// connection keeps reading the unlinked inode, whose `data_version` never
+/// changes, so the server would serve stale caches until restart.
+#[test]
+fn replaced_database_file_is_detected_as_external_change() {
+    let fx = fixture("replace");
+    msg(&fx, "msg_a", "user", "before");
+    assert!(!ocserve_store::poll_external_commits(&fx.db).unwrap());
+
+    // Simulate the restore drill: write a replacement file, then rename it
+    // over the live path (atomic replace; same path, new inode).
+    let tmp = fx.db.with_extension("restore.db");
+    let src =
+        rusqlite::Connection::open_with_flags(&fx.db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    src.execute("VACUUM INTO ?1", [tmp.to_str().unwrap()])
+        .unwrap();
+    drop(src);
+    std::fs::rename(&tmp, &fx.db).unwrap();
+
+    assert!(
+        ocserve_store::poll_external_commits(&fx.db).unwrap(),
+        "a replaced database file must be treated as an external change"
+    );
+}
+
+/// The boot gate must not trust the stamp alone: a row committed while the
+/// bulk trigger was absent is invisible to the index, and the old gate
+/// compared the stamp to the docsize (both missing the same row) and passed.
+#[test]
+fn boot_gate_repairs_rows_missing_from_the_index() {
+    let fx = fixture("gate");
+    // Simulate the exact window: trigger absent, then a real row lands.
+    {
+        let c = rusqlite::Connection::open(&fx.db).unwrap();
+        c.execute_batch("DROP TRIGGER IF EXISTS part_search_ai")
+            .unwrap();
+    }
+    ocserve_store::insert_message(
+        &fx.writer,
+        Some(&fx.blobs),
+        &fx.sid,
+        &json!({
+            "id": "msg_orphan", "sessionID": fx.sid, "role": "user",
+            "time": {"created": 10},
+        }),
+        &[json!({"id": "prt_orphan", "type": "text", "text": "orphan text"})],
+    )
+    .unwrap();
+    {
+        let c = rusqlite::Connection::open(&fx.db).unwrap();
+        // Recreate the trigger first: that is the exact shape the bug left
+        // behind (index missing a row, trigger healthy). Without this the old
+        // gate also ran the repair path, so the test would pass either way.
+        c.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS part_search_ai AFTER INSERT ON part_search BEGIN
+                 INSERT INTO part_search_fts(rowid, text) VALUES (new.rowid, new.text);
+             END",
+        )
+        .unwrap();
+        // Stamp the docsize, exactly as the buggy importer did.
+        let docs: i64 = c
+            .query_row("SELECT count(*) FROM part_search_fts_docsize", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        c.execute(
+            "INSERT OR REPLACE INTO import_manifest (key, value) VALUES ('parts_indexed', ?1)",
+            [docs],
+        )
+        .unwrap();
+    }
+
+    ocserve_store::backfill_part_search(&fx.writer, &fx.db).expect("boot repair must run");
+
+    let c = rusqlite::Connection::open(&fx.db).unwrap();
+    let docs: i64 = c
+        .query_row("SELECT count(*) FROM part_search_fts_docsize", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let rows: i64 = c
+        .query_row("SELECT count(*) FROM part_search", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(docs, rows, "boot must rebuild the index to match the rows");
+    let hits: i64 = c
+        .query_row(
+            "SELECT count(*) FROM part_search_fts WHERE part_search_fts MATCH '\"orphan\"'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(hits, 1, "the orphaned row must become searchable again");
+}

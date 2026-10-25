@@ -183,8 +183,17 @@ echo "== guard: environment-variable contract and generated reference (rule 58) 
 # code over a sabotaged file rather than asserting its own setup.
 uncontracted_reads() {
   local names
-  names=$(rg -o --no-filename 'env::var(?:_os)?\("(OCSERVE_[A-Z0-9_]+)"\)' "$@" 2>/dev/null \
-          | sed -E 's/.*"(OCSERVE_[A-Z0-9_]+)".*/\1/' | sort -u)
+  # Match every OCSERVE_* string literal, not just direct env::var calls: the
+  # code also reads through a key loop (`for key in ["OCSERVE_HOME", …]`) and a
+  # const alias (`OCSERVE_KIDS_CGROUP`), which a call-site regex missed.
+  #
+  # Names used ONLY inside #[cfg(test)] modules are listed here. The allowlist
+  # is narrow on purpose: if an allowlisted name ever appears on a line that
+  # reads the environment (`env::var`/`var_os`), it is still a runtime knob and
+  # the check below flags it.
+  local test_only=" OCSERVE_PTY_ENV_TEST OCSERVE_PTY_OK OCSERVE_PTY_OVERRIDE OCSERVE_UNIT_PROBE OCSERVE_PORTX "
+  names=$(rg -o --no-filename '"OCSERVE_[A-Z0-9_]+"' "$@" 2>/dev/null \
+          | tr -d '"' | sort -u)
   local name missing=""
   for name in $names; do
     # Only the table counts: a name in a doc comment or a unit test does not
@@ -192,10 +201,17 @@ uncontracted_reads() {
     # harness rows go through the `internal("NAME", …)` helper.
     if grep -qE "^[[:space:]]*\"$name\"," crates/ocserve-core/src/env_contract.rs \
        || grep -qE "^[[:space:]]*internal\(\"$name\"," crates/ocserve-core/src/env_contract.rs; then
-      :
-    else
-      missing="$missing $name"
+      continue
     fi
+    case "$test_only" in
+      *" $name "*) 
+        # Allowlisted as test-only, but only while no runtime read names it.
+        if rg -n --no-heading "env::var|var_os" "$@" 2>/dev/null | grep -q "\"$name\""; then
+          missing="$missing $name(runtime-read)"
+        fi
+        ;;
+      *) missing="$missing $name" ;;
+    esac
   done
   printf '%s' "$missing"
 }

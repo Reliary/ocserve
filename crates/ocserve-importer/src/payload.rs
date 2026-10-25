@@ -159,6 +159,7 @@ pub fn import_payloads(
         ))?;
         let mut rows = stmt.query(rusqlite::params_from_iter(session_ids))?;
         let mut batch = 0u64;
+        let mut last_progress = std::time::Instant::now();
         while let Some(row) = rows.next()? {
             let id: String = row.get(0)?;
             let mid: String = row.get(1)?;
@@ -199,7 +200,13 @@ pub fn import_payloads(
                 dst.execute_batch("COMMIT; BEGIN")?;
                 batch = 0;
             }
-            if stats.parts.is_multiple_of(40_000) {
+            // Progress every 2,000 parts or 10 s, whichever comes first. The
+            // old 40,000-only line meant a 5-minute import printed nothing,
+            // so "slow" and "hung" were indistinguishable (2026-10-25 review).
+            if stats.parts.is_multiple_of(2_000)
+                || last_progress.elapsed() >= std::time::Duration::from_secs(10)
+            {
+                last_progress = std::time::Instant::now();
                 let el = t_parts.elapsed().as_secs_f64();
                 tracing::info!(
                     "parts progress: {} in {el:.1}s ({:.0}/s)",
@@ -237,14 +244,34 @@ pub fn import_payloads(
         }
         let dst = ocserve_store::pragma::open_writer(target_db).context("reopen writer for fts")?;
         let t_rb = std::time::Instant::now();
-        dst.execute_batch("INSERT INTO part_search_fts(part_search_fts) VALUES('rebuild')")
-            .context("fts bulk rebuild")?;
+        // Rebuild and trigger recreation are ONE transaction. Split, a writer
+        // that committed between the two would insert part_search rows that
+        // the rebuild never saw and the trigger did not exist for — silently
+        // unsearchable forever, because the boot gate only compared the stamp
+        // to the FTS docsize. BEGIN IMMEDIATE takes the write lock for the
+        // whole window, so the only correct usage (no server running) is
+        // enforced rather than assumed.
+        dst.execute_batch("BEGIN IMMEDIATE")
+            .context("fts rebuild txn")?;
+        let rebuilt = dst
+            .execute_batch("INSERT INTO part_search_fts(part_search_fts) VALUES('rebuild')")
+            .context("fts bulk rebuild")
+            .and_then(|()| {
+                dst.execute_batch(
+                    "CREATE TRIGGER IF NOT EXISTS part_search_ai AFTER INSERT ON part_search BEGIN
+                         INSERT INTO part_search_fts(rowid, text) VALUES (new.rowid, new.text);
+                     END",
+                )
+                .context("recreate fts trigger")
+            });
+        match rebuilt {
+            Ok(()) => dst.execute_batch("COMMIT").context("commit fts rebuild")?,
+            Err(e) => {
+                let _ = dst.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
         tracing::info!("fts bulk build: {:.1}s", t_rb.elapsed().as_secs_f64());
-        dst.execute_batch(
-            "CREATE TRIGGER IF NOT EXISTS part_search_ai AFTER INSERT ON part_search BEGIN
-                 INSERT INTO part_search_fts(rowid, text) VALUES (new.rowid, new.text);
-             END",
-        )?;
         dst
     } else {
         // Incremental path: the trigger indexed every row as it landed. Only
@@ -265,11 +292,24 @@ pub fn import_payloads(
     // between rebuild and stamp keeps the old (or missing) value and the
     // full check still runs.
     {
+        // The stamp must describe the SOURCE OF TRUTH (part_search rows), not
+        // the index: if the two ever disagree the boot check has to notice.
+        // Before 2026-10-25 the stamp was the docsize, so a lost index row
+        // stamped itself as healthy.
+        let rows: i64 = dst
+            .query_row("SELECT count(*) FROM part_search", [], |r| r.get(0))
+            .context("part_search count after import")?;
         let docs: i64 = dst
             .query_row("SELECT count(*) FROM part_search_fts_docsize", [], |r| {
                 r.get(0)
             })
             .context("docsize after fts rebuild")?;
+        if docs != rows {
+            anyhow::bail!(
+                "search index incomplete after import: {docs} indexed / {rows} rows — refusing to \
+                 stamp the parity marker (boot self-heal will rebuild)"
+            );
+        }
         dst.execute(
             "INSERT OR REPLACE INTO import_manifest (key, value) VALUES ('parts_indexed', ?1)",
             [docs],

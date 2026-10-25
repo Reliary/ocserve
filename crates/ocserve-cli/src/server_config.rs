@@ -146,8 +146,12 @@ pub fn resolve_password(
                     );
                 }
             }
-            let raw =
-                std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
+            // Rule 8: the path itself can name a host/user and is treated as
+            // sensitive metadata — the error says WHICH source failed, never
+            // the path. (`with_context("read <path>")` contradicted the
+            // documented rule and leaked it into logs.)
+            let raw = std::fs::read_to_string(&p)
+                .map_err(|e| anyhow::anyhow!("read auth password file: {e}"))?;
             raw.strip_suffix('\n').unwrap_or(&raw).to_string()
         }
         None => std::env::var("OCSERVE_SERVER_PASSWORD").with_context(|| {

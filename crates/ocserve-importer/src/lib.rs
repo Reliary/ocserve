@@ -36,6 +36,7 @@ pub fn import_last_n(source: &Path, data_dir: &Path, limit: u32) -> Result<()> {
         .query_map([limit], |r| r.get(0))?
         .collect::<std::result::Result<_, _>>()?;
     tracing::info!("selected {} sessions", ids.len());
+    preflight_source(&src, &ids)?;
     import_selected(src, source, data_dir, &ids, false, IndexMode::Auto)
 }
 
@@ -86,6 +87,7 @@ pub fn import_sessions(
         );
     }
     tracing::info!("selected {} explicit session(s)", ids.len());
+    preflight_source(&src, ids)?;
     import_selected(src, source, data_dir, ids, force, mode)
 }
 
@@ -102,6 +104,38 @@ pub fn import_sessions(
 /// the trigger's superlinear cost, which is what this threshold approximates.
 pub const LIVE_IMPORT_PARTS_WARN: i64 = 10_000;
 
+/// Validate the source BEFORE the target is created, so a refusal leaves no
+/// empty database behind. The importer materialises each part into memory
+/// before deciding whether it should have been blobbed, so a crafted oversized
+/// row is a memory hazard rather than a data issue.
+fn preflight_source(src: &Connection, ids: &[String]) -> Result<()> {
+    if let Some((rows, max_bytes)) = source_part_size(src, ids)?
+        && max_bytes > MAX_SOURCE_PART_BYTES
+    {
+        bail!(
+            "source part too large: {max_bytes} bytes in {rows} part(s) (limit \
+             {MAX_SOURCE_PART_BYTES}); this is not a normal opencode part"
+        );
+    }
+    Ok(())
+}
+
+/// Largest single part in the selected sessions, and how many there are.
+fn source_part_size(src: &Connection, ids: &[String]) -> Result<Option<(i64, i64)>> {
+    let ph = placeholders(ids.len());
+    let row: (i64, Option<i64>) = src.query_row(
+        &format!("SELECT count(*), MAX(length(data)) FROM part WHERE session_id IN ({ph})"),
+        rusqlite::params_from_iter(ids.iter()),
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(row.1.map(|max| (row.0, max)))
+}
+
+/// A single stored part above this is not something the importer should
+/// materialise (upstream parts are text/tool payloads; 8 MiB is the inline
+/// ceiling and blob parts are chunked, but the SOURCE row is one string).
+pub const MAX_SOURCE_PART_BYTES: i64 = 32 * 1024 * 1024;
+
 fn source_part_count(src: &Connection, ids: &[String]) -> Result<i64> {
     let ph = placeholders(ids.len());
     let n: i64 = src.query_row(
@@ -117,13 +151,16 @@ fn open_source_ro(source: &Path) -> Result<Connection> {
     if !source.exists() {
         bail!("source database not found: {}", source.display());
     }
-    let uri = format!(
-        "file:{}?mode=ro",
-        source
-            .to_str()
-            .context("source path utf-8")?
-            .replace('?', "%3f")
-    );
+    // Percent-encode the URI characters SQLite would otherwise interpret:
+    // `#` starts a fragment (silently opening a DIFFERENT file), `?` starts
+    // the query, `%` starts an escape. Order matters: `%` first.
+    let encoded = source
+        .to_str()
+        .context("source path utf-8")?
+        .replace('%', "%25")
+        .replace('#', "%23")
+        .replace('?', "%3f");
+    let uri = format!("file:{encoded}?mode=ro");
     let src = Connection::open_with_flags(
         &uri,
         OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -136,6 +173,13 @@ fn open_source_ro(source: &Path) -> Result<Connection> {
         .context("source sqlite version")?;
     tracing::info!("source sqlite {ver}, read-only");
     Ok(src)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn placeholders(n: usize) -> String {
@@ -200,31 +244,42 @@ fn import_selected(
         tracing::info!("live import: {parts} source part(s) will be indexed incrementally");
     }
 
-    if !bulk_fts {
-        let present: Vec<String> = ids
-            .iter()
-            .filter(|id| session_in(&conn, id))
-            .cloned()
-            .collect();
-        if !present.is_empty() {
-            if !force {
-                bail!(
-                    "session(s) already in {}: {} (re-run with --force to replace)",
-                    db.display(),
-                    present.join(", ")
-                );
-            }
-            let tx = conn.unchecked_transaction()?;
-            for id in &present {
-                // event has no FK to session (delete_session removes it by hand)
-                tx.execute("DELETE FROM event WHERE session_id = ?1", [id])?;
-                // a replaced session must not keep a stale legacy-sync cursor
-                tx.execute("DELETE FROM import_sync WHERE session_id = ?1", [id])?;
-                tx.execute("DELETE FROM session WHERE id = ?1", [id])?;
-            }
-            tx.commit()?;
-            tracing::info!("replaced {} existing session(s)", present.len());
+    // Presence + --force applies to EVERY mode. This block used to sit inside
+    // `if !bulk_fts`, so a bulk re-import skipped the refusal and relied on
+    // `INSERT OR REPLACE INTO session` cascading the old rows away — which
+    // silently destroyed a session without `--force` and left `event` /
+    // `import_sync` behind (they have no FK). Found by review 2026-10-25.
+    let present: Vec<String> = ids
+        .iter()
+        .filter(|id| session_in(&conn, id))
+        .cloned()
+        .collect();
+    if !present.is_empty() {
+        if !force {
+            bail!(
+                "session(s) already in {}: {} (re-run with --force to replace)",
+                db.display(),
+                present.join(", ")
+            );
         }
+        // Replacing is destructive and the payload phase can still fail, so
+        // keep a restorable copy first (STORAGE §5). Cheap compared to the
+        // import; a failure to snapshot refuses the replacement.
+        let stamp = now_ms();
+        let backup = data_dir.join(format!("ocserve-pre-import-{stamp}.db"));
+        ocserve_store::backup_to(&conn, &backup)
+            .with_context(|| format!("pre-import backup to {}", backup.display()))?;
+        tracing::info!("pre-import backup: {}", backup.display());
+        let tx = conn.unchecked_transaction()?;
+        for id in &present {
+            // event has no FK to session (delete_session removes it by hand)
+            tx.execute("DELETE FROM event WHERE session_id = ?1", [id])?;
+            // a replaced session must not keep a stale legacy-sync cursor
+            tx.execute("DELETE FROM import_sync WHERE session_id = ?1", [id])?;
+            tx.execute("DELETE FROM session WHERE id = ?1", [id])?;
+        }
+        tx.commit()?;
+        tracing::info!("replaced {} existing session(s)", present.len());
     }
 
     // Full metadata pass (list shape = TUI/oc-remote contract, PLAN F1):

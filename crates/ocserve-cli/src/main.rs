@@ -746,8 +746,15 @@ async fn serve(
                 // dir) must invalidate the epoch-keyed caches even though OUR
                 // writer never ran. `PRAGMA data_version` on one long-lived
                 // reader sees exactly those commits.
-                match ocserve_store::poll_external_commits(&st.db) {
-                    Ok(true) => {
+                // File I/O + SQLite on the blocking pool: this runs on the
+                // async sampler and a slow disk/lock must not park a worker.
+                let poll_db = st.db.clone();
+                match tokio::task::spawn_blocking(move || {
+                    ocserve_store::poll_external_commits(&poll_db)
+                })
+                .await
+                {
+                    Ok(Ok(true)) => {
                         ocserve_store::bump_write_epoch();
                         ocserve_metrics::labeled_counter(
                             "ocserve_external_commit_total",
@@ -758,8 +765,25 @@ async fn serve(
                             "external commit observed on the data dir — caches invalidated"
                         );
                     }
-                    Ok(false) => {}
-                    Err(e) => tracing::debug!("external-commit poll: {e:#}"),
+                    Ok(Ok(false)) => {}
+                    // A broken watcher is a real observability failure (the
+                    // caches silently stop invalidating), not debug noise.
+                    Ok(Err(e)) => {
+                        ocserve_metrics::labeled_counter(
+                            "ocserve_external_commit_poll_errors_total",
+                            "source=\"sampler\"",
+                            1,
+                        );
+                        tracing::warn!("external-commit poll failed: {e:#}");
+                    }
+                    Err(e) => {
+                        ocserve_metrics::labeled_counter(
+                            "ocserve_external_commit_poll_errors_total",
+                            "source=\"sampler\"",
+                            1,
+                        );
+                        tracing::warn!("external-commit poll join failed: {e}");
+                    }
                 }
                 ocserve_metrics::sample_rss();
                 ocserve_metrics::gauge("ocserve_writer_queue_depth", writer_m.queue_depth());

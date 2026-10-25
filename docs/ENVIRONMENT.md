@@ -21,6 +21,7 @@ for the normal behaviour.
 |---|---|---|---|
 | `OCSERVE_PORT` | 4096 | 1-65535 | Listen port. Precedence: --port, then ocserve.toml, then this, then 4096. |
 | `OCSERVE_HOSTNAME` | 127.0.0.1 | an address | Bind address. Precedence: --hostname, then ocserve.toml, then this. |
+| `OCSERVE_HOME` | HOME, then USERPROFILE | a directory | Overrides the home directory used for config/cache lookups (harnesses set it). |
 | `OCSERVE_DATA_DIR` | ~/.local/share/ocserve | a directory | State directory: database, blobs, plugin host, snapshots. |
 | `OCSERVE_CONFIG_WRITE` | shared | shared \| overlay | Where PATCH /config writes. `overlay` keeps ocserve out of the opencode config. |
 | `OCSERVE_CORS` | (none) | origin[,origin...] | Extra allowed CORS origins, comma-separated. |
@@ -76,6 +77,7 @@ for the normal behaviour.
 | Variable | Default | Accepted | Meaning |
 |---|---|---|---|
 | `OCSERVE_CGROUP_PARTITION` | auto (only under systemd) | 0 \| 1 \| unset | Kids/ cgroup partition for child processes. |
+| `OCSERVE_KIDS_CGROUP` | (internal) | a cgroup directory | Set by the partition dance for child processes; do not set it yourself. |
 | `OCSERVE_KIDS_MEMORY_MAX_MB` | 700 | 32-1048576 | Aggregate memory cap for the kids/ cgroup. |
 | `OCSERVE_SIDECAR_RECYCLE_MB` | 280 | MB; 0 disables | Plugin-host RSS that triggers a graceful restart of the host. |
 | `OCSERVE_DRAIN_SECS` | 20 | seconds; 0 = forever | Shutdown drain deadline. |
@@ -116,5 +118,6 @@ for the normal behaviour.
 | `OCSERVE_PAIR_ALLOW` | (none) | (harness) | Pair-check allowlist path. |
 | `OCSERVE_SA_TIMING_DB` | (none) | (harness) | Disposable database for the migration timing probe. |
 | `OCSERVE_TEST_BIND_DELAY_MS` | (none) | (harness) | Debug-build bind delay for shutdown-race tests. |
+| `OCSERVE_VERSION` | the crate version | (harness) | Set by the server for the plugin host (`ctx.app.version`). |
 | `OCSERVE_BUILD_COMMIT` | build.rs | (harness) | Embedded revision stamp for release builds. |
 

@@ -513,3 +513,87 @@ fn live_slow_mode_bypasses_the_preflight_and_keeps_the_trigger() {
         "the live path indexed every row via the trigger"
     );
 }
+
+#[test]
+fn oversized_source_part_is_refused_before_any_work() {
+    let d = tempfile::tempdir().unwrap();
+    let src = make_source(d.path());
+    {
+        let c = Connection::open(&src).unwrap();
+        let big = "x".repeat((ocserve_importer::MAX_SOURCE_PART_BYTES + 1) as usize);
+        c.execute(
+            "INSERT INTO part VALUES ('prt_big', 'msg_ses_want', 'ses_want', 1, 1, ?1)",
+            [format!(
+                "{{\"id\":\"prt_big\",\"type\":\"text\",\"text\":\"{big}\"}}"
+            )],
+        )
+        .unwrap();
+    }
+    let data = d.path().join("data");
+    let err = import_sessions(
+        &src,
+        &data,
+        &["ses_want".to_string()],
+        false,
+        IndexMode::Auto,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("source part too large"),
+        "expected a named refusal, got: {err}"
+    );
+    assert!(!target_db(&data).exists(), "nothing may be written");
+}
+
+#[test]
+fn source_path_with_uri_metacharacters_opens_the_right_file() {
+    // `#` starts a URI fragment; before the fix `a#b.db` opened `a`.
+    let d = tempfile::tempdir().unwrap();
+    let plain = make_source(d.path());
+    let src = d.path().join("source#frag.db");
+    std::fs::rename(&plain, &src).unwrap();
+
+    let data = d.path().join("data");
+    import_sessions(
+        &src,
+        &data,
+        &["ses_want".to_string()],
+        false,
+        IndexMode::Auto,
+    )
+    .unwrap();
+    assert_eq!(
+        counts(&target_db(&data)).0,
+        1,
+        "the source with '#' in its name must be opened"
+    );
+}
+
+/// Bulk re-import must obey `--force` too. It used to skip the gate and let
+/// `INSERT OR REPLACE` cascade the old rows away silently.
+#[test]
+fn bulk_reimport_without_force_is_refused_and_leaves_the_session_intact() {
+    let d = tempfile::tempdir().unwrap();
+    let src = make_source(d.path());
+    let data = d.path().join("data");
+    let ids = ["ses_want".to_string()];
+
+    import_sessions(&src, &data, &ids, false, IndexMode::Auto).unwrap();
+    let db = target_db(&data);
+    let before = counts(&db);
+
+    let err = import_sessions(&src, &data, &ids, false, IndexMode::Bulk).unwrap_err();
+    assert!(
+        format!("{err}").contains("--force"),
+        "bulk must honour the force gate: {err}"
+    );
+    assert_eq!(
+        counts(&db),
+        before,
+        "a refused bulk import mutated the target"
+    );
+
+    // And with --force it replaces cleanly, events included (no duplicates).
+    import_sessions(&src, &data, &ids, true, IndexMode::Bulk).unwrap();
+    assert_eq!(counts(&db), before, "force replaces, never duplicates");
+}

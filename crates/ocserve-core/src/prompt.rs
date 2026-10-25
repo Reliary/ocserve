@@ -4561,3 +4561,94 @@ mod bounded_prompt_load_corpus {
         );
     }
 }
+
+#[cfg(test)]
+mod compaction_row_safety_tests {
+    use super::*;
+    use ocserve_store::{BlobStore, Writer};
+    use serde_json::json;
+
+    /// A summary WITHOUT `finish` still makes the full path reorder history
+    /// (`filter_compacted`'s reassembly only checks `summary:true` + parentID),
+    /// while the window used to take the "identity" budget branch. Any
+    /// compaction row must therefore disable the window.
+    #[test]
+    fn unfinished_summary_still_forces_the_full_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ocserve_store::writer::db_path(dir.path());
+        let writer = std::sync::Arc::new(Writer::spawn(db.clone()).unwrap());
+        let blobs = BlobStore::new(dir.path().join("blobs")).unwrap();
+        let sid = "ses_rowsafe";
+        ocserve_store::insert_session(
+            &writer,
+            &json!({
+                "id": sid, "projectID": "global", "directory": "/w",
+                "path": sid, "slug": sid, "title": "t", "version": "1",
+                "time": {"created": 1, "updated": 2},
+            }),
+        )
+        .unwrap();
+        let push = |id: &str, role: &str, text: &str, parts: Vec<Value>| {
+            ocserve_store::insert_message(
+                &writer,
+                Some(&blobs),
+                sid,
+                &json!({
+                    "id": id, "sessionID": sid, "role": role,
+                    "time": {"created": 10},
+                }),
+                &parts,
+            )
+            .unwrap();
+            let _ = text;
+        };
+        for i in 0..8 {
+            push(
+                &format!("msg_{i}"),
+                "user",
+                "x",
+                vec![json!({"id": format!("p{i}"), "type": "text", "text": "x".repeat(4096)})],
+            );
+        }
+        push(
+            "msg_anc",
+            "user",
+            "",
+            vec![json!({
+                "id": "p_anc", "type": "compaction", "auto": true,
+                "overflow": false, "tail_start_id": "msg_5",
+            })],
+        );
+        // summary WITHOUT finish: not "completed" for prompt_window, but the
+        // filter's reassembly still uses it.
+        push(
+            "msg_sum",
+            "assistant",
+            "",
+            vec![json!({"id": "p_sum", "type": "text", "text": "summary"})],
+        );
+        // fix the summary flags via a direct update of the stored info
+        writer
+            .write(vec![ocserve_store::WriteOp::Sql {
+                sql: "UPDATE msg SET info = json_set(info, '$.summary', json('true')) WHERE id = 'msg_sum'"
+                    .into(),
+                params: vec![],
+            }])
+            .unwrap();
+
+        for budget in [8_000usize, 10_000, 12_000, 8 << 20] {
+            let full = load_prompt_history_budget(&db, sid, budget, true, false).unwrap();
+            let bounded = load_prompt_history_budget(&db, sid, budget, false, false).unwrap();
+            assert_eq!(
+                serde_json::to_string(&to_provider_messages_budget(&full, budget)).unwrap(),
+                serde_json::to_string(&to_provider_messages_budget(&bounded, budget)).unwrap(),
+                "a summary without finish made the bounded window diverge at budget {budget}"
+            );
+            let (min_seq, _) = ocserve_store::prompt_window(&db, sid, budget).unwrap();
+            assert_eq!(
+                min_seq, 0,
+                "any compaction row must force the full load ({budget})"
+            );
+        }
+    }
+}

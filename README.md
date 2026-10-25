@@ -127,10 +127,16 @@ populated data dir always takes the per-row trigger path unless you ask for
 `--bulk`:
 
 ```sh
-# server stopped (the import drops the search trigger until its rebuild ends)
+# stop the service first (the forwarder is independent and may stay up)
+systemctl --user stop ocserve.service
 ocserve import --source ~/.local/share/opencode/opencode.db \
   --session ses_abc123 --bulk
+systemctl --user start ocserve.service
 ```
+
+`--force` takes a restorable `VACUUM INTO` copy in the data dir before it
+deletes anything, so a failed re-import never leaves you without the old
+session.
 
 `--bulk` replaces per-row indexing with one index rebuild. It is clearly faster
 for large sessions and can be slower for small ones (the rebuild has a fixed
