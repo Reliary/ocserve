@@ -2445,21 +2445,13 @@ pub async fn run_prompt_with(
                             "result=\"usage_limit\"",
                             1,
                         );
-                        emit_live(
-                            ctx,
-                            "session.error",
-                            json!({"sessionID": session_id, "error": {
-                                "name": "APIError",
-                                "data": {
-                                    "message": upsell,
-                                    "statusCode": 429,
-                                    "isRetryable": false,
-                                    "responseHeaders": {},
-                                    "responseBody": emsg,
-                                }
-                            }}),
-                        );
-                        anyhow::bail!("{upsell}");
+                        // Keep the marker in the error CHAIN: surface_run_failure
+                        // re-classifies on it to emit ONE durable typed APIError.
+                        // Bailing with the clean text alone lost the marker, so
+                        // the durable event fell back to UnknownError while a
+                        // second live-only error was emitted (two events, wrong
+                        // variant). The clean message is what the client shows.
+                        anyhow::bail!("{upsell} [FreeUsageLimitError] {emsg}");
                     }
                     if ocserve_llm::looks_like_context_overflow(&emsg) {
                         // Transient runs never compact (no session to anchor)
@@ -4706,6 +4698,21 @@ mod free_tier_tests {
             Some("Free usage exceeded, subscribe to Go")
         );
         assert!(!ocserve_llm::looks_like_context_overflow(body));
+    }
+
+    #[test]
+    fn the_bail_message_keeps_the_marker_for_durable_reclassification() {
+        // surface_run_failure sees only `format!("{err:#}")`; if the bail
+        // dropped "FreeUsageLimitError" the durable event degraded to
+        // UnknownError (found live 2026-10-25T17:26:58).
+        let chained = format!(
+            "{} [FreeUsageLimitError] provider 429 ...",
+            ocserve_llm::free_tier_limit("x FreeUsageLimitError").unwrap()
+        );
+        assert_eq!(
+            ocserve_llm::free_tier_limit(&chained),
+            Some("Free usage exceeded, subscribe to Go")
+        );
     }
 
     #[test]
