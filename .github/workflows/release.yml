@@ -63,13 +63,23 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
-      - name: install aarch64-linux cross-linker
+      - name: install aarch64-linux cross toolchain
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
+        # The C dependencies (BoringSSL, SQLite, zstd, brotli) are compiled by
+        # a C compiler, so the LINKER variable alone is not enough: BoringSSL's
+        # build script asks cmake for `CC_<target>`/`CXX_<target>` and silently
+        # falls back to the host compiler, producing x86-64 objects that fail
+        # at link time with "Relocations in generic ELF (EM: 62)". Set all
+        # three, and install g++ too (BoringSSL is C++).
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          {
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
+            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+            echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++"
+          } >> "$GITHUB_ENV"
 
       - name: install zig (musl)
         if: matrix.target == 'x86_64-unknown-linux-musl'

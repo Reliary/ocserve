@@ -149,10 +149,18 @@ jobs:
         run: |
           rustup target add aarch64-unknown-linux-gnu
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-      - name: cargo check (aarch64)
-        run: cargo check --workspace --release --target aarch64-unknown-linux-gnu
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          {
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
+            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+            echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++"
+          } >> "$GITHUB_ENV"
+      # BUILD, not check: `cargo check` never links, so it passed while the
+      # release link failed on 2026-10-25 (BoringSSL's C objects were compiled
+      # by the host compiler). A cross job that does not link cannot catch the
+      # one failure mode it exists for.
+      - name: cargo build (aarch64)
+        run: cargo build --release --target aarch64-unknown-linux-gnu -p ocserve
 
   musl-check:
     # musl is the static-Linux target: no glibc version skew, runs on Alpine and
