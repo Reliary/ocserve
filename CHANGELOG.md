@@ -14,10 +14,20 @@ differs is a named `D-*` row in `PLAN.md §17`.
   present unless `--force`, and require `--force` to name at least one
   session so a destructive import is never implicit. Session task lists are
   adopted too.
-- A live import above 20,000 source parts is refused before writing anything
-  unless `--allow-slow-live`: incremental search indexing was measured at
-  ~2,100 parts/s on an empty target and degrades with corpus size, and a
-  21k-part adoption ran for over 15 minutes with no progress output.
+- `ocserve import --bulk` gives a populated data dir the fast index path while
+  the server is stopped. Before this, stopping the server changed nothing: the
+  strategy was chosen from the target's contents (`existing == 0`), so an
+  existing data dir always took the per-row trigger path. `--bulk` drops the
+  trigger, streams the parts and rebuilds the index once; on the measured
+  5,722-part session that was 26-32 s versus 40-47 s incremental (warm), and
+  the warning states that a server must not be writing.
+- A live import above 10,000 source parts is refused before writing anything
+  unless `--allow-slow-live` or `--bulk`: per-row indexing was measured at
+  ~140 parts/s on a small populated target, and a 21k-message / 80k-part
+  adoption exceeded 15 minutes with no progress output.
+- Nullable upstream columns no longer abort the import. `session.path` is
+  nullable in the opencode schema; reading it as a `String` failed the whole
+  import with `Invalid column type Null` on a real row.
 - `ocserve doctor --env` and `ocserve env-reference` expose every `OCSERVE_*`
   variable with its default and accepted values. `docs/ENVIRONMENT.md` is
   generated from that contract, and guard rule 58 fails the build if a runtime

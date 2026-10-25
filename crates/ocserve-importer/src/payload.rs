@@ -135,10 +135,12 @@ pub fn import_payloads(
     // real 1.6GB live corpus measured 310s for its FTS rebuild in W1). When
     // `bulk_fts`, the trigger is DROPPED for the streaming phase, one
     // `'rebuild'` bulk-builds the index, then the trigger is recreated — ALL
-    // inside ONE transaction, so an interrupted import rolls back to the
-    // schema migrate() left (no window where future writes silently skip the
-    // index). A live/populated target NEVER takes this path (see
-    // `import_payloads`): it keeps the trigger and pays the incremental cost.
+    // with batched commits between chunks, so an interrupted import leaves a
+    // valid (if unindexed) part corpus and the boot self-heal
+    // (`backfill_part_search`) repairs the trigger/docsize. The trigger stays
+    // dropped only while this process runs, which is why `--bulk` is refused
+    // by the CLI unless the operator asserts no server is writing. A live
+    // target keeps the trigger and pays the incremental cost.
     let mut seq_part: HashMap<String, i64> = HashMap::new();
     let t_parts = std::time::Instant::now();
     // Batched commits (2026-10-11): ONE 178k-row transaction left the pager

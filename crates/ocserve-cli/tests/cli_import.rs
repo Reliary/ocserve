@@ -152,6 +152,93 @@ fn named_session_is_imported_and_force_is_required_to_replace_it() {
 }
 
 #[test]
+fn bulk_and_allow_slow_live_are_mutually_exclusive() {
+    let d = tempfile::tempdir().unwrap();
+    let src = make_source(d.path());
+    let data = d.path().join("data");
+    let out = run(&[
+        "import",
+        "--source",
+        src.to_str().unwrap(),
+        "--session",
+        "ses_one",
+        "--bulk",
+        "--allow-slow-live",
+        "--data-dir",
+        data.to_str().unwrap(),
+    ]);
+    assert!(
+        !out.status.success(),
+        "conflicting index modes must be refused"
+    );
+    assert_eq!(session_count(&data), -1, "nothing may be written");
+}
+
+#[test]
+fn bulk_on_a_populated_target_keeps_the_index_complete() {
+    let d = tempfile::tempdir().unwrap();
+    let src = make_source(d.path());
+    let data = d.path().join("data");
+    let src = src.to_str().unwrap();
+    let data = data.to_str().unwrap();
+
+    let seed = run(&[
+        "import",
+        "--source",
+        src,
+        "--session",
+        "ses_one",
+        "--data-dir",
+        data,
+    ]);
+    assert!(
+        seed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+
+    let bulk = run(&[
+        "import",
+        "--source",
+        src,
+        "--session",
+        "ses_two",
+        "--bulk",
+        "--data-dir",
+        data,
+    ]);
+    assert!(
+        bulk.status.success(),
+        "bulk import failed: {}",
+        String::from_utf8_lossy(&bulk.stderr)
+    );
+    assert_eq!(session_count(std::path::Path::new(data)), 2);
+
+    let c = Connection::open_with_flags(
+        std::path::Path::new(data).join("ocserve.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let docs: i64 = c
+        .query_row("SELECT count(*) FROM part_search_fts_docsize", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let rows: i64 = c
+        .query_row("SELECT count(*) FROM part_search", [], |r| r.get(0))
+        .unwrap();
+    let trigger: i64 = c
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='part_search_ai'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(docs, rows, "bulk rebuild indexes both sessions");
+    assert_eq!(trigger, 1, "the trigger is restored after the rebuild");
+}
+
+#[test]
 fn force_without_a_named_session_is_rejected_before_any_write() {
     let d = tempfile::tempdir().unwrap();
     let src = make_source(d.path());
@@ -181,7 +268,13 @@ fn force_without_a_named_session_is_rejected_before_any_write() {
 fn help_documents_the_session_flags() {
     let out = run(&["import", "--help"]);
     let text = String::from_utf8_lossy(&out.stdout);
-    for needle in ["--session", "--force", "--allow-slow-live", "--limit"] {
+    for needle in [
+        "--session",
+        "--force",
+        "--allow-slow-live",
+        "--bulk",
+        "--limit",
+    ] {
         assert!(
             text.contains(needle),
             "import --help lacks {needle}:\n{text}"

@@ -121,11 +121,22 @@ ocserve import --source ~/.local/share/opencode/opencode.db \
 Add `--force` to replace a session that is already there (`--force` requires at
 least one `--session`, so a destructive import is never implicit).
 
-A live import indexes each part through the search trigger as it lands, so it
-is safe but slower, and its cost grows with the corpus. Above 20,000 parts the
-command refuses and asks you to choose: stop the server (the bulk build is much
-faster) or pass `--allow-slow-live`. The refusal happens before anything is
-written.
+Stopping the server does not by itself make an import fast: the index strategy
+is chosen from the target's contents, not from whether a server is running. A
+populated data dir always takes the per-row trigger path unless you ask for
+`--bulk`:
+
+```sh
+# server stopped (the import drops the search trigger until its rebuild ends)
+ocserve import --source ~/.local/share/opencode/opencode.db \
+  --session ses_abc123 --bulk
+```
+
+`--bulk` replaces per-row indexing with one index rebuild. It is clearly faster
+for large sessions and can be slower for small ones (the rebuild has a fixed
+cost), so it is a choice, not a default. Above 10,000 source parts the import
+refuses before writing anything and asks you to pick `--bulk` (server stopped)
+or `--allow-slow-live` (server keeps running).
 
 ## Configuration
 

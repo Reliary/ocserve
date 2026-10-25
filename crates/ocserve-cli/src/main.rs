@@ -108,8 +108,12 @@ enum Cmd {
         force: bool,
         /// Accept a live import whose incremental search indexing may take a
         /// long time (large session into a populated data dir)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "bulk")]
         allow_slow_live: bool,
+        /// Fast index rebuild. Requires that no server is running against this
+        /// data dir: the search trigger is dropped until the rebuild finishes.
+        #[arg(long, conflicts_with = "allow_slow_live")]
+        bulk: bool,
         #[arg(long)]
         data_dir: Option<std::path::PathBuf>,
     },
@@ -276,6 +280,7 @@ fn main() -> Result<()> {
             sessions,
             force,
             allow_slow_live,
+            bulk,
             data_dir,
         } => {
             // `--force` without `--session` would silently mean "re-import the
@@ -289,7 +294,13 @@ fn main() -> Result<()> {
                 limit,
                 sessions,
                 force,
-                allow_slow_live,
+                if bulk {
+                    ocserve_importer::IndexMode::Bulk
+                } else if allow_slow_live {
+                    ocserve_importer::IndexMode::LiveSlow
+                } else {
+                    ocserve_importer::IndexMode::Auto
+                },
                 data_dir.unwrap_or_else(default_data_dir),
             )
         }
@@ -1558,7 +1569,7 @@ fn import(
     limit: u32,
     sessions: Vec<String>,
     force: bool,
-    allow_slow_live: bool,
+    mode: ocserve_importer::IndexMode,
     data_dir: std::path::PathBuf,
 ) -> Result<()> {
     if sessions.is_empty() {
@@ -1576,7 +1587,7 @@ fn import(
             data_dir.display(),
             if force { " (replacing existing)" } else { "" }
         );
-        ocserve_importer::import_sessions(&source, &data_dir, &sessions, force, allow_slow_live)?;
+        ocserve_importer::import_sessions(&source, &data_dir, &sessions, force, mode)?;
     }
     Ok(())
 }

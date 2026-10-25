@@ -8,6 +8,25 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 
+/// How to treat a live (running) server while indexing.
+///
+/// The trigram trigger indexes each part as it lands: safe for a running
+/// server, but its cost grows with the target corpus (measured ~2,100 parts/s
+/// into an empty target, ~170 parts/s into a small populated one, and a
+/// 21k-part adoption exceeded 15 minutes). The bulk path drops the trigger,
+/// streams the parts, rebuilds the index once and recreates the trigger — an
+/// order of magnitude faster, but it must never run while another process can
+/// write.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IndexMode {
+    /// Choose automatically: bulk for an empty target, live otherwise.
+    Auto,
+    /// Force the live (trigger-driven) path even for a large session.
+    LiveSlow,
+    /// Force the bulk path. The caller asserts that no server is writing.
+    Bulk,
+}
+
 /// Import the `limit` most recent sessions from `source` (read-only) into a fresh
 /// data dir. Chunked read transactions; never materializes large rows.
 pub fn import_last_n(source: &Path, data_dir: &Path, limit: u32) -> Result<()> {
@@ -17,23 +36,24 @@ pub fn import_last_n(source: &Path, data_dir: &Path, limit: u32) -> Result<()> {
         .query_map([limit], |r| r.get(0))?
         .collect::<std::result::Result<_, _>>()?;
     tracing::info!("selected {} sessions", ids.len());
-    import_selected(src, source, data_dir, &ids, false, false)
+    import_selected(src, source, data_dir, &ids, false, IndexMode::Auto)
 }
 
 /// Import an explicit set of sessions by id (read-only source). `force`
 /// removes an already-present target session (with its rows) before importing,
 /// which makes re-running an adoption idempotent.
 ///
-/// Unlike `import_last_n`, this is safe against a LIVE target database:
-/// the payload phase keeps the incremental FTS trigger in place (no DDL), so
-/// a running server writing concurrently can never observe a missing index
-/// trigger. The bulk trigger-drop path stays reserved for a fresh data dir.
+/// `mode` controls the search-index strategy. `Auto` keeps the incremental
+/// trigger while the target already has sessions (safe against a running
+/// server) and uses the bulk rebuild for an empty target. `Bulk` forces the
+/// rebuild and must only be used while no server is running; `LiveSlow`
+/// accepts the per-row trigger cost while a server keeps running.
 pub fn import_sessions(
     source: &Path,
     data_dir: &Path,
     ids: &[String],
     force: bool,
-    allow_slow_live: bool,
+    mode: IndexMode,
 ) -> Result<()> {
     if ids.is_empty() {
         bail!("no session ids given");
@@ -66,17 +86,21 @@ pub fn import_sessions(
         );
     }
     tracing::info!("selected {} explicit session(s)", ids.len());
-    import_selected(src, source, data_dir, ids, force, allow_slow_live)
+    import_selected(src, source, data_dir, ids, force, mode)
 }
 
 /// Live-target imports index every part through the trigram trigger as it
 /// lands. That is safe (no DDL) but its cost grows with the target corpus:
-/// measured ~2,100 parts/s on an empty target versus ~170 parts/s on a small
-/// populated one, and it degrades from there. A big session adopted into a
-/// live database can therefore run for tens of minutes with no progress
-/// signal, which looks like a hang. Above this many source parts the
-/// caller must opt in explicitly (or stop the server and take the bulk path).
-pub const LIVE_IMPORT_PARTS_WARN: i64 = 20_000;
+/// measured 5,722 parts in ~40 s (~140/s) on a small populated target, and a
+/// 21k-message / 80k-part adoption exceeded 15 minutes with no progress output,
+/// which looks like a hang. Above this many source parts the caller must opt
+/// in explicitly (`--allow-slow-live`, or `--bulk` with the server stopped).
+///
+/// The bulk path is not automatically faster: it replaces per-row indexing
+/// with one full trigram rebuild, which for the 64.7 MB / 5,722-part session
+/// measured ~60 s on its own. It wins when the session is large relative to
+/// the trigger's superlinear cost, which is what this threshold approximates.
+pub const LIVE_IMPORT_PARTS_WARN: i64 = 10_000;
 
 fn source_part_count(src: &Connection, ids: &[String]) -> Result<i64> {
     let ph = placeholders(ids.len());
@@ -126,7 +150,7 @@ fn import_selected(
     data_dir: &Path,
     ids: &[String],
     force: bool,
-    allow_slow_live: bool,
+    mode: IndexMode,
 ) -> Result<()> {
     std::fs::create_dir_all(data_dir)?;
     let db = ocserve_store::writer::db_path(data_dir);
@@ -137,25 +161,40 @@ fn import_selected(
     // safely drop/recreate the trigger and bulk-build once; a populated
     // target must never lose the trigger while a server may be writing.
     let existing = count_sessions(&conn)?;
-    let bulk_fts = existing == 0;
+    let bulk_fts = match mode {
+        IndexMode::Bulk => true,
+        IndexMode::LiveSlow => false,
+        IndexMode::Auto => existing == 0,
+    };
     tracing::info!(
-        "target session count {existing} → {} FTS import",
+        "target session count {existing} → {} FTS import ({mode:?})",
         if bulk_fts { "bulk" } else { "incremental" }
     );
+    if bulk_fts && existing > 0 {
+        // The caller asserted the server is stopped. Say it out loud: the
+        // trigger is dropped for the duration of the import, and a concurrent
+        // writer would insert rows that never reach the index.
+        tracing::warn!(
+            "--bulk on a populated data dir: the search trigger is dropped until the rebuild \
+             finishes. A server must not be writing while this runs."
+        );
+    }
 
     // Preflight the slow path before writing anything: a live import of a
     // large session can take tens of minutes because the trigram trigger
     // indexes each part row-by-row, and there is no progress output to
-    // distinguish that from a hang. The bulk path (empty target / stopped
-    // server) is an order of magnitude faster and is the right answer.
+    // distinguish that from a hang. Stopping the server alone changes nothing
+    // (the mode is chosen from the target's contents); `--bulk` is what makes
+    // the stopped case fast. It trades the per-row cost for one full index
+    // rebuild, so it wins on large sessions and can lose on small ones.
     if !bulk_fts {
         let parts = source_part_count(&src, ids)?;
-        if parts > LIVE_IMPORT_PARTS_WARN && !allow_slow_live {
+        if parts > LIVE_IMPORT_PARTS_WARN && mode != IndexMode::LiveSlow {
             bail!(
                 "refusing a live import of {parts} parts into a populated data dir: the search \
                  trigger indexes every row and this can run for tens of minutes. Stop the \
-                 server and re-run (the bulk build is much faster), or pass --allow-slow-live \
-                 if you accept the wait."
+                 server and re-run with --bulk (fast for large sessions; it rebuilds the whole \
+                 index once), or pass --allow-slow-live if the server must keep running."
             );
         }
         tracing::info!("live import: {parts} source part(s) will be indexed incrementally");
@@ -216,7 +255,12 @@ fn import_selected(
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
+                    // `session.path` is nullable in the upstream schema (a
+                    // session that never had one stored). Reading it as
+                    // String aborted the whole import with
+                    // `Invalid column type Null` — found 2026-10-25 on a real
+                    // source row. The target column is NOT NULL DEFAULT ''.
+                    row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, f64>(9)?,
