@@ -600,6 +600,19 @@ pub fn reference_markdown() -> String {
         }
         out.push('\n');
     }
+
+    // Upstream (OPENCODE_*) flags we honour are NOT in the contract (they are
+    // opencode's namespace), but a reader still needs to find them here.
+    out.push_str(
+        "## Upstream opencode flags honoured\n\n\
+         These are opencode's variables, not ours; ocserve reads them the same way\n\
+         upstream does.\n\n\
+         | Variable | Effect |\n|---|---|\n\
+         | `OPENCODE_ENABLE_EXPERIMENTAL_MODELS` | Serve `alpha` models. `deprecated` models are never served. |\n\
+         | `OPENCODE_API_KEY` | Key for the `opencode` provider (takes precedence over the keyless free tier). |\n\
+         | `OPENCODE_MODELS_URL` / `OPENCODE_MODELS_PATH` | Catalog source and cache path (same as upstream). |\n\
+         | `OPENCODE_DISABLE_MODELS_FETCH` | Disable catalog refresh. |\n",
+    );
     out
 }
 

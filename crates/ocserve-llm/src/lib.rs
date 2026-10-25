@@ -930,7 +930,7 @@ mod tests {
 
 #[cfg(test)]
 mod overflow_classifier_tests {
-    use super::looks_like_context_overflow;
+    use super::{free_tier_limit, looks_like_context_overflow};
 
     #[test]
     fn detects_request_size_rejections() {
@@ -946,6 +946,17 @@ mod overflow_classifier_tests {
         assert!(looks_like_context_overflow(
             "provider 400: The request exceeds the model's context limit"
         ));
+    }
+
+    #[test]
+    fn free_tier_limit_is_named_and_scoped() {
+        assert_eq!(
+            free_tier_limit("provider 429 Too Many Requests: {\"type\":\"FreeUsageLimitError\"}"),
+            Some("Free usage exceeded, subscribe to Go")
+        );
+        // A plain 429 is retryable, not a spent allowance.
+        assert_eq!(free_tier_limit("provider 429: rate limit exceeded"), None);
+        assert_eq!(free_tier_limit("provider 500: internal error"), None);
     }
 
     #[test]
@@ -968,6 +979,19 @@ mod overflow_classifier_tests {
             "provider 400: model 'nope' not found"
         ));
     }
+}
+
+/// Free-tier wall classifier (upstream session/retry.ts:99-110): the opencode
+/// free tier answers 429 `FreeUsageLimitError` once the allowance is spent.
+/// Upstream does not retry it into the void; it surfaces a fixed upsell
+/// message, because the limit will not clear within a retry window. Without
+/// this, every attempt died with a raw provider body and the app showed
+/// nothing actionable (2026-10-25: three identical silent attempts).
+pub fn free_tier_limit(err_msg: &str) -> Option<&'static str> {
+    if err_msg.contains("FreeUsageLimitError") {
+        return Some("Free usage exceeded, subscribe to Go");
+    }
+    None
 }
 
 /// Conservative request-size estimate for buffer pre-sizing (K-EFFICIENCY).

@@ -6,6 +6,22 @@ differs is a named `D-*` row in `PLAN.md §17`.
 
 ## Unreleased (after 0.6.7)
 
+### Fixed
+- **A spent opencode free allowance failed silently.** Three consecutive
+  attempts on 2026-10-25 died with the raw provider body (429
+  `FreeUsageLimitError`) and only a log line; the client showed nothing
+  actionable and the user retried blindly. It is now classified as terminal
+  and surfaced with upstream's exact upsell ("Free usage exceeded, subscribe
+  to Go") as a typed `APIError{statusCode:429,isRetryable:false}`, plus
+  `ocserve_zen_freetier_total{result="usage_limit"}`. The keyless/free tier is
+  not free at scale: the allowance is shared and finite.
+- **Retired models were still listed.** The served model map included every
+  catalog entry, so `opencode` showed 46 models, 37 of them `deprecated`
+  (upstream shows 9). Freeze deletes `status:"deprecated"` and, unless
+  `OPENCODE_ENABLE_EXPERIMENTAL_MODELS` is set, `status:"alpha"`
+  (`provider.ts:1744-1745`); ocserve now does the same in `build_providers`
+  and when picking the effective default, so the picker and the default agree.
+
 ### Added
 - `ocserve import --session <id>` (repeatable) and `--force` are now reachable
   from the CLI, matching the documented behaviour: adopt named sessions into a

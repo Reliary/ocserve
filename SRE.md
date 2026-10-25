@@ -147,9 +147,21 @@ endpoint (`Bearer public` + the proven discriminator wire — composite UA,
 native session id, ≥2 known tool names; evidence ledger
 `bench/zen-probe/FINDINGS.md` P5/P7/P8 + B1–B7). `OCSERVE_ZEN_KEYLESS=0`
 restores the pre-port behavior (no keyless endpoint → deepseek fallback
-default). Gate flips increment `ocserve_zen_freetier_total` and are checked
-nightly by the live trio (`crates/ocserve-llm/tests/zen_live.rs`: positive /
-text-only / negative — the negative proves the wall still exists).
+default). Gate flips increment `ocserve_zen_freetier_total`
+(`result="gate"` for a 403 tier rejection, `result="usage_limit"` for a spent
+free allowance) and are checked nightly by the live trio
+(`crates/ocserve-llm/tests/zen_live.rs`: positive / text-only / negative — the
+negative proves the wall still exists). A spent allowance surfaces upstream's
+fixed upsell ("Free usage exceeded, subscribe to Go") as a typed
+`APIError{statusCode:429,isRetryable:false}`, not a raw provider body: it is
+terminal, so retrying only produces silent failures.
+
+Retired models are not served. The catalog marks models `status:"deprecated"`
+(48 entries, 37 of them free models under `opencode` on 2026-10-25); freeze
+deletes those, plus `alpha` ones unless `OPENCODE_ENABLE_EXPERIMENTAL_MODELS`
+is set (`provider.ts:1744-1745`). ocserve applies the same rule in
+`build_providers` and when choosing the effective default, so the picker and
+the default can never disagree.
 
 Model catalog (K-MODELS) — same-as-upstream refresh, no operator action
 needed: honors `OPENCODE_MODELS_URL` / `OPENCODE_MODELS_PATH` /

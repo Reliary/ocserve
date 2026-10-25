@@ -121,3 +121,14 @@ for the normal behaviour.
 | `OCSERVE_VERSION` | the crate version | (harness) | Set by the server for the plugin host (`ctx.app.version`). |
 | `OCSERVE_BUILD_COMMIT` | build.rs | (harness) | Embedded revision stamp for release builds. |
 
+## Upstream opencode flags honoured
+
+These are opencode's variables, not ours; ocserve reads them the same way
+upstream does.
+
+| Variable | Effect |
+|---|---|
+| `OPENCODE_ENABLE_EXPERIMENTAL_MODELS` | Serve `alpha` models. `deprecated` models are never served. |
+| `OPENCODE_API_KEY` | Key for the `opencode` provider (takes precedence over the keyless free tier). |
+| `OPENCODE_MODELS_URL` / `OPENCODE_MODELS_PATH` | Catalog source and cache path (same as upstream). |
+| `OPENCODE_DISABLE_MODELS_FETCH` | Disable catalog refresh. |

@@ -2436,6 +2436,31 @@ pub async fn run_prompt_with(
                     // size-rejection at request open becomes a pending anchor
                     // with overflow=true, then the outer loop re-filters.
                     let emsg = format!("{e:#}");
+                    // Spent free allowance is terminal, not retryable (upstream
+                    // session/retry.ts:99). Surfacing upstream's fixed upsell
+                    // turns three silent attempts into one actionable message.
+                    if let Some(upsell) = ocserve_llm::free_tier_limit(&emsg) {
+                        ocserve_metrics::labeled_counter(
+                            "ocserve_zen_freetier_total",
+                            "result=\"usage_limit\"",
+                            1,
+                        );
+                        emit_live(
+                            ctx,
+                            "session.error",
+                            json!({"sessionID": session_id, "error": {
+                                "name": "APIError",
+                                "data": {
+                                    "message": upsell,
+                                    "statusCode": 429,
+                                    "isRetryable": false,
+                                    "responseHeaders": {},
+                                    "responseBody": emsg,
+                                }
+                            }}),
+                        );
+                        anyhow::bail!("{upsell}");
+                    }
                     if ocserve_llm::looks_like_context_overflow(&emsg) {
                         // Transient runs never compact (no session to anchor)
                         // — the rejection surfaces as the run error directly.
@@ -3802,15 +3827,28 @@ async fn surface_run_failure(
         Err(e) => tracing::error!("surface_run_failure part: {e:#}"),
     }
     let mut eseq = ocserve_store::next_event_seq(&ctx.db, sid).unwrap_or(1);
+    // A spent free allowance is reported as upstream's retryable APIError
+    // (statusCode/isRetryable), not UnknownError, so a client can render the
+    // upsell instead of a generic failure. Everything else stays UnknownError.
+    let error = match ocserve_llm::free_tier_limit(&full) {
+        Some(upsell) => json!({
+            "name": "APIError",
+            "data": {
+                "message": upsell,
+                "statusCode": 429,
+                "isRetryable": false,
+                "responseHeaders": {},
+                "responseBody": short,
+            }
+        }),
+        None => json!({"name": "UnknownError", "data": {"message": short}}),
+    };
     if let Err(e) = emit_durable(
         ctx,
         writer,
         sid,
         "session.error",
-        json!({
-            "sessionID": sid,
-            "error": {"name": "UnknownError", "data": {"message": short}}
-        }),
+        json!({"sessionID": sid, "error": error}),
         &mut eseq,
     ) {
         tracing::error!("surface_run_failure session.error: {e:#}");
@@ -4650,5 +4688,48 @@ mod compaction_row_safety_tests {
                 "any compaction row must force the full load ({budget})"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod free_tier_tests {
+    use super::*;
+
+    /// The exact body the opencode free tier returned on 2026-10-25. It must
+    /// be classified as the terminal upsell, not as an overflow and not as a
+    /// generic provider error.
+    #[test]
+    fn free_usage_limit_is_terminal_and_named() {
+        let body = "provider 429 Too Many Requests: {\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go\"}}";
+        assert_eq!(
+            ocserve_llm::free_tier_limit(body),
+            Some("Free usage exceeded, subscribe to Go")
+        );
+        assert!(!ocserve_llm::looks_like_context_overflow(body));
+    }
+
+    #[test]
+    fn the_surfaced_error_matches_the_frozen_api_error_shape() {
+        // APIError requires name + data{message,isRetryable}; the publisher
+        // must not fall back to UnknownError for this class.
+        let upsell = ocserve_llm::free_tier_limit("x FreeUsageLimitError").unwrap();
+        let error = json!({
+            "name": "APIError",
+            "data": {
+                "message": upsell,
+                "statusCode": 429,
+                "isRetryable": false,
+                "responseHeaders": {},
+                "responseBody": "x FreeUsageLimitError",
+            }
+        });
+        assert_eq!(error["name"], "APIError");
+        assert_eq!(error["data"]["isRetryable"], false);
+        assert!(
+            error["data"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("subscribe")
+        );
     }
 }
