@@ -7,6 +7,21 @@ differs is a named `D-*` row in `PLAN.md §17`.
 ## Unreleased (after 0.6.7)
 
 ### Fixed
+- **Free-tier models returned 429 for every request.** Two gates, both fixed.
+  The transport gate now fingerprints the TLS stack: the same body and headers
+  that opencode sends pass from Bun's BoringSSL and are rejected from rustls,
+  OpenSSL and curl (verified with a 5-stack replay), so opencode.ai goes
+  through a BoringSSL-backed lane while other providers keep rustls
+  (`D-ZEN-TLS`). The request gate also tightened: a short system prompt or a
+  small hand-built tool array is rejected, while the real production prompt
+  (~10 KB base + env + skills) and the real advertised tool set pass. The
+  nightly live trio now sends exactly what the server sends, so the gate
+  cannot silently drift again.
+- **A final chunk carrying both content and `finish_reason` lost the text.**
+  opencode's free tier sends `{"finish_reason":"stop","delta":{"content":"…"}}`
+  in one chunk; the parser returned Done and dropped the content, so the turn
+  completed with `finish=stop` and an empty reply. Content and terminal events
+  are now emitted in order from one payload.
 - **A spent opencode free allowance failed silently.** Three consecutive
   attempts on 2026-10-25 died with the raw provider body (429
   `FreeUsageLimitError`) and only a log line; the client showed nothing

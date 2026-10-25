@@ -153,13 +153,17 @@ step "backup drill (VACUUM INTO + integrity + counts)" bash -c "$(declare -f dri
 #      P0-P6 plugin batch: 61,746,576 B measured 2026-10-22 (hook timeouts +
 #      duplex sidecar + plugin tools + v2 prompt/dispatch/proxies; no new
 #      embedded assets) → ceiling 64,000,000 B (provenance rule).
+#     D-ZEN-TLS: 64,330,256 B measured 2026-10-25 (BoringSSL/hyper-boring
+#      linked for the opencode.ai fingerprint gate; +~2.1 MB over rustls).
+#      → ceiling 66,000,000 B (provenance rule; still ~2.9x smaller than
+#      upstream's 185 MB ELF).
 size_gate() {
   local bin="target/release/ocserve"
   if [ ! -x "$bin" ]; then
     echo "release binary missing — building"
     cargo build --release || return 1
   fi
-  local sz ceiling=64000000
+  local sz ceiling=66000000
   sz="$(stat -c%s "$bin")"
   echo "size=${sz} ceiling=${ceiling}"
   [ "$sz" -le "$ceiling" ] || { echo "OVER SIZE CEILING"; return 1; }
@@ -181,7 +185,7 @@ step "binary size ceiling" bash -c "$(declare -f size_gate); size_gate"
 #    still exists). Evidence ledger: bench/zen-probe/FINDINGS.md; production
 #    counts flips via ocserve_zen_freetier_total (K-MODEL-STATE).
 step "zen free-tier gate (live trio)" \
-  cargo test -p ocserve-llm --test zen_live -- --ignored
+  cargo test -p ocserve-core --test zen_live -- --ignored
 step "models.dev live fetch" \
   cargo test -p ocserve live_fetch_contains_big_pickle -- --ignored
 

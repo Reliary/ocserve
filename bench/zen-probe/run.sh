@@ -145,6 +145,26 @@ r3() {
   done
 }
 
+
+fp() {
+  # TLS/HTTP fingerprint of bun vs node with the SAME captured request.
+  # Each stack makes one request; tcpdump captures ClientHello for JA3.
+  local stage="$1"
+  tcpdump -i eth0 -s 0 -w "$RUNS/fp-$stage.pcap" >/dev/null 2>&1 &
+  local pid=$!
+  sleep 0.5
+  case "$stage" in
+    bun) /opt/bun run /probe2/exactprobe-bun.js ;;
+    node) node /probe2/exactprobe-node.mjs ;;
+  esac
+  sleep 1
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  echo "== ja3 $stage =="
+  tshark -r "$RUNS/fp-$stage.pcap" -Y 'tls.handshake.type==1' \
+    -T fields -e tls.handshake.ja3 -e tls.handshake.ja3_full -e tls.handshake.extensions_alpn_str \
+    2>/dev/null | head -2
+}
+
 stage_config
 case "${1:-}" in
   s0)  s0 ;;
@@ -166,6 +186,7 @@ case "${1:-}" in
     shift
     node /probe/replica-ocserve.js "$@"
     ;;
+  fp) shift; fp "${1:-bun}" ;;
   boot-check) boot && echo BOOT_OK ;;
   *) echo "usage: s0|s1|s1b|r1|r3|rv2 E1..E4|boot-check" >&2; exit 2 ;;
 esac

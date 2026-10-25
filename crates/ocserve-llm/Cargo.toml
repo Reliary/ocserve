@@ -14,9 +14,18 @@ description = "Provider clients: openai-compatible first; stream assembly + fuzz
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
-futures-core = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 futures-util.workspace = true
+futures-core = "0.3"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+# BoringSSL for opencode.ai only: their free-tier gate fingerprints the TLS
+# stack (verified 2026-10-25: identical bytes + headers pass from Bun's
+# BoringSSL and fail from rustls/OpenSSL/curl). reqwest/rustls stays for
+# every other provider. See D-ZEN-TLS in PLAN §17.
+hyper-boring = "5.3"
+boring = "5.3"
 ocserve-metrics.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

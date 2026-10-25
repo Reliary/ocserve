@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -150,15 +151,32 @@ impl ToolCallAssembler {
 /// Parse one SSE event (a `data: ...` line or multi-line block) into StreamEvent.
 /// Returns None for keep-alives/comments; Err only for malformed JSON payloads.
 pub fn parse_sse_data(payload: &str) -> Result<Option<StreamEvent>> {
+    let (content, terminal) = parse_sse_payload(payload)?;
+    Ok(content.or(terminal))
+}
+
+/// Split one SSE payload into its content event and its terminal event.
+///
+/// A single chunk may carry BOTH the final content delta and the finish
+/// reason. opencode's free tier does exactly that:
+///   {"choices":[{"finish_reason":"stop","delta":{"content":"ZEN_OK"}}]}
+/// The old single-event parser returned Done and DROPPED the content: the turn
+/// completed with finish=stop and empty text while the provider had sent the
+/// answer (live 2026-10-25). Returning both keeps every byte in order and
+/// keeps the live parser and the fixture replayer on one implementation.
+fn parse_sse_payload(payload: &str) -> Result<(Option<StreamEvent>, Option<StreamEvent>)> {
     let payload = payload.trim();
     if payload.is_empty() || payload.starts_with(':') {
-        return Ok(None);
+        return Ok((None, None));
     }
     if payload == "[DONE]" {
-        return Ok(Some(StreamEvent::Done {
-            finish: None,
-            usage: None,
-        }));
+        return Ok((
+            None,
+            Some(StreamEvent::Done {
+                finish: None,
+                usage: None,
+            }),
+        ));
     }
     let v: Value = serde_json::from_str(payload).context("sse json")?;
 
@@ -167,51 +185,66 @@ pub fn parse_sse_data(payload: &str) -> Result<Option<StreamEvent>> {
 
     let Some(choice) = v.pointer("/choices/0").filter(|c| !c.is_null()) else {
         // usage-only final chunk
-        if usage.is_some() {
-            return Ok(Some(StreamEvent::Done {
+        return Ok((
+            None,
+            usage.map(|usage| StreamEvent::Done {
                 finish: None,
-                usage,
-            }));
-        }
-        return Ok(None);
+                usage: Some(usage),
+            }),
+        ));
     };
 
-    if let Some(finish) = choice.get("finish_reason").and_then(|f| f.as_str()) {
-        if finish.is_empty() {
-            // fall through to delta parsing (some servers send both)
-        } else {
-            return Ok(Some(StreamEvent::Done {
-                finish: Some(finish.to_string()),
+    let finish_here = choice
+        .get("finish_reason")
+        .and_then(|f| f.as_str())
+        .filter(|f| !f.is_empty())
+        .map(str::to_string);
+
+    let content = choice.get("delta").and_then(delta_event);
+    match (content, finish_here) {
+        (Some(content), Some(finish)) => Ok((
+            Some(content),
+            Some(StreamEvent::Done {
+                finish: Some(finish),
                 usage,
-            }));
-        }
+            }),
+        )),
+        (Some(content), None) => Ok((Some(content), None)),
+        (None, Some(finish)) => Ok((
+            None,
+            Some(StreamEvent::Done {
+                finish: Some(finish),
+                usage,
+            }),
+        )),
+        (None, None) => Ok((
+            None,
+            usage.map(|usage| StreamEvent::Done {
+                finish: None,
+                usage: Some(usage),
+            }),
+        )),
     }
+}
 
-    let Some(delta) = choice.get("delta") else {
-        if usage.is_some() {
-            return Ok(Some(StreamEvent::Done {
-                finish: None,
-                usage,
-            }));
-        }
-        return Ok(None);
-    };
-
+/// The delta branch, shared so the finish-bearing path cannot drift from the
+/// ordinary one.
+fn delta_event(delta: &Value) -> Option<StreamEvent> {
     if let Some(rc) = delta.get("reasoning_content").and_then(|c| c.as_str())
         && !rc.is_empty()
     {
-        return Ok(Some(StreamEvent::ReasoningDelta(rc.to_string())));
+        return Some(StreamEvent::ReasoningDelta(rc.to_string()));
     }
     if let Some(content) = delta.get("content").and_then(|c| c.as_str())
         && !content.is_empty()
     {
-        return Ok(Some(StreamEvent::TextDelta(content.to_string())));
+        return Some(StreamEvent::TextDelta(content.to_string()));
     }
     if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array())
         && let Some(tc) = tcs.first()
     {
         let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-        return Ok(Some(StreamEvent::ToolCallDelta {
+        return Some(StreamEvent::ToolCallDelta {
             index,
             id: tc.pointer("/id").and_then(|i| i.as_str()).map(String::from),
             name: tc
@@ -223,9 +256,9 @@ pub fn parse_sse_data(payload: &str) -> Result<Option<StreamEvent>> {
                 .and_then(|a| a.as_str())
                 .unwrap_or("")
                 .to_string(),
-        }));
+        });
     }
-    Ok(None)
+    None
 }
 
 fn parse_usage(u: &Value) -> Usage {
@@ -278,7 +311,11 @@ pub fn split_sse_frames(raw: &[u8]) -> Vec<String> {
 pub fn replay_fixture(raw: &[u8]) -> Result<Vec<StreamEvent>> {
     let mut events = Vec::new();
     for frame in split_sse_frames(raw) {
-        if let Some(ev) = parse_sse_data(&frame)? {
+        let (content, terminal) = parse_sse_payload(&frame)?;
+        if let Some(ev) = content {
+            events.push(ev);
+        }
+        if let Some(ev) = terminal {
             events.push(ev);
         }
     }
@@ -309,9 +346,15 @@ impl SseLineParser {
             let line = String::from_utf8_lossy(&line);
             let line = line.trim_end_matches('\r').trim_end_matches('\n');
             if let Some(payload) = line.strip_prefix("data:") {
-                match parse_sse_data(payload.trim()) {
-                    Ok(Some(ev)) => self.pending.push_back(Ok(ev)),
-                    Ok(None) => continue, // keep-alive/blank → skip
+                match parse_sse_payload(payload.trim()) {
+                    Ok((content, terminal)) => {
+                        if let Some(ev) = content {
+                            self.pending.push_back(Ok(ev));
+                        }
+                        if let Some(ev) = terminal {
+                            self.pending.push_back(Ok(ev));
+                        }
+                    }
                     Err(e) => self.pending.push_back(Err(e)),
                 }
             }
@@ -326,9 +369,15 @@ impl SseLineParser {
             let rest = String::from_utf8_lossy(&self.buf).trim_end().to_string();
             self.buf.clear();
             if let Some(payload) = rest.strip_prefix("data:") {
-                match parse_sse_data(payload.trim()) {
-                    Ok(Some(ev)) => self.pending.push_back(Ok(ev)),
-                    Ok(None) => {}
+                match parse_sse_payload(payload.trim()) {
+                    Ok((content, terminal)) => {
+                        if let Some(ev) = content {
+                            self.pending.push_back(Ok(ev));
+                        }
+                        if let Some(ev) = terminal {
+                            self.pending.push_back(Ok(ev));
+                        }
+                    }
                     Err(e) => self.pending.push_back(Err(e)),
                 }
             }
@@ -459,6 +508,35 @@ pub struct Client {
     api_key: String,
 }
 
+/// BoringSSL-backed HTTP client, used ONLY for opencode.ai.
+///
+/// Their free tier gates on the TLS fingerprint, not on headers or body: the
+/// identical bytes pass from Bun's BoringSSL stack and fail (429
+/// `FreeUsageLimitError`) from rustls, OpenSSL and curl. Verified 2026-10-25
+/// by replaying the byte-exact captured request across five stacks. reqwest
+/// (rustls) remains for every other provider, where the fingerprint is
+/// irrelevant and the pure-Rust stack is preferable. D-ZEN-TLS.
+type ZenHttp = hyper_util::client::legacy::Client<
+    hyper_boring::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    http_body_util::Full<bytes::Bytes>,
+>;
+
+fn zen_http() -> &'static ZenHttp {
+    static ZEN: OnceLock<ZenHttp> = OnceLock::new();
+    ZEN.get_or_init(|| {
+        let mut ssl = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls())
+            .expect("boring ssl ctx");
+        // HTTP/1.1 only: the SSE path speaks HTTP/1.1 (bun negotiates the same).
+        ssl.set_alpn_protos(b"\x08http/1.1").expect("alpn");
+        let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
+        http.enforce_http(false);
+        let https =
+            hyper_boring::HttpsConnector::with_connector(http, ssl).expect("boring connector");
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build(https)
+    })
+}
+
 /// Free-tier zen gate (bench/zen-probe/FINDINGS: probes P5 vs P7 — the
 /// composite UA is load-bearing; the client/project/request headers are not).
 /// Sent ONLY on `opencode.ai` bases; other providers keep reqwest's default.
@@ -531,26 +609,95 @@ impl Client {
         let est = estimate_request_bytes(messages, tools);
         let mut buf = Vec::with_capacity(est);
         serde_json::to_writer(&mut buf, &body)?;
-        let resp = req.body(buf).send().await.context("provider request")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            // Gate-change visibility (K-MODEL-STATE): opencode can flip the
-            // free-tier wall anytime — count it, the prompt error still
-            // surfaces via session.error.
-            if status == reqwest::StatusCode::FORBIDDEN
-                && self.is_zen()
-                && text.contains("FreeTierError")
+        let bytes = bytes::Bytes::from(buf);
+        // opencode.ai goes over BoringSSL (their free tier fingerprints the
+        // TLS stack — see `zen_http`); every other provider keeps reqwest.
+        let src: futures_util::stream::BoxStream<'static, Result<bytes::Bytes>> = if self.is_zen() {
+            use http_body_util::BodyExt as _;
+            let mut hreq = hyper::Request::builder()
+                .method("POST")
+                .uri(format!("{}/chat/completions", self.base_url));
             {
-                ocserve_metrics::labeled_counter(
-                    "ocserve_zen_freetier_total",
-                    "result=\"gate\"",
-                    1,
+                let h = hreq.headers_mut().expect("headers");
+                let mut push = |k: &str, v: &str| {
+                    if let (Ok(name), Ok(val)) = (
+                        hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                        hyper::header::HeaderValue::from_str(v),
+                    ) {
+                        h.insert(name, val);
+                    }
+                };
+                push("authorization", &format!("Bearer {}", self.api_key));
+                push("content-type", "application/json");
+                push("accept", "text/event-stream");
+                let plugin_ua = opts
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+                    .map(|(_, v)| v.clone());
+                push(
+                    "user-agent",
+                    plugin_ua.as_deref().unwrap_or(ZEN_FREE_TIER_UA),
                 );
+                for (k, v) in &opts.headers {
+                    if !k.eq_ignore_ascii_case("user-agent") {
+                        push(k, v);
+                    }
+                }
+                if let Some(sid) = session_id {
+                    push("x-opencode-session", sid);
+                }
             }
-            anyhow::bail!("provider {status}: {}", &text[..text.len().min(400)]);
-        }
-        let src = resp.bytes_stream();
+            let hreq = hreq.body(http_body_util::Full::new(bytes.clone()))?;
+            let resp = zen_http().request(hreq).await.context("provider request")?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp
+                    .into_body()
+                    .collect()
+                    .await
+                    .map(|c| c.to_bytes())
+                    .unwrap_or_default();
+                let text = String::from_utf8_lossy(&body);
+                if text.contains("FreeTierError") {
+                    ocserve_metrics::labeled_counter(
+                        "ocserve_zen_freetier_total",
+                        "result=\"gate\"",
+                        1,
+                    );
+                }
+                anyhow::bail!("provider {status}: {}", &text[..text.len().min(400)]);
+            }
+            Box::pin(
+                resp.into_body()
+                    .into_data_stream()
+                    .map(|r| r.map_err(|e| anyhow::anyhow!("provider stream: {e}"))),
+            )
+        } else {
+            let resp = req
+                .body(bytes.to_vec())
+                .send()
+                .await
+                .context("provider request")?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                // Gate-change visibility (K-MODEL-STATE): opencode can flip
+                // the free-tier wall anytime — count it, the prompt error
+                // still surfaces via session.error.
+                if status == reqwest::StatusCode::FORBIDDEN && text.contains("FreeTierError") {
+                    ocserve_metrics::labeled_counter(
+                        "ocserve_zen_freetier_total",
+                        "result=\"gate\"",
+                        1,
+                    );
+                }
+                anyhow::bail!("provider {status}: {}", &text[..text.len().min(400)]);
+            }
+            resp.bytes_stream()
+                .map(|r| r.map_err(anyhow::Error::from))
+                .boxed()
+        };
         // Buffered line parser: a `data:` line can span TCP chunks (live 500s
         // proved it — M2c). Buffer until complete lines; keep remainder.
         // SseLineParser = the exact prior inline loop (M2c line buffering),
@@ -1144,5 +1291,60 @@ mod estimate_tests {
         assert!(Client::new("https://opencode.ai/zen/go/v1", "k").is_zen());
         assert!(!Client::new("https://api.deepseek.com/v1", "k").is_zen());
         assert!(!Client::new("http://127.0.0.1:9", "k").is_zen());
+    }
+}
+
+#[cfg(test)]
+mod finish_with_content_tests {
+    use super::*;
+
+    /// Live 2026-10-25: opencode's free tier packs the answer and the finish
+    /// into ONE chunk. The old parser returned Done and dropped the text, so
+    /// the turn completed with `finish=stop` and an empty reply.
+    #[test]
+    fn content_on_the_finish_chunk_is_not_dropped() {
+        let chunk = r#"data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"finish_reason":"stop","delta":{"role":"assistant","content":"ZEN_OK"}}]}"#;
+        let events = replay_fixture(chunk.as_bytes()).expect("parses");
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|e| match e {
+                StreamEvent::TextDelta(_) => "text",
+                StreamEvent::Done { .. } => "done",
+                StreamEvent::ReasoningDelta(_) => "reasoning",
+                StreamEvent::ToolCallDelta { .. } => "tool",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["text", "done"], "content must precede Done");
+        assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == "ZEN_OK"));
+        assert!(matches!(&events[1], StreamEvent::Done { finish: Some(f), .. } if f == "stop"));
+    }
+
+    /// The ordinary shape (content chunk, then a finish-only chunk) must be
+    /// unchanged: one text event then one Done.
+    #[test]
+    fn split_finish_chunks_keep_their_order() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"content\":\"AB\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let events = replay_fixture(raw.as_bytes()).expect("parses");
+        assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == "AB"));
+        assert!(matches!(&events[1], StreamEvent::Done { finish: Some(f), .. } if f == "stop"));
+        assert!(matches!(&events[2], StreamEvent::Done { finish: None, .. }));
+    }
+
+    /// Tool calls can also arrive on the finish chunk (some gateways do it).
+    #[test]
+    fn tool_call_on_the_finish_chunk_is_not_dropped() {
+        let chunk = r#"data: {"choices":[{"index":0,"finish_reason":"tool_calls","delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"bash","arguments":"{}"}}]}}]}"#;
+        let events = replay_fixture(chunk.as_bytes()).expect("parses");
+        assert!(
+            matches!(&events[0], StreamEvent::ToolCallDelta { name: Some(n), .. } if n == "bash"),
+            "tool delta must survive: {events:?}"
+        );
+        assert!(
+            matches!(&events[1], StreamEvent::Done { finish: Some(f), .. } if f == "tool_calls")
+        );
     }
 }

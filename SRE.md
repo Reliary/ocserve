@@ -150,11 +150,17 @@ restores the pre-port behavior (no keyless endpoint → deepseek fallback
 default). Gate flips increment `ocserve_zen_freetier_total`
 (`result="gate"` for a 403 tier rejection, `result="usage_limit"` for a spent
 free allowance) and are checked nightly by the live trio
-(`crates/ocserve-llm/tests/zen_live.rs`: positive / text-only / negative — the
+(`crates/ocserve-core/tests/zen_live.rs`: positive / text-only / negative — the
 negative proves the wall still exists). A spent allowance surfaces upstream's
 fixed upsell ("Free usage exceeded, subscribe to Go") as a typed
 `APIError{statusCode:429,isRetryable:false}`, not a raw provider body: it is
 terminal, so retrying only produces silent failures.
+
+opencode.ai requests are sent over BoringSSL (hyper-boring), not rustls: their
+free-tier gate fingerprints the TLS ClientHello, so a byte-identical request
+passes from Bun's stack and returns 429 from rustls/OpenSSL/curl (5-stack
+replay, 2026-10-25). Only that host uses the lane; all other providers keep
+rustls. Named divergence `D-ZEN-TLS` in PLAN §17.
 
 Retired models are not served. The catalog marks models `status:"deprecated"`
 (48 entries, 37 of them free models under `opencode` on 2026-10-25); freeze
