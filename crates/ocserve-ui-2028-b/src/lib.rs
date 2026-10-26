@@ -4,4 +4,6 @@
 //! concatenates every part for a tag and maps OCAP2 frame offsets across them,
 //! so the runtime format and the loader are unchanged. Parts exist only
 //! because crates.io caps a single `.crate` at 10 MiB.
+#![forbid(unsafe_code)]
+
 pub static PART: &[u8] = include_bytes!("../assets/part.bin");
