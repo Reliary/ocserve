@@ -38,6 +38,16 @@ jobs:
         run: |
           rustup toolchain install nightly --profile minimal
           cargo +nightly install cargo-fuzz --locked
+      # Seeds are the inputs that already found bugs (committed under
+      # fuzz/seeds, which .gitignore does not exclude). Copying them into the
+      # generated corpus keeps every regression shape in the rotation without
+      # committing cargo-fuzz's own (huge) corpus directory.
+      - name: seed the corpus with known regressions
+        run: |
+          mkdir -p "fuzz/corpus/${{ matrix.target }}"
+          if [ -d "fuzz/seeds/${{ matrix.target }}" ]; then
+            cp -n "fuzz/seeds/${{ matrix.target }}/"* "fuzz/corpus/${{ matrix.target }}/" || true
+          fi
       - name: run ${{ matrix.target }} (60s)
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60 -timeout=30
 

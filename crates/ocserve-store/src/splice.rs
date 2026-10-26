@@ -112,6 +112,15 @@ pub fn push_json_string(out: &mut Vec<u8>, s: &str) {
     out.push(b'"');
 }
 
+/// JSON's own whitespace set: space, tab, LF, CR. `char::is_ascii_whitespace`
+/// also accepts VT (0x0b) and FF (0x0c), which are ILLEGAL outside strings, so
+/// skipping them let such input through and the splice then emitted JSON serde
+/// cannot parse (fuzz-found 2026-10-26, `{"iiii"\x0c:{}}`).
+#[inline]
+fn is_json_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
 /// Scan a JSON string starting at `b[start] == b'"'`; returns the index one
 /// past the closing quote.
 fn scan_string(b: &[u8], start: usize) -> Option<usize> {
@@ -176,10 +185,26 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 fn needs_string_normalize(raw: &[u8]) -> bool {
     let mut i = 0usize;
     while i < raw.len() {
+        // A raw C0 byte is illegal in a JSON string and cannot be copied
+        // through: the splice would report success while emitting output
+        // serde rejects (fuzz-found 2026-10-26: `{"\x04":1}`). Returning
+        // true delegates to serde, whose parse fails, so the caller falls
+        // back to the DOM path like any other unprovable input.
+        if raw[i] < 0x20 {
+            return true;
+        }
         if raw[i] == b'\\' {
             match raw.get(i + 1) {
+                // Non-canonical: serde re-encodes these, so delegate.
                 Some(b'/') | Some(b'u') => return true,
-                _ => i += 2,
+                // Canonical short escapes serde emits verbatim.
+                Some(b'"') | Some(b'\\') | Some(b'b') | Some(b'f') | Some(b'n') | Some(b'r')
+                | Some(b't') => i += 2,
+                // Anything else is an ILLEGAL escape (`\{`, `\'`). Copying
+                // it produced output serde rejects while claiming success
+                // (fuzz-found 2026-10-26). Delegate to serde, whose parse
+                // fails, so the caller falls back to the DOM path.
+                _ => return true,
             }
         } else {
             i += 1;
@@ -233,7 +258,7 @@ fn is_canonical_number(tok: &[u8]) -> bool {
 /// in `{"a":1,"b":2}`.
 fn emit_value(b: &[u8], pos: usize, out: &mut Vec<u8>) -> Option<usize> {
     let mut i = pos;
-    while i < b.len() && (b[i] as char).is_ascii_whitespace() {
+    while i < b.len() && is_json_ws(b[i]) {
         i += 1;
     }
     match *b.get(i)? {
@@ -256,13 +281,31 @@ fn emit_value(b: &[u8], pos: usize, out: &mut Vec<u8>) -> Option<usize> {
             // in the fixture corpus (the `input: {}` shape).
             let mut saw_member = false;
             loop {
-                while i < b.len() && (b[i] as char).is_ascii_whitespace() {
+                while i < b.len() && is_json_ws(b[i]) {
                     i += 1;
                 }
                 match *b.get(i)? {
                     c if c == close => {
-                        if is_obj && phase == Phase::Key && saw_member {
-                            return None; // `{"a":1,}` — trailing comma
+                        // A close is valid only where a value is genuinely
+                        // complete: right after a value (Comma) or when the
+                        // container is still empty. In Key/Value phase WITH a
+                        // member already seen, the previous token was a comma,
+                        // so closing would emit a trailing comma (`{"a":1,}`,
+                        // `[1,]`) that does not parse (fuzz-found 2026-10-26).
+                        // Empty container: no member yet AND we are where the
+                        // first token belongs (Key for `{}`, Value for `[]`).
+                        // `phase` alone is not enough: `{":2"}` sits in Colon
+                        // phase with no member and would wrongly close
+                        // (fuzz-found 2026-10-26).
+                        let empty = !saw_member
+                            && if is_obj {
+                                phase == Phase::Key
+                            } else {
+                                phase == Phase::Value
+                            };
+                        let can_close = phase == Phase::Comma || empty;
+                        if !can_close {
+                            return None;
                         }
                         out.push(close);
                         return Some(i + 1);
@@ -297,6 +340,7 @@ fn emit_value(b: &[u8], pos: usize, out: &mut Vec<u8>) -> Option<usize> {
                             return None;
                         }
                         i = emit_value(b, i, out)?;
+                        saw_member = true;
                         phase = Phase::Comma;
                     }
                 }
@@ -353,7 +397,7 @@ fn emit_value(b: &[u8], pos: usize, out: &mut Vec<u8>) -> Option<usize> {
 /// column key's value, which we re-emit ourselves).
 fn skip_value(b: &[u8], pos: usize) -> Option<usize> {
     let mut i = pos;
-    while i < b.len() && (b[i] as char).is_ascii_whitespace() {
+    while i < b.len() && is_json_ws(b[i]) {
         i += 1;
     }
     match b.get(i)? {
@@ -417,7 +461,7 @@ pub fn compact_splice(
 ) -> bool {
     let b = src.as_bytes();
     let mut i = 0usize;
-    while i < b.len() && (b[i] as char).is_ascii_whitespace() {
+    while i < b.len() && is_json_ws(b[i]) {
         i += 1;
     }
     if b.get(i) != Some(&b'{') {
@@ -438,7 +482,7 @@ pub fn compact_splice(
     let mut ok = true;
 
     loop {
-        while i < b.len() && (b[i] as char).is_ascii_whitespace() {
+        while i < b.len() && is_json_ws(b[i]) {
             i += 1;
         }
         match b.get(i) {
@@ -469,7 +513,7 @@ pub fn compact_splice(
             }
         };
         i += raw_key.len();
-        while i < b.len() && (b[i] as char).is_ascii_whitespace() {
+        while i < b.len() && is_json_ws(b[i]) {
             i += 1;
         }
         if b.get(i) != Some(&b':') {
@@ -504,21 +548,43 @@ pub fn compact_splice(
                     }
                     scratch.put_key(k)
                 }
-                Err(_) => None,
+                // Not a valid JSON string (raw C0 byte, bad escape, lone
+                // surrogate). Copying it verbatim would emit output serde
+                // cannot parse, so refuse and let the DOM path decide.
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
             }
         } else {
-            match std::str::from_utf8(&raw_key[1..raw_key.len() - 1]) {
-                Ok(k) => {
+            let inner = &raw_key[1..raw_key.len() - 1];
+            // A raw C0 byte in a key is illegal JSON and the key bytes are
+            // copied verbatim below, so validate before accepting (the same
+            // class the value path refuses in `needs_string_normalize`).
+            match std::str::from_utf8(inner) {
+                Ok(k) if k.as_bytes().iter().all(|b| *b >= 0x20) => {
                     if !scratch.seen(fnv1a(k.as_bytes())) {
                         ok = false; // duplicate key — DOM path decides
                         break;
                     }
                     Some(k)
                 }
-                // a non-UTF8 key cannot appear in valid JSON
-                Err(_) => None,
+                // non-UTF8 or a raw control byte: not valid JSON
+                _ => {
+                    ok = false;
+                    break;
+                }
             }
         };
+        // serde_json reserves `$serde_json::private::*` keys for its own
+        // number representation when `arbitrary_precision` is enabled (it IS
+        // enabled in production, pulled in by rolldown). A user object that
+        // carries such a key makes the DOM path fail, so copying it through
+        // would emit output that does not parse (fuzz-found 2026-10-26).
+        if key_ref.is_some_and(|k| k.starts_with("$serde_json::private")) {
+            ok = false;
+            break;
+        }
         let key: Option<Col> = key_ref.and_then(Col::of);
 
         if !first {
@@ -588,7 +654,7 @@ pub fn compact_splice(
             work.extend_from_slice(b"\":");
             push_json_string(&mut work, v);
         }
-        while i < b.len() && (b[i] as char).is_ascii_whitespace() {
+        while i < b.len() && is_json_ws(b[i]) {
             i += 1;
         }
         if i != b.len() {

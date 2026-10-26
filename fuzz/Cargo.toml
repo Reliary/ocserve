@@ -9,7 +9,11 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-serde_json = "1"
+# Match the real workspace: `preserve_order` (key order on the wire) and
+# `arbitrary_precision` (enabled transitively by rolldown in production). The
+# fuzzer was previously exercising a DIFFERENT serde configuration than the
+# one we ship, which hid the reserved-key behaviour.
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 
 [dependencies.ocserve-llm]
 path = "../crates/ocserve-llm"
