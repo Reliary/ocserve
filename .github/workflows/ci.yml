@@ -176,6 +176,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions-rust-lang/setup-rust-toolchain@c8ff772090ab9d00f7f7bd7b388f3c3032282e3b  # v2.0.0
+        with:
+          # setup-rust-toolchain v2 defaults to CARGO_BUILD_WARNINGS=deny. The
+          # musl link of BoringSSL emits a linker path warning from its build
+          # script that rustc's `linker_messages` lint deliberately ignores
+          # under `-D warnings`; denying at the cargo level therefore fails a
+          # build that links and runs. The `cargo zigbuild` step below still
+          # passes RUSTFLAGS="-D warnings", so code warnings remain fatal.
+          build-warnings: warn
       - name: install zig + musl target
         run: |
           rustup target add x86_64-unknown-linux-musl
