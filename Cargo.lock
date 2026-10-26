@@ -1731,7 +1731,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "anyhow",
  "axum",
@@ -1762,7 +1762,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-core"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -1785,7 +1785,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-http"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "anyhow",
  "axum",
@@ -1832,7 +1832,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-importer"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "anyhow",
  "ocserve-store",
@@ -1846,7 +1846,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-llm"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "anyhow",
  "boring",
@@ -1868,7 +1868,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-mcp"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "anyhow",
  "ocserve-metrics",
@@ -1884,11 +1884,11 @@ dependencies = [
 
 [[package]]
 name = "ocserve-metrics"
-version = "0.6.9"
+version = "0.6.10"
 
 [[package]]
 name = "ocserve-plugin"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "anyhow",
  "hex",
@@ -1908,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-pty"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "libc",
  "ocserve-core",
@@ -1921,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-store"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1943,7 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-tools"
-version = "0.6.9"
+version = "0.6.10"
 dependencies = [
  "anyhow",
  "libc",
@@ -1962,27 +1962,27 @@ dependencies = [
 
 [[package]]
 name = "ocserve-ui-11831-a"
-version = "0.6.9"
+version = "0.6.10"
 
 [[package]]
 name = "ocserve-ui-11831-b"
-version = "0.6.9"
+version = "0.6.10"
 
 [[package]]
 name = "ocserve-ui-2028-a"
-version = "0.6.9"
+version = "0.6.10"
 
 [[package]]
 name = "ocserve-ui-2028-b"
-version = "0.6.9"
+version = "0.6.10"
 
 [[package]]
 name = "ocserve-ui-2028-c"
-version = "0.6.9"
+version = "0.6.10"
 
 [[package]]
 name = "ocserve-ui-2028-d"
-version = "0.6.9"
+version = "0.6.10"
 
 [[package]]
 name = "once_cell"

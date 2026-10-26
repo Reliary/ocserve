@@ -4,6 +4,36 @@ All notable changes to ocserve. The wire contract targets the frozen
 openccode 1.18.31 release and the v2 surface the 2.0.28 client; anything that
 differs is a named `D-*` row in `PLAN.md §17`.
 
+## 0.6.10
+
+### Fixed
+- **The JSON fast path could emit output it could not parse.** `compact_splice`
+  (the zero-parse passthrough used for every stored `info`/`inline` row)
+  promised "accepted output is valid JSON" and seven inputs broke that promise
+  while returning success: raw C0 bytes in a value or key, VT/FF accepted as
+  whitespace (`char::is_ascii_whitespace` is Rust's set, not JSON's), illegal
+  escapes copied through, a container closing in the wrong phase (`{"a":}`,
+  `{"a"`), a nested trailing comma (`[1,]`), and serde_json's reserved
+  `$serde_json::private::Number` key. Every case now refuses and falls back to
+  the DOM path, so behaviour on real payloads is unchanged. Found by the
+  nightly fuzz job, which had been running with a different serde_json feature
+  set than production.
+- The fuzz workspace now resolves `serde_json` exactly as the shipped server
+  does (`preserve_order` plus the transitively enabled `arbitrary_precision`),
+  and the corpus is seeded from `fuzz/seeds/` so regression shapes cannot fall
+  out of rotation (**guard 59**, with planted controls).
+
+### Changed
+- Dependency bumps: sha2 0.11 and parking_lot 0.13 required source changes
+  (digest output no longer implements `LowerHex`, so hashes are hex-encoded
+  explicitly; `const_mutex` was removed because `Mutex::new` is const), plus
+  hyper 1.12, serde_json 1.0.154, toml 1.1, libc 0.2.191, rolldown 1.2.15,
+  base64 0.23, brotli 9 and similar 3.
+- CI actions: setup-rust-toolchain v2.0.0 (its `CARGO_BUILD_WARNINGS=deny`
+  default is relaxed only on the musl leg, where a benign BoringSSL linker-path
+  warning is not a defect), download-artifact v8.0.2, scorecard-action v2.5.0,
+  and codeql-action v4.39.1 for init, analyze and upload-sarif together.
+
 ## 0.6.9
 
 ### Fixed
