@@ -498,6 +498,29 @@ pub async fn get_integration(
     }
 }
 
+/// True when `id` is one of the integrations this build knows about. Used by
+/// the connect endpoints, where the reference answers 204 for a known id and
+/// the tagged `IntegrationNotFoundError` for an unknown one (probed live),
+/// and by `GET /api/integration/{id}` to answer `data: null`.
+///
+/// A KNOWN integration is anything the model catalog names (that is where the
+/// reference's 5,000-entry registry and our catalog agree), plus any provider
+/// configured with a custom id. The reference lists far more than any local
+/// catalog; the status contract only needs to separate "we serve it" from
+/// "nothing by that name", so extra names are not fabricated, they simply do
+/// not exist here.
+fn integration_is_known(st: &AppState, id: &str) -> bool {
+    let payloads = st.payloads.read();
+    if payloads.catalog.get(id).is_some_and(|v| v.is_object()) {
+        return true;
+    }
+    payloads
+        .config
+        .get("provider")
+        .and_then(|v| v.as_object())
+        .is_some_and(|m| m.contains_key(id))
+}
+
 /// GET /api/reference — `{location, data:[]}` (no references configured).
 pub async fn list_references(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({"location": api_location(&st), "data": []}))
@@ -5214,21 +5237,84 @@ pub async fn git_init(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     }))
 }
 
-/// PATCH /api/credential/{credentialID} — NoContent (no credential store;
-/// ocserve has no OAuth credential backend — named divergence D-CREDENTIAL).
-pub async fn credential_update(Path(_id): Path<String>) -> StatusCode {
-    StatusCode::NO_CONTENT
+/// PATCH /api/credential/{credentialID} — 204. Probed live against 2.0.28:
+/// the body is `{label: string}` (required, `additionalProperties` ignored by
+/// the reference), an unknown id is still 204, and a missing or non-string
+/// label is the tagged `Payload` error. Until 2026-10-26 this was an unchecked
+/// 204 that edited nothing, so a client renaming a credential saw success and
+/// no change.
+pub async fn credential_update(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    let label = match body.get("label") {
+        Some(Value::String(s)) => s.clone(),
+        Some(_) => {
+            return Err(crate::HttpError::TaggedData {
+                status: StatusCode::BAD_REQUEST,
+                tag: "InvalidRequestError",
+                fields: json!({
+                    "message": "Expected string\n  at [\"label\"]",
+                    "kind": "Payload",
+                }),
+            });
+        }
+        None => {
+            return Err(crate::HttpError::TaggedData {
+                status: StatusCode::BAD_REQUEST,
+                tag: "InvalidRequestError",
+                fields: json!({
+                    "message": "Missing key\n  at [\"label\"]",
+                    "kind": "Payload",
+                }),
+            });
+        }
+    };
+    // Unknown id = 204 no-op (probed live).
+    ocserve_store::credential_update_label(&st.writer, &id, &label, now_ms()).map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
-/// DELETE /api/credential/{credentialID} — NoContent.
-pub async fn credential_remove(Path(_id): Path<String>) -> StatusCode {
-    StatusCode::NO_CONTENT
+/// DELETE /api/credential/{credentialID} — 204, and an unknown id is also 204
+/// (probed live against 2.0.28).
+pub async fn credential_remove(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    ocserve_store::credential_delete(&st.writer, &id).map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /api/integration/{integrationID}/connect/key — NoContent (no
-/// credential backend; named divergence D-CREDENTIAL).
-pub async fn integration_connect_key(Path(_id): Path<String>) -> StatusCode {
-    StatusCode::NO_CONTENT
+/// POST /api/integration/{integrationID}/connect/key — 204. Probed live
+/// against 2.0.28: a KNOWN integration id answers 204 for any body, and an
+/// unknown id answers the tagged `IntegrationNotFoundError`. The body's key is
+/// not persisted by the reference at this endpoint (the credential endpoints
+/// are the stored path), so this is a no-op with the real status contract.
+pub async fn integration_connect_key(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, HttpError> {
+    if !st.v2_enabled {
+        return Err(v2_not_found(&id));
+    }
+    if !integration_is_known(&st, &id) {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "IntegrationNotFoundError",
+            fields: json!({
+                "integrationID": id,
+                "message": format!("Integration not found: {id}"),
+            }),
+        });
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// POST /api/integration/{integrationID}/connect/oauth — 401 (no OAuth

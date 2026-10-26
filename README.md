@@ -55,24 +55,40 @@ is this machine's config with a 5.3 MB catalog.
 
 ## Install
 
-Download a release (no toolchain, checksum-verified) from
-<https://github.com/Reliary/ocserve/releases>. Linux x86_64 and aarch64
-tarballs, each with a `.sha256` and a combined `SHA256SUMS`.
+### cargo
 
-From source (this is the supported path for current releases):
+```sh
+cargo install ocserve
+```
+
+That compiles the crate family from crates.io, including the embedded web UI
+packs, so `cargo install ocserve --version 0.6.10` gives you the same feature
+set the GitHub release tarballs carry (compiled on your machine, so the bytes
+differ). `0.6.9` is the first version with all of it; earlier ones predate the
+sharded UI. Building needs a C toolchain because BoringSSL is compiled from
+source: `cmake`, `perl`, a C compiler and `pkg-config` (Debian and Ubuntu:
+`build-essential cmake perl pkg-config`; macOS: `xcode-select --install` plus
+`cmake`). Rust 1.98 or newer.
+
+### Prebuilt binary
+
+Download a checksum-verified tarball (no toolchain, no build) from
+<https://github.com/Reliary/ocserve/releases>: Linux x86_64 and aarch64 (glibc),
+Linux x86_64 (static musl), macOS x86_64 and aarch64, Windows x86_64 and
+aarch64. Each tarball has its own `.sha256`, and the release carries a combined
+`SHA256SUMS`.
+
+```sh
+tar xzf ocserve-v0.6.10-linux-x86_64.tar.gz
+./ocserve-v0.6.10-linux-x86_64/ocserve --version
+```
+
+### From source
 
 ```sh
 git clone https://github.com/Reliary/ocserve && cd ocserve
-cargo build --release          # needs Rust 1.98+
+cargo build --release
 ```
-
-**crates.io is stale on purpose.** `cargo install ocserve` resolves to
-**0.3.1**; the 0.4.x and later crates are not published because `ocserve-http`
-embeds the version-matched web UI and its packed payload exceeds crates.io's
-10 MiB per-crate limit. A size-increase request is with the registry, and
-nothing is shipped that would silently drop the air-gapped web UI just to fit.
-Use a release tarball (above) or build from the tag. This note will be removed
-the release the limit is raised.
 
 From a clone, including an optional systemd user service (never installed
 implicitly):
@@ -83,6 +99,11 @@ implicitly):
 ./scripts/install.sh --dry-run   # show what it would do first
 ./scripts/uninstall.sh           # keeps history by default
 ```
+
+`scripts/fetch-release.sh --platform linux-x86_64-musl` selects the static
+build, and a positional tag (`scripts/fetch-release.sh v0.6.10`) pins a version.
+`install.sh --bin <path>` installs a binary you already have (for example one
+you built) and renders the unit to point at it.
 
 ## Quick start
 
@@ -109,9 +130,9 @@ read-only, and never writes to them. To bring history across:
 ocserve import --source ~/.local/share/opencode/opencode.db
 ```
 
-That takes the 20 most recent sessions. To adopt named sessions into a data dir
-that already has history (safe while `ocserve serve` is running: the import
-keeps the search trigger and uses short write transactions):
+That takes the 20 most recent sessions (`--limit N` changes it). Adding
+`--session <id>` (repeatable) adopts named sessions instead, which is safe
+while `ocserve serve` is running:
 
 ```sh
 ocserve import --source ~/.local/share/opencode/opencode.db \
@@ -197,11 +218,18 @@ the `<available_skills>` block in the system prompt. The full capability matrix,
 including what is deliberately not bridged, is in
 `crates/ocserve-plugin/src/host/README-v2.md`.
 
-Named divergences are listed in `PLAN.md` section 17. They are documented
-decisions, not gaps: `D-V2-UNION` (single-port union shapes, since no
-discriminator exists), `D-PROV-SECRETS` (settings never carry apiKey values),
-`D-REVERT-NODELETE` (mark-only revert), `D-EVENT-ALWAYSON` (the log is always
-on where upstream defaults it off).
+Every divergence is one row in the single ledger at `PLAN.md` section 18
+(`D-*`), with the reason and the evidence behind it. They are documented
+decisions, not gaps. The ones a client author will notice first:
+
+- `D-V2-UNION`: one port serves both shapes, because no client sends a
+  version discriminator
+- `D-PROV-SECRETS`: settings never carry API-key values
+- `D-REVERT-NODELETE`: revert restores files and marks history; it does not
+  delete rows
+- `D-EVENT-ALWAYSON`: the durable log is on by default where upstream needs
+  `persist: true`
+- `D-TASK-BACKGROUND`: `task` runs in the foreground
 
 ### Not implemented
 
@@ -210,8 +238,14 @@ Named rather than hidden:
 - hosted share links (the record is returned, but there is no remote backend)
 - provider OAuth login
 - `task` background mode (the tool runs foreground)
+- two websearch providers behind `D-WEBSEARCH-PARTIAL` (Tavily and Exa work)
 
 Unmatched paths get the version-matched web app, not a 404, matching upstream.
+
+Web UI assets are embedded, not fetched: the release ships the bundle from the
+same upstream version it targets, so a server with no outbound network still
+serves the UI. `OCSERVE_DISABLE_EMBEDDED_WEB_UI=1` switches to proxying the
+hosted bundle instead.
 
 ### Contract
 

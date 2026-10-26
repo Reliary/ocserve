@@ -1,4 +1,4 @@
-//! ocserve CLI: serve, import, doctor, bench.
+//! ocserve CLI: serve, import, doctor, replay, backup, models, env-reference, shutdown.
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 use anyhow::{Context, Result};

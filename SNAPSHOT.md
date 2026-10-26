@@ -70,6 +70,9 @@ the start of the next prompt.
 
 ## 3. Divergences from upstream (named, deliberate)
 
+Every row below is also in the single ledger at `PLAN.md §18`. This table keeps
+the snapshot-specific reasoning.
+
 | ID | Divergence | Reason |
 |---|---|---|
 | D-SNAP-RUST-GIT | Snapshot uses the host `git` binary via `std::process::Command` (like `vcs.rs`), not libgit2. | upstream also shells to git; no new dependency. |

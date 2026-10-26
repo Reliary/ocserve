@@ -68,7 +68,7 @@ Roll-in rules (P1c):
 - Hard guards: output ≤ raw AND output non-empty when raw non-empty (observed:
   `compress_unified` can return `""` on degenerate input — empty guard is load-bearing),
   subprocess timeout → raw, deterministic memoized per output hash.
-- Model-facing `[compressed N→M bytes]` marker; divergence row in PLAN §17.
+- Model-facing `[compressed N→M bytes]` marker; divergence row in the PLAN §18 ledger.
 
 Rejected local primitives (evidence): reasoning-compress (§3.9), conversation/context
 rewrites (SYNTHESIS #3), quali (Python seam, SYNTHESIS Seam 2, no loop bench),

@@ -221,7 +221,7 @@ pub struct PairResult {
     pub detail: String,
 }
 
-/// Allowlist for pair divergences: one `name # D-ROW reason` per line
+/// Allowlist for pair divergences: one `name # D-<id> reason` per line
 /// (env `OCSERVE_PAIR_ALLOW`). Empty/missing file = no allowances. Every
 /// entry must cite a named divergence row — this file is the only way a
 /// divergence passes the gate.

@@ -946,9 +946,8 @@ async fn message_and_part_mutations_roundtrip() {
 #[tokio::test]
 async fn file_find_question_routes() {
     // base directory = AppState paths.directory = /work (with_payloads);
-    // scope_path canonicalizes — create a real dir the state can see? paths
-    // are env-derived: use HOME-based temp instead by building state normally
-    // and pointing requests at paths that exist under the canonical base.
+    // containment verifies the opened handle, so seed real files under the
+    // state's own base rather than trusting a lexical path.
     let st = ocserve_http::AppState::with_payloads(None, ocserve_http::Payloads::default());
     let base = std::path::Path::new(st.paths["directory"].as_str().unwrap_or("/"));
     // with_payloads directory = current_dir (canonicalizable). Seed a file

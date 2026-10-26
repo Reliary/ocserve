@@ -9,7 +9,7 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
-description = "Streaming read-only 20-session importer"
+description = "Streaming read-only session importer (opencode.db to ocserve)"
 
 [dependencies]
 anyhow.workspace = true

@@ -19,7 +19,7 @@ references and stale divergences on every commit.
 
 | Doc | Authority |
 |---|---|
-| `PLAN.md` | scope, wire contract and freeze, architecture, API surface, milestones, divergence ledger (§17) |
+| `PLAN.md` | scope, wire contract and freeze, architecture, API surface, milestones, and the single divergence ledger (§18, every `D-*` with reason and evidence) |
 | `STORAGE.md` | SQLite pragmas, schema and blob protocol, FTS5 design, storage gates |
 | `MEMORY.md` | memory budget lines, allocator rules, allocation gates |
 | `SRE.md` | boot checks, metric-per-KPI table, config knobs, CPU policy, CI/CD, systemd, runbook |
@@ -59,7 +59,7 @@ references and stale divergences on every commit.
   the other is edited in the same commit (AGENTS §1).
 - Status lines carry a date. A status that is not current is a defect, not a
   style issue.
-- A capability that is not implemented is written as `D-<NAME>` in `PLAN.md §17`
+- A capability that is not implemented is written as `D-<NAME>` in the `PLAN.md §18` ledger
   or `README-v2.md`, never as prose that implies it works.
 - No em dashes in `README.md`, `SECURITY.md`, `CONTRIBUTING.md`; the linter
   enforces it.

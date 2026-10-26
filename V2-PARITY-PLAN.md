@@ -169,7 +169,7 @@ admit-only; the turn executor is unchanged). Binary 33,013,072 B ≤ 34M.
 - D-PLUGIN-INVENTORY: CLOSED — `/api/plugin` serves the real inventory, and
   `ctx.plugin.list()` in the v2 shim reports the loaded plugins (it returned
   `[]` before 2026-10-18; K-SHIM-HONESTY).
-- D-ENV: CLOSED — `PUT /api/session/{id}/environment` bound (replace
+- D-ENV: DONE (recorded as an accepted divergence in PLAN §18) — `PUT /api/session/{id}/environment` bound (replace
   semantics); `session_environment` table; read once per turn, injected
   into bash subprocess env; never sent to the provider (e2e asserts tool
   result carries the value + first provider body lacks it).
@@ -186,7 +186,7 @@ admit-only; the turn executor is unchanged). Binary 33,013,072 B ≤ 34M.
   TinyFish → same failure envelope (D-WEBSEARCH-PARTIAL — the envelope
   upstream emits when ITS backend fails, never fabricated results).
   `GET /api/websearch/provider` — same verdict (exact list).
-- D-CREDENTIAL: CLOSED — `credential` table (upstream shape); CRUD with
+- D-CREDENTIAL: DONE for the stored-credential path (2026-10-26: PATCH/DELETE are real edits now, not unchecked 204s) — `credential` table (upstream shape); CRUD with
   single-active-per-integration (create default + activate, verified live);
   unknown activate = 204 no-op; label defaults "default"; value union
   validated with exact Payload wording; values echo on GET (upstream

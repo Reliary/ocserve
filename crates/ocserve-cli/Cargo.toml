@@ -9,7 +9,7 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
-description = "ocserve binary: serve, import, doctor, bench"
+description = "ocserve binary: serve, import, doctor, replay, backup, models, env-reference"
 
 [[bin]]
 name = "ocserve"

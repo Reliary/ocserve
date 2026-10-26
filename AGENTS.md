@@ -8,7 +8,7 @@ tests pass.
 
 | Doc | Authority |
 |---|---|
-| `PLAN.md` | scope, contract freeze, architecture, API surface, harness, milestones, standards (F1–F6, N1–N7), antagonism ledger |
+| `PLAN.md` | scope, contract freeze, architecture, API surface, harness, milestones, standards (F1–F6, N1–N7), antagonism ledger, and the single divergence ledger (§18) |
 | `STORAGE.md` | every SQLite PRAGMA, schema/blob rule, FTS5 design, storage CI gates |
 | `MEMORY.md` | 300 MB budget lines, allocator/runtime settings, allocation rules, memory gates |
 | `SRE.md` | fail-fast boot checks, metric-per-KPI table, config knobs, CPU policy, CI/CD, systemd |

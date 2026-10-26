@@ -160,7 +160,7 @@ opencode.ai requests are sent over BoringSSL (hyper-boring), not rustls: their
 free-tier gate fingerprints the TLS ClientHello, so a byte-identical request
 passes from Bun's stack and returns 429 from rustls/OpenSSL/curl (5-stack
 replay, 2026-10-25). Only that host uses the lane; all other providers keep
-rustls. Named divergence `D-ZEN-TLS` in PLAN §17.
+rustls. Named divergence `D-ZEN-TLS` in the PLAN §18 ledger.
 
 Retired models are not served. The catalog marks models `status:"deprecated"`
 (48 entries, 37 of them free models under `opencode` on 2026-10-25); freeze
@@ -400,10 +400,13 @@ other than the async worker (thread identity recorded by a test-only seam).
   and take the service with it. The fetcher's `--selftest` (run by guard rule
   39) proves a corrupted tarball is rejected.
 - **Release is a tag, not a local build.** `release.yml` fires on `v*` and
-  publishes linux x86_64 + aarch64 tarballs + `SHA256SUMS` to the GitHub
-  Release. macOS/Windows are best-effort (the PTY shim is Linux/glibc). The
-  crates.io publish is a separate manual workflow and is not on the release
-  path.
+  publishes linux x86_64 + aarch64 (glibc), linux x86_64 (static musl), and
+  macOS/Windows x86_64 + aarch64 tarballs + `SHA256SUMS` to the GitHub Release;
+  `publish.yml` also fires on the same tag and publishes all 17 crates in
+  dependency order, with `ocserve` last. A cancelled matrix leg makes the
+  attach step skip, so the assets are only there once every target succeeds
+  (re-run the failed leg; it is usually a reclaimed runner, not a build
+  failure).
 - **Uninstall (application-clean; history sacred):** `scripts/uninstall.sh`
   — default removes ocserve\* units/timers/drop-ins (glob), the
   receipt/ExecStart binary (dev `target/` builds KEPT with a note), and

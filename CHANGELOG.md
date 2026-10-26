@@ -2,7 +2,28 @@
 
 All notable changes to ocserve. The wire contract targets the frozen
 openccode 1.18.31 release and the v2 surface the 2.0.28 client; anything that
-differs is a named `D-*` row in `PLAN.md §17`.
+differs is a named `D-*` row in the ledger at `PLAN.md §18`.
+
+## Unreleased
+
+### Fixed
+- **Credential rename and delete were no-ops.** `PATCH /api/credential/{id}` and
+  `DELETE /api/credential/{id}` returned 204 without touching the store, so a
+  client renaming a credential saw success and no change. Both now edit the
+  `credential` table with the reference's exact status and error bodies
+  (missing `label` is the tagged `Payload` error; an unknown id is still a 204
+  no-op, as the 2.0.28 server does). `POST /api/integration/{id}/connect/key`
+  also answers the known/unknown split instead of a blanket 204.
+
+### Changed
+- The README documents `cargo install ocserve` as a first-class install path
+  (it was still calling crates.io stale), names the build prerequisites, and
+  lists every published target.
+- Every `D-*` divergence now has one row in a single ledger (`PLAN.md` §18),
+  and `scripts/check-docs.py` fails a token used in source but not declared
+  there.
+- The CLI description and module header listed a `bench` subcommand that no
+  longer exists; they now name the real set.
 
 ## 0.6.10
 

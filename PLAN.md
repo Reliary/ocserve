@@ -1,10 +1,11 @@
 # ocserve — Rust drop-in server for opencode v1
 
-Status (2026-10-18): **v0.4.0** is a tag-triggered CI release (binaries +
-SHA256SUMS from `release.yml`); crates.io publish is pending a per-crate
-upload-limit increase for `ocserve-http` (two embedded web-UI packs), so the
-0.3.1 crates remain the latest on the registry. This document originated as the
-build plan; the milestone record, parity ledger (§17), and standards below are current.
+Status (2026-10-26): **v0.6.10** is a tag-triggered CI release (binaries +
+SHA256SUMS from `release.yml`) **and** a crates.io release: the web UI is split
+at zstd frame boundaries into six `ocserve-ui-*` asset crates, so every part
+stays under the registry's 10 MiB per-crate cap and `cargo install ocserve`
+delivers the same binary as the tarball. This document originated as the build
+plan; the milestone record, route coverage (§17), divergence ledger (§18) and standards below are current.
 Every claim is sourced from local trees/service/DB measurements, direct empirical tests, or a
 verified reference (§12). Nothing is aspirational.
 
@@ -503,6 +504,77 @@ slowest plugin). Plugin-declared tools are advertised with schemas generated in
 the plugin's own runtime and executed through the sidecar; `OCSERVE_PLUGIN_TOOLS=0`
 is the kill switch. Demand for every declared hook is recorded in
 `bench/plugins/demand.json` and enforced by guard 50.
+
+## 18. Divergence ledger (single source)
+
+Every `D-*` token that appears in code, a crate README or another document has
+exactly one row here. `scripts/check-docs.py` fails a token that is used but not
+declared, so a divergence cannot exist only in a comment. "open" rows are known
+and accepted; "closed" rows are recorded history and must not be re-listed as
+current anywhere.
+
+| ID | Divergence | Status |
+|---|---|---|
+| `D-AGENT-MODEL` | Compaction runs on the request's model; upstream honors a per-agent model pin (`agent.model`). | open |
+| `D-BACKGROUND-NOOP` | `POST /api/session/{id}/background` records the request and returns 204; turns run tools inline, so there is nothing to background. | accepted |
+| `D-BASH-SPLIT` | `bash_patterns::split_commands` approximates the shell (quote-aware only). Heredocs, `$( )`, backticks, `&>` and `2>&1` can split a sub-command, which can produce a slightly-off external-directory or arity ask. The tool still runs the whole command. | accepted |
+| `D-CONFIG-1` | Upstream has no config file watcher (invalidated only on its own write), so an external edit needs a restart there. ocserve applies it within one poll interval. | accepted |
+| `D-CREDENTIAL` | The credential store is implemented (`GET`/`POST`/`PATCH`/`DELETE /api/credential`); only the OAuth code exchange is absent, so `connect/oauth` answers the probe's 401. | open (OAuth only) |
+| `D-ENV` | Session environment variables are stored and injected into the bash tool's child env; they are never sent to the provider. | accepted |
+| `D-EVENT-ALWAYSON` | The durable event log is on by default; upstream needs `persist: true` per session. | accepted |
+| `D-FIND-IGNORE` | `/find` uses an explicit exclude list where upstream discovers ignores from `.gitignore`. | open |
+| `D-FORK-1` | `session.created` fires after the copy completes; upstream publishes before cloning, so a client reacting to the event can read a partial session. | accepted |
+| `D-FS-CONTAIN` | Filesystem routes resolve and verify through a handle (`openat2`/`F_GETPATH`/`GetFinalPathNameByHandleW`); a path outside the allowed root is refused rather than lexically rewritten. | accepted |
+| `D-MODELS-1` | No embedded model-catalog snapshot, so a first boot with no network and no cache has an empty catalog. | accepted |
+| `D-MODELS-2` | The fetched catalog is parse-validated before it replaces the previous file. | accepted |
+| `D-MODELS-3` | Catalog paths stay `$HOME`-based; the XDG environment variables are ignored, matching the rest of the runtime path resolution. | accepted |
+| `D-PARITY-METRICS` | Upstream has no public `/metrics` (it serves the SPA there), so differential harnesses report ocserve's counters and `n/a` for the reference rather than a fabricated zero. There is nothing to compare metric-by-metric. | accepted |
+| `D-PLATFORM-XDG` | Data and config roots stay XDG-shaped on macOS and Windows, which is both upstream's own resolution and the choice that does not orphan an existing database. | accepted |
+| `D-PLATFORM-UNVERIFIED` | A platform shipped without a differential run against its own freeze binary. | closed (macOS and Windows each ran `pair-check` against their own binary) |
+| `D-PLUGIN-INVENTORY` | `/api/plugin` served an empty list while plugins were loaded. | closed |
+| `D-PROMPT-BUDGET` | Prompt history is tail-weighted to an 8 MiB byte budget; upstream sends the whole session. Oldest messages are dropped first, newest always kept. | accepted |
+| `D-PROMPT-LOAD` | History is loaded as a provable `seq` suffix (O(8 MB)) with a full-load fallback, instead of reading the whole session. | accepted |
+| `D-PROV-SECRETS` | Provider `settings` carry non-secret values only; API keys stay in config and never appear on the v2 wire. | accepted |
+| `D-PTY-1` | The PTY output cursor counts UTF-16 code units (JS `chunk.length`), and the connect-token accepts a request with no `Origin` header (safe on loopback). | accepted |
+| `D-PTY-2` | The `workspace` query is ignored: one directory per server. | accepted |
+| `D-REPORT` | A few internal report documents use a different shape than the shipped tool output (diagnostics only, no model-facing surface). | accepted |
+| `D-REVERT-EVENTS` | The inner `session.revert.*` payload is `{sessionID, info}`; the outer event envelope matches every other event. Clients read `event.type` and resync. | accepted |
+| `D-REVERT-NODELETE` | Revert restores files, reverts tool `patch` parts and marks history; rows are kept, not deleted. | accepted |
+| `D-RPC` | No constructible state enables v2 RPC upstream either, so an unregistered id answers the byte-exact 400 `rpc.unavailable`. | closed |
+| `D-SHARE-NOBACKEND` | `POST /session/{id}/share` returns the Session record, but no hosted share backend exists, so `share` is never set. | accepted |
+| `D-SKILL-FILES` | Skill content ships inline, so the v1 file-list sampler is skipped. | accepted |
+| `D-SNAP-GC-PROC` | Snapshot `gc --prune=7.days` runs on an in-process hourly tick rather than an Effect-scoped fiber. | accepted |
+| `D-SNAP-NOOP-NONGIT` | A non-git project has snapshots disabled, so revert does not restore files there. | accepted |
+| `D-SNAP-RUST-GIT` | Snapshots shell out to the host `git` binary (as upstream does) rather than linking libgit2. | accepted |
+| `D-TASK-BACKGROUND` | `task` runs in the foreground; background subagents are refused with that reason. | accepted |
+| `D-TITLE-1` | ocserve derives a session title from the first user message; the frozen v1 server never generates one. | accepted |
+| `D-TOKENS-FORK` | A forked session copies the messages but starts its usage row at zero; upstream nets the cloned step usage. | accepted |
+| `D-TOKENS-PARTDELETE` | Deleting or patching a part does not subtract from the session usage row; upstream applies `-1` on PartRemoved. | accepted |
+| `D-TOOLS-SHELL-WINDOWS` | The shell tool has no PowerShell or `cmd` profiles; the POSIX shell path is used. | open |
+| `D-TOOLS-TRUNC-FILE` | Large tool output is truncated in place; upstream also spills the full output to a file and tells the model the path. | open |
+| `D-V2-AISDK` | The v2 AI-SDK adapter is Effect-specific; ocserve has its own provider client. | accepted |
+| `D-V2-DOMAIN` | A v2 plugin hook on an unbridged `ctx` domain throws a named `notBridged` error instead of silently doing nothing. | accepted |
+| `D-V2-PERM-EVAL` | `permission.evaluate` is not bridged as a v2 hook; the server's own gate is authoritative. | accepted |
+| `D-V2-RPC-EVENTS` | `rpc.events.emit` is not bridged: there is no v2 RPC event SSE surface. | accepted |
+| `D-V2-SESSION-LIFECYCLE` | Transport-level v2 hooks (`model.request`, `http.*`, `retry`, `title`, `generate`) are not bridged. | accepted |
+| `D-V2-STORAGE-MEM` | `ctx.storage` is in-memory for the life of the sidecar; it is not disk-backed. | accepted |
+| `D-V2-SESSION-GENERATE` | The transient generate path runs, but the v2 `session.generate` hook is not dispatched. | accepted |
+| `D-V2-TOOL-EDITOR` | `tool.transform` registers and records, but the tool registry is static, so it is not applied; `tool.list` returns `[]`. | accepted |
+| `D-V2-UNION` | One port serves both wire shapes; no client sends a version discriminator. | accepted |
+| `D-V2-WS` | Experimental WebSocket hooks register but are not dispatched. | accepted |
+| `D-VIEW-NOWATERMARK` | View records and their 204s are served without tracking a read watermark. | accepted |
+| `D-WEBFETCH-MD` | Markdown conversion of fetched HTML is implemented locally rather than with upstream's turndown, so edge-case formatting can differ (the fetch itself is identical). | accepted |
+| `D-WEBSEARCH-PARTIAL` | Tavily and Exa are implemented directly; Firecrawl, Parallel and TinyFish return the same backend-failure envelope upstream emits when its own backend fails, never fabricated results. | accepted |
+| `D-WIN-LONGPATH` | Paths beyond `MAX_PATH` are rejected rather than transparently prefixed. | open |
+| `D-WIN-WAL-NETWORK` | A data directory on a network filesystem is refused at boot rather than degraded. | accepted |
+| `D-MACOS-TRIM` | `trim_heap()` is a no-op off glibc unless measurement justifies otherwise. | open |
+| `D-TOOLS-TASK` | The `task` subagent tool was advertised by the frozen provider but not implemented. | closed (the tool runs on the shared executor with a depth guard) |
+
+Historical rows kept for the tokens' own history, all closed: `D-GENERATE-EPHEMERAL`,
+`D-REVERT-NOSNAP`, `D-VCS-NOAPPLY`, `D-HOOK-*` items are in §16.9 and
+`D-PERM-*` items are in §17.
+
+---
 
 ## 17. oc-remote route coverage (exhaustive client audit)
 

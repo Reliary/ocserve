@@ -20,7 +20,7 @@ Antagonism findings incorporated: A1 (twin dialects + module-dir shim + mechanic
 2. Inline plants for 16b (temp-spec minus one op → GAP + nonzero, trap-restore) + 35 (`__rule35_plant.rs` bare trim+join → flagged, removed).
 3. Header honesty (:1-5): enumerate exactly which rules self-prove vs rely on suite tests.
 4. Ceilings: CI (`ci.yml:116`) + SRE (`SRE.md:258`) to 34M with nightly's provenance chain.
-5. Hygiene: trace rule 34; fix `D-PERM-V2-*` (cited in scripts, absent from PLAN §17); restore pair-v2 exec bit; event-validate non-vacuous (seeded window or minimum-row gate); update TRACEABILITY `:177-178`.
+5. Hygiene: trace rule 34; fix `D-PERM-V2-*` (cited in scripts, absent from the PLAN §18 ledger); restore pair-v2 exec bit; event-validate non-vacuous (seeded window or minimum-row gate); update TRACEABILITY `:177-178`.
 6. Kill-criteria amendment: add *no silent gate re-basing*.
 7. Gate separation: closed thresholds for closed runs only; arrival gets its own pre-registered gate (achieved% floor, p95 bound, `dropped_iterations=0`, err bound, freeze-RSS co-tenant guard). Fix contradicting comments.
 

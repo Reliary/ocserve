@@ -260,6 +260,52 @@ def check_em_dashes() -> list[str]:
     return findings
 
 
+def check_divergence_undeclared() -> list[str]:
+    """A `D-*` token used in source must appear in `PLAN.md`.
+
+    Divergences are the contract with the reader: a named behaviour difference
+    with a reason. `websearch.rs` carried `D-WEBSEARCH-PARTIAL` in its header
+    while the ledger had no such row, so the claim "every divergence is listed
+    in PLAN.md §17" was false in the one place a reader would check it. Tokens
+    that exist but are recorded only inside a crate README are still invisible
+    from the ledger, which is what this catches.
+
+    Scope: `crates/**/*.rs`, `*.mjs`, and crate READMEs. A token must appear as a
+    whole token in PLAN.md. `D-WEBSEARCH` is accepted when `D-WEBSEARCH-PARTIAL`
+    is declared (prefix families), matching how the ledger groups them.
+    """
+    plan_path = os.path.join(ROOT, "PLAN.md")
+    if not os.path.isfile(plan_path):
+        return ["PLAN.md is missing; the divergence ledger cannot be checked"]
+    ledger = set(re.findall(r"D-[A-Z][A-Z0-9-]{2,}", open(plan_path, encoding="utf-8").read()))
+    findings = []
+    seen: dict[str, set[str]] = {}
+    import pathlib
+
+    crates = pathlib.Path(ROOT) / "crates"
+    for path in list(crates.rglob("*.rs")) + list(crates.rglob("*.mjs")):
+        if "target" in path.parts:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        # A token must stand alone: `READ-ONLY` contains `D-ONLY` and
+        # `THIRD-PARTY` contains `D-PARTY`, neither of which is a divergence.
+        for tok in re.findall(r"(?<![A-Za-z])D-[A-Z][A-Z0-9-]{2,}(?![A-Za-z])", text):
+            # Ignore a token that is only a prefix of a longer declared one.
+            if tok in ledger or any(t.startswith(tok + "-") for t in ledger):
+                continue
+            # ...or one that a longer form in the same file defines/mentions.
+            seen.setdefault(tok, set()).add(str(path.relative_to(ROOT)))
+    for tok in sorted(seen):
+        sites = ", ".join(sorted(seen[tok])[:3])
+        findings.append(
+            f"{sites}: names {tok}, which has no row in PLAN.md (undeclared divergence)"
+        )
+    return findings
+
+
 def run_all() -> list[str]:
     return (
         check_dead_paths()
@@ -267,6 +313,7 @@ def run_all() -> list[str]:
         + check_removed_divergence()
         + check_closed_divergence_reopened()
         + check_em_dashes()
+        + check_divergence_undeclared()
     )
 
 
@@ -318,6 +365,20 @@ def selftest() -> int:
     finally:
         shutil.move(ph_backup, ph_victim)
 
+    # plant an UNDECLARED divergence token in source and require detection
+    # (the 2026-10-26 finding: `websearch.rs` named a divergence the ledger
+    # never declared).
+    src_victim = os.path.join(ROOT, "crates", "ocserve-http", "src", "v2.rs")
+    src_backup = src_victim + ".lintbak"
+    shutil.copy2(src_victim, src_backup)
+    caught_div = False
+    try:
+        with open(src_victim, "a", encoding="utf-8") as f:
+            f.write("\n// (selftest) D-RULE31-SELFTEST-DIV\n")
+        caught_div = any("D-RULE31-SELFTEST-DIV" in x for x in run_all())
+    finally:
+        shutil.move(src_backup, src_victim)
+
     # plant an em dash in a reader-facing doc (house style: none)
     em_victim = os.path.join(ROOT, "README.md")
     em_backup = em_victim + ".lintbak"
@@ -330,15 +391,24 @@ def selftest() -> int:
     finally:
         shutil.move(em_backup, em_victim)
 
-    if caught_path and caught_rule and caught_closed and caught_placeholder and caught_em:
+    if (
+        caught_path
+        and caught_rule
+        and caught_closed
+        and caught_placeholder
+        and caught_div
+        and caught_em
+    ):
         print(
             "selftest: PASS (dead path + bogus rule ref + reopened closed "
-            "divergence + dead placeholder dir + em dash all detected)"
+            "divergence + undeclared divergence + dead placeholder dir + em dash "
+            "all detected)"
         )
         return 0
     print(
         f"selftest: FAIL (path={caught_path} rule={caught_rule} closed={caught_closed} "
-        f"placeholder={caught_placeholder} em_dash={caught_em}) - guard is vacuous",
+        f"placeholder={caught_placeholder} undeclared={caught_div} "
+        f"em_dash={caught_em}) - guard is vacuous",
         file=sys.stderr,
     )
     return 1

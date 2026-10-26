@@ -3021,6 +3021,31 @@ pub fn credential_activate(
     Ok(())
 }
 
+/// Rename a credential. Unknown id is a no-op: the reference answers 204 for
+/// an id that does not exist (probed live against 2.0.28), so a caller can
+/// retry safely.
+pub fn credential_update_label(
+    writer: &Writer,
+    id: &str,
+    label: &str,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    writer.write(vec![WriteOp::Sql {
+        sql: "UPDATE credential SET label = ?2, time_updated = ?3 WHERE id = ?1".into(),
+        params: vec![id.into(), label.into(), now_ms.into()],
+    }])?;
+    Ok(())
+}
+
+/// Delete a credential. Unknown id is a no-op, matching the reference's 204.
+pub fn credential_delete(writer: &Writer, id: &str) -> anyhow::Result<()> {
+    writer.write(vec![WriteOp::Sql {
+        sql: "DELETE FROM credential WHERE id = ?1".into(),
+        params: vec![id.into()],
+    }])?;
+    Ok(())
+}
+
 /// The ACTIVE credential value for an integration (websearch key lookup).
 /// `None` when no active row exists.
 pub fn credential_active_value(

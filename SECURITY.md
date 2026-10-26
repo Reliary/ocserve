@@ -49,7 +49,7 @@ for a fix.
 
 ## Current known divergences
 
-The parity ledger (`PLAN.md §17`, `bench/*/allow.txt`) names every intentional
+The parity ledger (`PLAN.md §18`, `bench/*/allow.txt`) names every intentional
 difference from upstream. One is security-relevant and documented, not hidden:
 
 - `D-PTY-1`: the PTY connect-token accepts a request with no `Origin`. That is safe on

@@ -13,7 +13,9 @@ was measured where. Anything weaker is recorded as a named divergence.
 
 ### 1.1 Current build reality
 
-`release.yml` declares six targets. The v0.4.0 run produced:
+`release.yml` now declares seven targets (the six below plus
+`x86_64-unknown-linux-musl`, added 2026-10-19). The v0.4.0 baseline run, before
+any of the platform work, produced:
 
 | Target | Result |
 |---|---|
@@ -210,7 +212,7 @@ Each entry is a design decision attacked before code. Status: `resolved` (design
 | A2 | "Same performance" is unprovable across platforms: ClusterBench (arXiv:2608.10956) measures **5%** variation across spec-identical nodes, so a cross-platform number is noise | Never publish a cross-platform perf comparison. Per platform: measure against *that platform's* freeze binary. Portable yardstick: allocation bytes/request (arXiv:2203.04394), which is deterministic and OS-independent *if* measured | resolved |
 | A3 | Replacing `sh -c` silently changes tool semantics; upstream v2 selects `COMSPEC`/PowerShell and v1 has `cygpath`/`Shell.ps` branches | Three shell families (`posix`, `cmd`, `pwsh`), no cross-dialect translation. Smoosh (arXiv:1907.05308) shows even POSIX-aspiring shells disagree; translating quoting is unsound | resolved |
 | A4 | Process-tree kill does not port: `killpg` is Unix-only | Job Object on Windows with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (survives server crash, unlike `taskkill`); pre-registered fallback `taskkill /T /F` if Job Objects fail the spike | resolved |
-| A5 | Path containment will be wrong on Windows: `canonicalize` yields `\\?\` verbatim paths; NTFS is case-insensitive. CVE-2021-21300 (arXiv:2211.16735) is exactly this class at the app layer | `scope_path` gains a platform normalizer: strip verbatim prefix, compare case-insensitively on case-insensitive filesystems, reject trailing dot/space and 8.3 aliases. Property-tested per platform | resolved |
+| A5 | Path containment will be wrong on Windows: `canonicalize` yields `\\?\` verbatim paths; NTFS is case-insensitive. CVE-2021-21300 (arXiv:2211.16735) is exactly this class at the app layer | Resolved by **handle verification, not string comparison**: `openat2(RESOLVE_BENEATH)` on Linux, `F_GETPATH` on macOS, `GetFinalPathNameByHandleW` + `CompareStringOrdinal` on Windows. The earlier string-normalizer plan was withdrawn because NTFS uses its own uppercase table, so `to_lowercase()` is a security bug |
 | A6 | The allocator story is glibc-only: `MALLOC_ARENA_MAX=1` + `malloc_trim` measured 237→91 MB | Measure per platform before porting. If retention is already flat, `trim_heap()` stays a documented no-op per platform rather than gaining an unjustified `malloc_zone_pressure_relief` | resolved |
 | A7 | `continue-on-error` means the gate rots again | Flip to hard-required in the same commit that makes the target pass | resolved |
 | A8 | Replacing `grep` is a *semantic* change, not a portable-executable swap | Measured: GNU `grep -E '\d+'` returns **no match** (rc 1) where ripgrep matches. Upstream 1.18.31 uses ripgrep (`grep.ts:5`). So the current behaviour is a silent-miss bug. Replacement is gated by a corpus diff proving *intended* widening | resolved |
@@ -402,6 +404,9 @@ Exit: every claim in the README has a runnable artifact behind it on the platfor
 ---
 
 ## 5. Divergence ledger
+
+These rows are also in the single ledger at `PLAN.md §18`; this table keeps the
+platform-specific detail (exit criteria) beside the platform work.
 
 | ID | Divergence | Status |
 |---|---|---|

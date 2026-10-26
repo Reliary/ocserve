@@ -47,9 +47,13 @@ Releases are tag-triggered; nothing is built by hand.
 4. Deploy a host with `./scripts/install.sh --release` (fetches and verifies the
    artifact; no Rust toolchain needed).
 
-crates.io is separate and manual (`publish.yml`, `workflow_dispatch`, requires
-`CARGO_REGISTRY_TOKEN`). It is not on the release path; `check-crate-payload.py`
-(rule 38) fails the build if any crate would exceed the registry's upload limit.
+crates.io publishes from the same `v*` tag (`publish.yml`), in dependency order
+with `ocserve` last, and needs the `CARGO_REGISTRY_TOKEN` secret; a
+`workflow_dispatch` run defaults to a dry-run rehearsal. `check-crate-payload.py`
+(rule 38) fails the build if any crate would exceed the registry's 10 MiB upload
+limit, and `check-publish-order.py` (rule 28) derives the order from the
+workspace graph. Verify a publish with a clean
+`CARGO_HOME=$(mktemp -d) cargo install ocserve@<version>`, then boot it.
 
 ## Docs are the spec
 
