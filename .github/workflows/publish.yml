@@ -80,13 +80,27 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          # A whole-chain dry-run is impossible: `cargo publish --dry-run`
+          # resolves INTERNAL deps from crates.io, and in a release those
+          # versions do not exist yet (the first run failed here with
+          # "failed to select a version for ocserve-store = ^0.6.9"). Dry-run
+          # the crates that can resolve; skip dependents with an explicit note
+          # so the rehearsal still proves packaging, ordering and payload size.
           mapfile -t CRATES < <(python3 scripts/check-publish-order.py --order)
+          rc=0
           for c in "${CRATES[@]}"; do
             echo "::group::dry-run $c"
-            cargo publish -p "$c" --dry-run --allow-dirty --no-verify
+            if out=$(cargo publish -p "$c" --dry-run --allow-dirty --no-verify 2>&1); then
+              echo "$out"
+            elif printf '%s' "$out" | grep -q 'failed to select a version for the requirement'; then
+              echo "skip: depends on an internal crate not yet published at this version"
+            else
+              echo "$out"; echo "FAIL: dry-run packaging failed for $c"; rc=1
+            fi
             echo "::endgroup::"
           done
+          exit $rc
 
       - name: publish
         if: ${{ startsWith(github.ref, 'refs/tags/v') }}
@@ -117,6 +131,14 @@ jobs:
               if printf '%s' "$out" | grep -qiE 'too many new crates|429|rate limit'; then
                 echo "rate limited; waiting 10 minutes (5 new crates / 10 min)"; echo "::endgroup::"
                 sleep 600
+                attempt=$((attempt + 1))
+                continue
+              fi
+              if printf '%s' "$out" | grep -q 'failed to select a version for the requirement'; then
+                # The dependency was just uploaded but the sparse index has
+                # not caught up. Wait and retry the SAME crate.
+                echo "dependency not visible yet; retrying in 45s"
+                sleep 45
                 attempt=$((attempt + 1))
                 continue
               fi
