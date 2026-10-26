@@ -11,8 +11,9 @@
 #   1. boot the freeze binary on a throwaway port
 #   2. GET / → parse every src/href (entry JS + CSS + favicons + manifest)
 #   3. transitively GET every asset each references (CSS fonts, worker JS)
-#   4. write a scratch tree, then pack it into the owning crate's assets:
-#      crates/ocserve-http/assets/webui/<tag>.pack.zst (+ <tag>.manifest.json)
+#   4. write a scratch tree, pack it into OCAP2, then shard the frame region:
+#      crates/ocserve-http/assets/webui/<tag>.index.bin + <tag>.manifest.json
+#      crates/ocserve-ui-<tag>-<a..>/assets/part.bin  (crates.io 10 MiB cap)
 #
 # The pack is committed and embedded at build time. It MUST live inside the
 # crate that embeds it — an artifact under `bench/` (outside every crate root)
@@ -161,14 +162,15 @@ mkdir -p "$(dirname "$OUT")"
 rm -rf "$OUT"
 mv "$TMP/out" "$OUT"
 
-# Pack the closure into ONE embeddable artifact inside the owning crate. The
-# loose files are dropped after packing (vendored third-party assets must not
-# live in git); the committed source of truth is the pack + manifest:
-#   crates/ocserve-http/assets/webui/<tag>.pack.zst      — embedded (include_bytes!)
-#   crates/ocserve-http/assets/webui/<tag>.manifest.json — path → sha256 → bytes
+# Pack the closure, then shard it. The loose files are dropped after packing
+# (vendored third-party assets must not live in git); the committed source of
+# truth is the index + parts + manifest:
+#   crates/ocserve-http/assets/webui/<tag>.index.bin      — index (include_bytes!)
+#   crates/ocserve-ui-<tag>-<letter>/assets/part.bin      — frame bytes per part
+#   crates/ocserve-http/assets/webui/<tag>.manifest.json  — path → sha256 → bytes
+#   crates/ocserve-http/assets/webui/parts.json           — order + sizes
 #
-# Format (OCAP2, per-file zstd frames), BEFORE the outer... NOTE the outer file
-# is ALSO zstd (`zstd -19`). OCAP2 exists so the loader can decompress ONE file
+# Format (OCAP2, per-file zstd frames). OCAP2 exists so the loader can decompress ONE file
 # at a time into a bounded cache instead of materializing the whole closure:
 # the full v2 closure is ~87 MB raw (36 MB of lazily-loaded office-preview
 # WASM); eager decompress would allocate 87 MB on every boot that selects the
@@ -230,14 +232,23 @@ with open(manifest_path, "w") as f:
 print(f"packed {len(entries)} files: raw {sum(len(d) for _,d in entries)} bytes, pack {len(blob)} bytes")
 PY
 
-# The OCAP2 blob already carries a per-file zstd frame each, so it is embedded
-# AS-IS (no outer zstd — that would force a full decompress at boot to reach
-# the index; the loader reads the frames lazily). Copy into place.
+# The OCAP2 blob carries a per-file zstd frame each. crates.io caps one
+# `.crate` at 10 MiB, so the frames are split at frame boundaries into
+# `ocserve-ui-*` crates and the index stays in ocserve-http. The pack is
+# staged inside the webui dir only long enough to be sharded.
 cp "$TMP/app.pack" "$ASSET_DIR/$TAG.pack.zst"
-stat -c 'pack: %s bytes (OCAP2, per-file zstd frames)' "$ASSET_DIR/$TAG.pack.zst"
+PARTS="${PARTS:-}"
+if [ -z "$PARTS" ]; then
+  case "$TAG" in
+    1.18.31) PARTS=2 ;;
+    *)       PARTS=4 ;;
+  esac
+fi
+python3 "$REPO/scripts/shard-pack.py" "$TAG" "$PARTS"
+rm -f "$ASSET_DIR/$TAG.pack.zst"
 
 # Loose extracted files are regenerable from the pack via the manifest; keep
-# the tree small. The committed source of truth is <tag>.pack.zst +
-# <tag>.manifest.json (both inside the owning crate).
+# the tree small. The committed source of truth is <tag>.index.bin + the
+# ocserve-ui-* parts + <tag>.manifest.json + parts.json.
 rm -rf "$OUT"
-echo "extract-app: wrote $ASSET_DIR/$TAG.pack.zst + $TAG.manifest.json"
+echo "extract-app: wrote $TAG.index.bin + $PARTS parts + $TAG.manifest.json"

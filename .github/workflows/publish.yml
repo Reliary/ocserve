@@ -12,10 +12,13 @@ name: publish
 # finding) makes publish abort at ocserve-http because its dependency is not on
 # the registry. Keep this list in lockstep with Cargo.toml members.
 
-# Manual-only until a CARGO_REGISTRY_TOKEN repository secret exists (none yet —
-# publishing is done from the maintainer's local Cargo credentials for v0.2.0).
-# When the secret is added, restore the `push: tags: ['v*']` trigger.
+# A v* tag publishes; workflow_dispatch defaults to dry-run so a release can be
+# rehearsed without uploading. Requires the CARGO_REGISTRY_TOKEN secret — the
+# job fails loudly at the first upload if it is missing, and because `ocserve`
+# is published LAST a missing token cannot leave users pointed at a half-chain.
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       dry_run:
@@ -33,18 +36,14 @@ jobs:
     # crates.io's per-crate upload ceiling, declared here so the registry's
     # real limit has exactly ONE declaration (check-crate-payload.py reads it).
     #
-    # ocserve-http is intentionally large: it embeds BOTH web-UI packs
-    # (1.18.31 = 9.7 MB, 2.0.28 = 24.4 MB zstd) so the server is air-gapped and
-    # serves the version-matched app with no network dependency. That puts its
-    # packed payload at ~35 MB, over the 10 MiB default — crates.io grants
-    # per-crate increases on request (a support request sets the
-    # `max_upload_size` row for that crate), raised for ocserve-http on
-    # 2026-10-18.
-    #
-    # Lowering this back to the default without shrinking the packs would make
-    # the publish chain abort at ocserve-http (rule 38 catches it in CI).
+    # crates.io's default per-crate cap. The web UI is sharded across
+    # `ocserve-ui-*` crates (see scripts/shard-pack.py) so every member fits;
+    # there is NO per-crate increase (the API reports max_upload_size: null),
+    # and a size request was sent by the maintainer on 2026-10-20 and is
+    # pending. If a grant lands, this value can rise, but nothing depends on
+    # it: the shards are the shipping design.
     env:
-      CRATE_PAYLOAD_LIMIT_BYTES: 67108864 # 64 MiB
+      CRATE_PAYLOAD_LIMIT_BYTES: 10485760 # 10 MiB
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions-rust-lang/setup-rust-toolchain@46a9d261ee2ace4b93b3bd6e867168ac38627b38  # v1.12.0
@@ -68,8 +67,11 @@ jobs:
       - name: crates are packageable
         run: |
           set -euo pipefail
-          for c in ocserve-store ocserve-metrics ocserve-llm ocserve-mcp ocserve-plugin \
-                   ocserve-importer ocserve-tools ocserve-core ocserve-pty ocserve-http ocserve; do
+          # Order is DERIVED from Cargo.toml, never hand-maintained: a new
+          # crate (the six `ocserve-ui-*` shards, for example) cannot be
+          # forgotten or mis-ordered.
+          mapfile -t CRATES < <(python3 scripts/check-publish-order.py --order)
+          for c in "${CRATES[@]}"; do
             cargo package -p "$c" --list --allow-dirty >/dev/null
           done
 
@@ -79,8 +81,8 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
-          for c in ocserve-store ocserve-metrics ocserve-llm ocserve-mcp ocserve-plugin \
-                   ocserve-importer ocserve-tools ocserve-core ocserve-pty ocserve-http ocserve; do
+          mapfile -t CRATES < <(python3 scripts/check-publish-order.py --order)
+          for c in "${CRATES[@]}"; do
             echo "::group::dry-run $c"
             cargo publish -p "$c" --dry-run --allow-dirty --no-verify
             echo "::endgroup::"
@@ -94,19 +96,38 @@ jobs:
           set -uo pipefail
           publish() {
             c="$1"
-            echo "::group::publish $c"
-            if cargo publish -p "$c" --no-verify; then
-              echo "published $c"
-            else
-              # Idempotent re-run: an already-uploaded version is fine.
-              echo "publish of $c failed (may already be published) — continuing"
-            fi
-            echo "::endgroup::"
-            sleep 30   # crates.io index propagation before dependents resolve
+            attempt=1
+            while [ "$attempt" -le 4 ]; do
+              echo "::group::publish $c (attempt $attempt)"
+              if out=$(cargo publish -p "$c" --no-verify 2>&1); then
+                echo "$out"; echo "published $c"; echo "::endgroup::"
+                sleep 30   # index propagation before dependents resolve
+                return 0
+              fi
+              echo "$out"
+              # Only an already-present version is benign. Anything else must
+              # stop the chain: the old "continue on any failure" silently left
+              # a crate unpublished and then failed every dependent, after the
+              # earlier crates had already been uploaded (unrecoverable).
+              if printf '%s' "$out" | grep -qiE 'already exists|already uploaded|crate version .* is already'; then
+                echo "already published: $c"; echo "::endgroup::"
+                sleep 30
+                return 0
+              fi
+              if printf '%s' "$out" | grep -qiE 'too many new crates|429|rate limit'; then
+                echo "rate limited; waiting 10 minutes (5 new crates / 10 min)"; echo "::endgroup::"
+                sleep 600
+                attempt=$((attempt + 1))
+                continue
+              fi
+              echo "::endgroup::"
+              echo "FAIL: $c failed to publish and is not already on the registry"; return 1
+            done
+            echo "FAIL: $c still rate-limited after $((attempt - 1)) waits"; return 1
           }
-          for c in ocserve-store ocserve-metrics ocserve-llm ocserve-mcp ocserve-plugin \
-                   ocserve-importer ocserve-tools ocserve-core ocserve-pty ocserve-http ocserve; do
-            publish "$c"
+          mapfile -t CRATES < <(python3 scripts/check-publish-order.py --order)
+          for c in "${CRATES[@]}"; do
+            publish "$c" || exit 1
           done
 
       # End-to-end check that the uploaded crates actually build for a user —

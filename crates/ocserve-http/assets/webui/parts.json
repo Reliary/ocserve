@@ -1,0 +1,46 @@
+{
+ "1.18.31": {
+  "index_bytes": 42422,
+  "index_sha256": "16972b588e986a654215932198916a193af4a0dca107135f39aebf3a48dc04bb",
+  "parts": [
+   {
+    "bytes": 5007967,
+    "crate": "ocserve-ui-11831-a",
+    "sha256": "86579a8f0e9e14d7d22b0b96acef1d20a7e2dd208e217644df19bec5eb1faf3b"
+   },
+   {
+    "bytes": 5115988,
+    "crate": "ocserve-ui-11831-b",
+    "sha256": "12471caf9f40c2c05d0561b8fa1207b52b9ee3a92848a442e3bdd89afcf190b8"
+   }
+  ],
+  "total": 10123955
+ },
+ "2.0.28": {
+  "index_bytes": 74993,
+  "index_sha256": "302b90cdd980dd3aea710ce7d07f34e47b232443314b9808b1b0e411bd4bdfee",
+  "parts": [
+   {
+    "bytes": 6397816,
+    "crate": "ocserve-ui-2028-a",
+    "sha256": "7aaa5aa80aeb9ac47ac0cbb37668328a1537f2572c3750deab944249ccf6b6c5"
+   },
+   {
+    "bytes": 7294668,
+    "crate": "ocserve-ui-2028-b",
+    "sha256": "64f7e365cb95de6e418e5037e29cb132f2603b9aeb34f9dff43b6fe47c652c23"
+   },
+   {
+    "bytes": 6097535,
+    "crate": "ocserve-ui-2028-c",
+    "sha256": "32b7478742b367c123bd4ba71801c59758f4e4afbd09ef8e298f2ca78a3880cd"
+   },
+   {
+    "bytes": 5727204,
+    "crate": "ocserve-ui-2028-d",
+    "sha256": "cc4fb5265d6dd6c34bffb970790f69a5b6be4f7be962747f76ca74cb1701c86c"
+   }
+  ],
+  "total": 25517223
+ }
+}

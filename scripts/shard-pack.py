@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Split a pinned web-UI pack into per-part asset crates (rule 17).
+
+Why: crates.io rejects any `.crate` above 10 MiB (10,485,760 B). The 2.0.28
+closure is 25.6 MB and the 1.18.31 closure 10.2 MB, so a single
+`ocserve-http` crate cannot carry both. Splitting the OCAP2 blob at **zstd
+frame boundaries** keeps the format, the loader, the 16 MiB cache and the
+binary size identical; only the bytes live in several crates.
+
+Input:  crates/ocserve-http/assets/webui/<tag>.pack.zst  (OCAP2 monolith)
+Output: crates/ocserve-http/assets/webui/<tag>.index.bin (index only)
+        crates/ocserve-ui-<tag>-<letter>/assets/part.bin (raw frames)
+        crates/ocserve-http/assets/webui/parts.json (order + sizes + hashes)
+
+Usage: shard-pack.py <tag> <parts> [--check]
+  `--check` verifies the committed artifacts are consistent and exits non-zero
+  otherwise (used by the guard); it writes nothing.
+"""
+import hashlib
+import json
+import pathlib
+import struct
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+WEBUI = ROOT / "crates/ocserve-http/assets/webui"
+LIMIT = 10_485_760
+SAFETY = 9_800_000  # leave room for Cargo metadata in the .crate tarball
+
+
+def crate_name(tag: str, letter: str) -> str:
+    return f"ocserve-ui-{tag.replace('.', '')}-{letter}"
+
+
+def letters(n: int) -> list[str]:
+    return [chr(ord("a") + i) for i in range(n)]
+
+
+def parse_index(blob: bytes):
+    if blob[:6] != b"OCAP2\n":
+        raise SystemExit(f"bad pack magic {blob[:6]!r}")
+    (count,) = struct.unpack_from("<I", blob, 6)
+    i = 10
+    entries = []
+    for _ in range(count):
+        (plen,) = struct.unpack_from("<H", blob, i)
+        i += 2
+        path = blob[i : i + plen].decode()
+        i += plen
+        off, raw, comp = struct.unpack_from("<QII", blob, i)
+        i += 16
+        entries.append({"path": path, "off": off, "raw": raw, "comp": comp})
+    return entries, i  # i = data base
+
+
+def index_bytes(entries: list) -> bytes:
+    out = bytearray(b"OCAP2\n")
+    out += struct.pack("<I", len(entries))
+    for e in entries:
+        pb = e["path"].encode()
+        out += struct.pack("<H", len(pb)) + pb
+        out += struct.pack("<QII", e["off"], e["raw"], e["comp"])
+    return bytes(out)
+
+
+def balanced_cuts(entries: list, n: int) -> list[int]:
+    """Split indices into n contiguous groups, nearest to equal bytes."""
+    total = sum(e["comp"] for e in entries)
+    cuts = [0]
+    acc = 0
+    cum = []
+    for e in entries:
+        acc += e["comp"]
+        cum.append(acc)
+    for k in range(1, n):
+        want = total * k / n
+        lo = cuts[-1] + 1
+        best = None
+        for idx in range(lo, len(entries) - (n - k) + 1):
+            d = abs(cum[idx - 1] - want)
+            if best is None or d < best[0]:
+                best = (d, idx)
+        if best is None:
+            raise SystemExit(f"cannot split {len(entries)} entries into {n}")
+        cuts.append(best[1])
+    cuts.append(len(entries))
+    return cuts
+
+
+def split(tag: str, n: int) -> dict:
+    pack = WEBUI / f"{tag}.pack.zst"
+    blob = pack.read_bytes()
+    entries, base = parse_index(blob)
+    cuts = balanced_cuts(entries, n)
+    groups = [entries[cuts[k] : cuts[k + 1]] for k in range(n)]
+
+    # The index keeps ABSOLUTE offsets into the concatenated frames region, so
+    # the loader is unchanged: it maps an offset to the part that contains it.
+    idx_blob = index_bytes(entries)
+    (WEBUI / f"{tag}.index.bin").write_bytes(idx_blob)
+
+    parts = []
+    for k, group in enumerate(groups):
+        first = group[0]["off"]
+        last = group[-1]
+        end = last["off"] + last["comp"]
+        data = blob[base + first : base + end]
+        if len(data) != end - first:
+            raise SystemExit(f"{tag}: part {k} slice short")
+        name = crate_name(tag, letters(n)[k])
+        dest = ROOT / "crates" / name / "assets"
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "part.bin").write_bytes(data)
+        parts.append(
+            {
+                "crate": name,
+                "bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        )
+        if len(data) > SAFETY:
+            raise SystemExit(f"{name}: part {len(data):,} B exceeds safety {SAFETY:,}")
+
+    return {
+        "tag": tag,
+        "total": sum(e["comp"] for e in entries),
+        "index_bytes": len(idx_blob),
+        "index_sha256": hashlib.sha256(idx_blob).hexdigest(),
+        "parts": parts,
+    }
+
+
+def read_parts_json() -> dict:
+    p = WEBUI / "parts.json"
+    return json.loads(p.read_text()) if p.exists() else {}
+
+
+def write_parts_json(entries: dict) -> None:
+    (WEBUI / "parts.json").write_text(json.dumps(entries, indent=1, sort_keys=True) + "\n")
+
+
+def check() -> int:
+    """Verify committed index + parts match parts.json and the manifests."""
+    doc = read_parts_json()
+    if not doc:
+        print("FAIL: parts.json missing (run scripts/shard-pack.py)")
+        return 1
+    bad = 0
+    try:
+        from compression import zstd  # Python >= 3.14
+    except ImportError:
+        zstd = None
+        print("note: compression.zstd unavailable; checking hashes/sizes only")
+    for tag, meta in sorted(doc.items()):
+        idx_path = WEBUI / f"{tag}.index.bin"
+        if not idx_path.exists():
+            print(f"FAIL: {tag}: index missing")
+            bad = 1
+            continue
+        idx_blob = idx_path.read_bytes()
+        if hashlib.sha256(idx_blob).hexdigest() != meta["index_sha256"]:
+            print(f"FAIL: {tag}: index hash mismatch")
+            bad = 1
+        entries, _ = parse_index(idx_blob)
+        blobs = []
+        for part in meta["parts"]:
+            p = ROOT / "crates" / part["crate"] / "assets" / "part.bin"
+            if not p.exists():
+                print(f"FAIL: {part['crate']}: part.bin missing")
+                bad = 1
+                continue
+            data = p.read_bytes()
+            if len(data) != part["bytes"]:
+                print(f"FAIL: {part['crate']}: size {len(data)} != {part['bytes']}")
+                bad = 1
+            if hashlib.sha256(data).hexdigest() != part["sha256"]:
+                print(f"FAIL: {part['crate']}: sha256 mismatch")
+                bad = 1
+            if len(data) > LIMIT:
+                print(f"FAIL: {part['crate']}: {len(data):,} B over the 10 MiB cap")
+                bad = 1
+            blobs.append(data)
+        blob = b"".join(blobs)
+        if len(blob) != meta["total"]:
+            print(f"FAIL: {tag}: concatenated parts {len(blob):,} != {meta['total']:,}")
+            bad = 1
+        if zstd is not None and not bad:
+            manifest = json.loads((WEBUI / f"{tag}.manifest.json").read_text())["files"]
+            if len(manifest) != len(entries):
+                print(f"FAIL: {tag}: index {len(entries)} != manifest {len(manifest)}")
+                bad = 1
+            for e in entries[:0] or entries:
+                frame = blob[e["off"] : e["off"] + e["comp"]]
+                if len(frame) != e["comp"]:
+                    print(f"FAIL: {tag}: {e['path']} overruns the parts")
+                    bad = 1
+                    break
+                try:
+                    raw = zstd.decompress(frame)
+                except Exception as exc:  # noqa: BLE001 - report, never raise
+                    print(f"FAIL: {tag}: {e['path']} does not decompress: {exc}")
+                    bad = 1
+                    break
+                m = manifest.get("/" + e["path"])
+                if m is None:
+                    print(f"FAIL: {tag}: {e['path']} absent from the manifest")
+                    bad = 1
+                    break
+                if len(raw) != m["bytes"] or hashlib.sha256(raw).hexdigest() != m["sha256"]:
+                    print(f"FAIL: {tag}: {e['path']} content mismatch")
+                    bad = 1
+                    break
+    if bad:
+        return 1
+    total_parts = sum(len(v["parts"]) for v in doc.values())
+    biggest = max(
+        (p["bytes"] for v in doc.values() for p in v["parts"]), default=0
+    )
+    print(
+        f"ok ({len(doc)} packs in {total_parts} parts; largest {biggest:,} B "
+        f"= {100 * biggest / LIMIT:.1f}% of the 10 MiB cap)"
+    )
+    return 0
+
+
+def main() -> int:
+    if "--check" in sys.argv:
+        return check()
+    if len(sys.argv) < 3:
+        print(__doc__)
+        return 2
+    tag, n = sys.argv[1], int(sys.argv[2])
+    if n < 1:
+        print("parts must be >= 1")
+        return 2
+    meta = split(tag, n)
+    doc = read_parts_json()
+    doc[tag] = {k: v for k, v in meta.items() if k != "tag"}
+    write_parts_json(doc)
+    for p in meta["parts"]:
+        print(f"  {p['crate']:22s} {p['bytes']:>10,} B")
+    print(f"index {meta['index_bytes']:,} B; total {meta['total']:,} B in {n} parts")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

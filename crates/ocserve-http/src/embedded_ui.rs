@@ -10,11 +10,14 @@
 //! the proxy only under `OCSERVE_DISABLE_EMBEDDED_WEB_UI=1` (mirroring
 //! upstream's `OPENCODE_DISABLE_EMBEDDED_WEB_UI`).
 //!
-//! Each pinned build is a single zstd pack (`assets/webui/<tag>.pack.zst`,
+//! Each pinned build is an OCAP2 blob: an index plus per-file zstd frames,
 //! produced by `scripts/extract-app.sh` through each binary's PUBLIC HTTP
-//! interface — not binary scraping). Pack format before zstd: `OCAP1\n` +
-//! u32 count + (u16 pathlen, path, u64 datalen, data)*. Decompressed once at
-//! boot into an in-memory map (bounded: each closure is ~7 MB raw).
+//! interface (not binary scraping). Because crates.io caps a single `.crate`
+//! at 10 MiB and the closures are 10.2 MB / 25.6 MB, the frame region is
+//! split at frame boundaries into `ocserve-ui-*` crates (`scripts/shard-pack.py`);
+//! the index stays here. The loader maps an absolute frame offset to the part
+//! that contains it, so the runtime format, the 16 MiB cache and the binary
+//! size are unchanged. Nothing is dropped to fit the registry.
 //!
 //! Air-gapped property: an unknown asset under the embedded arm returns the
 //! upstream JSON 404 `{"error":"Not Found"}` — it never falls through to the
@@ -22,20 +25,23 @@
 
 use std::sync::OnceLock;
 
-/// The pinned v1 pack. `include_bytes!` keeps `/` working on a bare machine
-/// with no network and no data dir (the "boots with defaults" invariant).
-///
-/// Lives INSIDE this crate (`assets/webui/<tag>.pack.zst`) so it is packaged
-/// and published with the crate; embedding from `bench/` (outside the crate
-/// root) is not in the `.crate` tarball, so `cargo install ocserve` fails to
-/// compile it (the 0.3.0 defect; guard rule 30). Produced by
-/// `scripts/extract-app.sh` through the freeze's public HTTP interface.
-static PACK_ZST: &[u8] = include_bytes!("../assets/webui/1.18.31.pack.zst");
+/// Index (paths + frame offsets) for the v1 pack. `include_bytes!` keeps `/`
+/// working on a bare machine with no network and no data dir (the "boots with
+/// defaults" invariant). The frame bytes live in `ocserve-ui-11831-*` because
+/// crates.io caps one crate at 10 MiB; the index is small (42 KB).
+static PACK_INDEX: &[u8] = include_bytes!("../assets/webui/1.18.31.index.bin");
+static PACK_V2_INDEX: &[u8] = include_bytes!("../assets/webui/2.0.28.index.bin");
 
-/// The pinned v2 pack (Phase E): extracted from the real
-/// `@opencode/cli-linux-x64@2.0.28` binary's own HTTP surface (173 files,
-/// 6.4 MB raw → 3.2 MB zstd). Same pipeline, second tag.
-static PACK_V2_ZST: &[u8] = include_bytes!("../assets/webui/2.0.28.pack.zst");
+/// Frame bytes for v1, in pack order.
+static PACK_V1_PARTS: &[&[u8]] = &[ocserve_ui_11831_a::PART, ocserve_ui_11831_b::PART];
+
+/// Frame bytes for v2 (the 2.0.28 closure), in pack order.
+static PACK_V2_PARTS: &[&[u8]] = &[
+    ocserve_ui_2028_a::PART,
+    ocserve_ui_2028_b::PART,
+    ocserve_ui_2028_c::PART,
+    ocserve_ui_2028_d::PART,
+];
 
 /// The freeze tag the v1 pack was built from — must match `FREEZE_VERSION`.
 pub const APP_TAG: &str = "1.18.31";
@@ -73,8 +79,68 @@ static FILES_V2: OnceLock<Pack> = OnceLock::new();
 pub struct Pack {
     /// path (no leading slash) → (frame_offset, raw_len, comp_len)
     index: std::collections::HashMap<String, (usize, usize, usize)>,
-    blob: &'static [u8],
+    blob: ShardedBlob,
     cache: std::sync::Mutex<Cache>,
+}
+
+/// The concatenated frame region, backed by several `include_bytes!` parts.
+/// Offsets in the index are absolute within this logical blob; a range may
+/// span two parts (each frame is cut at a boundary, but the accessor handles
+/// spanning so a future split cannot silently corrupt a file).
+struct ShardedBlob {
+    parts: &'static [&'static [u8]],
+    len: usize,
+}
+
+impl ShardedBlob {
+    fn new(parts: &'static [&'static [u8]]) -> Self {
+        Self {
+            len: parts.iter().map(|p| p.len()).sum(),
+            parts,
+        }
+    }
+
+    fn slice(&self, off: usize, len: usize) -> Option<bytes::Bytes> {
+        let end = off.checked_add(len)?;
+        if end > self.len {
+            return None;
+        }
+        let mut at = 0usize;
+        let mut out: Option<Vec<u8>> = None;
+        for part in self.parts {
+            let part_end = at + part.len();
+            if off < part_end && end > at {
+                let lo = off.saturating_sub(at);
+                let hi = (end - at).min(part.len());
+                match &mut out {
+                    None if lo == 0 && hi == part.len() && std::ptr::eq(*part, self.parts[0]) => {
+                        // fast path below
+                    }
+                    None => out = Some(part[lo..hi].to_vec()),
+                    Some(v) => v.extend_from_slice(&part[lo..hi]),
+                }
+            }
+            at = part_end;
+            if at >= end {
+                break;
+            }
+        }
+        match out {
+            Some(v) => Some(bytes::Bytes::from(v)),
+            None => {
+                // Single part, zero-copy slice.
+                let mut at = 0usize;
+                for part in self.parts {
+                    let part_end = at + part.len();
+                    if off >= at && end <= part_end {
+                        return Some(bytes::Bytes::copy_from_slice(&part[off - at..end - at]));
+                    }
+                    at = part_end;
+                }
+                None
+            }
+        }
+    }
 }
 
 /// Bounded LRU for decompressed files (MEMORY.md: caches declare a bound).
@@ -96,8 +162,8 @@ impl Pack {
             return Some(v.clone());
         }
         let (off, raw_len, comp_len) = *self.index.get(key)?;
-        let frame = self.blob.get(off..off + comp_len)?;
-        let data = zstd::stream::decode_all(frame).ok()?;
+        let frame = self.blob.slice(off, comp_len)?;
+        let data = zstd::stream::decode_all(&frame[..]).ok()?;
         debug_assert_eq!(data.len(), raw_len);
         let arc = bytes::Bytes::from(data);
         if let Ok(mut c) = self.cache.lock() {
@@ -120,46 +186,33 @@ impl Pack {
     }
 }
 
-/// Parse an OCAP2 pack's index (no per-file decompress). Falls back to the
-/// legacy OCAP1 eager parse so an unmigrated committed pack still loads.
-fn parse_pack(pack: &'static [u8]) -> Pack {
-    if pack.len() >= 6 && &pack[..6] == b"OCAP2\n" {
-        return parse_ocap2(pack);
-    }
-    // Legacy OCAP1: eagerly decode every file (previous behavior).
-    parse_ocap1(pack)
-}
-
-fn parse_ocap2(blob: &'static [u8]) -> Pack {
+/// Parse an OCAP2 INDEX (the header + entries, no frames) and attach the
+/// sharded frame region. The index is generated by `scripts/shard-pack.py`
+/// alongside the parts; it repeats the OCAP2 header so the parser is the same.
+fn parse_pack(index: &'static [u8], parts: &'static [&'static [u8]]) -> Pack {
     let mut i = 6usize;
     let ok = (|| -> Result<Pack, String> {
-        let count = read_u32(blob, &mut i)? as usize;
+        if index.len() < 6 || &index[..6] != b"OCAP2\n" {
+            return Err("not an OCAP2 index".into());
+        }
+        let count = read_u32(index, &mut i)? as usize;
         let mut idx = std::collections::HashMap::with_capacity(count);
-        let mut specs = Vec::with_capacity(count);
         for _ in 0..count {
-            let plen = read_u16(blob, &mut i)? as usize;
-            if i + plen > blob.len() {
+            let plen = read_u16(index, &mut i)? as usize;
+            if i + plen > index.len() {
                 return Err("path overruns".into());
             }
             let path =
-                String::from_utf8(blob[i..i + plen].to_vec()).map_err(|_| "bad path utf8")?;
+                String::from_utf8(index[i..i + plen].to_vec()).map_err(|_| "bad path utf8")?;
             i += plen;
-            let off = read_u64(blob, &mut i)? as usize;
-            let raw_len = read_u32(blob, &mut i)? as usize;
-            let comp_len = read_u32(blob, &mut i)? as usize;
-            specs.push((path, off, raw_len, comp_len));
-        }
-        let data_base = i;
-        for (path, off, raw_len, comp_len) in specs {
-            let abs = data_base + off;
-            if abs + comp_len > blob.len() {
-                return Err("frame overruns".into());
-            }
-            idx.insert(path, (abs, raw_len, comp_len));
+            let off = read_u64(index, &mut i)? as usize;
+            let raw_len = read_u32(index, &mut i)? as usize;
+            let comp_len = read_u32(index, &mut i)? as usize;
+            idx.insert(path, (off, raw_len, comp_len));
         }
         Ok(Pack {
             index: idx,
-            blob,
+            blob: ShardedBlob::new(parts),
             cache: std::sync::Mutex::new(Cache {
                 map: std::collections::HashMap::new(),
                 order: std::collections::VecDeque::new(),
@@ -168,15 +221,15 @@ fn parse_ocap2(blob: &'static [u8]) -> Pack {
         })
     })();
     ok.unwrap_or_else(|e| {
-        tracing::warn!("embedded UI pack: OCAP2 parse failed: {e}");
-        empty_pack(blob)
+        tracing::warn!("embedded UI index: parse failed: {e}");
+        empty_pack(parts)
     })
 }
 
-fn empty_pack(blob: &'static [u8]) -> Pack {
+fn empty_pack(parts: &'static [&'static [u8]]) -> Pack {
     Pack {
         index: std::collections::HashMap::new(),
-        blob,
+        blob: ShardedBlob::new(parts),
         cache: std::sync::Mutex::new(Cache {
             map: std::collections::HashMap::new(),
             order: std::collections::VecDeque::new(),
@@ -185,69 +238,12 @@ fn empty_pack(blob: &'static [u8]) -> Pack {
     }
 }
 
-/// Legacy OCAP1 (whole-pack zstd of an eager file table). Kept so a committed
-/// pack made before the OCAP2 migration still boots.
-fn parse_ocap1(pack: &'static [u8]) -> Pack {
-    let raw = match zstd::stream::decode_all(pack) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("embedded UI pack: zstd decode failed: {e:#}");
-            return empty_pack(pack);
-        }
-    };
-    let mut idx = std::collections::HashMap::new();
-    let mut cache = Cache {
-        map: std::collections::HashMap::new(),
-        order: std::collections::VecDeque::new(),
-        bytes: 0,
-    };
-    // store every file eagerly in the cache (bounded by the pack's own size)
-    if raw.len() >= 6 && &raw[..6] == b"OCAP1\n" {
-        let mut i = 6usize;
-        let count = read_u32(&raw, &mut i).unwrap_or(0) as usize;
-        for _ in 0..count {
-            let Ok(plen) = read_u16(&raw, &mut i) else {
-                break;
-            };
-            let plen = plen as usize;
-            if i + plen > raw.len() {
-                break;
-            }
-            let Ok(path) = String::from_utf8(raw[i..i + plen].to_vec()) else {
-                break;
-            };
-            i += plen;
-            let Ok(dlen) = read_u64(&raw, &mut i) else {
-                break;
-            };
-            let dlen = dlen as usize;
-            if i + dlen > raw.len() {
-                break;
-            }
-            let data = raw[i..i + dlen].to_vec();
-            i += dlen;
-            idx.insert(path.clone(), (0, 0, 0));
-            cache.bytes += data.len();
-            cache.map.insert(path.clone(), bytes::Bytes::from(data));
-            cache.order.push_back(path);
-        }
-    }
-    // leak the eager map into a static-compatible blob via Box::leak so the
-    // lifetime matches the 'static signature (OCAP1 path is transitional).
-    let leaked: &'static [u8] = Box::leak(raw.into_boxed_slice());
-    Pack {
-        index: idx,
-        blob: leaked,
-        cache: std::sync::Mutex::new(cache),
-    }
-}
-
 fn files() -> &'static Pack {
-    FILES.get_or_init(|| parse_pack(PACK_ZST))
+    FILES.get_or_init(|| parse_pack(PACK_INDEX, PACK_V1_PARTS))
 }
 
 fn files_v2() -> &'static Pack {
-    FILES_V2.get_or_init(|| parse_pack(PACK_V2_ZST))
+    FILES_V2.get_or_init(|| parse_pack(PACK_V2_INDEX, PACK_V2_PARTS))
 }
 
 /// The active pack (flag-selected; see `active_tag`).
@@ -367,6 +363,23 @@ mod tests {
             .get("_assets/index-Bn6xbm4C.js")
             .expect("v2 entry present");
         assert!(entry.len() > 1000, "entry bundle too small");
+    }
+
+    /// The frame region is split across crates; an offset near a part
+    /// boundary must still resolve, and a spanning range must be assembled.
+    /// Without this the first file after a split would silently 404.
+    #[test]
+    fn sharded_blob_reads_across_part_boundaries() {
+        let a: &'static [u8] = b"AAAA";
+        let b: &'static [u8] = b"BBBB";
+        static PARTS: &[&[u8]] = &[b"AAAA", b"BBBB"];
+        let blob = ShardedBlob::new(PARTS);
+        assert_eq!(&blob.slice(0, 4).unwrap()[..], b"AAAA");
+        assert_eq!(&blob.slice(4, 4).unwrap()[..], b"BBBB");
+        assert_eq!(&blob.slice(2, 4).unwrap()[..], b"AABB");
+        assert_eq!(&blob.slice(3, 2).unwrap()[..], b"AB");
+        assert!(blob.slice(7, 2).is_none(), "overrun must fail, never panic");
+        let _ = (a, b);
     }
 
     #[test]

@@ -4,6 +4,31 @@ All notable changes to ocserve. The wire contract targets the frozen
 openccode 1.18.31 release and the v2 surface the 2.0.28 client; anything that
 differs is a named `D-*` row in `PLAN.md §17`.
 
+## 0.6.9
+
+### Fixed
+- **`cargo install ocserve` was stuck on 0.3.1.** `ocserve-http` embedded both
+  pinned web-UI packs (35.8 MB), and crates.io caps a single `.crate` at
+  10 MiB, so no version after 0.3.1 could be published. The packs are now
+  split at zstd frame boundaries into six `ocserve-ui-*` crates (v1 in two
+  parts, v2 in four); the index stays in `ocserve-http` and the loader maps
+  absolute frame offsets across the parts. Nothing is dropped and the binary
+  is unchanged: the installed product is the same one the release tarball
+  ships. Largest part is 69.6% of the cap.
+- The publish workflow no longer keeps a hand-written crate list: it asks
+  `scripts/check-publish-order.py --order` (derived from `Cargo.toml`), so a
+  new crate cannot be forgotten or mis-ordered. It also fails closed now: only
+  "already published" is tolerated, while any other failure stops the chain
+  instead of leaving a crate unpublished and every dependent broken. New
+  crates hit crates.io's 5-per-10-minutes limit, so the job waits and retries.
+- `CRATE_PAYLOAD_LIMIT_BYTES` is back to the real 10 MiB. It had been set to
+  64 MiB on the belief that the size increase was granted; the registry API
+  reports `max_upload_size: null`, so the guard was validating an aspiration
+  and publish would have failed at `ocserve-http` after uploading ten crates.
+- The size-increase request document now reflects that it was sent (2026-10-20)
+  rather than "draft, not sent", with current figures. The request is no longer
+  on the critical path.
+
 ## 0.6.8
 
 ### Fixed

@@ -1,6 +1,7 @@
 # crates.io upload-size increase request
 
-Status: draft, not sent.
+Status: sent by the maintainer 2026-10-20 (per their report); awaiting reply.
+Superseded figures below are from 2026-10-21; 0.6.8 packed `ocserve-http` at 37,332,357 B before sharding.
 
 - To: the crates.io help address (`help` at the crates.io domain)
 - Subject: Upload size increase for `ocserve-http` (34 MiB packed)
@@ -14,7 +15,7 @@ Measured facts behind the request (2026-10-21):
 |---|---|
 | default limit (crates.io `src/config/publish_limits.rs`) | 10,485,760 B (10 MiB) |
 | `ocserve-http` 0.3.1 as published | 5,315,755 B |
-| `ocserve-http` 0.4.1 packed | 35,919,096 B (34.26 MiB) |
+| `ocserve-http` 0.6.8 packed (pre-shard) | 37,332,357 B (35.6 MiB) |
 | of which `assets/webui/2.0.28.pack.zst` | 24.41 MiB |
 | of which `assets/webui/1.18.31.pack.zst` | 9.70 MiB |
 | other 10 workspace crates, packed, combined | 0.54 MiB |

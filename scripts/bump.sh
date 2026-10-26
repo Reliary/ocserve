@@ -72,7 +72,7 @@ case "$LINE" in
 
     echo "=== step 3: re-extract the web-UI pack ==="
     run scripts/extract-app.sh "$CLI" "$VER"
-    echo "  (WROTE crates/ocserve-http/assets/webui/$VER.pack.zst + manifest)"
+    echo "  (WROTE $VER.index.bin + parts.json + ocserve-ui-* parts + manifest)"
 
     echo "=== step 4: classify ==="
     echo "  4a. cross-line (v1 vs new v2) against ocserve's router:"

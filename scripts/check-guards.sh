@@ -453,13 +453,20 @@ echo "== guard: embedded UI version-skew (rule 17) =="
 # manifest must have the SAME entry count and a known format — a manifest
 # regenerated without its pack (or vice-versa) shipped once (2026-10-18) and
 # only the browser caught it; this makes that class a commit-time failure.
-if python3 scripts/check-pack-manifest.py; then
-  echo "ok (pack/manifest entry counts + format)"
+# Rule 17: the pinned web UI is sharded across ocserve-ui-* crates (crates.io
+# caps a crate at 10 MiB). Reconstruct each tag, hash every entry against its
+# manifest, and cap each part. Selftest plants swap/truncation/oversize.
+if python3 scripts/check-embedded-ui.py --selftest >/dev/null 2>&1; then
+  if out=$(python3 scripts/check-embedded-ui.py 2>&1); then
+    echo "$out"
+  else
+    echo "$out"; echo "FAIL: embedded web-UI shards (rule 17)"; fail=1
+  fi
 else
-  echo "FAIL: embedded UI pack/manifest inconsistent (rule 17)"; fail=1
+  echo "FAIL: embedded web-UI planted controls not detected (rule 17 vacuous)"; fail=1
 fi
 for _tag in 1.18.31 2.0.28; do
-  _pack="crates/ocserve-http/assets/webui/$_tag.pack.zst"
+  _pack="crates/ocserve-http/assets/webui/$_tag.index.bin"
   _spec="crates/ocserve-core/assets/openapi/$_tag.json"
   if [ -f "$_pack" ] && [ -f "$_spec" ]; then
     if out=$(python3 bench/webui/check-app-skew.py "$_pack" "$_spec" 2>&1); then

@@ -12,13 +12,19 @@ members = [
     "crates/ocserve-metrics",
     "crates/ocserve-pty",
     "crates/ocserve-cli",
+    "crates/ocserve-ui-11831-a",
+    "crates/ocserve-ui-11831-b",
+    "crates/ocserve-ui-2028-a",
+    "crates/ocserve-ui-2028-b",
+    "crates/ocserve-ui-2028-c",
+    "crates/ocserve-ui-2028-d",
 ]
 # The cargo-fuzz crate has its own [workspace] (cargo-fuzz requirement) and
 # depends on nightly libfuzzer-sys; keep it out of the normal build graph.
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.6.8"
+version = "0.6.9"
 edition = "2024"
 license = "MIT"
 rust-version = "1.98"
@@ -29,16 +35,22 @@ categories = ["web-programming::http-server", "database-implementations", "devel
 
 [workspace.dependencies]
 # internal
-ocserve-core = { path = "crates/ocserve-core", version = "0.6.8" }
-ocserve-store = { path = "crates/ocserve-store", version = "0.6.8" }
-ocserve-http = { path = "crates/ocserve-http", version = "0.6.8" }
-ocserve-llm = { path = "crates/ocserve-llm", version = "0.6.8" }
-ocserve-tools = { path = "crates/ocserve-tools", version = "0.6.8" }
-ocserve-mcp = { path = "crates/ocserve-mcp", version = "0.6.8" }
-ocserve-plugin = { path = "crates/ocserve-plugin", version = "0.6.8" }
-ocserve-metrics = { path = "crates/ocserve-metrics", version = "0.6.8" }
-ocserve-pty = { path = "crates/ocserve-pty", version = "0.6.8" }
-ocserve-importer = { path = "crates/ocserve-importer", version = "0.6.8" }
+ocserve-core = { path = "crates/ocserve-core", version = "0.6.9" }
+ocserve-store = { path = "crates/ocserve-store", version = "0.6.9" }
+ocserve-http = { path = "crates/ocserve-http", version = "0.6.9" }
+ocserve-llm = { path = "crates/ocserve-llm", version = "0.6.9" }
+ocserve-tools = { path = "crates/ocserve-tools", version = "0.6.9" }
+ocserve-mcp = { path = "crates/ocserve-mcp", version = "0.6.9" }
+ocserve-plugin = { path = "crates/ocserve-plugin", version = "0.6.9" }
+ocserve-metrics = { path = "crates/ocserve-metrics", version = "0.6.9" }
+ocserve-pty = { path = "crates/ocserve-pty", version = "0.6.9" }
+ocserve-importer = { path = "crates/ocserve-importer", version = "0.6.9" }
+ocserve-ui-11831-a = { path = "crates/ocserve-ui-11831-a", version = "0.6.9" }
+ocserve-ui-11831-b = { path = "crates/ocserve-ui-11831-b", version = "0.6.9" }
+ocserve-ui-2028-a = { path = "crates/ocserve-ui-2028-a", version = "0.6.9" }
+ocserve-ui-2028-b = { path = "crates/ocserve-ui-2028-b", version = "0.6.9" }
+ocserve-ui-2028-c = { path = "crates/ocserve-ui-2028-c", version = "0.6.9" }
+ocserve-ui-2028-d = { path = "crates/ocserve-ui-2028-d", version = "0.6.9" }
 
 # runtime / web
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs", "io-util", "net"] }

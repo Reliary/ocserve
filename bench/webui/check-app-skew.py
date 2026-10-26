@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """P6c — embedded-UI version-skew guard.
 
-The pinned web UI (crates/ocserve-http/assets/webui/<tag>.pack.zst) is a Vite build of
+The pinned web UI (crates/ocserve-http/assets/webui/<tag>.index.bin plus the
+`ocserve-ui-*` frame parts) is a Vite build of
 `packages/app` at the freeze tag, so every API route it calls must exist in the
 frozen OpenAPI contract (bench/openapi/<tag>.json). If they ever disagree, the
 extraction captured the wrong build (or the spec is stale) and the UI would
@@ -12,11 +13,12 @@ the spec. It is the version-matched replacement for the old
 bench/webui-routes.txt (which tracked Cloudflare's *latest* bundle, not the
 frozen one).
 
-Usage: check-app-skew.py <pack.zst> <spec.json>
+Usage: check-app-skew.py <tag>.index.bin <spec.json>
 Exit 0 = every route the bundle calls is in the spec; 1 otherwise.
 """
 import json
 import os
+import pathlib
 import re
 import struct
 import subprocess
@@ -24,8 +26,26 @@ import sys
 import tempfile
 
 
+def _assemble_parts(tag):
+    """Concatenate the sharded frame region from ocserve-ui-* crates."""
+    root = pathlib.Path(__file__).resolve().parent.parent.parent
+    doc = json.loads((root / "crates/ocserve-http/assets/webui/parts.json").read_text())
+    meta = doc.get(tag)
+    if not meta:
+        sys.exit(f"{tag}: no shard plan in parts.json")
+    out = bytearray()
+    for part in meta["parts"]:
+        out += (root / "crates" / part["crate"] / "assets/part.bin").read_bytes()
+    return bytes(out)
+
+
 def read_pack(path):
-    raw = open(path, "rb").read()
+    """path may be a legacy pack, or `<tag>.index.bin` (the sharded form)."""
+    p = pathlib.Path(path)
+    if p.name.endswith(".index.bin"):
+        tag = p.name[: -len(".index.bin")]
+        return _read_ocap2_index(p.read_bytes(), _assemble_parts(tag))
+    raw = p.read_bytes()
     # OCAP2 is stored raw (per-file zstd frames; no outer frame). Legacy OCAP1
     # is an outer zstd of an eager table. Detect by magic, decompress only
     # OCAP1. (An outer-decompress of an OCAP2 blob fails — and the old code
@@ -61,21 +81,25 @@ def read_pack(path):
 
 
 def _read_ocap2(blob):
-    (count,) = struct.unpack_from("<I", blob, 6)
+    return _read_ocap2_index(blob, blob)
+
+
+def _read_ocap2_index(index, blob):
+    """Parse the index; frames come from `blob` (same bytes, or concatenated parts)."""
+    (count,) = struct.unpack_from("<I", index, 6)
     i = 10
     entries = []
     for _ in range(count):
-        (plen,) = struct.unpack_from("<H", blob, i)
+        (plen,) = struct.unpack_from("<H", index, i)
         i += 2
-        name = blob[i : i + plen].decode()
+        name = index[i : i + plen].decode()
         i += plen
-        off, raw_len, comp_len = struct.unpack_from("<QII", blob, i)
+        off, raw_len, comp_len = struct.unpack_from("<QII", index, i)
         i += 16
         entries.append((name, off, raw_len, comp_len))
-    data_base = i
     files = {}
     for name, off, _raw_len, comp_len in entries:
-        frame = blob[data_base + off : data_base + off + comp_len]
+        frame = blob[off : off + comp_len]
         files[name] = subprocess.run(
             ["zstd", "-d", "-c"], input=frame, capture_output=True, check=True
         ).stdout

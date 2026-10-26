@@ -1,0 +1,14 @@
+[package]
+name = "ocserve-ui-2028-a"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Embedded web-UI pack part (2.0.28, part a) for ocserve"
+include = ["src/**", "assets/**", "README.md"]
+
+[dependencies]
