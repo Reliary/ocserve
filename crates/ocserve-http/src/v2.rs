@@ -2503,7 +2503,7 @@ pub async fn pair_mint(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         let mut h = Sha256::new();
         h.update(now.to_be_bytes());
         h.update(std::process::id().to_be_bytes());
-        format!("{:x}", h.finalize())[..16].to_string()
+        hex::encode(h.finalize())[..16].to_string()
     };
     map.insert(code.clone(), now + PAIR_TTL_MS);
     Json(json!({"code": code, "expires_in": 600})).into_response()
@@ -2522,7 +2522,7 @@ pub async fn pair_connect(Path(code): Path<String>) -> axum::response::Response 
                 let mut h = Sha256::new();
                 h.update(code.as_bytes());
                 h.update(now.to_be_bytes());
-                format!("{:x}", h.finalize())
+                hex::encode(h.finalize())
             };
             Json(json!({"token": token})).into_response()
         }

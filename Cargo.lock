@@ -1891,6 +1891,7 @@ name = "ocserve-plugin"
 version = "0.6.9"
 dependencies = [
  "anyhow",
+ "hex",
  "ocserve-metrics",
  "ocserve-store",
  "parking_lot 0.13.0",

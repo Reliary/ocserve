@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions-rust-lang/setup-rust-toolchain@46a9d261ee2ace4b93b3bd6e867168ac38627b38  # v1.12.0
+      - uses: actions-rust-lang/setup-rust-toolchain@c8ff772090ab9d00f7f7bd7b388f3c3032282e3b  # v2.0.0
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -118,7 +118,7 @@ jobs:
     needs: gates
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions-rust-lang/setup-rust-toolchain@46a9d261ee2ace4b93b3bd6e867168ac38627b38  # v1.12.0
+      - uses: actions-rust-lang/setup-rust-toolchain@c8ff772090ab9d00f7f7bd7b388f3c3032282e3b  # v2.0.0
       - name: build + check size
         run: |
           cargo build --release -p ocserve
@@ -144,7 +144,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions-rust-lang/setup-rust-toolchain@46a9d261ee2ace4b93b3bd6e867168ac38627b38  # v1.12.0
+      - uses: actions-rust-lang/setup-rust-toolchain@c8ff772090ab9d00f7f7bd7b388f3c3032282e3b  # v2.0.0
       - name: install arm64 cross toolchain + target
         run: |
           rustup target add aarch64-unknown-linux-gnu
@@ -175,7 +175,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions-rust-lang/setup-rust-toolchain@46a9d261ee2ace4b93b3bd6e867168ac38627b38  # v1.12.0
+      - uses: actions-rust-lang/setup-rust-toolchain@c8ff772090ab9d00f7f7bd7b388f3c3032282e3b  # v2.0.0
       - name: install zig + musl target
         run: |
           rustup target add x86_64-unknown-linux-musl
@@ -229,7 +229,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions-rust-lang/setup-rust-toolchain@46a9d261ee2ace4b93b3bd6e867168ac38627b38  # v1.12.0
+      - uses: actions-rust-lang/setup-rust-toolchain@c8ff772090ab9d00f7f7bd7b388f3c3032282e3b  # v2.0.0
       - name: cargo check
         # `check`, not `build`: link-time gaps in the OS layer are Phase P/W work,
         # and a type error is what the two ungated unix imports used to produce.
@@ -326,7 +326,9 @@ jobs:
         # This is the line between "wrote a macOS PTY" and "a macOS runner
         # exercised it": real forkpty spawn, type, resize (TIOCGWINSZ round-trip
         # proves the Darwin ioctl constant), exit code, and kill.
-        # `-D warnings` matches the toolchain's default RUSTFLAGS.
+        # setup-rust-toolchain v2 sets CARGO_BUILD_WARNINGS=deny instead of
+        # RUSTFLAGS (so target.*.rustflags is not clobbered); these steps set
+        # RUSTFLAGS explicitly because they also parse the log.
         shell: bash
         run: |
           set -o pipefail
@@ -338,7 +340,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions-rust-lang/setup-rust-toolchain@46a9d261ee2ace4b93b3bd6e867168ac38627b38  # v1.12.0
+      - uses: actions-rust-lang/setup-rust-toolchain@c8ff772090ab9d00f7f7bd7b388f3c3032282e3b  # v2.0.0
       - name: install cargo-deny
         run: cargo install cargo-deny --locked
       - name: cargo-deny

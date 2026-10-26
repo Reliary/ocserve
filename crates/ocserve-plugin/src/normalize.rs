@@ -469,14 +469,15 @@ fn content_hash(entry: &Path) -> Result<String> {
     h.update([0xff]);
     h.update(SHIM_SRC.as_bytes());
     h.update(NORMALIZER_VERSION.as_bytes());
-    Ok(format!("{:x}", h.finalize()))
+    // sha2 0.11 output no longer implements LowerHex; hex-encode explicitly.
+    Ok(hex::encode(h.finalize()))
 }
 
 /// Data-dir subdirectory for an entry: path-hash (16 hex chars).
 fn path_key(entry: &Path) -> String {
     let mut h = Sha256::new();
     h.update(entry.to_string_lossy().as_bytes());
-    format!("{:x}", h.finalize())[..16].to_string()
+    hex::encode(h.finalize())[..16].to_string()
 }
 
 fn warm(out: &Path, want: &str) -> bool {
@@ -687,7 +688,8 @@ pub fn normalize_or_raw_sync(root: Option<&Path>, entry: &Path) -> (PathBuf, Out
 mod tests {
     use super::*;
 
-    static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+    // parking_lot 0.13 removed the const_* constructors; `new` is const now.
+    static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// M4b idiom: real-plugin tests exist only where the artifact exists.
     fn real_entry(pkg: &str, rel: &str) -> Option<PathBuf> {
