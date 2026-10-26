@@ -128,6 +128,9 @@
 #  58. every runtime `OCSERVE_*` read is in the env contract, and the committed
 #      env reference matches the contract exactly (an undocumented knob is
 #      undiscoverable; a stale reference lies) [plant: bogus read + stale doc]
+#  60. the soak sampler records exactly one health code (`curl -w` prints 000 on
+#      failure, so `|| echo 000` wrote `000000`; a dead probe must stay a
+#      single visible 000) [suite: planted double-code probe]
 #  59. the fuzz workspace resolves serde_json with production's features
 #      (arbitrary_precision arrives transitively from rolldown), and every
 #      target with committed seeds is in the CI matrix. The fuzzer previously
@@ -918,6 +921,44 @@ if [ -n "$ban_hits" ]; then
 else
   echo "ok (no interpreter spawns; planted node detected)"
 fi
+
+echo "== guard: the soak sampler records one health code (rule 60) =="
+# 2026-10-26: `curl -w '%{http_code}'` already prints 000 on failure, and the
+# script appended `|| echo 000`, so a dead probe wrote `000000`. Fail-closed
+# either way, but the column must be a single code or every downstream parse
+# silently sees a different value.
+_soak_pred() {
+  python3 - "$1" <<'PY2'
+import re, sys
+s = open(sys.argv[1]).read()
+# Exactly one health capture, and no `|| echo 000` fallback on it.
+caps = re.findall(r'^\s*health=.*$', s, re.M)
+ok = (
+    len(caps) == 1
+    and "echo 000" not in caps[0]
+    and re.search(r'\[ -n "\$health" \] \|\| health=000', s) is not None
+)
+sys.exit(0 if ok else 1)
+PY2
+}
+if _soak_pred scripts/soak.sh; then
+  echo "ok (health recorded as exactly one HTTP code)"
+else
+  echo "FAIL: soak health column can record multiple codes (rule 60)"; fail=1
+fi
+_soak_plant="$(mktemp)"
+python3 - scripts/soak.sh "$_soak_plant" <<'PY2'
+import sys
+s = open(sys.argv[1]).read()
+s = s.replace('|| true)', '|| echo 000)')
+open(sys.argv[2], "w").write(s)
+PY2
+if _soak_pred "$_soak_plant"; then
+  echo "FAIL: rule 60 planted double-code health probe not detected"; fail=1
+else
+  echo "ok (planted double-code health probe detected)"
+fi
+rm -f "$_soak_plant"
 
 echo "== guard: fuzz workspace matches production and seeds are wired (rule 59) =="
 if python3 scripts/check-fuzz-parity.py --selftest >/dev/null 2>&1; then

@@ -14,7 +14,11 @@ end=$(( $(date +%s) + HOURS * 3600 ))
 while [ "$(date +%s)" -lt "$end" ]; do
   ts=$(date +%s)
   m=$(curl -fsS --max-time 5 "$URL/metrics" || true)
-  health=$(curl -fss -o /dev/null -w '%{http_code}' --max-time 5 "$URL/global/health" || echo 000)
+  # `-w` already prints 000 on a connection failure, so `|| echo 000` appended a
+  # SECOND one: a dead probe was recorded as `000000` (2026-10-26, seen during a
+  # deliberate restart). Fail-closed either way, but the column must be one code.
+  health=$(curl -so /dev/null -w '%{http_code}' --max-time 5 "$URL/global/health" 2>/dev/null || true)
+  [ -n "$health" ] || health=000
   get() { echo "$m" | awk -v k="$1" '$1==k {print $2; exit}'; }
   # labeled series (durations render name_sum{label}) — prefix match
   getp() { echo "$m" | awk -v k="$1" 'index($1, k) == 1 {print $2; exit}'; }
