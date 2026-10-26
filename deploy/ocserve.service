@@ -2,9 +2,14 @@
 # Install (preferred, but NEVER automatic — the service is an optional overlay
 # and foreground `ocserve serve` is fully supported):  scripts/install.sh
 #   [--dry-run|--bin-only]  — renders this template, enables, health-probes.
+#   [--bin <path>]          — installs THAT binary (e.g. a release artifact).
 # Uninstall (keeps session history by default):  scripts/uninstall.sh [--purge]
-# Manual alternative: cp deploy/ocserve.service ~/.config/systemd/user/ &&
-#   systemctl --user daemon-reload && systemctl --user enable --now ocserve.service
+#
+# Do NOT copy this file by hand: `ExecStart` below points at a development
+# checkout's `target/release`, which is not the verified artifact. A hand-copy
+# is how production ran a `-dirty` build while `~/.local/bin/ocserve` held the
+# published one (2026-10-26). install.sh rewrites ExecStart to the stable path.
+# Manual equivalent:  scripts/install.sh --bin ~/.local/bin/ocserve
 [Unit]
 Description=ocserve (opencode-compatible server, freeze 1.18.31)
 After=network.target
