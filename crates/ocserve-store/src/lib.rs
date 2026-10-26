@@ -2502,7 +2502,9 @@ pub mod instruction {
 
     fn hash(value: &str) -> String {
         use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(value.as_bytes()))
+        // sha2 0.11's digest output no longer implements LowerHex; hex-encode
+        // explicitly so the stored wire value stays 64 lowercase hex digits.
+        hex::encode(Sha256::digest(value.as_bytes()))
     }
 
     /// Put a key (insert-or-replace the link + the blob). Value is caller JSON.
