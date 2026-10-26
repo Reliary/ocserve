@@ -103,9 +103,10 @@ fn splice_refuses_duplicate_keys_which_serde_collapses() {
 #[test]
 fn splice_tolerates_trailing_comma_that_serde_rejects() {
     // serde rejects `{"a":1,}` so no DOM oracle exists for it. The splice
-    // still emits valid JSON — strictly safer than the old behavior (which
-    // errored the whole request), so the contract is "valid output", not
-    // "byte-identical".
+    // emits valid JSON for a TOP-LEVEL trailing comma by not copying it,
+    // which is safer than erroring the whole request; the contract here is
+    // "valid output", not "byte-identical". NESTED trailing commas are
+    // refused so the splice can never emit `[1,]`.
     let mut out = Vec::new();
     let mut scratch = SpliceScratch::default();
     assert!(compact_splice(
@@ -132,6 +133,31 @@ fn splice_refuses_malformed_so_dom_path_runs() {
         r#"{,}"#,     // leading comma
         "",
         "{",
+        // Raw C0 control bytes inside strings are illegal JSON. The splice
+        // used to copy them through and report success (fuzz-found
+        // 2026-10-26), so the "accepted output is valid JSON" invariant broke.
+        "{\"\u{4}\":44444}",
+        "{\"a\":\"x\u{1}y\"}",
+        // VT/FF are Rust whitespace but illegal JSON outside strings, so
+        // skipping them produced output serde rejects (fuzz-found 2026-10-26).
+        "{\"iiii\"\u{c}:{}}",
+        "{\u{c}\"a\":1}",
+        "{\"a\":\u{b}1}",
+        // Illegal escape sequences (`\{`, `\'`, trailing `\`) are copied
+        // through by a naive scanner; the output then does not parse.
+        r#"{"a":"\{/"}"#,
+        r#"{"a":"x\'y"}"#,
+        // serde_json reserves this key when arbitrary_precision is on, so the
+        // DOM path fails and the splice must not claim success.
+        r#"{"$serde_json::private::Number":0}"#,
+        // Object in Colon phase with no member yet must not close.
+        r#"{"" :{": 2"}}"#,
+        // A container that closes before its value is complete.
+        r#"{"a":}"#,
+        r#"{"a"}"#,
+        r#"{"a":{"b":}}"#,
+        r#"{"a":[1,]}"#,
+        "{\"itr]ed\"\r :{\"\" :\t\n}}",
     ];
     for b in bad {
         let mut out = Vec::new();
@@ -186,6 +212,37 @@ fn splice_output_is_valid_json() {
     assert_eq!(v["sessionID"], "s");
     assert_eq!(v["messageID"], "m");
     assert_eq!(v["text"], "a,b}c");
+}
+
+/// The invariant the fuzzer enforces, encoded for `cargo test`: whenever the
+/// splice accepts, serde must parse its output. Seven distinct silent-corruption
+/// shapes were found by fuzzing on 2026-10-26 (raw control bytes, VT/FF
+/// whitespace, illegal escapes, incomplete containers, nested trailing commas,
+/// empty-container mis-close, and serde's reserved `$serde_json::private` key);
+/// all are now seeded into `fuzz/seeds/splice_parser`.
+#[test]
+fn accepted_output_always_parses() {
+    let cases = [
+        r#"{"a":1}"#,
+        r#"{"a":[1,{"b":null},true]}"#,
+        r#"{"a":"\u00e9","b":"\n"}"#,
+        "{\"a\":\"\u{4}\",\"b\":1}",
+        "{\"a\":1}\u{c}",
+        r#"{"a":"\{/"}"#,
+        r#"{"a":}"#,
+        r#"{"a":[1,]}"#,
+        r#"{"" :{": 2"}}"#,
+        r#"{"$serde_json::private::Number":0}"#,
+        r#"{"a":1,}"#,
+    ];
+    for src in cases {
+        let mut out = Vec::new();
+        let mut scratch = SpliceScratch::default();
+        if compact_splice(src, "i", "s", Some("m"), &mut out, &mut scratch) {
+            serde_json::from_slice::<serde_json::Value>(&out)
+                .unwrap_or_else(|e| panic!("accepted {src:?} but emitted invalid JSON: {e}"));
+        }
+    }
 }
 
 /// **Corpus differential** — the actual ship gate. Runs only when

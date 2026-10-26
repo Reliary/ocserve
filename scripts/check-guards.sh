@@ -128,6 +128,11 @@
 #  58. every runtime `OCSERVE_*` read is in the env contract, and the committed
 #      env reference matches the contract exactly (an undocumented knob is
 #      undiscoverable; a stale reference lies) [plant: bogus read + stale doc]
+#  59. the fuzz workspace resolves serde_json with production's features
+#      (arbitrary_precision arrives transitively from rolldown), and every
+#      target with committed seeds is in the CI matrix. The fuzzer previously
+#      ran a different parser and hid seven silent-corruption shapes found on
+#      2026-10-26 [suite: check-fuzz-parity.py --selftest]
 #  51. hook/RPC dispatch takes a Handle, never the owner lock (holding it
 #      across the await re-serialized every session; 2026-10-23 review H3)
 #      [plant: owner-lock trigger call]
@@ -912,6 +917,17 @@ if [ -n "$ban_hits" ]; then
   echo "FAIL: interpreter spawn in server paths (rule 34)"; fail=1
 else
   echo "ok (no interpreter spawns; planted node detected)"
+fi
+
+echo "== guard: fuzz workspace matches production and seeds are wired (rule 59) =="
+if python3 scripts/check-fuzz-parity.py --selftest >/dev/null 2>&1; then
+  if out=$(python3 scripts/check-fuzz-parity.py 2>&1); then
+    echo "$out"
+  else
+    echo "$out"; echo "FAIL: fuzz parity (rule 59)"; fail=1
+  fi
+else
+  echo "FAIL: fuzz-parity planted controls not detected (rule 59 vacuous)"; fail=1
 fi
 
 echo "== guard: docs are not stale (rule 31) =="
