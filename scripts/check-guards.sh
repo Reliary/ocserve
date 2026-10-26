@@ -1558,8 +1558,8 @@ _fwd_pred() {
   name="$(basename "$unit" .service)"
   ! grep -qE '^(PartOf|Requires|BindsTo)=.*ocserve\.service' "$unit" \
     && grep -q '^Restart=always$' "$unit" \
-    && grep -q "systemctl --user start \"\$_fwd.service\"" "$2" \
-    && grep -q -- '-f "$UNIT_DIR/\$_fwd.service"' "$2"
+    && grep -q "systemctl --user start $name.service" "$2" \
+    && grep -q "\[ -f \"\$UNIT_DIR/$name.service\" \]" "$2"
 }
 if _fwd_pred deploy/ocserve-tailscale-forward.service scripts/install.sh \
    && _fwd_pred deploy/ocserve-web4096.service scripts/install.sh; then

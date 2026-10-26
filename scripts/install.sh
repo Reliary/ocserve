@@ -221,16 +221,23 @@ fi
 # via PartOf/Requires while nothing started them again, so every deploy silently
 # cut access: the tailnet one on 2026-10-24, and the loopback 4096 one on
 # 2026-10-23 (dead for two days). Neither propagates stop now; this restores
-# whichever is enabled, and leaves a disabled one alone.
-for _fwd in ocserve-tailscale-forward ocserve-web4096; do
-  if [ -f "$UNIT_DIR/$_fwd.service" ]; then
-    if [ "$(systemctl --user is-enabled "$_fwd.service" 2>/dev/null)" = "enabled" ]; then
-      systemctl --user start "$_fwd.service" && say "forwarder $_fwd: running"
-    else
-      say "forwarder $_fwd: installed but disabled (left alone)"
-    fi
+# whichever is enabled, and leaves a disabled one alone. The unit names stay
+# LITERAL on each start line so guard 6 can see this script only touches
+# ocserve units (a `"$unit"` variable reads as an unknown target).
+if [ -f "$UNIT_DIR/ocserve-tailscale-forward.service" ]; then
+  if [ "$(systemctl --user is-enabled ocserve-tailscale-forward.service 2>/dev/null)" = "enabled" ]; then
+    systemctl --user start ocserve-tailscale-forward.service && say "forwarder ocserve-tailscale-forward: running"
+  else
+    say "forwarder ocserve-tailscale-forward: installed but disabled (left alone)"
   fi
-done
+fi
+if [ -f "$UNIT_DIR/ocserve-web4096.service" ]; then
+  if [ "$(systemctl --user is-enabled ocserve-web4096.service 2>/dev/null)" = "enabled" ]; then
+    systemctl --user start ocserve-web4096.service && say "forwarder ocserve-web4096: running"
+  else
+    say "forwarder ocserve-web4096: installed but disabled (left alone)"
+  fi
+fi
 
 # --- health probe -----------------------------------------------------------
 PORT=4912
