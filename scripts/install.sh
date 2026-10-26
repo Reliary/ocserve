@@ -217,18 +217,20 @@ else
   systemctl --user enable --now ocserve.service
 fi
 
-# The tailnet forwarder is a separate optional unit. Restarting ocserve used
-# to stop it via PartOf/Requires and nothing started it again, so every deploy
-# silently cut tailnet access (2026-10-24 review, critical). The unit no longer
-# propagates stop; this also restores it for an install that already has it.
-if [ -f "$UNIT_DIR/ocserve-tailscale-forward.service" ]; then
-  if [ "$(systemctl --user is-enabled ocserve-tailscale-forward.service 2>/dev/null)" = "enabled" ]; then
-    systemctl --user start ocserve-tailscale-forward.service \
-      && say "tailnet forwarder: running"
-  else
-    say "tailnet forwarder: installed but disabled (left alone)"
+# Optional forwarders are separate units. Restarting ocserve used to stop them
+# via PartOf/Requires while nothing started them again, so every deploy silently
+# cut access: the tailnet one on 2026-10-24, and the loopback 4096 one on
+# 2026-10-23 (dead for two days). Neither propagates stop now; this restores
+# whichever is enabled, and leaves a disabled one alone.
+for _fwd in ocserve-tailscale-forward ocserve-web4096; do
+  if [ -f "$UNIT_DIR/$_fwd.service" ]; then
+    if [ "$(systemctl --user is-enabled "$_fwd.service" 2>/dev/null)" = "enabled" ]; then
+      systemctl --user start "$_fwd.service" && say "forwarder $_fwd: running"
+    else
+      say "forwarder $_fwd: installed but disabled (left alone)"
+    fi
   fi
-fi
+done
 
 # --- health probe -----------------------------------------------------------
 PORT=4912

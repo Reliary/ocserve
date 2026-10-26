@@ -1409,28 +1409,44 @@ async fn doctor(
     // dead-and-DISABLED while loopback stayed healthy — tailnet clients got
     // connection refused and nothing anywhere said so). Informational only:
     // the forwarder is per-host (bind IP), installer never manages it.
-    let fwd_unit = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".config/systemd/user/ocserve-tailscale-forward.service");
-    if fwd_unit.exists() {
+    // Both forwarders suffer the same failure mode, so both are reported and
+    // both shout when dead: the 4096 one stayed dead for two days (2026-10-23)
+    // while nothing said so.
+    for (unit, label, route, down) in [
+        (
+            "ocserve-tailscale-forward",
+            "tailnet fwd:",
+            "100.x:4912 -> 127.0.0.1:4912",
+            "TAILNET IS DOWN",
+        ),
+        (
+            "ocserve-web4096",
+            "web 4096 fwd:",
+            "127.0.0.1:4096 -> 127.0.0.1:4912",
+            "PORT 4096 IS DOWN",
+        ),
+    ] {
+        let fwd_unit = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(format!(".config/systemd/user/{unit}.service"));
+        if !fwd_unit.exists() {
+            continue;
+        }
         let state = std::process::Command::new("systemctl")
-            .args(["--user", "is-active", "ocserve-tailscale-forward"])
+            .args(["--user", "is-active", unit])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
         let enabled = std::process::Command::new("systemctl")
-            .args(["--user", "is-enabled", "ocserve-tailscale-forward"])
+            .args(["--user", "is-enabled", unit])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
-        // A dead-but-enabled forwarder is the 2026-10-24 incident (every
-        // install restarted ocserve, PartOf stopped socat, nothing started it
-        // again). Make it a visible defect, not a neutral status line.
         let warn = if state != "active" {
-            "  <-- TAILNET IS DOWN"
+            format!("  <-- {down}")
         } else {
-            ""
+            String::new()
         };
-        println!("  tailnet fwd:    {state} ({enabled}; 100.x:4912 -> 127.0.0.1:4912){warn}");
+        println!("  {label:<15} {state} ({enabled}; {route}){warn}");
     }
     let db = ocserve_store::writer::db_path(&data_dir);
     if db.exists() {

@@ -1509,18 +1509,36 @@ echo "== guard: tailnet forwarder survives an ocserve restart (rule 55) =="
 # install.sh restarts ocserve on every deploy, so tailnet access died silently
 # (enabled, inactive, ECONNREFUSED). Predicate: no PartOf/Requires edge from
 # ocserve in the unit, Restart=always, and install.sh starts it when present.
+# Applies to EVERY forwarder unit: the same PartOf bug hit the tailnet unit
+# (2026-10-24) and then the loopback 4096 unit (2026-10-23, dead two days).
 _fwd_pred() {
-  [ -f "$1" ] || return 1
-  ! grep -qE '^(PartOf|Requires|BindsTo)=.*ocserve\.service' "$1" \
-    && grep -q '^Restart=always$' "$1" \
-    && grep -q 'ocserve-tailscale-forward.service' "$2" \
-    && grep -q 'systemctl --user start ocserve-tailscale-forward.service' "$2"
+  unit="$1"
+  [ -f "$unit" ] || return 1
+  name="$(basename "$unit" .service)"
+  ! grep -qE '^(PartOf|Requires|BindsTo)=.*ocserve\.service' "$unit" \
+    && grep -q '^Restart=always$' "$unit" \
+    && grep -q "systemctl --user start \"\$_fwd.service\"" "$2" \
+    && grep -q -- '-f "$UNIT_DIR/\$_fwd.service"' "$2"
 }
-if _fwd_pred deploy/ocserve-tailscale-forward.service scripts/install.sh; then
-  echo "ok (forwarder is independent and install restores it)"
+if _fwd_pred deploy/ocserve-tailscale-forward.service scripts/install.sh \
+   && _fwd_pred deploy/ocserve-web4096.service scripts/install.sh; then
+  echo "ok (every forwarder is independent and install restores it)"
 else
-  echo "FAIL: tailnet forwarder can die on an ocserve restart (rule 55)"; fail=1
+  echo "FAIL: a forwarder can die on an ocserve restart (rule 55)"; fail=1
 fi
+# planted control: re-introduce the PartOf edge on the 4096 unit
+_w4="$(mktemp)"; cp deploy/ocserve-web4096.service "$_w4"
+python3 - "$_w4" <<'PY2'
+import sys
+u = open(sys.argv[1]).read().replace("Wants=ocserve.service", "PartOf=ocserve.service")
+open(sys.argv[1], "w").write(u)
+PY2
+if _fwd_pred "$_w4" scripts/install.sh; then
+  echo "FAIL: rule 55 planted PartOf edge on the 4096 forwarder not detected"; fail=1
+else
+  echo "ok (planted 4096 PartOf edge detected)"
+fi
+rm -f "$_w4"
 _fwd_plant="$(mktemp)"; _fwd_inst="$(mktemp)"
 cp deploy/ocserve-tailscale-forward.service "$_fwd_plant"
 cp scripts/install.sh "$_fwd_inst"
