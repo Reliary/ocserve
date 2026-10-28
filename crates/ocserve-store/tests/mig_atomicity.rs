@@ -16,10 +16,7 @@
 use rusqlite::Connection;
 
 fn fresh_dir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "ocserve-mig-{tag}-{}",
-        std::process::id()
-    ));
+    let d = std::env::temp_dir().join(format!("ocserve-mig-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -63,8 +60,7 @@ fn repeated_heals_converge() {
     for i in 0..25 {
         let c = Connection::open(&db).unwrap();
         c.pragma_update(None, "user_version", 0i64).unwrap();
-        ocserve_store::schema::migrate(&c)
-            .unwrap_or_else(|e| panic!("heal {i} failed: {e:#}"));
+        ocserve_store::schema::migrate(&c).unwrap_or_else(|e| panic!("heal {i} failed: {e:#}"));
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();

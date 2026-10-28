@@ -486,42 +486,44 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
         }
         conn.execute_batch("BEGIN IMMEDIATE;")?;
         let step: Result<()> = (|| {
-        match ver {
-            0 => {
-                // Fresh database: the current DDL IS the migration, so stamp
-                // the final version directly (one step, no loop pass). The
-                // trailing bump below would otherwise re-stamp it.
-                //
-                // SELF-HEAL (2026-10-28): `user_version = 0` with the schema
-                // already present is the exact crash window the old code left
-                // open — DDL committed, version stamp not. Re-running the DDL
-                // then failed with "table session already exists" on EVERY
-                // boot, permanently. Version 0 can only mean "nothing applied
-                // yet", so if the tables are there the DDL was applied and only
-                // the stamp is missing: stamp it. New steps are atomic now, so
-                // this is the last window of its kind.
-                let has_schema: i64 = conn
+            match ver {
+                0 => {
+                    // Fresh database: the current DDL IS the migration, so stamp
+                    // the final version directly (one step, no loop pass). The
+                    // trailing bump below would otherwise re-stamp it.
+                    //
+                    // SELF-HEAL (2026-10-28): `user_version = 0` with the schema
+                    // already present is the exact crash window the old code left
+                    // open — DDL committed, version stamp not. Re-running the DDL
+                    // then failed with "table session already exists" on EVERY
+                    // boot, permanently. Version 0 can only mean "nothing applied
+                    // yet", so if the tables are there the DDL was applied and only
+                    // the stamp is missing: stamp it. New steps are atomic now, so
+                    // this is the last window of its kind.
+                    let has_schema: i64 = conn
                     .query_row(
                         "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='session'",
                         [],
                         |r| r.get(0),
                     )
                     .unwrap_or(0);
-                if has_schema > 0 {
-                    tracing::warn!(
-                        "schema: user_version=0 but the schema exists (interrupted first                          migrate before 2026-10-28) — stamping version {SCHEMA_VERSION}                          instead of re-running DDL"
-                    );
+                    if has_schema > 0 {
+                        tracing::warn!(
+                            "schema: user_version=0 but the schema exists (interrupted \
+                             first migrate before 2026-10-28) — stamping version \
+                             {SCHEMA_VERSION} instead of re-running DDL"
+                        );
+                        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                        return Ok(());
+                    }
+                    conn.execute_batch(DDL)?;
                     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                     return Ok(());
                 }
-                conn.execute_batch(DDL)?;
-                conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                return Ok(());
-            }
-            1 => {
-                // v1→v2: session list fields (PLAN F1 — TUI/oc-remote list shape).
-                conn.execute_batch(
-                    "ALTER TABLE session ADD COLUMN path TEXT NOT NULL DEFAULT '';
+                1 => {
+                    // v1→v2: session list fields (PLAN F1 — TUI/oc-remote list shape).
+                    conn.execute_batch(
+                        "ALTER TABLE session ADD COLUMN path TEXT NOT NULL DEFAULT '';
                  ALTER TABLE session ADD COLUMN agent TEXT;
                  ALTER TABLE session ADD COLUMN model TEXT;
                  ALTER TABLE session ADD COLUMN cost REAL NOT NULL DEFAULT 0;
@@ -533,43 +535,43 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                  ALTER TABLE session ADD COLUMN tokens_reasoning INTEGER NOT NULL DEFAULT 0;
                  ALTER TABLE session ADD COLUMN tokens_cache_read INTEGER NOT NULL DEFAULT 0;
                  ALTER TABLE session ADD COLUMN tokens_cache_write INTEGER NOT NULL DEFAULT 0;",
-                )?;
-                migrate_message_tables(conn)?;
-            }
-            2 => {
-                migrate_message_tables(conn)?;
-            }
-            3 => {
-                // v3→v4: session-scoped part index (M3 latency gate: count(*) on
-                // the 16k-msg session was an 86ms table scan without it).
-                conn.execute_batch(
-                    "CREATE INDEX IF NOT EXISTS idx_part_session ON msg_part(session_id, seq);",
-                )?;
-            }
-            4 => {
-                // v4→v5: cursor-paging window index (session_id, time_created, id)
-                // — tuple-ordered before/limit pages without scanning the session.
-                conn.execute_batch(
+                    )?;
+                    migrate_message_tables(conn)?;
+                }
+                2 => {
+                    migrate_message_tables(conn)?;
+                }
+                3 => {
+                    // v3→v4: session-scoped part index (M3 latency gate: count(*) on
+                    // the 16k-msg session was an 86ms table scan without it).
+                    conn.execute_batch(
+                        "CREATE INDEX IF NOT EXISTS idx_part_session ON msg_part(session_id, seq);",
+                    )?;
+                }
+                4 => {
+                    // v4→v5: cursor-paging window index (session_id, time_created, id)
+                    // — tuple-ordered before/limit pages without scanning the session.
+                    conn.execute_batch(
                     "CREATE INDEX IF NOT EXISTS idx_msg_page ON msg(session_id, time_created, id);",
                 )?;
-            }
-            5 => {
-                // v5→v6: legacy-delta sync state (additive bridge; see sync.rs)
-                conn.execute_batch(
-                    "CREATE TABLE IF NOT EXISTS import_sync (
+                }
+                5 => {
+                    // v5→v6: legacy-delta sync state (additive bridge; see sync.rs)
+                    conn.execute_batch(
+                        "CREATE TABLE IF NOT EXISTS import_sync (
                     session_id TEXT PRIMARY KEY,
                     cursor TEXT,
                     last_sync_ms INTEGER NOT NULL DEFAULT 0
                 ) STRICT;",
-                )?;
-            }
-            6 => {
-                // v6→v7: part content search (W1). Trigram stack + drop the
-                // dead title tables (search_doc/search_fts never populated —
-                // count=0 live; title search runs in-memory contains).
-                // Backfill runs at boot (store::backfill_part_search).
-                conn.execute_batch(
-                    "CREATE TABLE part_search (
+                    )?;
+                }
+                6 => {
+                    // v6→v7: part content search (W1). Trigram stack + drop the
+                    // dead title tables (search_doc/search_fts never populated —
+                    // count=0 live; title search runs in-memory contains).
+                    // Backfill runs at boot (store::backfill_part_search).
+                    conn.execute_batch(
+                        "CREATE TABLE part_search (
                         rowid      INTEGER PRIMARY KEY,
                         part_id    TEXT NOT NULL UNIQUE REFERENCES msg_part(id) ON DELETE CASCADE,
                         session_id TEXT NOT NULL,
@@ -593,13 +595,13 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                     END;
                     DROP TABLE IF EXISTS search_fts;
                     DROP TABLE IF EXISTS search_doc;",
-                )?;
-            }
-            7 => {
-                // v7→v8: compaction projection (M6, COMPACTION.md §4).
-                // Backfill of pre-existing anchors runs at boot
-                // (store::backfill_compaction).
-                conn.execute_batch(
+                    )?;
+                }
+                7 => {
+                    // v7→v8: compaction projection (M6, COMPACTION.md §4).
+                    // Backfill of pre-existing anchors runs at boot
+                    // (store::backfill_compaction).
+                    conn.execute_batch(
                     "CREATE TABLE compaction (
                         session_id     TEXT NOT NULL,
                         part_id        TEXT NOT NULL UNIQUE REFERENCES msg_part(id) ON DELETE CASCADE,
@@ -612,39 +614,39 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                     ) STRICT;
                     CREATE INDEX idx_compaction_session ON compaction(session_id, time_ms);",
                 )?;
-            }
-            8 => {
-                // v8→v9: persisted per-session "always" permission keys
-                // (K-ALWAYS — was in-memory only; lost on restart).
-                conn.execute_batch("ALTER TABLE session ADD COLUMN permission TEXT;")?;
-            }
-            9 => {
-                // v9->v10: time-encoded part_search rowids (PERF-10X S-A).
-                // Rowid reorder cannot happen in place (PK collisions mid-
-                // shuffle) — full rebuild in one transaction: copy with dense
-                // per-ms ranks, swap, rebuild the fts shadow, recreate the
-                // triggers (dropping the table kills them), add the session
-                // index and the rowid/time invariant trigger.
-                let step = |label: &str, sql: &str| -> Result<()> {
-                    let t = std::time::Instant::now();
-                    conn.execute_batch(sql)?;
+                }
+                8 => {
+                    // v8→v9: persisted per-session "always" permission keys
+                    // (K-ALWAYS — was in-memory only; lost on restart).
+                    conn.execute_batch("ALTER TABLE session ADD COLUMN permission TEXT;")?;
+                }
+                9 => {
+                    // v9->v10: time-encoded part_search rowids (PERF-10X S-A).
+                    // Rowid reorder cannot happen in place (PK collisions mid-
+                    // shuffle) — full rebuild in one transaction: copy with dense
+                    // per-ms ranks, swap, rebuild the fts shadow, recreate the
+                    // triggers (dropping the table kills them), add the session
+                    // index and the rowid/time invariant trigger.
+                    let step = |label: &str, sql: &str| -> Result<()> {
+                        let t = std::time::Instant::now();
+                        conn.execute_batch(sql)?;
+                        tracing::info!(
+                            "migrate v9->v10: {label} took {:.1}s",
+                            t.elapsed().as_secs_f32()
+                        );
+                        Ok(())
+                    };
+                    let (rows, bytes): (i64, i64) = conn.query_row(
+                        "SELECT count(*), coalesce(sum(length(text)), 0) FROM part_search",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?;
                     tracing::info!(
-                        "migrate v9->v10: {label} took {:.1}s",
-                        t.elapsed().as_secs_f32()
+                        "migrate v9->v10: time-encoded part_search rowids — {rows} rows, {bytes} bytes text; the trigram fts rebuild is the long step (measured ~5-9 min on a 1.5GB db, one-time; fresh imports skip this path)"
                     );
-                    Ok(())
-                };
-                let (rows, bytes): (i64, i64) = conn.query_row(
-                    "SELECT count(*), coalesce(sum(length(text)), 0) FROM part_search",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )?;
-                tracing::info!(
-                    "migrate v9->v10: time-encoded part_search rowids — {rows} rows, {bytes} bytes text; the trigram fts rebuild is the long step (measured ~5-9 min on a 1.5GB db, one-time; fresh imports skip this path)"
-                );
-                step(
-                    "create+copy",
-                    "CREATE TABLE part_search_v10 (
+                    step(
+                        "create+copy",
+                        "CREATE TABLE part_search_v10 (
                         rowid      INTEGER PRIMARY KEY,
                         part_id    TEXT NOT NULL UNIQUE REFERENCES msg_part(id) ON DELETE CASCADE,
                         session_id TEXT NOT NULL,
@@ -656,22 +658,22 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                          + (ROW_NUMBER() OVER (PARTITION BY m.time_created ORDER BY ps.rowid) - 1),
                            ps.part_id, ps.session_id, ps.message_id, ps.text
                     FROM part_search ps JOIN msg m ON m.id = ps.message_id;",
-                )?;
-                step(
-                    "drop old+swap",
-                    "DROP TABLE part_search_fts;
+                    )?;
+                    step(
+                        "drop old+swap",
+                        "DROP TABLE part_search_fts;
                     DROP TABLE part_search;
                     ALTER TABLE part_search_v10 RENAME TO part_search;
                     CREATE INDEX idx_part_search_session ON part_search(session_id);",
-                )?;
-                step(
-                    "create fts + rebuild (long)",
-                    "CREATE VIRTUAL TABLE part_search_fts USING fts5(
+                    )?;
+                    step(
+                        "create fts + rebuild (long)",
+                        "CREATE VIRTUAL TABLE part_search_fts USING fts5(
                         text, content='part_search', content_rowid='rowid', tokenize='trigram'
                     );
                     INSERT INTO part_search_fts(part_search_fts) VALUES('rebuild');",
-                )?;
-                step(
+                    )?;
+                    step(
                     "triggers",
                     "CREATE TRIGGER part_search_ai AFTER INSERT ON part_search BEGIN
                         INSERT INTO part_search_fts(rowid, text) VALUES (new.rowid, new.text);
@@ -691,63 +693,63 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                         SELECT RAISE(ABORT, 'part_search rowid/time mismatch (encoding overflow or direct rowid write)');
                     END;",
                 )?;
-                tracing::info!("migrate v9->v10: step complete");
-            }
-            10 => {
-                // v10->v11: session revert marker (K-REVERT). The v1 revert
-                // route sets {messageID, partID?, snapshot?, diff?} on the
-                // session info and unrevert clears it; file-level snapshot
-                // restore is the snapshot engine (SNAPSHOT.md). JSON text.
-                // Guard: idempotent when a test rewinds user_version without
-                // dropping the column (the version gate normally prevents
-                // re-runs; the guard keeps rewind-based arms composable).
-                let has: i64 = conn
+                    tracing::info!("migrate v9->v10: step complete");
+                }
+                10 => {
+                    // v10->v11: session revert marker (K-REVERT). The v1 revert
+                    // route sets {messageID, partID?, snapshot?, diff?} on the
+                    // session info and unrevert clears it; file-level snapshot
+                    // restore is the snapshot engine (SNAPSHOT.md). JSON text.
+                    // Guard: idempotent when a test rewinds user_version without
+                    // dropping the column (the version gate normally prevents
+                    // re-runs; the guard keeps rewind-based arms composable).
+                    let has: i64 = conn
                     .query_row(
                         "SELECT count(*) FROM pragma_table_info('session') WHERE name = 'revert'",
                         [],
                         |r| r.get(0),
                     )
                     .unwrap_or(0);
-                if has == 0 {
-                    conn.execute_batch("ALTER TABLE session ADD COLUMN revert TEXT;")?;
+                    if has == 0 {
+                        conn.execute_batch("ALTER TABLE session ADD COLUMN revert TEXT;")?;
+                    }
                 }
-            }
-            11 => {
-                // v11->v12: event retention prune index (perf dive 2026-10-11).
-                // The age DELETE ran as an unindexed full scan of `event`
-                // (EQP: SCAN event) INSIDE the writer transaction every 1024th
-                // durable append; the cap-window DELETE additionally built a
-                // temp b-tree over all rows (ROW_NUMBER window). Measured on
-                // the live DB: event = 166k rows / 317 MB. The (time_created)
-                // index makes the age delete a seek; `idx_event_session`
-                // already exists for the cap window. The migration itself is
-                // a one-time index build (fast on any realistic event table —
-                // it is a narrow integer key).
-                // Guard: synthetic/replayed v1 fixtures may not carry the
-                // event table yet (same composability rule as v10->v11) —
-                // index only when the table exists.
-                let has: i64 = conn
+                11 => {
+                    // v11->v12: event retention prune index (perf dive 2026-10-11).
+                    // The age DELETE ran as an unindexed full scan of `event`
+                    // (EQP: SCAN event) INSIDE the writer transaction every 1024th
+                    // durable append; the cap-window DELETE additionally built a
+                    // temp b-tree over all rows (ROW_NUMBER window). Measured on
+                    // the live DB: event = 166k rows / 317 MB. The (time_created)
+                    // index makes the age delete a seek; `idx_event_session`
+                    // already exists for the cap window. The migration itself is
+                    // a one-time index build (fast on any realistic event table —
+                    // it is a narrow integer key).
+                    // Guard: synthetic/replayed v1 fixtures may not carry the
+                    // event table yet (same composability rule as v10->v11) —
+                    // index only when the table exists.
+                    let has: i64 = conn
                     .query_row(
                         "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='event'",
                         [],
                         |r| r.get(0),
                     )
                     .unwrap_or(0);
-                if has > 0 {
-                    conn.execute_batch(
-                        "CREATE INDEX IF NOT EXISTS idx_event_time ON event(time_created);",
-                    )?;
+                    if has > 0 {
+                        conn.execute_batch(
+                            "CREATE INDEX IF NOT EXISTS idx_event_time ON event(time_created);",
+                        )?;
+                    }
                 }
-            }
-            12 => {
-                // v12->v13: v2 inbox + instruction state (V2-PLAN.md P2).
-                // Additive tables only (see DDL above); the migration is a
-                // pure CREATE — no data movement, no index rebuild, fast on
-                // any DB size. Guard: rewind-based test arms may re-run this
-                // step without dropping the tables (same composability rule
-                // as v10->v11 / v11->v12).
-                conn.execute_batch(
-                    "CREATE TABLE IF NOT EXISTS session_inbox (
+                12 => {
+                    // v12->v13: v2 inbox + instruction state (V2-PLAN.md P2).
+                    // Additive tables only (see DDL above); the migration is a
+                    // pure CREATE — no data movement, no index rebuild, fast on
+                    // any DB size. Guard: rewind-based test arms may re-run this
+                    // step without dropping the tables (same composability rule
+                    // as v10->v11 / v11->v12).
+                    conn.execute_batch(
+                        "CREATE TABLE IF NOT EXISTS session_inbox (
                         id           TEXT PRIMARY KEY,
                         session_id   TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
                         type         TEXT NOT NULL,
@@ -798,13 +800,13 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                     ) STRICT;
                     CREATE INDEX IF NOT EXISTS idx_form_session
                         ON form(session_id, time_created);",
-                )?;
-            }
-            13 => {
-                // v13->v14: credentials + session environment (gap closure).
-                // Pure CREATE, no data movement (same fast-path rule as v12).
-                conn.execute_batch(
-                    "CREATE TABLE IF NOT EXISTS credential (
+                    )?;
+                }
+                13 => {
+                    // v13->v14: credentials + session environment (gap closure).
+                    // Pure CREATE, no data movement (same fast-path rule as v12).
+                    conn.execute_batch(
+                        "CREATE TABLE IF NOT EXISTS credential (
                         id             TEXT PRIMARY KEY,
                         integration_id TEXT,
                         label          TEXT NOT NULL,
@@ -820,40 +822,40 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                         variables    TEXT NOT NULL DEFAULT '{}',
                         time_updated INTEGER NOT NULL
                     ) STRICT;",
-                )?;
-            }
-            14 => {
-                // v14→v15 (security review F3): the `permission` column was
-                // OVERLOADED — `session_grant_always` stores its always-keys
-                // there as a `["perm\tpat"]` string array, while the `task`
-                // tool stored a derived ruleset there as `[{permission,...}]`
-                // objects. Each writer read the other's shape as "empty" and
-                // OVERWROTE it, so a subagent's "always" reply wiped its
-                // derived deny rules (privilege regression). Split: the
-                // `permission` column stays the always-grants; a new
-                // `subagent_rules` column holds the derived child ruleset.
-                // SQLite has no `ADD COLUMN IF NOT EXISTS`, and a fresh v15 DB
-                // already carries the column — guard on the column set so the
-                // arm is idempotent (migration-order tests rewind user_version).
-                let has_col: bool = conn
-                    .prepare("PRAGMA table_info(session)")?
-                    .query_map([], |r| r.get::<_, String>(1))?
-                    .filter_map(|r| r.ok())
-                    .any(|name| name == "subagent_rules");
-                if !has_col {
-                    conn.execute_batch("ALTER TABLE session ADD COLUMN subagent_rules TEXT;")?;
+                    )?;
+                }
+                14 => {
+                    // v14→v15 (security review F3): the `permission` column was
+                    // OVERLOADED — `session_grant_always` stores its always-keys
+                    // there as a `["perm\tpat"]` string array, while the `task`
+                    // tool stored a derived ruleset there as `[{permission,...}]`
+                    // objects. Each writer read the other's shape as "empty" and
+                    // OVERWROTE it, so a subagent's "always" reply wiped its
+                    // derived deny rules (privilege regression). Split: the
+                    // `permission` column stays the always-grants; a new
+                    // `subagent_rules` column holds the derived child ruleset.
+                    // SQLite has no `ADD COLUMN IF NOT EXISTS`, and a fresh v15 DB
+                    // already carries the column — guard on the column set so the
+                    // arm is idempotent (migration-order tests rewind user_version).
+                    let has_col: bool = conn
+                        .prepare("PRAGMA table_info(session)")?
+                        .query_map([], |r| r.get::<_, String>(1))?
+                        .filter_map(|r| r.ok())
+                        .any(|name| name == "subagent_rules");
+                    if !has_col {
+                        conn.execute_batch("ALTER TABLE session ADD COLUMN subagent_rules TEXT;")?;
+                    }
+                }
+                other => {
+                    bail!(
+                        "database schema version {other} out of step for {SCHEMA_VERSION}; \
+                 refuse to touch it (upgrade path runs through migrations)"
+                    );
                 }
             }
-            other => {
-                bail!(
-                    "database schema version {other} out of step for {SCHEMA_VERSION}; \
-                 refuse to touch it (upgrade path runs through migrations)"
-                );
-            }
-        }
-        let now: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        conn.pragma_update(None, "user_version", now + 1)?;
-        Ok(())
+            let now: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            conn.pragma_update(None, "user_version", now + 1)?;
+            Ok(())
         })();
         match step {
             Ok(()) => conn.execute_batch("COMMIT;")?,

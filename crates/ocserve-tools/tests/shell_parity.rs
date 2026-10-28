@@ -82,8 +82,15 @@ fn config_shell_wins_and_reaches_both_sides() {
     let before = ocserve_store::platform::tool_shell().name;
     ocserve_store::platform::set_config_shell(Some("bash".into()));
     let after = ocserve_store::platform::tool_shell().name;
-    assert_eq!(after, "bash", "config.shell must be honoured (was {before})");
-    assert_eq!(reported_shell(), "bash", "execution must follow config.shell");
+    assert_eq!(
+        after, "bash",
+        "config.shell must be honoured (was {before})"
+    );
+    assert_eq!(
+        reported_shell(),
+        "bash",
+        "execution must follow config.shell"
+    );
 
     ocserve_store::platform::set_config_shell(Some("  ".into()));
     assert_eq!(
@@ -100,7 +107,10 @@ fn denied_shells_are_skipped_not_run() {
     // shell must not be executed; it falls through to the next candidate.
     ocserve_store::platform::set_config_shell(Some("fish".into()));
     let picked = ocserve_store::platform::tool_shell().name;
-    assert_ne!(picked, "fish", "fish must never be selected for the bash tool");
+    assert_ne!(
+        picked, "fish",
+        "fish must never be selected for the bash tool"
+    );
     ocserve_store::platform::set_config_shell(None);
 }
 
