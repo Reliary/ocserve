@@ -563,6 +563,19 @@ impl Runtime {
     /// 470→665→749MB then the cap killed dispose) — the reloader moves the
     /// fields instead of duplicating the whole payload set every call.
     pub fn into_payloads(self) -> ocserve_http::Payloads {
+        // Publish `config.shell` for the bash tool. This is the single choke
+        // point every payload build passes through (boot, file reload, plugin
+        // `config` hook derive), so a hot-edited shell is visible to the very
+        // next command — upstream reads it at spawn time and does not cache.
+        // Without this the tool rendered the description for `$SHELL` and then
+        // executed `/bin/sh`, so a command the model was told would work could
+        // not find `cargo` (measured 2026-10-27).
+        ocserve_store::platform::set_config_shell(
+            self.config
+                .get("shell")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        );
         let compaction = self
             .config
             .pointer("/compaction")

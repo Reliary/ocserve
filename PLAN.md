@@ -550,8 +550,7 @@ current anywhere.
 | `D-TITLE-1` | ocserve derives a session title from the first user message; the frozen v1 server never generates one. | accepted |
 | `D-TOKENS-FORK` | A forked session copies the messages but starts its usage row at zero; upstream nets the cloned step usage. | accepted |
 | `D-TOKENS-PARTDELETE` | Deleting or patching a part does not subtract from the session usage row; upstream applies `-1` on PartRemoved. | accepted |
-| `D-TOOLS-SHELL-WINDOWS` | The shell tool has no PowerShell or `cmd` profiles; the POSIX shell path is used. | open |
-| `D-TOOLS-TRUNC-FILE` | Large tool output is truncated in place; upstream also spills the full output to a file and tells the model the path. | open |
+| `D-TOOLS-SHELL-PROFILE` | The bash tool now resolves the SAME shell for its description and its spawn (`config.shell` > `$SHELL` > platform fallback, fish/nu denied), but it does not replicate upstream's per-shell login/rc argument forms: upstream's shell TOOL spawns `ChildProcess.make(command, [], {shell})` (a plain `<shell> -c`), while its `!` command path uses `Shell.args()` with `-l` plus an rc-sourcing wrapper. We implement the former for both. Consequence: a zsh user gets `zsh -c`, so `~/.zshenv` is read (as measured on this host: `cargo` resolves) but `~/.zshrc` is not. Named rather than silently assumed. | accepted |
 | `D-V2-AISDK` | The v2 AI-SDK adapter is Effect-specific; ocserve has its own provider client. | accepted |
 | `D-V2-DOMAIN` | A v2 plugin hook on an unbridged `ctx` domain throws a named `notBridged` error instead of silently doing nothing. | accepted |
 | `D-V2-PERM-EVAL` | `permission.evaluate` is not bridged as a v2 hook; the server's own gate is authoritative. | accepted |

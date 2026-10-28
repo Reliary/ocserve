@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result, bail};
 pub mod shell_prompt;
+pub mod truncate;
 
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -120,18 +121,12 @@ pub fn evaluate(permission: &str, resource: &str, rules: &[Rule]) -> String {
         .unwrap_or_else(|| "ask".to_string())
 }
 
-/// Truncation (v1 shell: MAX_LINES/MAX_BYTES constants).
+/// Truncation limits (freeze parity, `tool/truncate.ts` at v1.18.31).
 ///
-/// Freeze parity: `packages/opencode/src/tool/truncate.ts` at v1.18.31 uses
-/// 2000 lines / 50 KiB as DEFAULTS, overridable by `tool_output.{max_lines,
-/// max_bytes}`. The frozen shell tool ALSO streams into a file once the raw
-/// output passes `limits.maxBytes`, and prepends `...output truncated...
-/// Full output saved to: <file>` — so the model keeps access to the rest.
-/// ocserve does not have that file sink yet (D-TOOLS-TRUNC-FILE), but the
-/// capture ceiling is raised to 1 MiB so a legitimate large listing is not
-/// silently cut at 50 KiB before the model ever sees it.
-pub const MAX_LINES: usize = 2000;
-pub const MAX_BYTES: usize = 1024 * 1024;
+/// Re-exported from `truncate` so the description text and the enforcement
+/// read the same numbers: the description previously advertised 1 MiB while
+/// capdiff compared it against freeze's 50 KiB and could never pass.
+pub use truncate::{MAX_BYTES, MAX_LINES};
 
 pub struct ToolResult {
     pub output: String,
@@ -142,6 +137,11 @@ pub struct ToolResult {
     /// Custom part-state metadata (todowrite → {todos}); None → bash-style
     /// {output, exit, truncated} template in the runner.
     pub metadata: Option<serde_json::Value>,
+    /// Where the full output was spilled when it was truncated (upstream
+    /// `metadata.outputPath`). `None` when nothing was cut, or when the data
+    /// dir was not writable — in which case the model is told the output was
+    /// cut but not given a path it could not read.
+    pub output_path: Option<String>,
 }
 
 /// todowrite: validate the list (persistence happens in the runner, which
@@ -177,6 +177,7 @@ fn todowrite(input: &Value) -> Result<ToolResult> {
         title: "todowrite".into(),
         error: false,
         metadata: Some(json!({"todos": normalized})),
+        output_path: None,
     })
 }
 
@@ -246,22 +247,14 @@ pub fn schemas() -> Vec<Value> {
 /// Host shell basename (upstream `Shell.name`) + model temp dir
 /// (upstream `Global.Path.tmp`, which is `<tmp>/opencode`).
 fn host_shell_and_tmp() -> (String, String) {
-    // The description names the shell the model must write for. On Windows that
-    // is cmd, not sh — telling the model "sh" there produces commands that do
-    // not parse (PLATFORM.md §3.3).
-    let shell = std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| {
-            std::path::Path::new(&s)
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| match ocserve_store::platform::shell() {
-            (ocserve_store::platform::ShellKind::Posix, _) => "sh".to_string(),
-            (ocserve_store::platform::ShellKind::Cmd, _) => "cmd".to_string(),
-            (ocserve_store::platform::ShellKind::Pwsh, _) => "pwsh".to_string(),
-        });
+    // The description names the shell the model must write for. BOTH the text
+    // and the spawn come from `platform::tool_shell()`, which honours
+    // `config.shell` > `$SHELL` > the platform fallback and skips the shells
+    // upstream denies (fish, nu). Reading `$SHELL` here directly (the previous
+    // form) is how the description came to promise `zsh` while execution used
+    // a hardcoded `/bin/sh` — rc-file PATH additions were then invisible to
+    // the tool (measured 2026-10-27: `sh -c 'command -v cargo'` found nothing).
+    let shell = ocserve_store::platform::tool_shell().name;
     let tmp = std::env::temp_dir()
         .join("opencode")
         .to_string_lossy()
@@ -404,33 +397,6 @@ pub fn drain_until<R: std::io::Read + Send + 'static>(
     out
 }
 
-fn truncate(mut output: String) -> (String, bool) {
-    let mut truncated = false;
-    if output.len() > MAX_BYTES {
-        // `String::truncate` PANICS when the index is not a UTF-8 char
-        // boundary (the old "repair loop" after it was dead code — the panic
-        // fires inside truncate). Find the floor char boundary <= MAX_BYTES
-        // first, then truncate. release = panic=abort, so this was an outage.
-        let mut cut = MAX_BYTES;
-        while cut > 0 && !output.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        output.truncate(cut);
-        truncated = true;
-    }
-    let lines = output.split('\n').count();
-    if lines > MAX_LINES {
-        let keep: String = output
-            .split('\n')
-            .take(MAX_LINES)
-            .collect::<Vec<_>>()
-            .join("\n");
-        output = keep;
-        truncated = true;
-    }
-    (output, truncated)
-}
-
 /// Execute a tool by v1 name. `cwd` scopes relative paths. `env` carries
 /// session environment variables (PUT /api/session/{id}/environment) into
 /// subprocess-bearing tools (bash); other tools ignore it. Session vars
@@ -529,18 +495,18 @@ fn bash(input: &Value, cwd: &Path, env: &[(String, String)]) -> Result<ToolResul
     // ratcheted unbounded bytes into RSS — the OOM chain).
     let so = child.stdout.take();
     let se = child.stderr.take();
-    // +1 past MAX_BYTES so the post-concat head-truncate still fires and
-    // sets `truncated` exactly like full-capture did
-    // +1 past MAX_BYTES so the post-concat head-truncate still fires and
-    // sets `truncated` exactly like full-capture did.
+    // Bound the capture at 2x the byte budget (upstream's `keep =
+    // limits.maxBytes * 2`) so a TAIL window has enough material to fill the
+    // preview with the newest lines, while still capping memory. The +1 makes
+    // the over-budget condition observable.
     let gate = DrainGate::new();
     let h_out = {
         let g = gate.clone();
-        std::thread::spawn(move || drain_until(so, MAX_BYTES + 1, &g))
+        std::thread::spawn(move || drain_until(so, MAX_BYTES * 2 + 1, &g))
     };
     let h_err = {
         let g = gate.clone();
-        std::thread::spawn(move || drain_until(se, MAX_BYTES + 1, &g))
+        std::thread::spawn(move || drain_until(se, MAX_BYTES * 2 + 1, &g))
     };
     // bounded wait (AGENTS §2.3): poll to deadline, kill on overrun
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
@@ -599,7 +565,12 @@ fn bash(input: &Value, cwd: &Path, env: &[(String, String)]) -> Result<ToolResul
         }
         stdout.push_str(&stderr);
     }
-    let (output, truncated) = truncate(stdout);
+    let t = truncate::truncate(&stdout, truncate::Direction::Tail);
+    let (output, truncated, output_path) = (
+        t.text,
+        t.truncated,
+        t.output_path.map(|p| p.display().to_string()),
+    );
     let code = match exit_status {
         Some(st) => st.code().unwrap_or(-1),
         None => 124, // killed on timeout
@@ -611,6 +582,7 @@ fn bash(input: &Value, cwd: &Path, env: &[(String, String)]) -> Result<ToolResul
         title: shell_title(command),
         error: timed_out || code != 0,
         metadata: None,
+        output_path,
     })
 }
 
@@ -639,7 +611,12 @@ fn read(input: &Value, cwd: &Path) -> Result<ToolResult> {
         };
         &lines[offset..end].join("\n")
     };
-    let (output, truncated) = truncate(slice.to_string());
+    let t = truncate::truncate(slice, truncate::Direction::Head);
+    let (output, truncated, output_path) = (
+        t.text,
+        t.truncated,
+        t.output_path.map(|p| p.display().to_string()),
+    );
     Ok(ToolResult {
         output,
         truncated,
@@ -647,6 +624,7 @@ fn read(input: &Value, cwd: &Path) -> Result<ToolResult> {
         title: fp.to_string(),
         error: false,
         metadata: None,
+        output_path,
     })
 }
 
@@ -665,6 +643,7 @@ fn write(input: &Value, cwd: &Path) -> Result<ToolResult> {
         title: fp.to_string(),
         error: false,
         metadata: None,
+        output_path: None,
     })
 }
 
@@ -707,6 +686,7 @@ fn edit(input: &Value, cwd: &Path) -> Result<ToolResult> {
         title: fp.to_string(),
         error: false,
         metadata: None,
+        output_path: None,
     })
 }
 
@@ -720,7 +700,12 @@ fn glob(input: &Value, cwd: &Path) -> Result<ToolResult> {
     walk(&base, &base, pattern, &mut matches, 0)?;
     matches.sort();
     let joined = matches.join("\n");
-    let (output, truncated) = truncate(joined);
+    let t = truncate::truncate(&joined, truncate::Direction::Head);
+    let (output, truncated, output_path) = (
+        t.text,
+        t.truncated,
+        t.output_path.map(|p| p.display().to_string()),
+    );
     Ok(ToolResult {
         output,
         truncated,
@@ -728,6 +713,7 @@ fn glob(input: &Value, cwd: &Path) -> Result<ToolResult> {
         title: pattern.to_string(),
         error: false,
         metadata: None,
+        output_path,
     })
 }
 
@@ -769,7 +755,12 @@ fn grep(input: &Value, cwd: &Path) -> Result<ToolResult> {
     let mut hits: Vec<String> = Vec::new();
     grep_walk(&base, &base, &re, include.as_deref(), &mut hits, 0)?;
     hits.sort();
-    let (output, truncated) = truncate(hits.join("\n"));
+    let t = truncate::truncate(&hits.join("\n"), truncate::Direction::Head);
+    let (output, truncated, output_path) = (
+        t.text,
+        t.truncated,
+        t.output_path.map(|p| p.display().to_string()),
+    );
     Ok(ToolResult {
         output,
         truncated,
@@ -777,6 +768,7 @@ fn grep(input: &Value, cwd: &Path) -> Result<ToolResult> {
         title: pattern.to_string(),
         error: false,
         metadata: None,
+        output_path,
     })
 }
 
@@ -810,7 +802,12 @@ fn webfetch(input: &Value) -> Result<ToolResult> {
         "text" | "markdown" => html_to_text(&body),
         _ => html_to_text(&body),
     };
-    let (output, truncated) = truncate(out);
+    let t = truncate::truncate(&out, truncate::Direction::Head);
+    let (output, truncated, output_path) = (
+        t.text,
+        t.truncated,
+        t.output_path.map(|p| p.display().to_string()),
+    );
     Ok(ToolResult {
         output,
         truncated,
@@ -818,6 +815,7 @@ fn webfetch(input: &Value) -> Result<ToolResult> {
         title: url,
         error: false,
         metadata: None,
+        output_path,
     })
 }
 
@@ -1246,31 +1244,42 @@ mod tests {
 
     #[test]
     fn truncation_bounds() {
+        let d = tempfile::tempdir().unwrap();
         let big = "x".repeat(MAX_BYTES + 100);
-        let (out, t) = truncate(big);
-        assert!(t);
-        assert!(out.len() <= MAX_BYTES);
+        let t =
+            crate::truncate::truncate_in(&big, Some(d.path()), crate::truncate::Direction::Head);
+        assert!(t.truncated);
+        assert!(t.text.len() <= MAX_BYTES + 512);
         let many = "\n".repeat(MAX_LINES + 50);
-        let (out2, t2) = truncate(many);
-        assert!(t2);
-        assert!(out2.split('\n').count() <= MAX_LINES + 1);
+        let t2 =
+            crate::truncate::truncate_in(&many, Some(d.path()), crate::truncate::Direction::Head);
+        assert!(t2.truncated);
+        // The preview holds at most MAX_LINES body lines; the truncation banner
+        // and the spill hint are appended after it (a few more lines).
+        let body = t2.text.split("\n\n...").next().unwrap_or("");
+        assert!(
+            body.lines().count() <= MAX_LINES,
+            "body {} lines",
+            body.lines().count()
+        );
     }
 
-    /// 2026-10-11 bug hunt: the old `truncate` called `String::truncate(MAX_BYTES)`
-    /// directly, which PANICS when MAX_BYTES is not a UTF-8 char boundary (the
-    /// "repair loop" after it was dead code). A file of ASCII + a multibyte char
-    /// straddling the cutoff aborted the process (panic=abort). Must now floor to
-    /// a boundary and never panic.
+    /// The multibyte-boundary panic (2026-10-11) must stay fixed through the
+    /// tail window: a byte cut that lands mid-character would abort the process
+    /// in a release build (panic=abort).
     #[test]
     fn truncate_never_panics_on_multibyte_boundary() {
-        // MAX_BYTES ASCII bytes then a 3-byte char whose boundary straddles the cap
+        let d = tempfile::tempdir().unwrap();
         let mut s = "a".repeat(MAX_BYTES - 1);
-        s.push('€'); // 3 bytes: bytes MAX_BYTES-1, MAX_BYTES, MAX_BYTES+1
+        s.push('€'); // 3 bytes straddling the budget boundary
         s.push_str(&"b".repeat(100));
-        let (out, t) = truncate(s);
-        assert!(t);
-        assert!(out.len() <= MAX_BYTES);
-        assert!(out.is_char_boundary(out.len()));
+        let t = crate::truncate::truncate_in(&s, Some(d.path()), crate::truncate::Direction::Tail);
+        assert!(t.truncated);
+        assert!(
+            t.text
+                .is_char_boundary(t.text.len() - t.text.trim_end().len())
+        );
+        assert!(!t.text.contains('\u{FFFD}'), "no replacement chars");
     }
 
     #[test]
@@ -1429,7 +1438,18 @@ mod drain_tests {
             &r.output[..80.min(r.output.len())]
         );
         assert!(r.truncated, "output capped");
-        assert!(r.output.len() <= MAX_BYTES, "bounded: {}", r.output.len());
+        // The preview is bounded by the byte budget; the spill hint and the
+        // "output truncated" banner add a fixed, small amount on top.
+        assert!(
+            r.output.len() <= MAX_BYTES + 512,
+            "preview bounded: {}",
+            r.output.len()
+        );
+        assert!(
+            r.output.contains("Full output saved to:"),
+            "the full output must be recoverable: {:?}",
+            &r.output[..120.min(r.output.len())]
+        );
     }
 
     /// small outputs unaffected (byte-parity path)

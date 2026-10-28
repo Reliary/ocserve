@@ -147,61 +147,210 @@ impl ShellKind {
     }
 }
 
-/// The shell to use for command strings, and the program to launch.
+/// A resolved shell: the family (how to pass a command string), the program
+/// to launch, and the name the model is told about.
+///
+/// One resolver for BOTH the description text and the spawn, because they
+/// drifted apart and the drift was invisible: `host_shell_and_tmp()` rendered
+/// the description from `$SHELL` (→ `Shell: zsh`) while execution used a
+/// hardcoded `/bin/sh -c`. On a stock box `sh` does not read `~/.zshenv`, so a
+/// command the description promised would work could not find `cargo` at all
+/// (measured 2026-10-27: `sh -c 'command -v cargo'` → not found, `zsh -c` →
+/// `/home/<user>/.cargo/bin/cargo`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedShell {
+    pub kind: ShellKind,
+    /// Program to execute (may be an absolute path or a bare name).
+    pub program: String,
+    /// Basename the model is told about, e.g. `zsh`.
+    pub name: String,
+}
+
+/// Upstream's deny table (`packages/core/src/shell.ts` META): shells that
+/// exist but cannot run a command string safely or at all.
+///
+/// `fish` and `nu` are denied; note that upstream still *lists fish* in the
+/// PTY shell picker, so this table is about the **bash tool**, not the terminal.
+fn denied(name: &str) -> bool {
+    matches!(name, "fish" | "nu")
+}
+
+/// Basename of a path, lowercased like upstream's `Shell.name` on POSIX.
+fn base_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_lowercase())
+        .unwrap_or_else(|| path.to_lowercase())
+}
+
+/// Is this program an existing, executable file (absolute) or on PATH (bare)?
+fn resolvable(program: &str) -> bool {
+    let p = std::path::Path::new(program);
+    if p.is_absolute() {
+        is_executable_file(p)
+    } else if cfg!(unix) {
+        which_on_path(program).is_some()
+    } else {
+        which_on_path(&exe(program)).is_some()
+    }
+}
+
+/// Upstream's `fallback()`: the shell used when nothing else is configured or
+/// resolvable. Darwin → `/bin/zsh`; otherwise the `bash` on PATH; else
+/// `/bin/sh`. This is why a bare Linux box should NOT end up on `sh` when a
+/// real `bash` exists.
+fn fallback_program() -> String {
+    if cfg!(target_os = "macos") {
+        return "/bin/zsh".to_string();
+    }
+    if cfg!(unix) && which_on_path("bash").is_some() {
+        return "bash".to_string();
+    }
+    if cfg!(unix) && std::path::Path::new("/bin/sh").exists() {
+        return "/bin/sh".to_string();
+    }
+    // Windows: COMSPEC, else cmd.exe.
+    std::env::var("COMSPEC")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "cmd.exe".to_string())
+}
+
+/// Family for a named shell, from the name alone.
+fn kind_of(name: &str) -> ShellKind {
+    match name {
+        "cmd" | "cmd.exe" => ShellKind::Cmd,
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => ShellKind::Pwsh,
+        _ => ShellKind::Posix,
+    }
+}
+
+/// Upstream `Shell.select(file, {acceptable})`, without the process-cached
+/// results (a server that hot-reloads config must not cache the first answer).
+///
+/// Precedence, mirroring `Shell.acceptable(cfg.shell)`:
+///   1. an explicit `config.shell`, if it resolves and is not denied;
+///   2. `$SHELL`, same rules;
+///   3. the platform fallback.
+///
+/// An explicit shell that does not resolve is NOT an error here: upstream
+/// falls through to the next candidate. That is a real divergence from "fail
+/// fast", and it is deliberate — a bad `shell` value must not make the tool
+/// unusable.
+pub fn resolve_shell(config_shell: Option<&str>) -> ResolvedShell {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(c) = config_shell.map(str::trim).filter(|c| !c.is_empty()) {
+        candidates.push(c.to_string());
+    }
+    if let Ok(s) = std::env::var("SHELL")
+        && !s.trim().is_empty()
+    {
+        candidates.push(s.trim().to_string());
+    }
+    for cand in candidates {
+        let name = base_name(&cand);
+        if denied(&name) {
+            continue;
+        }
+        // `select` resolves the program; a program that is not executable is
+        // skipped rather than spawned and failed.
+        if resolvable(&cand) {
+            return ResolvedShell {
+                kind: kind_of(&name),
+                program: cand,
+                name,
+            };
+        }
+    }
+    let program = fallback_program();
+    let name = base_name(&program);
+    let kind = kind_of(&name);
+    ResolvedShell {
+        kind,
+        program,
+        name,
+    }
+}
+
+/// The shell used by the bash tool and the `!` command path.
 ///
 /// `OCSERVE_SHELL_KIND` (`posix`|`cmd`|`pwsh`) forces the family — the same knob
-/// shape as `OCSERVE_PLUGIN_RUNTIME`. `OCSERVE_SHELL` forces the program (used by
-/// the Windows tests to point at git-bash).
-pub fn shell() -> (ShellKind, String) {
-    let forced_kind = std::env::var("OCSERVE_SHELL_KIND").ok();
-    let forced_prog = std::env::var("OCSERVE_SHELL")
+/// shape as `OCSERVE_PLUGIN_RUNTIME`. `OCSERVE_SHELL` forces the program, and
+/// takes precedence over everything including `config.shell` (it exists so a
+/// harness can pin the shell on any host, including the Windows tests that
+/// point at git-bash).
+pub fn shell_with(config_shell: Option<&str>) -> ResolvedShell {
+    if let Some(prog) = std::env::var("OCSERVE_SHELL")
         .ok()
-        .filter(|v| !v.is_empty());
-
-    let kind = match forced_kind.as_deref() {
-        Some("posix") => ShellKind::Posix,
-        Some("cmd") => ShellKind::Cmd,
-        Some("pwsh") => ShellKind::Pwsh,
-        _ => default_kind(),
-    };
-
-    if let Some(p) = forced_prog {
-        return (kind, p);
+        .filter(|v| !v.is_empty())
+    {
+        let name = base_name(&prog);
+        let kind = match std::env::var("OCSERVE_SHELL_KIND").ok().as_deref() {
+            Some("cmd") => ShellKind::Cmd,
+            Some("pwsh") => ShellKind::Pwsh,
+            Some("posix") => ShellKind::Posix,
+            _ => kind_of(&name),
+        };
+        return ResolvedShell {
+            kind,
+            program: prog,
+            name,
+        };
     }
+    let mut r = resolve_shell(config_shell);
+    if let Some(k) = std::env::var("OCSERVE_SHELL_KIND").ok().as_deref() {
+        r.kind = match k {
+            "cmd" => ShellKind::Cmd,
+            "pwsh" => ShellKind::Pwsh,
+            "posix" => ShellKind::Posix,
+            _ => r.kind,
+        };
+    }
+    r
+}
 
-    let prog = match kind {
-        ShellKind::Posix => {
-            // /bin/sh always exists on Unix. On Windows a POSIX shell only
-            // exists if the user installed one (git-bash); callers that need it
-            // get a spawn error naming the program, never a silent fallback.
-            if cfg!(unix) {
-                "/bin/sh".to_string()
-            } else {
-                exe("sh")
-            }
-        }
-        ShellKind::Cmd => std::env::var("COMSPEC")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "cmd.exe".to_string()),
-        ShellKind::Pwsh => {
-            // Stock Windows ships powershell.exe (5.1); pwsh.exe is the optional
-            // PowerShell 7 install. Prefer 7 when present, fall back to 5.1 —
-            // selecting the pwsh family must not fail on a default machine.
-            if cfg!(windows) {
-                if is_executable_file(std::path::Path::new("pwsh.exe"))
-                    || which_on_path("pwsh.exe").is_some()
-                {
-                    "pwsh.exe".to_string()
-                } else {
-                    "powershell.exe".to_string()
-                }
-            } else {
-                "pwsh".to_string()
-            }
-        }
+/// The `shell` value from the user's opencode config, published once at boot
+/// and again on every reload.
+///
+/// This is a process-global for the same reason `cgroup::publish` is: the tool
+/// executor takes `(name, input, cwd, env)` and threading a config handle
+/// through it would touch every call site for one string. Upstream reads
+/// `config.shell` at spawn time, so a hot reload must be visible to the next
+/// command — hence a write, not a `OnceLock`.
+static CONFIG_SHELL: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Publish the configured shell (empty/whitespace clears it back to `$SHELL`).
+pub fn set_config_shell(value: Option<String>) {
+    let normalized = value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let mut w = match CONFIG_SHELL.write() {
+        Ok(w) => w,
+        Err(poisoned) => poisoned.into_inner(),
     };
-    (kind, prog)
+    *w = normalized;
+}
+
+/// The currently published configured shell, if any.
+pub fn config_shell() -> Option<String> {
+    match CONFIG_SHELL.read() {
+        Ok(r) => r.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// The shell the bash tool will ACTUALLY use, honouring `config.shell`.
+///
+/// Both the description text and the spawn go through this, so the model is
+/// never told about a shell it will not get.
+pub fn tool_shell() -> ResolvedShell {
+    shell_with(config_shell().as_deref())
+}
+
+/// Backwards-compatible tuple form used by the existing call sites.
+pub fn shell() -> (ShellKind, String) {
+    let r = tool_shell();
+    (r.kind, r.program)
 }
 
 /// Resolve a bare program name on PATH (suffix already applied by `exe`).
@@ -216,6 +365,7 @@ fn which_on_path(prog: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+#[cfg(test)]
 fn default_kind() -> ShellKind {
     #[cfg(windows)]
     {

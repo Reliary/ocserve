@@ -505,17 +505,14 @@ async fn plugin_tool_exec(
         );
     }
     ocserve_metrics::labeled_counter("ocserve_plugin_tool_total", "result=\"ok\"", 1);
-    let output = res["output"].as_str().unwrap_or("").to_string();
-    let truncated = output.len() > ocserve_tools::MAX_BYTES;
-    let output = if truncated {
-        let mut cut = ocserve_tools::MAX_BYTES;
-        while cut > 0 && !output.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        format!("{}…", &output[..cut])
-    } else {
-        output
-    };
+    // Same truncation contract as a builtin tool: the plugin's output is
+    // bounded at the same 50 KiB, cut at a line boundary, and the full text is
+    // spilled so the model can still read it. A plugin returning megabytes
+    // must not be a special case with its own ad-hoc byte cut.
+    let raw_output = res["output"].as_str().unwrap_or("");
+    let t = ocserve_tools::truncate::truncate(raw_output, ocserve_tools::truncate::Direction::Head);
+    let (output, truncated) = (t.text, t.truncated);
+    let output_path = t.output_path.map(|p| p.display().to_string());
     // A plugin may return any JSON here. `IndexMut` on a non-object PANICS in
     // serde_json, and release builds abort (review H-1: one tool returning
     // `metadata: []` killed every live session). Only an object may enter the
@@ -532,6 +529,7 @@ async fn plugin_tool_exec(
         title: res["title"].as_str().unwrap_or(name).to_string(),
         error: false,
         metadata,
+        output_path,
     })
 }
 
@@ -1245,6 +1243,7 @@ fn skill_exec(
         title: format!("Loaded skill: {name}"),
         error: false,
         metadata: None,
+        output_path: None,
     })
 }
 
@@ -1379,6 +1378,7 @@ fn task_exec<'a>(
                 "parentSessionId": session_id,
                 "sessionId": child_id,
             })),
+            output_path: None,
         })
     })
 }
@@ -3104,6 +3104,7 @@ pub async fn run_prompt_with(
                                     title: call.name.clone(),
                                     error: false,
                                     metadata: None,
+                                    output_path: None,
                                 }),
                                 Some(Err(e)) => Err(e),
                                 None => {
@@ -3139,13 +3140,21 @@ pub async fn run_prompt_with(
                             Ok(r) => {
                                 // todowrite supplies {todos} metadata; everything
                                 // else keeps the bash-style template
-                                let meta = r.metadata.unwrap_or_else(|| {
+                                let mut meta = r.metadata.unwrap_or_else(|| {
                                     json!({
                                         "output": "",
                                         "exit": r.exit,
                                         "truncated": r.truncated,
                                     })
                                 });
+                                // upstream `metadata.outputPath` (shell.ts): only
+                                // present when the output was actually spilled, so
+                                // its ABSENCE is meaningful to clients.
+                                if let (Some(p), Some(o)) =
+                                    (r.output_path.as_deref(), meta.as_object_mut())
+                                {
+                                    o.insert("outputPath".into(), json!(p));
+                                }
                                 (r.output, meta, r.title, r.error)
                             }
                             Err(e) => (format!("Error: {e:#}"), json!({}), call.name.clone(), true),

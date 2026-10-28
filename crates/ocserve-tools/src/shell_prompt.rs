@@ -5,8 +5,9 @@
 //! template so the description is correct on the running host (K-CAPDIFF:
 //! capdiff compares description bytes too; a stale/host-baked string is red).
 //!
-//! The unix/bash profile is implemented (ocserve ships on unix); the
-//! powershell/cmd profiles are a named gap (D-TOOLS-SHELL-WINDOWS).
+//! The unix/bash profile is implemented; the powershell/cmd profiles are a
+//! named gap (D-TOOLS-SHELL-PROFILE), as is upstream's per-shell `-l` + rc
+//! form for the `!` command path.
 
 const SHELL_TEMPLATE: &str = include_str!("../assets/tool/shell.txt");
 const COMMAND_SECTION: &str = include_str!("../assets/tool/bash-command-section.txt");
