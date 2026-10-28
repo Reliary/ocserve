@@ -11,6 +11,44 @@ First full-scope `cargo-mutants` baseline (TESTING §1 rule 1, K-MUTANTS).
   146 unviable → **43.5 % mutation score** (939 / 2160 scored).
 - **Gate:** `scripts/check-mutants.py` ceiling = 1221 missed (ratchet down only).
 
+## Correction (2026-10-28): the scope was wrong
+
+The baseline above was produced WITHOUT `--test-workspace true`, so
+cargo-mutants ran only each **mutated package's** tests. `ocserve-store`
+functions are largely covered by `ocserve-http`'s integration tests (the fork
+and revert routes), so the package default reports them as survivors.
+
+Measured directly on 2026-10-28, same host, same tool:
+
+| Module | package scope | workspace scope |
+|---|---|---|
+| `ocserve-store/src/fork.rs` | 0 % (0 caught / 26 missed) | **77 %** (23 caught / 3 missed) |
+| `ocserve-core/src/revert.rs` | 45 % (9 caught / 17 missed) | (same shape) |
+
+The injected-mutant check confirms it is scope, not luck: replacing
+`fork_session`'s body with `Ok(Default::default())` leaves three
+`ocserve-http/tests/fork.rs` tests red.
+
+Consequences, stated plainly:
+
+- The per-module `0 %` rows for `fork.rs` and `revert.rs` in the table below
+  are an ARTIFACT of the wrong scope, not coverage gaps. Everything else in
+  that table was measured at the same scope and is likewise understated.
+- The aggregate ceiling (1221 missed) is therefore **loose, not tight**: it was
+  ratcheted from a number that over-counted survivors. It is still a valid
+  ratchet (the corrected run can only come in lower), but it must not be cited
+  as evidence of coverage quality.
+- A corrected full-scope baseline is 2707 mutants and did not finish inside
+  40 minutes on `CARGO_MUTANTS_JOBS=8`. Until it is re-run to completion and
+  committed (with `--test-workspace true`), this document is the older,
+  mis-scoped measurement plus this correction rather than a green claim.
+- The scope is now mechanical: `scripts/run-mutants.sh` is the single
+  invocation, nightly calls it, and guard rule 63 fails the build on any
+  `cargo-mutants` invocation that omits the flag. Guard rule 63 also requires
+  `fuzz/**` to stay excluded — `fuzz/` is its own workspace, so cargo-mutants
+  copied its 17 GB `target/` into the sandbox and aborted with ENOSPC before
+  testing a single mutant.
+
 ## Method (why these choices)
 
 - `--lib` was tried and **removed**: it makes cargo-mutants drop

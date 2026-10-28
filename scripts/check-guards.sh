@@ -131,6 +131,10 @@
 #  60. the soak sampler records exactly one health code (`curl -w` prints 000 on
 #      failure, so `|| echo 000` wrote `000000`; a dead probe must stay a
 #      single visible 000) [suite: planted double-code probe]
+#  63. cargo-mutants runs with the workspace test scope (the package default
+#      reports http-covered store functions as survivors; fork.rs read 0% when
+#      it is 77%) and excludes the fuzz workspace (17 GB → ENOSPC)
+#      [plant: scope-less invocation]
 #  62. a repo-root Docker build context is readable and under the ceiling (the
 #      snapshot harness died for ten days on root-owned scratch inside 3.57 GB)
 #      [plant: unreadable dir / oversized / unexcluded scratch]
@@ -988,6 +992,92 @@ if python3 scripts/check-gate-wiring.py --selftest >/dev/null 2>&1; then
 else
   echo "FAIL: gate-wiring plants not detected (rule 61 vacuous)"; fail=1
 fi
+
+echo "== guard: the mutation run uses the workspace test scope (rule 63) =="
+# cargo-mutants runs only the MUTATED PACKAGE's tests by default, which reports
+# every store function covered solely by ocserve-http integration tests as a
+# survivor. Measured 2026-10-28: fork.rs 0% at the default scope, 77% with
+# --test-workspace true. The 2026-10-17 baseline used the default, so its 0%
+# module rows are an artifact.
+# The rule: no cargo-mutants invocation anywhere in the tree may omit
+# --test-workspace true, and the fuzz workspace must stay excluded (it is its
+# own workspace, so cargo-mutants copied its 17 GB target into the sandbox and
+# aborted with ENOSPC before testing a single mutant).
+_mut_scope_pred() {
+  python3 - "$1" <<'PY2'
+import re, sys, pathlib
+root = pathlib.Path(sys.argv[1])
+bad = []
+for f in list(root.glob("scripts/*.sh")) + list(root.glob("scripts/*.py")) + [
+    root / "bench" / "load" / "load-test.sh",
+]:
+    if not f.exists():
+        continue
+    text = f.read_text(errors="ignore")
+    for i, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if s.startswith("#") or "cargo mutants" not in s and "cargo-mutants" not in s:
+            continue
+        # A real invocation (not prose in a comment, echo, heredoc or
+        # docstring — all of which mention the command by name).
+        if not re.match(
+            r"^(exec |env |CARGO_MUTANTS_JOBS=\S+ |TMPDIR=\S+ )*(cargo|\S*cargo) (mutants|-mutants)\b",
+            s,
+        ):
+            continue
+        # Gather the logical invocation (this line + continuations).
+        chunk = s
+        j = i
+        lines = text.splitlines()
+        while chunk.rstrip().endswith("\\") and j < len(lines):
+            chunk += " " + lines[j].strip()
+            j += 1
+        if "--test-workspace true" not in chunk:
+            bad.append(f"{f}:{i}: cargo mutants without --test-workspace true")
+sys.exit(1 if bad else 0)
+PY2
+}
+if _mut_scope_pred .; then
+  echo "ok (every cargo-mutants invocation uses the workspace test scope)"
+else
+  python3 - . <<'PY2'
+import re, sys, pathlib
+root = pathlib.Path(sys.argv[1])
+for f in list(root.glob("scripts/*.sh")) + list(root.glob("scripts/*.py")):
+    text = f.read_text(errors="ignore")
+    for i, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if s.startswith("#") or not re.match(
+            r"^(exec |env |CARGO_MUTANTS_JOBS=\S+ |TMPDIR=\S+ )*(cargo|\S*cargo) (mutants|-mutants)\b",
+            s,
+        ):
+            continue
+        chunk = s
+        lines = text.splitlines()
+        j = i
+        while chunk.rstrip().endswith("\\") and j < len(lines):
+            chunk += " " + lines[j].strip()
+            j += 1
+        if "--test-workspace true" not in chunk:
+            print(f"FAIL: {f}:{i}: cargo mutants without --test-workspace true (rule 63)")
+PY2
+  fail=1
+fi
+if grep -q '^exclude_globs = \["fuzz/\*\*"\]' .cargo/mutants.toml 2>/dev/null; then
+  echo "ok (fuzz workspace excluded from the mutation sandbox)"
+else
+  echo "FAIL: .cargo/mutants.toml must exclude fuzz/** (17 GB target copied → ENOSPC) (rule 63)"; fail=1
+fi
+_plant_mut="$(mktemp --suffix=.sh)"
+printf '#!/usr/bin/env bash\ncargo mutants -p ocserve-store\n' > "$_plant_mut"
+_plant_dir="$(mktemp -d)"
+mkdir -p "$_plant_dir/scripts"; cp "$_plant_mut" "$_plant_dir/scripts/plant.sh"
+if _mut_scope_pred "$_plant_dir"; then
+  echo "FAIL: rule 63 planted scope-less invocation not detected"; fail=1
+else
+  echo "ok (planted scope-less cargo mutants detected)"
+fi
+rm -rf "$_plant_dir" "$_plant_mut"
 
 echo "== guard: repo-root Docker build context is readable and bounded (rule 62) =="
 # 2026-10-27: the snapshot harness failed every night for ten days with

@@ -285,10 +285,22 @@ if [ "$WITH_MUTANTS" = "1" ]; then
     # jobs via CARGO_MUTANTS_JOBS (cargo-mutants defaults to 1; the measured
     # baseline used 4 locally / 8 on the i9).
     mkdir -p target/mutants-tmp
-    step "cargo mutants (store+core)" env TMPDIR="$PWD/target/mutants-tmp" \
+    # --test-workspace true is NOT optional. cargo-mutants runs only the
+    # MUTATED PACKAGE's tests by default, so every `ocserve-store` function
+    # covered solely by `ocserve-http`'s integration tests reads as a survivor.
+    # Measured 2026-10-28: fork.rs scored 0% (26 missed / 0 caught) at the
+    # package default and 77% (3 missed / 23 caught) with the workspace scope;
+    # the 0% figures in the 2026-10-17 baseline are that artifact, not a
+    # coverage gap. revert.rs is the same shape (0% -> 45%).
+    #
+    # `--skip sigkill` stays: that harness kills a child at a random offset, so
+    # under mutation it fails for reasons unrelated to the mutant. Note that it
+    # is also the only test that ever observed the non-atomic migration bug
+    # (2026-10-28), which is why that class is now pinned by a deterministic
+    # test in tests/mig_atomicity.rs instead of relying on this fuzz.
+    step "cargo mutants (store+core, workspace test scope)" env TMPDIR="$PWD/target/mutants-tmp" \
       CARGO_MUTANTS_JOBS="${CARGO_MUTANTS_JOBS:-4}" \
-      cargo mutants -p ocserve-store -p ocserve-core \
-      -- -- --skip chunk_split --skip sigkill
+      ./scripts/run-mutants.sh
     # Gate the survivor count against the agreed ceiling (TESTING §1 rule 1:
     # threshold agreed at first run, then ratcheted down). Only meaningful if
     # the run produced outcomes; absent results are a FAIL not a skip.
