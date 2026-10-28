@@ -174,6 +174,22 @@ def check(root: Path) -> list[str]:
             f"{MAX_CONTEXT_BYTES // (1024 * 1024)} MiB ceiling"
         )
 
+    # In-tree scratch must not exist at all. The containers run as root, so an
+    # in-tree scratch dir is root-owned and unreadable afterwards: that broke
+    # the build context AND every tool that walks the tree (`cargo mutants`
+    # failed with EACCES on bench/snapshot-it/data). Run.sh now puts scratch
+    # under the system temp dir; a reappearance means the harness regressed.
+    for stale in ("bench/snapshot-it/data", "bench/snapshot-it/work",
+                  "bench/snapshot-it/freeze-work"):
+        p = root / stale
+        if p.exists():
+            problems.append(
+                f"{stale} exists in the tree (root-owned container scratch; "
+                "run.sh must keep it under TMPDIR)"
+            )
+        if p.exists() and p.stat().st_uid == 0:
+            problems.append(f"{stale} is root-owned (unreadable to the build and to test tools)")
+
     # Runtime scratch dirs must be excluded by NAME, not merely ignored by git:
     # a gitignored dir is still sent to BuildKit.
     must_exclude = [

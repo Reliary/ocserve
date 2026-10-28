@@ -24,13 +24,30 @@ fi
 # a compose bridge). The password is generated per run rather than committed —
 # a checked-in credential is a checked-in credential even in a harness — and
 # the file must be mode 600 or the server correctly refuses to read it.
+#
+# Scratch state lives OUTSIDE the repository. The containers run as root, so
+# in-tree scratch became root-owned and unreadable: the repo-root Docker build
+# context choked on it ("error from sender") and `cargo mutants`/ripgrep/git
+# all failed walking the tree. A temp dir removes the class instead of
+# cleaning up after it.
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/snapshot-it.XXXXXX")"
 PWFILE="$HERE/config/password"
 umask 077
 head -c 24 /dev/urandom | base64 | tr -d '\n=+/' >"$PWFILE"
 chmod 600 "$PWFILE"
 export SNAPSHOT_AUTH="opencode:$(cat "$PWFILE")"
-cleanup_pw() { rm -f "$PWFILE"; }
-trap cleanup_pw EXIT
+export SNAPSHOT_WORK="$SCRATCH/work"
+export SNAPSHOT_DATA="$SCRATCH/data"
+export SNAPSHOT_FREEZE="$SCRATCH/freeze-work"
+mkdir -p "$SNAPSHOT_WORK" "$SNAPSHOT_DATA" "$SNAPSHOT_FREEZE"
+# The containers write these as root; a host-side rm fails. Ask a throwaway
+# container to remove the tree, then remove the (now empty) parent ourselves.
+cleanup() {
+  rm -f "$PWFILE" 2>/dev/null || true
+  docker run --rm -v "$SCRATCH:/x" alpine:3 sh -c 'rm -rf /x/*' >/dev/null 2>&1 || true
+  rmdir "$SCRATCH" 2>/dev/null || rm -rf "$SCRATCH" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 echo "== build ocserve image (in-container, bookworm glibc) =="
 docker compose -f "$HERE/compose.yaml" build
@@ -43,14 +60,15 @@ docker compose -f "$HERE/compose.yaml" build
 # repo-root Docker build then choked on (2026-10-17..27: nightly red with
 # "error from sender: permission denied"). Reset failure is now LOUD.
 reset_scratch() {
-  docker run --rm -v "$HERE:/x" alpine:3 sh -c \
-    'rm -rf /x/work /x/data /x/freeze-work && mkdir -p /x/work /x/data /x/freeze-work' \
-    >/dev/null || {
-    echo "snapshot-it: could not reset work/data/freeze-work" >&2
-    echo "  these are written by in-container root; run:" >&2
-    echo "  docker run --rm -v \"$HERE:/x\" alpine:3 sh -c 'rm -rf /x/work /x/data /x/freeze-work'" >&2
+  # Scratch is a temp dir owned by this user, so no container round-trip is
+  # needed. Failure is LOUD: this used to end in `|| true`, which left the
+  # previous run's state in place so a failed reset silently measured stale
+  # worktrees.
+  rm -rf "$SNAPSHOT_WORK" "$SNAPSHOT_DATA" "$SNAPSHOT_FREEZE" || {
+    echo "snapshot-it: could not reset $SCRATCH" >&2
     return 1
   }
+  mkdir -p "$SNAPSHOT_WORK" "$SNAPSHOT_DATA" "$SNAPSHOT_FREEZE"
 }
 
 reset_scratch

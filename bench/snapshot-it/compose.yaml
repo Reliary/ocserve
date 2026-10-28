@@ -4,6 +4,17 @@
 #             bind-mounted shared worktree at /work.
 # `driver`  — a curl/python driver that mutates + reverts through the server
 #             and asserts the observable effects on the shared worktree.
+#
+# SCRATCH DISCIPLINE: the containers run as root, so anything they write into a
+# bind mount is root-owned afterwards. Scratch state therefore lives OUTSIDE the
+# repository, in a directory run.sh creates under the system temp dir and
+# removes on exit (root-owned, so removal goes through a throwaway container).
+#
+# It used to live in-tree (./work, ./data, ./freeze-work). Beyond polluting the
+# working copy that had two real costs: the repo-root Docker build context
+# choked on the unreadable `data` dir ("error from sender"), and every tool
+# that walks the tree — `cargo mutants`, ripgrep, git status in some editors —
+# failed on it with EACCES. Both symptoms were observed on 2026-10-27/28.
 name: snapshot-it
 
 services:
@@ -31,8 +42,8 @@ services:
       - ./config/auth.json:/root/.local/share/opencode/auth.json:ro
       - ./config/model.json:/root/.local/state/opencode/model.json:ro
       - ./config/password:/run/secrets/snapshot-password:ro
-      - ./work:/work
-      - ./data:/data
+      - ${SNAPSHOT_WORK:-./work}:/work
+      - ${SNAPSHOT_DATA:-./data}:/data
     working_dir: /work
     # F5: an auth-off server refuses a non-loopback bind (the credential store
     # echoes provider keys). Inside a compose bridge the driver is a separate
@@ -56,7 +67,7 @@ services:
       - ./config/opencode.json:/root/.config/opencode/opencode.json:ro
       - ./config/auth.json:/root/.local/share/opencode/auth.json:ro
       - ./config/model.json:/root/.local/state/opencode/model.json:ro
-      - ./freeze-work:/freeze
+      - ${SNAPSHOT_FREEZE:-./freeze-work}:/freeze
     # upstream entrypoint serves on 4921; override to bind the shared worktree
     entrypoint: ["opencode", "serve", "--port", "4926", "--hostname", "0.0.0.0"]
     working_dir: /freeze
@@ -74,7 +85,7 @@ services:
       GIT_CONFIG_KEY_0: safe.directory
       GIT_CONFIG_VALUE_0: "*"
     volumes:
-      - ./work:/work
+      - ${SNAPSHOT_WORK:-./work}:/work
     depends_on:
       - server
       - stub
@@ -91,7 +102,7 @@ services:
       WF: /freeze
       WO: /work
     volumes:
-      - ./freeze-work:/freeze
+      - ${SNAPSHOT_FREEZE:-./freeze-work}:/freeze
       - ./work:/work
     depends_on:
       - freeze
