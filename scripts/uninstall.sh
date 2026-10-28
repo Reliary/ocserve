@@ -183,8 +183,15 @@ PY
   printf '{"plugin": ["%s/src/reliary8/opencode-plugin/dist/index.js"]}' "$fake" \
     > "$fake/.config/opencode/opencode.json"
 
+  # Hermetic from the FIRST run too: a leaked OCSERVE_DATA_DIR would point the
+  # default (non-purge) run at the real install.
+  # XDG_STATE_HOME is unset too: STATE_DIR resolves from it and would
+  # otherwise escape the staged HOME.
+  local -a cenviron=(env -u OCSERVE_DATA_DIR -u XDG_STATE_HOME
+                     HOME="$fake" OCSERVE_UNINSTALL_SYSTEMD=0)
+
   say "== selftest: default run (history must survive) =="
-  if ! HOME="$fake" OCSERVE_UNINSTALL_SYSTEMD=0 "$SELF_BIN"; then echo "FAIL: default run rc!=0"; rc=1; fi
+  if ! "${cenviron[@]}" "$SELF_BIN"; then echo "FAIL: default run rc!=0"; rc=1; fi
   check() { # must-exist $1, must-be-gone $2, label $3
     if [ ! -e "$1" ]; then echo "FAIL($3): missing $1"; rc=1; fi
     if [ -e "$2" ]; then echo "FAIL($3): should be gone: $2"; rc=1; fi
@@ -213,10 +220,10 @@ PY
   [ -e "$fake/.local/state/ocserve/soak" ] || { echo "FAIL: default run must KEEP state"; rc=1; }
 
   say "== selftest: idempotent second run =="
-  HOME="$fake" OCSERVE_UNINSTALL_SYSTEMD=0 "$SELF_BIN" || { echo "FAIL: second run rc!=0"; rc=1; }
+  "${cenviron[@]}" "$SELF_BIN" || { echo "FAIL: second run rc!=0"; rc=1; }
 
   say "== selftest: purge --yes (history goes, canaries stay) =="
-  HOME="$fake" OCSERVE_UNINSTALL_SYSTEMD=0 "$SELF_BIN" --purge --yes || { echo "FAIL: purge rc!=0"; rc=1; }
+  "${cenviron[@]}" "$SELF_BIN" --purge --yes || { echo "FAIL: purge rc!=0"; rc=1; }
   [ -e "$fake/.local/share/ocserve" ] && { echo "FAIL: purge left data dir"; rc=1; }
   [ -e "$fake/.local/state/ocserve" ] && { echo "FAIL: purge left state dir"; rc=1; }
   [ "$(cat "$fake/.local/share/opencode/auth.json")" = "auth-canary" ] || { echo "FAIL: purge ate auth"; rc=1; }

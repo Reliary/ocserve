@@ -131,6 +131,9 @@
 #  60. the soak sampler records exactly one health code (`curl -w` prints 000 on
 #      failure, so `|| echo 000` wrote `000000`; a dead probe must stay a
 #      single visible 000) [suite: planted double-code probe]
+#  64. a staged destructive selftest clears the ambient data/state dirs (the
+#      uninstall battery resolved the LIVE data dir during a nightly run)
+#      [plant: staged selftest without the clears]
 #  63. cargo-mutants runs with the workspace test scope (the package default
 #      reports http-covered store functions as survivors; fork.rs read 0% when
 #      it is 77%) and excludes the fuzz workspace (17 GB → ENOSPC)
@@ -992,6 +995,70 @@ if python3 scripts/check-gate-wiring.py --selftest >/dev/null 2>&1; then
 else
   echo "FAIL: gate-wiring plants not detected (rule 61 vacuous)"; fail=1
 fi
+
+echo "== guard: a destructive selftest cannot touch the live install (rule 64) =="
+# 2026-10-28 nightly: the uninstall canary battery inherited the ambient
+# OCSERVE_DATA_DIR (nightly runs with the real one set), resolved DATA_DIR to
+# the LIVE install, correctly refused it as "outside HOME", and then reported
+# "purge left data dir" for a purge it never attempted. The class: a staged
+# selftest that re-execs its own binary must clear the ambient overrides, or it
+# is testing — and potentially destroying — the real installation.
+_destructive_selftest_pred() {
+  python3 - "$1" <<'PY2'
+import re, sys, pathlib
+root = pathlib.Path(sys.argv[1])
+bad = []
+for f in root.glob("scripts/*.sh"):
+    text = f.read_text(errors="ignore")
+    if "--selftest" not in text:
+        continue
+    # Does it re-exec itself inside a staged HOME?
+    if not re.search(r"\$SELF_BIN|\$\{SELF_BIN\}|readlink -f \"\$0\"", text):
+        continue
+    if "OCSERVE_DATA_DIR" not in text and "XDG_STATE_HOME" not in text:
+        continue
+    # ...and does it clear the ambient ones before doing so?
+    clears_data = re.search(r"-u OCSERVE_DATA_DIR", text) or re.search(
+        r"OCSERVE_DATA_DIR=(""|)", text
+    )
+    clears_state = re.search(r"-u XDG_STATE_HOME", text)
+    if not (clears_data and clears_state):
+        bad.append(f"{f}: staged selftest inherits the ambient data/state dir")
+sys.exit(1 if bad else 0)
+PY2
+}
+if _destructive_selftest_pred .; then
+  echo "ok (staged destructive selftests clear the ambient data/state dirs)"
+else
+  python3 - . <<'PY2'
+import re, sys, pathlib
+for f in pathlib.Path(sys.argv[1]).glob("scripts/*.sh"):
+    text = f.read_text(errors="ignore")
+    if "--selftest" not in text or not re.search(r"\$SELF_BIN|\$\{SELF_BIN\}", text):
+        continue
+    if "OCSERVE_DATA_DIR" not in text and "XDG_STATE_HOME" not in text:
+        continue
+    if not (re.search(r"-u OCSERVE_DATA_DIR", text) and re.search(r"-u XDG_STATE_HOME", text)):
+        print(f"FAIL: {f}: staged selftest inherits the ambient data/state dir (rule 64)")
+PY2
+  fail=1
+fi
+_plant64="$(mktemp -d)"; mkdir -p "$_plant64/scripts"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'SELF_BIN=$(readlink -f "$0")\n'
+  printf 'if [ "${1:-}" = "--selftest" ]; then\n'
+  printf '  HOME="$fake" OCSERVE_UNINSTALL_SYSTEMD=0 "$SELF_BIN" --purge --yes\n'
+  printf 'fi\n'
+  printf 'DATA_DIR=${OCSERVE_DATA_DIR:-$HOME/.local/share/ocserve}\n'
+  printf 'STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/ocserve\n'
+} > "$_plant64/scripts/plant.sh"
+if _destructive_selftest_pred "$_plant64"; then
+  echo "FAIL: rule 64 planted staged selftest not detected (inherits the live dir)"; fail=1
+else
+  echo "ok (planted staged selftest inheriting the live dir is detected)"
+fi
+rm -rf "$_plant64"
 
 echo "== guard: the mutation run uses the workspace test scope (rule 63) =="
 # cargo-mutants runs only the MUTATED PACKAGE's tests by default, which reports
