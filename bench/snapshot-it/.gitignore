@@ -1,3 +1,17 @@
+# Runtime scratch. The harness runs its containers as root and writes into
+# these bind mounts, so after a run they are ROOT-OWNED and sometimes
+# unreadable. They must never enter the repo-root Docker build context (they
+# did, and the build died with "error from sender: permission denied" every
+# night from 2026-10-17 to 2026-10-27 — see .dockerignore and rule 62).
 work/
 data/
 freeze-work/
+
+# Generated per run by run.sh (mode 600). Never committed: even a harness
+# password is a credential, and the reset is free.
+config/password
+
+# A root-owned scratch dir that cannot be deleted without sudo is moved aside
+# with this suffix instead of being force-removed. The next run recreates the
+# real one, so these are pure litter and safe to delete once permissions allow.
+*.stale-root-*/

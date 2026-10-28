@@ -1,3 +1,46 @@
+# Docker build context.
+#
+# The `server` arm of both bench harnesses builds with the REPO ROOT as its
+# context (`bench/parity/Dockerfile.ocserve` does `COPY . /src`). That sent
+# 3.57 GB per build, and on 2026-10-27 it failed outright:
+#
+#   #38 ERROR: error from sender: open .../bench/snapshot-it/data:
+#       permission denied
+#
+# because a scratch directory left behind by an earlier containerised run is
+# root-owned (the containers run as root and write into bind mounts). A
+# root-owned scratch dir inside a build context is not a harness bug to work
+# around with sudo: it is state that must never be in the context at all.
+#
+# Everything below is either not needed to compile the workspace (benchmarks,
+# recorded corpora, fuzz corpus, safety backups, local runs) or is
+# machine-local state that would make the image non-reproducible.
+
 target/
 .git/
-bench/parity/.runs/
+
+# Benchmarks and their scratch state. Nothing under bench/ or testdata/ is
+# compiled into the binary: the only include_str!/include_bytes! assets live
+# under crates/*/assets or crates/*/testdata (guard rule 30 enforces crate
+# containment), so excluding them cannot break the build.
+bench/
+mutants.out*/
+fuzz/
+
+# Local safety backups (pre-migration VACUUM INTO snapshots). Large, private,
+# and unrelated to any build.
+.safety/
+
+# Harness outputs and local runs that can be enormous and are not sources.
+**/.runs/
+**/.runs-archive-*/
+**/work/
+**/freeze-work/
+**/*.db
+**/*.db-wal
+**/*.db-shm
+
+# Editor/OS noise.
+.env
+.env.*
+!.env.example

@@ -30,11 +30,17 @@ services:
       - ./config/opencode.json:/root/.config/opencode/opencode.json:ro
       - ./config/auth.json:/root/.local/share/opencode/auth.json:ro
       - ./config/model.json:/root/.local/state/opencode/model.json:ro
+      - ./config/password:/run/secrets/snapshot-password:ro
       - ./work:/work
       - ./data:/data
     working_dir: /work
+    # F5: an auth-off server refuses a non-loopback bind (the credential store
+    # echoes provider keys). Inside a compose bridge the driver is a separate
+    # container, so the bind must be 0.0.0.0 — which means this arm has to
+    # carry real auth. Using it, rather than adding an escape hatch to the
+    # guard, also exercises the auth path in-container.
     # override the parity entrypoint: serve /work on 4925, data under /data
-    entrypoint: ["ocserve", "serve", "--port", "4925", "--hostname", "0.0.0.0", "--data-dir", "/data"]
+    entrypoint: ["ocserve", "serve", "--port", "4925", "--hostname", "0.0.0.0", "--data-dir", "/data", "--auth-mode", "basic", "--auth-password-file", "/run/secrets/snapshot-password"]
     networks: [snap]
 
   freeze:
@@ -63,6 +69,7 @@ services:
     environment:
       SERVER: "http://server:4925"
       WORK: /work
+      AUTH: "${SNAPSHOT_AUTH:?run via run.sh, which generates the password}"
       GIT_CONFIG_COUNT: "1"
       GIT_CONFIG_KEY_0: safe.directory
       GIT_CONFIG_VALUE_0: "*"
@@ -80,6 +87,7 @@ services:
     environment:
       FREEZE: "http://freeze:4926"
       OCSERVE: "http://server:4925"
+      AUTH: "${SNAPSHOT_AUTH:?run via run.sh, which generates the password}"
       WF: /freeze
       WO: /work
     volumes:

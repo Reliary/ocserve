@@ -131,6 +131,9 @@
 #  60. the soak sampler records exactly one health code (`curl -w` prints 000 on
 #      failure, so `|| echo 000` wrote `000000`; a dead probe must stay a
 #      single visible 000) [suite: planted double-code probe]
+#  62. a repo-root Docker build context is readable and under the ceiling (the
+#      snapshot harness died for ten days on root-owned scratch inside 3.57 GB)
+#      [plant: unreadable dir / oversized / unexcluded scratch]
 #  61. every scheduled gate writes a receipt naming its own gate, and `doctor`
 #      FAILS on an unhealthy one (nightly was red on 19 of 21 runs, 2026-10-04
 #      → 2026-10-27, and nothing surfaced it — a gate nobody sees is not a gate)
@@ -984,6 +987,22 @@ if python3 scripts/check-gate-wiring.py --selftest >/dev/null 2>&1; then
   fi
 else
   echo "FAIL: gate-wiring plants not detected (rule 61 vacuous)"; fail=1
+fi
+
+echo "== guard: repo-root Docker build context is readable and bounded (rule 62) =="
+# 2026-10-27: the snapshot harness failed every night for ten days with
+# "error from sender: open .../bench/snapshot-it/data: permission denied" —
+# root-owned runtime scratch inside a 3.57 GB build context. This reproduces
+# BuildKit's walk (apply .dockerignore, then require readability) so the
+# failure appears at commit time, not ten nights later.
+if python3 scripts/check-docker-context.py --selftest >/dev/null 2>&1; then
+  if out=$(python3 scripts/check-docker-context.py 2>&1); then
+    echo "$out"
+  else
+    echo "$out"; echo "FAIL: Docker build context (rule 62)"; fail=1
+  fi
+else
+  echo "FAIL: build-context plants not detected (rule 62 vacuous)"; fail=1
 fi
 
 echo "== guard: docs are not stale (rule 31) =="

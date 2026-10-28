@@ -20,6 +20,8 @@ import time
 import urllib.error
 import urllib.request
 
+_AUTH = os.environ.get("AUTH", "")
+
 FREEZE = os.environ.get("FREEZE", "http://freeze:4926")
 OCSERVE = os.environ.get("OCSERVE", "http://ocserve:4925")
 WF = os.environ.get("WF", "/freeze")
@@ -39,6 +41,12 @@ def http(base, method, path, body=None, timeout=30):
     if body is not None:
         data = json.dumps(body).encode()
         headers["content-type"] = "application/json"
+    if _AUTH:
+        import base64
+
+        headers["authorization"] = (
+            "Basic " + base64.b64encode(_AUTH.encode()).decode()
+        )
     req = urllib.request.Request(base + path, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:

@@ -28,6 +28,20 @@ SERVER = os.environ.get("SERVER", "http://server:4925")
 WORK = os.environ.get("WORK", "/work")
 FAILS = []
 
+# The server arm binds 0.0.0.0 inside the compose bridge, which the F5 guard
+# only permits with auth ON (the credential store echoes provider keys). So the
+# harness authenticates like a real remote client would.
+_AUTH = os.environ.get("AUTH", "")
+
+
+def _auth_header():
+    if not _AUTH:
+        return {}
+    import base64
+
+    token = base64.b64encode(_AUTH.encode()).decode()
+    return {"authorization": "Basic " + token}
+
 
 def check(cond, msg):
     print(("ok   " if cond else "FAIL ") + msg)
@@ -42,6 +56,7 @@ def http(method, path, body=None, timeout=30):
     if body is not None:
         data = json.dumps(body).encode()
         headers["content-type"] = "application/json"
+    headers.update(_auth_header())
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:

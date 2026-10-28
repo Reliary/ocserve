@@ -6,8 +6,17 @@
 # NOTE: RUN type=bind mounts are read-only in BuildKit (mkdir of the
 # /src/target cache mountpoint failed on it) — hence COPY, not bind.
 FROM rust:1-bookworm AS build
+# Build deps for the Rust dependency tree:
+#   cmake + g++      BoringSSL (the `boring`/`hyper-boring` free-tier lane)
+#   clang + libclang bindgen generates boring-sys's Rust bindings at build time
+#                    and PANICS without libclang ("Unable to find libclang").
+# The GitHub release runners already ship clang, so this only ever bit the
+# containerised harnesses — the snapshot/parity builds were broken from the
+# moment the BoringSSL lane landed and nothing noticed, because the snapshot
+# step had been failing earlier (on the build CONTEXT) for ten days first.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends cmake \
+    && apt-get install -y --no-install-recommends \
+        cmake g++ clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . /src
