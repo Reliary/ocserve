@@ -469,16 +469,54 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
     // v1/v2 database would silently miss later steps' DDL). Fresh DBs (0)
     // get the current DDL and jump straight to SCHEMA_VERSION; every other
     // version advances exactly one step per pass.
+    //
+    // ATOMICITY (2026-10-28): each step's DDL and its `user_version` stamp are
+    // ONE transaction. They used to be two independent writes, so a crash in
+    // between left a database whose tables existed but whose version still
+    // said the old number — and every subsequent boot then re-ran the DDL and
+    // failed with "table session already exists", permanently. Found by a
+    // mutation run whose mutant made `crash_fuzz` fail with exactly that
+    // message at iter 22; reproduced deterministically by rewinding
+    // `user_version` after a successful migrate. SQLite DDL is transactional,
+    // so the fix is the standard one: BEGIN, do the step, stamp, COMMIT.
     loop {
         let ver: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if ver == SCHEMA_VERSION {
             break;
         }
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let step: Result<()> = (|| {
         match ver {
             0 => {
+                // Fresh database: the current DDL IS the migration, so stamp
+                // the final version directly (one step, no loop pass). The
+                // trailing bump below would otherwise re-stamp it.
+                //
+                // SELF-HEAL (2026-10-28): `user_version = 0` with the schema
+                // already present is the exact crash window the old code left
+                // open — DDL committed, version stamp not. Re-running the DDL
+                // then failed with "table session already exists" on EVERY
+                // boot, permanently. Version 0 can only mean "nothing applied
+                // yet", so if the tables are there the DDL was applied and only
+                // the stamp is missing: stamp it. New steps are atomic now, so
+                // this is the last window of its kind.
+                let has_schema: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='session'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                if has_schema > 0 {
+                    tracing::warn!(
+                        "schema: user_version=0 but the schema exists (interrupted first                          migrate before 2026-10-28) — stamping version {SCHEMA_VERSION}                          instead of re-running DDL"
+                    );
+                    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                    return Ok(());
+                }
                 conn.execute_batch(DDL)?;
                 conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                break;
+                return Ok(());
             }
             1 => {
                 // v1→v2: session list fields (PLAN F1 — TUI/oc-remote list shape).
@@ -604,7 +642,6 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                 tracing::info!(
                     "migrate v9->v10: time-encoded part_search rowids — {rows} rows, {bytes} bytes text; the trigram fts rebuild is the long step (measured ~5-9 min on a 1.5GB db, one-time; fresh imports skip this path)"
                 );
-                conn.execute_batch("BEGIN;")?;
                 step(
                     "create+copy",
                     "CREATE TABLE part_search_v10 (
@@ -654,8 +691,7 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                         SELECT RAISE(ABORT, 'part_search rowid/time mismatch (encoding overflow or direct rowid write)');
                     END;",
                 )?;
-                conn.execute_batch("COMMIT")?;
-                tracing::info!("migrate v9->v10: committed");
+                tracing::info!("migrate v9->v10: step complete");
             }
             10 => {
                 // v10->v11: session revert marker (K-REVERT). The v1 revert
@@ -817,6 +853,17 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
         }
         let now: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         conn.pragma_update(None, "user_version", now + 1)?;
+        Ok(())
+        })();
+        match step {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                // Roll back so the database stays at the version it started
+                // at; a half-applied step is worse than no step.
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
+        }
     }
     Ok(())
 }

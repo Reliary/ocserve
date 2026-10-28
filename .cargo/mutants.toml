@@ -19,3 +19,11 @@
 #   median on each of ~10% hanging mutants).
 profile = "mutants"
 minimum_test_timeout = 45.0
+
+# NEVER include the fuzz workspace. `fuzz/` is its own workspace (excluded from
+# the root, a cargo-fuzz requirement), so cargo-mutants does not treat
+# `fuzz/target` as a target directory and copies it into the sandbox tree —
+# measured 17 GB, which filled /tmp and aborted the run with
+# "No space left on device" before a single mutant was tested (2026-10-28).
+# The fuzz crate has no mutants we care about: it consumes the library.
+exclude_globs = ["fuzz/**"]
