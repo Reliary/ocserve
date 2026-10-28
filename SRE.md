@@ -449,6 +449,14 @@ other than the async worker (thread identity recorded by a test-only seam).
     slope/health (replaces eyeballing). Restart manually after every deploy.
   All timers `Persistent=true` (missed runs catch up on boot).
 - **Runbook:** `ocserve doctor` = boot checks + storage health + FTS integrity + blob GC dry-run
+  + **gate health**. `doctor` exits non-zero when a scheduled verification
+  program (nightly, drift watch, soak) is failing, stale, abandoned, or has
+  stopped sampling. Each program writes an atomic receipt to
+  `<data_dir>/gate-status/<gate>.json` (`scripts/lib/gate-status.sh`); absent
+  receipts on a machine with no units installed are informational, never a
+  failure. This exists because nightly was red on 19 of 21 runs
+  (2026-10-04 → 2026-10-27) and nothing said so — a gate nobody sees is not a
+  gate. Guard rule 61 keeps both halves wired.
   + version/contract info; `ocserve import` (legacy snapshot), `ocserve replay --target|--pair`,
   and the harnesses `scripts/{replay-check,pair-check,load-test,capdiff-check}.sh` (`ocserve bench` was
   documented here but NEVER existed — clap rejects it; corrected 2026-10-06).

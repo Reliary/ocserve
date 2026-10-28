@@ -210,6 +210,7 @@ fn default_data_dir() -> std::path::PathBuf {
     }
 }
 
+mod gate_status;
 mod models_dev;
 // The platform seam lives in ocserve-core so every crate shares one copy.
 use ocserve_store::platform;
@@ -1449,6 +1450,9 @@ async fn doctor(
         println!("  {label:<15} {state} ({enabled}; {route}){warn}");
     }
     let db = ocserve_store::writer::db_path(&data_dir);
+    // Gate receipts: did nightly/drift/soak actually run, recently, and pass?
+    // 2026-10-27: nightly had been red for 19 of 21 runs and nothing said so.
+    let gates_ok = gate_status::report(&data_dir);
     if db.exists() {
         match ocserve_store::pragma::open_writer(&db) {
             Ok(conn) => {
@@ -1510,6 +1514,18 @@ async fn doctor(
     }
     if plugins {
         plugin_report(&data_dir).await;
+    }
+    // Only gates make `doctor` exit non-zero. Everything above is a report of
+    // state (a not-yet-created database, an absent optional unit) and must stay
+    // informational on a bare machine — but an installed verification program
+    // that has silently stopped running is the failure this command exists for
+    // (2026-10-27: nightly red for 19 of 21 runs, nobody told).
+    if !gates_ok {
+        anyhow::bail!(
+            "gate health check failed: a verification program is failing or has stopped running \
+             (see the `gates:` section above; `ocserve doctor` exits 0 only when every \
+             installed gate is passing and current)"
+        );
     }
     Ok(())
 }

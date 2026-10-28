@@ -255,10 +255,36 @@ replay_once() { # $1 url  $2 outfile → echoes "pass fail defer"; crash if no s
 
 MODE="${1:-}"
 
+# The selftest is a unit check, not a drift run: it must never write a
+# receipt (a green receipt from a selftest would be a lie about coverage).
 if [ "$MODE" = "--selftest" ]; then
   run_selftest
   exit $?
 fi
+
+# Receipt for `ocserve doctor` (scripts/lib/gate-status.sh). This script exits
+# from several branches, so the receipt is written by a trap that reads the
+# real exit code instead of duplicating bookkeeping at each return.
+#
+# The trap is INSTALLED HERE but the script installs its own EXIT trap further
+# down (workdir cleanup). That one WINS — bash keeps only the newest — so the
+# cleanup trap calls `gate_exit_trap` explicitly. Overwriting silently left the
+# receipt saying `running` forever, which reads as ABANDONED, which is a
+# failure doctor reports: correct verdict, wrong cause, and it took a live run
+# to see it.
+# shellcheck source=scripts/lib/gate-status.sh
+. "$(dirname "$0")/lib/gate-status.sh"
+DRIFT_DETAIL="exited before completing"
+gate_begin drift-watch
+gate_exit_trap() {
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    gate_finish drift-watch ok "$DRIFT_DETAIL"
+  else
+    gate_finish drift-watch failed "exit ${rc}: ${DRIFT_DETAIL}"
+  fi
+  return $rc
+}
 
 resolve_bin
 command -v docker >/dev/null || { echo "harness failure: docker missing"; exit 1; }
@@ -290,7 +316,7 @@ exec 9>"$REPORT_DIR/.watch.lock"
 flock -n 9 || { echo "another drift watch is running (lock: $REPORT_DIR/.watch.lock)"; exit 1; }
 cleanup
 WORK="$(mktemp -d)"
-trap 'cleanup; rm -rf "$WORK"' EXIT
+trap 'gate_exit_trap; _rc=$?; cleanup; rm -rf "$WORK"; exit $_rc' EXIT
 
 # control arm: freeze image × FREEZE_RUNS (determinism gate)
 if [ ! -d "$CFG" ]; then echo "harness failure: $CFG missing"; exit 1; fi
@@ -331,6 +357,7 @@ cp "$WORK/freeze.1.out" "$REPORT_DIR/.freeze.out"
 cat "$WORK/freeze.1.fail" | sort -u >"$WORK/freeze.fail"
 
 if [ "$MODE" = "--freeze-only" ]; then
+  DRIFT_DETAIL="freeze-only: control arm passed (no latest probe)"
   echo "freeze-only: control arm pass. (no latest probe)"
   exit 0
 fi
@@ -340,6 +367,7 @@ if [ "$LATEST" = "$FROZEN" ]; then
   : >"$WORK/drift"; : >"$WORK/noise"; : >"$WORK/anom"
   report_write "$REPORT_DIR/${STAMP}-upstream-drift.md" "$FROZEN" "$LATEST" "$V2NOTE" \
     "$WORK/drift" "$WORK/noise" "$WORK/anom" "$FCOUNTS" "same-version"
+  DRIFT_DETAIL="latest == freeze (${LATEST}); nothing to watch"
   echo "report: $REPORT_DIR/${STAMP}-upstream-drift.md"
   exit 0
 fi
@@ -371,4 +399,5 @@ report_write "$REPORT" "$FROZEN" "$LATEST" "$V2NOTE" \
 echo "== summary =="
 echo "drift: $(wc -l <"$WORK/drift")  noise: $(wc -l <"$WORK/noise")  anomaly: $(wc -l <"$WORK/anom")"
 [ "$(wc -l <"$WORK/anom")" -eq 0 ] || { echo "FAIL: control-only failures (anomaly) — investigate before trusting drift"; cat "$WORK/anom"; exit 1; }
+DRIFT_DETAIL="drift $(wc -l <"$WORK/drift") noise $(wc -l <"$WORK/noise") anomaly $(wc -l <"$WORK/anom")"
 echo "report: $REPORT"

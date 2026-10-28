@@ -296,6 +296,7 @@ reviews for session lifecycle; API contract review per handler), rustdoc example
 |---|---|---|
 | M0→M1 | fixtures captured, upstream container builds | upstream passes its own corpus (harness self-test); freeze artifacts complete |
 | M1→M2 | smoke + SSE byte-goldens green | system-level list/attach tests green; auth decision table covered |
+| 2026-10-27 | a verification gate is red or has stopped running | silent-red gate: nightly red 19/21 runs, nothing surfaced | **rule 61** (`check-gate-wiring.py`, 5 plants) + `gate_status` unit tests ×8 + live `doctor` wrong-path check | a gate receipt is written by any scheduled program but `doctor` does not fail on it, an installed unit has no receipt, a receipt says `running` past 2 h, a sampler's output stopped, or a cleanup trap overwrites the receipt trap |
 | M2→M3 | component/integration suites green | recorded transcript replay 0 diff; state-transition suite green; provider fuzz green |
 | M3→M4 | storage/memory gates green | import gates green; p95/max gates green; mutation threshold met |
 | M4→M5 | plugin/MCP gates green | 3 plugins + 3 MCP servers acceptance flows green; OAuth expiry test green |

@@ -10,6 +10,13 @@ HOURS="${3:-24}"
 OUT="${SOAK_OUT:-/tmp/opencode/ocserve-soak-$(date +%s).csv}"
 mkdir -p "$(dirname "$OUT")"
 echo "ts,rss,peak,sidecar,wal,sse,queue,locks,tasks,health,rss_delta,db_opens,sync_us,oc_rss,cgroup,cgroup_peak,kids" > "$OUT"
+
+# Receipt for `ocserve doctor` (scripts/lib/gate-status.sh): a sampler is
+# judged by the freshness of this CSV and the health code on its newest row,
+# so a soak that quietly stops writing is NOT SAMPLING rather than green.
+# shellcheck source=scripts/lib/gate-status.sh
+. "$(dirname "$0")/lib/gate-status.sh"
+gate_sampler soak "$OUT" "$INTERVAL"
 end=$(( $(date +%s) + HOURS * 3600 ))
 while [ "$(date +%s)" -lt "$end" ]; do
   ts=$(date +%s)
@@ -19,9 +26,13 @@ while [ "$(date +%s)" -lt "$end" ]; do
   # deliberate restart). Fail-closed either way, but the column must be one code.
   health=$(curl -so /dev/null -w '%{http_code}' --max-time 5 "$URL/global/health" 2>/dev/null || true)
   [ -n "$health" ] || health=000
-  get() { echo "$m" | awk -v k="$1" '$1==k {print $2; exit}'; }
+  # Read the whole metric body: an `awk ... exit` here closed the pipe while
+  # the producer was still writing, and under `set -o pipefail` the resulting
+  # SIGPIPE killed the sampler mid-run (2026-10-27 08:46: "echo: write error:
+  # Broken pipe" after 8h46m). Print the first match instead of exiting early.
+  get() { printf '%s\n' "$m" | awk -v k="$1" '$1==k && !seen {print $2; seen=1}'; }
   # labeled series (durations render name_sum{label}) — prefix match
-  getp() { echo "$m" | awk -v k="$1" 'index($1, k) == 1 {print $2; exit}'; }
+  getp() { printf '%s\n' "$m" | awk -v k="$1" 'index($1, k) == 1 && !seen {print $2; seen=1}'; }
   # opencode mirror RSS (MEMORY §7.6 — native as the future-usage ceiling model)
   oc_rss=0
   oc_pid=$(pgrep -f "opencode serve --port 4901" 2>/dev/null | head -1 || true)

@@ -22,6 +22,14 @@ LOG="bench/drift/nightly-${STAMP}.log"
 mkdir -p bench/drift
 : >"$LOG"
 FAILS=0
+FAILED_STEPS=()
+
+# Receipt for `ocserve doctor` (scripts/lib/gate-status.sh). Nightly was red on
+# 19 of 21 runs (2026-10-04 → 2026-10-27) and nothing surfaced it: the timer's
+# exit code lived only in `systemctl show`, the log in a gitignored dir.
+# shellcheck source=scripts/lib/gate-status.sh
+. "$(dirname "$0")/lib/gate-status.sh"
+gate_begin nightly
 
 step() { # $1 = label, rest = command
   local label="$1"; shift
@@ -31,6 +39,7 @@ step() { # $1 = label, rest = command
   else
     echo "FAIL: ${label}" | tee -a "$LOG"
     FAILS=$((FAILS + 1))
+    FAILED_STEPS+=("$label")
   fi
 }
 
@@ -292,4 +301,9 @@ fi
 
 echo "== nightly summary: ${FAILS} failed ==" | tee -a "$LOG"
 echo "log: $LOG"
+if [ "$FAILS" -eq 0 ]; then
+  gate_finish nightly ok "all steps ok"
+else
+  gate_finish nightly failed "${FAILS} step(s) failed" "${FAILED_STEPS[@]}"
+fi
 [ "$FAILS" -eq 0 ]

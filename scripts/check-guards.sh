@@ -131,6 +131,10 @@
 #  60. the soak sampler records exactly one health code (`curl -w` prints 000 on
 #      failure, so `|| echo 000` wrote `000000`; a dead probe must stay a
 #      single visible 000) [suite: planted double-code probe]
+#  61. every scheduled gate writes a receipt naming its own gate, and `doctor`
+#      FAILS on an unhealthy one (nightly was red on 19 of 21 runs, 2026-10-04
+#      → 2026-10-27, and nothing surfaced it — a gate nobody sees is not a gate)
+#      [plant: writer removed / wrong gate name / verdict ignored / unsourced]
 #  59. the fuzz workspace resolves serde_json with production's features
 #      (arbitrary_precision arrives transitively from rolldown), and every
 #      target with committed seeds is in the CI matrix. The fuzzer previously
@@ -969,6 +973,17 @@ if python3 scripts/check-fuzz-parity.py --selftest >/dev/null 2>&1; then
   fi
 else
   echo "FAIL: fuzz-parity planted controls not detected (rule 59 vacuous)"; fail=1
+fi
+
+echo "== guard: scheduled gates write receipts doctor fails on (rule 61) =="
+if python3 scripts/check-gate-wiring.py --selftest >/dev/null 2>&1; then
+  if out=$(python3 scripts/check-gate-wiring.py 2>&1); then
+    echo "$out"
+  else
+    echo "$out"; echo "FAIL: gate-receipt wiring (rule 61)"; fail=1
+  fi
+else
+  echo "FAIL: gate-wiring plants not detected (rule 61 vacuous)"; fail=1
 fi
 
 echo "== guard: docs are not stale (rule 31) =="
