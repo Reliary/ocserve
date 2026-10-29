@@ -5,11 +5,19 @@ server, written in Rust. It speaks the same HTTP and SSE wire as upstream, so
 the official clients work against it unmodified: the TUI (`opencode attach`),
 the web UI, and anything else that talks to the API.
 
-Two contracts are covered:
+Both contracts are covered, and both are verified against real upstream
+binaries rather than described:
 
-- the **1.18.x server API** (frozen at 1.18.31), used by today's clients
-- the **opencode 2 API** (`/api/*`, pinned at 2.0.28), used by the current TUI
-  and web UI
+- the **1.18.x server API** (frozen at 1.18.31), used by today's clients:
+  **188 of 188** operations implemented
+- the **opencode 2 API** (`/api/*`, pinned at 2.0.28), used by the current 2.x
+  TUI and web UI: **142 of 142** operations implemented, including every route
+  a 2.x TUI calls at boot
+
+The v2-only operations are opt-in, because `/api/*` also carries 58 operations
+that 1.18.31 clients use. Run with `OCSERVE_V2=1` to serve the full 2.x surface;
+without it those 96 v2-only operations answer a clean JSON 404. Details and the
+exact gate are in [v2](#v2-opencode-2) below.
 
 ## When to use this
 
@@ -203,13 +211,20 @@ The same suite also passes against 2.0.32, the newest 2.x release at the time
 of writing.
 
 Everything that exists only in the 2.x contract is behind `OCSERVE_V2=1` and
-answers a clean JSON 404 without it. The gate is derived mechanically from the
-two contracts, not by path prefix: `/api/*` is part of the frozen 1.18.31
-contract too (58 operations, and the 1.18.31 TUI calls them), so those keep
-working. What the flag actually gates is the 96 operations present in 2.0.28
-and absent from 1.18.31: the run engine (inbox admission, write-ahead claims,
-`content[]` projection, dual-grammar events, `log?after&follow` replay, form
-service) plus the v2-only administration surface.
+answers a clean JSON 404 without it, so pointing this at an existing 1.x install
+changes nothing until you ask for it:
+
+```sh
+OCSERVE_V2=1 ocserve serve --port 4096
+```
+
+The gate is derived mechanically from the two contracts, not by path prefix:
+`/api/*` is part of the frozen 1.18.31 contract too (58 operations, and the
+1.18.31 TUI calls them), so those keep working. What the flag actually gates is
+the 96 operations present in 2.0.28 and absent from 1.18.31: the run engine
+(inbox admission, write-ahead claims, `content[]` projection, dual-grammar
+events, `log?after&follow` replay, form service) plus the v2-only
+administration surface.
 
 v2 plugins work, in both authoring shapes (promise and Effect). `session.context`,
 `session.compaction`, `tool.execute.before` and `tool.execute.after` are bridged,
