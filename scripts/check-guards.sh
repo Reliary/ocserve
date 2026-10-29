@@ -1135,16 +1135,17 @@ if grep -q '^exclude_globs = \["fuzz/\*\*"\]' .cargo/mutants.toml 2>/dev/null; t
 else
   echo "FAIL: .cargo/mutants.toml must exclude fuzz/** (17 GB target copied → ENOSPC) (rule 63)"; fail=1
 fi
-_plant_mut="$(mktemp --suffix=.sh)"
-printf '#!/usr/bin/env bash\ncargo mutants -p ocserve-store\n' > "$_plant_mut"
+# BSD mktemp (macOS) has no --suffix and no template-less form: use a plain
+# -d plus an explicit filename, which works on both.
 _plant_dir="$(mktemp -d)"
-mkdir -p "$_plant_dir/scripts"; cp "$_plant_mut" "$_plant_dir/scripts/plant.sh"
+mkdir -p "$_plant_dir/scripts"
+printf '#!/usr/bin/env bash\ncargo mutants -p ocserve-store\n' > "$_plant_dir/scripts/plant.sh"
 if _mut_scope_pred "$_plant_dir"; then
   echo "FAIL: rule 63 planted scope-less invocation not detected"; fail=1
 else
   echo "ok (planted scope-less cargo mutants detected)"
 fi
-rm -rf "$_plant_dir" "$_plant_mut"
+rm -rf "$_plant_dir"
 
 echo "== guard: repo-root Docker build context is readable and bounded (rule 62) =="
 # 2026-10-27: the snapshot harness failed every night for ten days with
