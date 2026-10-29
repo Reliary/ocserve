@@ -6,10 +6,15 @@
 # `ocserve-http`'s integration tests (the fork/revert routes), so the package
 # default reports them as survivors.
 #
-# Measured 2026-10-28:
-#   fork.rs    package scope  0% (0 caught / 26 missed)
-#              workspace scope 77% (23 caught / 3 missed)
-#   revert.rs  package scope 45% (9 caught / 17 missed)
+# Measured 2026-10-29 (post migration-atomicity fix):
+#   fork.rs    package scope   0 / 26   (no coverage reachable)
+#              workspace scope 13 / 13
+#   revert.rs  workspace scope 10 / 16
+#
+# An earlier "77%" (23 caught / 3 missed) was withdrawn: all 23 were caught by
+# `sigkill_fuzz_blob_db_protocol` while that test was failing spuriously from
+# the non-atomic-migration bug, so the run measured the broken harness. See
+# bench/mutants/BASELINE.md.
 #
 # The 2026-10-17 baseline (43.5%, 1221 missed) was produced with the package
 # default, so its per-module 0% rows are an artifact, not a coverage gap. Its

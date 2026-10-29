@@ -288,10 +288,11 @@ if [ "$WITH_MUTANTS" = "1" ]; then
     # --test-workspace true is NOT optional. cargo-mutants runs only the
     # MUTATED PACKAGE's tests by default, so every `ocserve-store` function
     # covered solely by `ocserve-http`'s integration tests reads as a survivor.
-    # Measured 2026-10-28: fork.rs scored 0% (26 missed / 0 caught) at the
-    # package default and 77% (3 missed / 23 caught) with the workspace scope;
-    # the 0% figures in the 2026-10-17 baseline are that artifact, not a
-    # coverage gap. revert.rs is the same shape (0% -> 45%).
+    # Measured 2026-10-29: fork.rs scores 0/26 at the package default and
+    # 13/13 with the workspace scope; revert.rs 10/16. (An earlier 23/3 for
+    # fork.rs is withdrawn: those catches all came from crash_fuzz failing
+    # spuriously before the migration-atomicity fix, so the run measured a
+    # broken harness. See bench/mutants/BASELINE.md.)
     #
     # `--skip sigkill` stays: that harness kills a child at a random offset, so
     # under mutation it fails for reasons unrelated to the mutant. Note that it

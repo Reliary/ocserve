@@ -20,14 +20,28 @@ and revert routes), so the package default reports them as survivors.
 
 Measured directly on 2026-10-28, same host, same tool:
 
-| Module | package scope | workspace scope |
-|---|---|---|
-| `ocserve-store/src/fork.rs` | 0 % (0 caught / 26 missed) | **77 %** (23 caught / 3 missed) |
-| `ocserve-core/src/revert.rs` | 45 % (9 caught / 17 missed) | (same shape) |
+Measured twice, and the two runs DISAGREE. That disagreement is the finding.
 
-The injected-mutant check confirms it is scope, not luck: replacing
-`fork_session`'s body with `Ok(Default::default())` leaves three
-`ocserve-http/tests/fork.rs` tests red.
+| Module | scope | caught / missed | note |
+|---|---|---|---|
+| `ocserve-store/src/fork.rs` | package default | 0 / 26 | the original baseline |
+| `ocserve-store/src/fork.rs` | workspace tests | **13 / 13** | 2026-10-29, post-fix |
+| `ocserve-store/src/fork.rs` | workspace tests (first attempt) | 23 / 3 | **RETRACTED**, see below |
+| `ocserve-core/src/revert.rs` | workspace tests | 10 / 16 | 2026-10-29, post-fix |
+
+The 23 / 3 figure was published on 2026-10-28 and is **withdrawn**. Every one
+of those 23 "caught" mutants was caught by the SAME test:
+`sigkill_fuzz_blob_db_protocol`, which at that moment was failing spuriously
+because of the non-atomic-migration bug fixed the same day (a kill between a
+DML step and its `user_version` stamp left a database that could not boot, so
+the crash fuzz aborted on `table session already exists` regardless of the
+mutant). A mutation run whose failures come from a broken harness measures the
+harness, not the tests. Re-measured after the fix: **13 caught / 13 missed**.
+
+The injected-mutant check still holds and is independent of that bug:
+replacing `fork_session`'s body with `Ok(Default::default())` leaves three
+`ocserve-http/tests/fork.rs` tests red, so the workspace tests DO cover the
+function. The package default is still wrong; it just is not worth 23 catches.
 
 Consequences, stated plainly:
 
@@ -36,8 +50,11 @@ Consequences, stated plainly:
   that table was measured at the same scope and is likewise understated.
 - The aggregate ceiling (1221 missed) is therefore **loose, not tight**: it was
   ratcheted from a number that over-counted survivors. It is still a valid
-  ratchet (the corrected run can only come in lower), but it must not be cited
-  as evidence of coverage quality.
+  ratchet, but it must not be cited as evidence of coverage quality.
+- A full-scope run costs ~130 s per mutant on the 22-thread laptop (measured:
+  9 mutants in 20 min), so all 2707 mutants is roughly **100 hours**. It is not
+  a nightly job at that cost with the current workspace-wide test scope, and
+  nothing in this file claims a completed re-measurement.
 - A corrected full-scope baseline is 2707 mutants and did not finish inside
   40 minutes on `CARGO_MUTANTS_JOBS=8`. Until it is re-run to completion and
   committed (with `--test-workspace true`), this document is the older,
