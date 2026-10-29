@@ -111,7 +111,8 @@ implicitly):
 `scripts/fetch-release.sh --platform linux-x86_64-musl` selects the static
 build, and a positional tag (`scripts/fetch-release.sh v0.6.10`) pins a version.
 `install.sh --bin <path>` installs a binary you already have (for example one
-you built) and renders the unit to point at it.
+you built) and renders the unit to point at it. `install.sh --bin-only` is the
+different, common case: place the binary and leave systemd untouched.
 
 ## Quick start
 

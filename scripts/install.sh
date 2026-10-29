@@ -24,17 +24,30 @@ cd "$(dirname "$0")/.."
 REPO=$PWD
 
 BIN_ONLY=0 DRY=0 SRC="" RELEASE=0 TAG="" LIMITS=1 RENDER_TO=""
+
+# A flag that takes a value must say so when the value is missing. The previous
+# form read `$2` directly, which under `set -u` aborted with "line 31: $2:
+# unbound variable" — a shell internal naming neither the flag nor the fix
+# (2026-10-29, hit while deploying).
+need_arg() { # $1 = flag, $2 = remaining arg count
+  [ "$2" -ge 2 ] || {
+    echo "install.sh: $1 requires a value" >&2
+    echo "  try: install.sh --help" >&2
+    exit 2
+  }
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --bin-only) BIN_ONLY=1 ;;
     --dry-run)  DRY=1 ;;
-    --bin)      SRC=$2; shift ;;
+    --bin)      need_arg "$1" "$#"; SRC=$2; shift ;;
     --release)  RELEASE=1 ;;
-    --tag)      TAG=$2; shift ;;
+    --tag)      need_arg "$1" "$#"; TAG=$2; shift ;;
     --no-resource-limits|--unmanaged) LIMITS=0 ;;
-    --render-to) RENDER_TO=$2; shift ;;
+    --render-to) need_arg "$1" "$#"; RENDER_TO=$2; shift ;;
     -h|--help)  sed -n '2,20p' "$0"; exit 0 ;;
-    *) echo "install.sh: unknown flag: $1" >&2; exit 2 ;;
+    *) echo "install.sh: unknown flag: $1" >&2; echo "  try: install.sh --help" >&2; exit 2 ;;
   esac
   shift
 done

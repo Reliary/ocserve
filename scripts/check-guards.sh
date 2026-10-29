@@ -131,6 +131,9 @@
 #  60. the soak sampler records exactly one health code (`curl -w` prints 000 on
 #      failure, so `|| echo 000` wrote `000000`; a dead probe must stay a
 #      single visible 000) [suite: planted double-code probe]
+#  65. a flag that takes a value checks for it before reading `$2` (the
+#      `install.sh --bin` unbound-variable abort hit while deploying)
+#      [plant: unguarded `$2` in an argument loop]
 #  64. a staged destructive selftest clears the ambient data/state dirs (the
 #      uninstall battery resolved the LIVE data dir during a nightly run)
 #      [plant: staged selftest without the clears]
@@ -1146,6 +1149,80 @@ else
   echo "ok (planted scope-less cargo mutants detected)"
 fi
 rm -rf "$_plant_dir"
+
+echo "== guard: a flag with a missing value names the flag (rule 65) =="
+# 2026-10-29: `install.sh --bin` (no value) aborted with
+#   install.sh: line 31: $2: unbound variable
+# under `set -u` — a shell internal naming neither the flag nor the fix, hit
+# while deploying. fetch-release.sh and plugin-corpus-remote.sh had the identical
+# defect. The rule: in a top-level argument loop, a `case` arm that assigns from
+# `$2` must first verify the value exists.
+_missing_value_pred() {
+  python3 - "$1" <<'PY2'
+import re, sys, pathlib
+root = pathlib.Path(sys.argv[1])
+bad = []
+for f in root.glob("scripts/*.sh"):
+    text = f.read_text(errors="ignore")
+    lines = text.splitlines()
+    # Find the argument loop, then its case arms.
+    try:
+        start = next(i for i, l in enumerate(lines) if re.search(r"while \[ \$# -gt 0 \]", l))
+    except StopIteration:
+        continue
+    end = next((i for i in range(start, len(lines)) if lines[i].strip() == "done"), len(lines))
+    block = "\n".join(lines[start:end])
+    for arm in re.finditer(r"^\s*(-{1,2}[A-Za-z0-9|_-]+)\)(.*)$", block, re.M):
+        flag, body = arm.group(1), arm.group(2)
+        if not re.search(r"=\$(\{)?2\b", body):
+            continue
+        if re.search(r"_need_arg|need_arg|\$# -ge 2|\$# -lt 2", body):
+            continue
+        bad.append(f"{f}: flag {flag} reads $2 without a value check")
+sys.exit(1 if bad else 0)
+PY2
+}
+if _missing_value_pred .; then
+  echo 'ok (every flag that reads a positional value checks it first)'
+else
+  python3 - . <<'PY2'
+import re, sys, pathlib
+root = pathlib.Path(sys.argv[1])
+for f in root.glob("scripts/*.sh"):
+    text = f.read_text(errors="ignore")
+    lines = text.splitlines()
+    try:
+        start = next(i for i, l in enumerate(lines) if re.search(r"while \[ \$# -gt 0 \]", l))
+    except StopIteration:
+        continue
+    end = next((i for i in range(start, len(lines)) if lines[i].strip() == "done"), len(lines))
+    block = "\n".join(lines[start:end])
+    for arm in re.finditer(r"^\s*(-{1,2}[A-Za-z0-9|_-]+)\)(.*)$", block, re.M):
+        flag, body = arm.group(1), arm.group(2)
+        if re.search(r"=\$(\{)?2\b", body) and not re.search(
+            r"_need_arg|need_arg|\$# -ge 2|\$# -lt 2", body
+        ):
+            print(f"FAIL: {f}: flag {flag} reads $2 without a value check (rule 65)")
+PY2
+  fail=1
+fi
+_plant65="$(mktemp -d)"; mkdir -p "$_plant65/scripts"
+{
+  printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+  printf 'X=""\n'
+  printf 'while [ $# -gt 0 ]; do\n'
+  printf '  case "$1" in\n'
+  printf '    --thing) X=$2; shift ;;\n'
+  printf '  esac\n'
+  printf '  shift\n'
+  printf 'done\n'
+} > "$_plant65/scripts/plant.sh"
+if _missing_value_pred "$_plant65"; then
+  echo 'FAIL: rule 65 planted unguarded positional read not detected'; fail=1
+else
+  echo 'ok (planted unguarded positional read detected)'
+fi
+rm -rf "$_plant65"
 
 echo "== guard: repo-root Docker build context is readable and bounded (rule 62) =="
 # 2026-10-27: the snapshot harness failed every night for ten days with

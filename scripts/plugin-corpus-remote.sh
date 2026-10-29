@@ -19,9 +19,17 @@ cd "$(dirname "$0")/.."
 
 HOST="${PLUGIN_HOST:-john@192.168.1.227}"
 REUSE=0
+# Same guard as install.sh/fetch-release.sh: a missing value must name the
+# flag, not abort with "$2: unbound variable".
+_need_arg() { # $1 = flag, $2 = remaining count
+  [ "$2" -ge 2 ] || {
+    echo "plugin-corpus-remote.sh: $1 requires a value" >&2
+    exit 2
+  }
+}
 while [ $# -gt 0 ]; do
   case "$1" in
-    --host) HOST="$2"; shift 2 ;;
+    --host) _need_arg "$1" "$#"; HOST="$2"; shift 2 ;;
     --reuse) REUSE=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac

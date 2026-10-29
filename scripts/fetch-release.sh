@@ -21,10 +21,20 @@ set -euo pipefail
 REPO_SLUG=${OCSERVE_REPO_SLUG:-Reliary/ocserve}
 TAG="" DEST="" PLATFORM="linux-x86_64" SELFTEST=0
 
+# A flag that takes a value says so when the value is missing. Reading `$2`
+# directly aborts with "line N: $2: unbound variable" under `set -u`.
+_need_arg() { # $1 = flag, $2 = remaining count
+  [ "$2" -ge 2 ] || {
+    echo "fetch-release.sh: $1 requires a value" >&2
+    echo "  try: fetch-release.sh --help" >&2
+    exit 2
+  }
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dest)     DEST=$2; shift ;;
-    --platform) PLATFORM=$2; shift ;;
+    --dest)     _need_arg "$1" "$#"; DEST=$2; shift ;;
+    --platform) _need_arg "$1" "$#"; PLATFORM=$2; shift ;;
     --selftest) SELFTEST=1 ;;
     -h|--help)  sed -n '2,15p' "$0"; exit 0 ;;
     -*)         echo "fetch-release.sh: unknown flag: $1" >&2; exit 2 ;;
