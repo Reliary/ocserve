@@ -26,8 +26,17 @@ cd "$(dirname "$0")/.."
 #                  that have nothing to do with the mutant (this is exactly how
 #                  it masked a real non-atomic-migration bug on 2026-10-28; that
 #                  class is now pinned by tests/mig_atomicity.rs instead)
-exec cargo mutants \
+#
+# CONFIG TEST-ARGS ARE APPENDED AFTER THE `--` SEPARATOR. `.cargo/mutants.toml`
+# documents this for `additional_cargo_test_args`, and the same trap applies to
+# anything a caller passes through: `"$@"` after `--` becomes a TEST BINARY
+# argument. Passing `--output /tmp/x` that way produced
+#   error: Unrecognized option: 'output'
+# and cargo-mutants then aborted with "cargo test failed in an unmutated tree"
+# — a confusing diagnosis for a wrapper bug (2026-10-29, first remote attempt).
+# So: cargo-mutants' own options go BEFORE the separator, and the test-arg
+# passthrough stays fixed and last.
+exec cargo mutants "$@" \
   -p ocserve-store -p ocserve-core \
   --test-workspace true \
-  -- -- --skip chunk_split --skip sigkill \
-  "$@"
+  -- -- --skip chunk_split --skip sigkill

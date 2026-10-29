@@ -131,6 +131,9 @@
 #  60. the soak sampler records exactly one health code (`curl -w` prints 000 on
 #      failure, so `|| echo 000` wrote `000000`; a dead probe must stay a
 #      single visible 000) [suite: planted double-code probe]
+#  66. no cargo-mutants option is passed after the `--` test separator (the
+#      wrapper turned `--output` into a test-binary arg)
+#      [plant: trailing "$@" after the separator]
 #  65. a flag that takes a value checks for it before reading `$2` (the
 #      `install.sh --bin` unbound-variable abort hit while deploying)
 #      [plant: unguarded `$2` in an argument loop]
@@ -1223,6 +1226,65 @@ else
   echo 'ok (planted unguarded positional read detected)'
 fi
 rm -rf "$_plant65"
+
+echo "== guard: no cargo-mutants option is passed after the test separator (rule 66) =="
+# `.cargo/mutants.toml` documents that config test-args are appended AFTER
+# `--`, and the same trap applies to a wrapper's own `"$@"`. `run-mutants.sh`
+# ended with `... -- -- --skip X "$@"`, so `--output /tmp/x` became a test
+# binary argument:
+#   error: Unrecognized option: 'output'
+# and cargo-mutants reported "cargo test failed in an unmutated tree", which
+# points at the tests rather than at the wrapper (2026-10-29).
+_mut_sep_pred() {
+  python3 - "$1" <<'PY2'
+import re, sys, pathlib
+root = pathlib.Path(sys.argv[1])
+bad = []
+for f in sorted(root.glob("scripts/*.sh")):
+    if f.name == "check-guards.sh":
+        continue  # holds the plants and the prose about them
+    text = f.read_text(errors="ignore")
+    for m in re.finditer(r"cargo mutants(.*?)(?=\n[^ \\]|\Z)", text, re.S):
+        chunk = m.group(1).replace("\\\n", " ")
+        if "cargo mutants" in text and m.start() == 0:
+            pass
+        # Find the last `--` separator in the invocation.
+        if " -- " in chunk or chunk.rstrip().endswith("--"):
+            after = chunk.split(" -- ", 1)[1] if " -- " in chunk else ""
+            if re.search(r'"\$@|\$\{|--output|--test-workspace|--package|-p ', after):
+                bad.append(f"{f}: a cargo-mutants option follows the `--` separator")
+sys.exit(1 if bad else 0)
+PY2
+}
+if _mut_sep_pred .; then
+  echo "ok (no cargo-mutants options after the test separator)"
+else
+  python3 - . <<'PY2'
+import re, sys, pathlib
+for f in sorted(pathlib.Path(sys.argv[1]).glob("scripts/*.sh")):
+    if f.name == "check-guards.sh":
+        continue
+    text = f.read_text(errors="ignore")
+    for m in re.finditer(r"cargo mutants(.*?)(?=\n[^ \\]|\Z)", text, re.S):
+        chunk = m.group(1).replace("\\\n", " ")
+        if " -- " in chunk:
+            after = chunk.split(" -- ", 1)[1]
+            if re.search(r'"\$@|--output|--test-workspace|-p ', after):
+                print(f"FAIL: {f}: a cargo-mutants option follows the `--` separator (rule 66)")
+PY2
+  fail=1
+fi
+_plant66="$(mktemp -d)"; mkdir -p "$_plant66/scripts"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'exec cargo mutants -p ocserve-store -- -- --skip x "$@"\n'
+} > "$_plant66/scripts/plant.sh"
+if _mut_sep_pred "$_plant66"; then
+  echo 'FAIL: rule 66 planted trailing "$@" not detected'; fail=1
+else
+  echo 'ok (planted trailing "$@" after the separator detected)'
+fi
+rm -rf "$_plant66"
 
 echo "== guard: repo-root Docker build context is readable and bounded (rule 62) =="
 # 2026-10-27: the snapshot harness failed every night for ten days with
