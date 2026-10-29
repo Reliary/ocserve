@@ -20,6 +20,24 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# `-i/--in-place` edits the SOURCE TREE and restores it when each mutant is
+# done. A killed run (timeout, Ctrl-C, OOM, a rebooting box) therefore leaves a
+# mutant on disk, and the next `git commit` would ship it. Caught on
+# 2026-10-29: after a killed calibration, `crates/ocserve-core/src/ids.rs` was
+# still mutated. Refuse to start on a dirty tree, and require the caller to
+# clean up after an interrupted in-place run rather than discovering it later.
+for arg in "$@"; do
+  case "$arg" in
+    -i|--in-place)
+      if [ -n "$(git status --porcelain)" ]; then
+        echo "run-mutants.sh: --in-place needs a clean tree (a killed run leaves a mutant behind)" >&2
+        echo "  fix: git checkout -- .   # after confirming you have no real edits" >&2
+        exit 2
+      fi
+      ;;
+  esac
+done
+
 # The two known-slow harness tests are skipped under mutation:
 #   chunk_split  — 50 s seeded fuzz, unrelated to a mutant's behaviour
 #   sigkill      — kills a child at a RANDOM offset, so it fails for reasons
@@ -36,6 +54,18 @@ cd "$(dirname "$0")/.."
 # — a confusing diagnosis for a wrapper bug (2026-10-29, first remote attempt).
 # So: cargo-mutants' own options go BEFORE the separator, and the test-arg
 # passthrough stays fixed and last.
+# `--test-workspace true` re-runs the WHOLE workspace test build per mutant,
+# which is correct but expensive: each job compiles every crate and links every
+# integration binary. Two consequences worth knowing before setting jobs:
+#   * per-mutant cost is ~40 s at -j1 (measured), so the full 2707-mutant run is
+#     ~30 CPU-hours; it is a nightly/weekly job, never a commit gate;
+#   * jobs multiply that rebuild, not just the test time. `-j16` on a 32-thread
+#     box drove load past 200 and made no faster progress than `-j8`
+#     (2026-10-29). Eight is the measured sweet spot on this tree.
+#
+# `--in-place` avoids copying the repo (and, on the laptop, an 801 GB target
+# tree that a copy would try to duplicate). It restores the source itself; a
+# killed run can leave a mutant on disk, so check `git status` after an abort.
 exec cargo mutants "$@" \
   -p ocserve-store -p ocserve-core \
   --test-workspace true \
