@@ -36,7 +36,7 @@
 #             pair, external-connect, vcs/init.
 #
 # Output is pretty-printed and written to the owning crate's assets directory,
-# `crates/ocserve-core/assets/openapi/<tag>.json`. It MUST live inside a crate
+# `crates/ocserve-core/assets/openapi/<slot>.json` (`v1`/`v2`). It MUST live inside a crate
 # so it is packaged and published with it — an artifact embedded from outside
 # a crate root (`bench/`) is not in the `.crate` tarball, so `cargo install`
 # fails to compile it (the 0.3.0 defect; guard rule 30). The file is a
@@ -45,7 +45,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 TAG="${1:?usage: extract-spec.sh <tag> [--from-live URL | --regen]}"
-OUT="crates/ocserve-core/assets/openapi/${TAG}.json"
+# SLOT output (2026-11-04): the asset is named by line, not by tag, so a bump
+# rewrites the same file the crate embeds (`v1.json` / `v2.json`). The tag is
+# what gets recorded in the Rust pin and `parts.json`.
+case "$TAG" in
+  1.*) SLOT=v1 ;;
+  2.*) SLOT=v2 ;;
+  *) echo "extract-spec: tag must start with 1. or 2. (got $TAG)" >&2; exit 2 ;;
+esac
+OUT="crates/ocserve-core/assets/openapi/${SLOT}.json"
 mkdir -p "$(dirname "$OUT")"
 
 if [ "${2:-}" = "--regen" ]; then
@@ -147,7 +155,7 @@ d = json.load(open(p))
 ops = sum(len([m for m in v if m in ("get","post","put","delete","patch")]) for v in d["paths"].values())
 print(f"  openapi={d.get('openapi')} paths={len(d['paths'])} ops={ops} schemas={len(d.get('components',{}).get('schemas',{}))}")
 PY
-echo "wrote ${OUT}"
+echo "wrote ${OUT} (slot ${SLOT}, tag ${TAG})"
 
 # The v2 gate table is derived from the two vendored contracts, so it must be
 # regenerated whenever either one moves. Guard rule 42 fails the build on drift.

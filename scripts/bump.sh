@@ -7,7 +7,13 @@
 #
 #   scripts/bump.sh v2 2.0.32            # acquire + re-vendor + re-extract + classify
 #   scripts/bump.sh v2 2.0.32 --dry-run  # print the steps, change nothing
-#   scripts/bump.sh v1 1.19.3            # freeze line (acquire only; rest printed)
+#   scripts/bump.sh v1 1.19.5            # freeze line: acquire -> contract ->
+#                                        # prompts/rules -> provider capture ->
+#                                        # move pin -> full battery
+#
+# Both lines are mechanical through the PIN MOVE; the full oracle battery
+# after it is the ADOPTION gate (printed with exact commands, run by a human or
+# the agent because it needs the vendored freeze and the .227 load runner).
 #
 # Steps (v2 line):
 #   1. acquire  — npm pack protocol/schema/cli tarballs into a STABLE scratch dir
@@ -100,13 +106,105 @@ case "$LINE" in
     fi
     ;;
   v1)
+    if [ "$CLEAN" = 1 ]; then rm -rf "$SCRATCH"; echo "cleaned $SCRATCH"; exit 0; fi
     echo "=== bump v1 → $VER (freeze line) ==="
-    echo "  scripts/acquire-freeze.sh $VER   (staged vendor binary)"
-    echo "  then: replay corpus re-record (hermetic fixture), pair, spec-validate,"
-    echo "  drift-watch control arm re-baseline, TRACEABILITY K-row."
-    echo "  NOTE: this re-pins the FREEZE every v1 oracle is measured against —"
-    echo "  run it in a worktree and adopt only after the full battery is green."
-    [ "$DRY" = 1 ] || true
+    echo "scratch: $SCRATCH  (kept across runs; --clean to remove)"
+    mkdir -p "$SCRATCH"
+    PREV="$(sed -n 's/.*pub const FREEZE_VERSION: &str = "\([^"]*\)".*/\1/p' crates/ocserve-llm/src/lib.rs | head -1)"
+    echo "current pin: ${PREV:-unreadable}"
+
+    echo "=== step 1: acquire the freeze binary (staged vendor) ==="
+    # acquire-freeze honours a positional version. It writes
+    # bench/parity/vendor/opencode, which the differential harnesses resolve;
+    # the update is what makes every later step measure the NEW pin instead of
+    # silently re-testing the old binary.
+    run scripts/acquire-freeze.sh "$VER"
+
+    echo "=== step 2: re-vendor the v1 contract ==="
+    # --from-live reads $URL/doc from the NEW freeze (byte-identical to the
+    # tag's packages/sdk/openapi.json), which also proves the staged binary
+    # actually boots. Slot output (v1.json) either way.
+    BOOT_PORT="${BUMP_FREEZE_PORT:-4951}"
+    if [ "$DRY" = 0 ] && [ -x bench/parity/vendor/opencode ]; then
+      BOOT_HOME="$(mktemp -d "$SCRATCH/home.XXXXXX")"
+      mkdir -p "$BOOT_HOME/.config/opencode" "$BOOT_HOME/.local/share/opencode" \
+               "$BOOT_HOME/.local/state/opencode"
+      for f in opencode.json auth.json model.json; do
+        case "$f" in
+          opencode.json) dst="$BOOT_HOME/.config/opencode/$f" ;;
+          auth.json)     dst="$BOOT_HOME/.local/share/opencode/$f" ;;
+          model.json)    dst="$BOOT_HOME/.local/state/opencode/$f" ;;
+        esac
+        [ -f "bench/parity/config/$f" ] && cp "bench/parity/config/$f" "$dst"
+      done
+      ( HOME="$BOOT_HOME" setsid bench/parity/vendor/opencode serve \
+          --port "$BOOT_PORT" --hostname 127.0.0.1 >"$SCRATCH/freeze.log" 2>&1 & echo $! >"$SCRATCH/freeze.pid" )
+      ok=0
+      for _ in $(seq 1 60); do
+        if curl -fsS -m 2 "http://127.0.0.1:$BOOT_PORT/global/health" >/dev/null 2>&1; then ok=1; break; fi
+        sleep 1
+      done
+      if [ "$ok" != 1 ]; then
+        tail -5 "$SCRATCH/freeze.log" >&2 || true
+        kill "$(cat "$SCRATCH/freeze.pid")" 2>/dev/null || true
+        echo "FAIL: staged freeze $VER did not become healthy on :$BOOT_PORT" >&2
+        exit 2
+      fi
+      run scripts/extract-spec.sh "$VER" --from-live "http://127.0.0.1:$BOOT_PORT"
+      kill "$(cat "$SCRATCH/freeze.pid")" 2>/dev/null || true
+    else
+      echo "  [dry-run] scripts/extract-spec.sh $VER --from-live http://127.0.0.1:$BOOT_PORT"
+    fi
+
+    echo "=== step 3: re-vendor prompt assets + pure-data tables ==="
+    run scripts/extract-prompts.sh "$VER"
+    run scripts/extract-rules.sh "$VER"
+
+    echo "=== step 4: provider-boundary capture (needs a booted freeze) ==="
+    if [ "$DRY" = 0 ] && [ -x bench/parity/vendor/opencode ]; then
+      run scripts/capture-provider-contract.sh
+    else
+      echo "  [dry-run] scripts/capture-provider-contract.sh"
+    fi
+
+    echo "=== step 5: move the pin ==="
+    # The pin is the LAST mechanical edit: every artifact above was extracted
+    # from $VER, and this line is what makes the server report it.
+    if [ "$DRY" = 1 ]; then
+      echo "  [dry-run] set FREEZE_VERSION = $VER in crates/ocserve-llm/src/lib.rs"
+    else
+      PREV="$PREV" VER="$VER" python3 - <<'PYEOF'
+import os, pathlib, re, sys
+p = pathlib.Path("crates/ocserve-llm/src/lib.rs")
+s = p.read_text()
+old, new = os.environ["PREV"], os.environ["VER"]
+pat = re.compile(r'(pub const FREEZE_VERSION: &str = ")[^"]*(";)')
+s2, n = pat.subn(rf'\g<1>{new}\g<2>', s, count=1)
+if n != 1:
+    sys.exit("FAIL: FREEZE_VERSION const not found exactly once")
+p.write_text(s2)
+print(f"  pin: {old} -> {new}")
+PYEOF
+      grep -q "pub const FREEZE_VERSION: &str = \"$VER\";" crates/ocserve-llm/src/lib.rs \
+        || { echo "FAIL: pin edit did not apply" >&2; exit 2; }
+    fi
+
+    echo
+    echo "=== step 6: full battery (the ADOPTION gate) ==="
+    echo "  cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings"
+    echo "  cargo test --workspace"
+    echo "  ./scripts/check-guards.sh && ./scripts/check-matrix.sh && ./scripts/check-docs.py"
+    echo "  OCSERVE_CORPUS=testdata/fixture ./scripts/replay-check.sh   # re-record first:"
+    echo "    ./scripts/record-corpus.sh  (hermetic fixture HOME; the recorded corpus"
+    echo "     encodes env-dependent values — 2026-11-04 paired-check finding)"
+    echo "  ./scripts/pair-check.sh && ./scripts/capdiff-check.sh --selftest --full"
+    echo "  ./scripts/permission-check.sh && ./scripts/field-contract-check.sh"
+    echo "  ./scripts/hook-contract-check.sh"
+    echo "  ./scripts/spec-validate-v2.sh  (v1/spec-validate via pair's spec mode)"
+    echo "  G2 load thresholds re-derive on .227 (arrival runs stay separate)"
+    echo
+    echo "Judgment: corpus re-record diff, G2 bounds, TRACEABILITY K-<version> row."
+    echo "Adopt only when the whole battery is green; revert = one commit."
     ;;
   *)
     echo "usage: bump.sh <v1|v2> <version> [--dry-run] [--clean]" >&2

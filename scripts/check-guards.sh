@@ -1440,12 +1440,16 @@ echo "== guard: bump pipeline actually runs its mechanical steps (rule 37) =="
 # expose --dry-run. Static check so the defect cannot silently return.
 # Planted control: the SAME predicate run on a sabotaged copy must return false
 # (proves the check bites, not just that grep works).
-bump_ok() { # $1 = bump.sh path → 0 when the pipeline invokes its steps
+bump_ok() { # $1 = bump.sh path → 0 when BOTH lines invoke their steps
   grep -q 'run scripts/extract-spec.sh' "$1" \
     && grep -q 'run scripts/extract-app.sh' "$1" \
     && grep -q 'run python3 scripts/contract-diff.py' "$1" \
     && grep -q -- '--dry-run' "$1" \
-    && grep -q -- '--delta' "$1"
+    && grep -q -- '--delta' "$1" \
+    && grep -q 'run scripts/acquire-freeze.sh' "$1" \
+    && grep -q 'run scripts/extract-prompts.sh' "$1" \
+    && grep -q 'run scripts/extract-rules.sh' "$1" \
+    && grep -q 'run scripts/capture-provider-contract.sh' "$1"
 }
 _bump="scripts/bump.sh"
 if [ ! -f "$_bump" ]; then
@@ -1461,7 +1465,15 @@ else
   if bump_ok "$_plant"; then
     echo "FAIL: rule 37 planted control not detected (check is vacuous)"; fail=1
   else
-    echo "ok (planted removed step → predicate false)"
+    echo "ok (planted removed v2 step → predicate false)"
+  fi
+  # Second plant: the v1 arm was a PRINTER for two releases. Removing its
+  # acquire line must fail the same predicate.
+  grep -v 'run scripts/acquire-freeze.sh' "$_bump" > "$_plant"
+  if bump_ok "$_plant"; then
+    echo "FAIL: rule 37 planted v1 printer not detected (check is vacuous)"; fail=1
+  else
+    echo "ok (planted removed v1 acquire → predicate false)"
   fi
   rm -f "$_plant"
 fi
