@@ -52,20 +52,19 @@ trap cleanup EXIT
 echo "== build ocserve image (in-container, bookworm glibc) =="
 docker compose -f "$HERE/compose.yaml" build
 
-# Reset the scratch dirs. They are written by in-container root, so they are
-# ROOT-OWNED afterwards and a plain host-side `rm -rf` fails. The alpine helper
-# runs as root and CAN delete them — but this used to end in `|| true`, so a
-# failed reset left the previous run's state in place and the next run silently
-# measured stale data. It also left root-owned dirs inside the repo, which the
-# repo-root Docker build then choked on (2026-10-17..27: nightly red with
-# "error from sender: permission denied"). Reset failure is now LOUD.
+# Reset the scratch dirs. They are written by in-container root, so their
+# CONTENTS are ROOT-OWNED even though the dirs themselves are user-created
+# bind-mount targets — a plain host-side `rm -rf` fails on the files inside
+# (2026-10-..: nightly red with a permission error, differential all green,
+# i.e. the failure was teardown-only). `rm -rf` on the user-owned SCRATCH
+# itself is not possible mid-run (PWD is there), so reset asks the throwaway
+# alpine root container the same way cleanup() does. Failure is LOUD: a silent
+# `|| true` here previously left the previous run's state in place and the
+# next run silently measured stale worktrees.
 reset_scratch() {
-  # Scratch is a temp dir owned by this user, so no container round-trip is
-  # needed. Failure is LOUD: this used to end in `|| true`, which left the
-  # previous run's state in place so a failed reset silently measured stale
-  # worktrees.
-  rm -rf "$SNAPSHOT_WORK" "$SNAPSHOT_DATA" "$SNAPSHOT_FREEZE" || {
-    echo "snapshot-it: could not reset $SCRATCH" >&2
+  docker run --rm -v "$SCRATCH:/x" alpine:3 \
+    sh -c 'rm -rf /x/work /x/data /x/freeze-work' >/dev/null 2>&1 || {
+    echo "snapshot-it: could not reset $SCRATCH (alpine helper failed)" >&2
     return 1
   }
   mkdir -p "$SNAPSHOT_WORK" "$SNAPSHOT_DATA" "$SNAPSHOT_FREEZE"

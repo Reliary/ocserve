@@ -103,7 +103,7 @@ services:
       WO: /work
     volumes:
       - ${SNAPSHOT_FREEZE:-./freeze-work}:/freeze
-      - ./work:/work
+      - ${SNAPSHOT_WORK:-./work}:/work
     depends_on:
       - freeze
       - server
