@@ -43,11 +43,13 @@ static PACK_V2_PARTS: &[&[u8]] = &[
     ocserve_ui_2028_d::PART,
 ];
 
-/// The freeze tag the v1 pack was built from — must match `FREEZE_VERSION`.
-pub const APP_TAG: &str = "1.18.31";
+/// The freeze tag the v1 pack was built from — the same pin `/global/health`
+/// reports (no third copy).
+pub const APP_TAG: &str = ocserve_llm::FREEZE_VERSION;
 
-/// The v2 tag the second pack was built from — must match `SPEC_V2_TAG`.
-pub const APP_TAG_V2: &str = "2.0.28";
+/// The v2 tag the second pack was built from — the same pin the v2 contract
+/// was vendored under.
+pub const APP_TAG_V2: &str = ocserve_core::spec::V2_TAG;
 
 /// Which pack serves `/`. `OCSERVE_UI_PACK=2.0.28` selects the v2 shell
 /// (natural pair with `OCSERVE_V2=1`); anything else serves v1. Explicit

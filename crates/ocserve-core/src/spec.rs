@@ -15,9 +15,9 @@
 //! `GET /doc` works on a bare machine with no config or network (the "boots
 //! with defaults" invariant) because the bytes are embedded.
 
-/// The freeze tag the vendored contract was extracted from. Must match
-/// `FREEZE_VERSION` / `/global/health`.
-pub const TAG: &str = "1.18.31";
+/// The freeze tag the vendored contract was extracted from — the SAME
+/// constant `/global/health` reports, re-exported so there is one truth.
+pub use ocserve_llm::FREEZE_VERSION as TAG;
 
 /// The frozen 1.18.31 OpenAPI document, byte-identical to the upstream tag's
 /// `packages/sdk/openapi.json` and to freeze's live `GET /doc` (verified

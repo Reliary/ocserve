@@ -119,7 +119,8 @@ pub fn is_fresh(path: &Path, now: SystemTime) -> bool {
 /// every part honors the same env overrides upstream reads.
 pub fn user_agent() -> String {
     let channel = std::env::var("OPENCODE_CHANNEL").unwrap_or_else(|_| "latest".into());
-    let version = std::env::var("OPENCODE_VERSION").unwrap_or_else(|_| "1.18.31".into());
+    let version = std::env::var("OPENCODE_VERSION")
+        .unwrap_or_else(|_| ocserve_http::FREEZE_VERSION.to_string());
     let client = std::env::var("OPENCODE_CLIENT").unwrap_or_else(|_| "cli".into());
     format!("opencode/{channel}/{version}/{client}")
 }

@@ -537,9 +537,21 @@ fn zen_http() -> &'static ZenHttp {
     })
 }
 
+/// The frozen v1 pin. This crate is the LOWEST in the dependency graph that
+/// needs it (the zen UA embeds the opencode version), so the constant lives
+/// here and `ocserve-http` re-exports it — one truth, no third copy. A bump
+/// edits this line and `crates/ocserve-core/src/spec.rs` (the v2 pin).
+pub const FREEZE_VERSION: &str = "1.18.31";
+
 /// Free-tier zen gate (bench/zen-probe/FINDINGS: probes P5 vs P7 — the
 /// composite UA is load-bearing; the client/project/request headers are not).
 /// Sent ONLY on `opencode.ai` bases; other providers keep reqwest's default.
+///
+/// The opencode segment MUST equal [`FREEZE_VERSION`]; the test below fails on
+/// a bump that forgets it. Upstream derives this UA from its own binary
+/// version, so a stale literal here breaks the keyless free tier while every
+/// other gate stays green (no oracle compared provider headers before
+/// PARITY-SYNC-PLAN P2).
 pub const ZEN_FREE_TIER_UA: &str =
     "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
 
@@ -726,6 +738,28 @@ impl Client {
             },
         );
         Ok(Box::pin(parsed))
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    /// Load-bearing: the UA names the same opencode version the server
+    /// reports. Built with format! because `concat!` cannot read a const —
+    /// the assertion is the point, and it is what a bump must satisfy.
+    #[test]
+    fn zen_ua_carries_the_freeze_version() {
+        let expected = format!("opencode/{FREEZE_VERSION} ");
+        assert!(
+            ZEN_FREE_TIER_UA.starts_with(&expected),
+            "ZEN_FREE_TIER_UA (`{ZEN_FREE_TIER_UA}`) must start with `{expected}` —              re-derive it when bumping FREEZE_VERSION"
+        );
+        assert!(
+            ZEN_FREE_TIER_UA.contains("ai-sdk/provider-utils/")
+                && ZEN_FREE_TIER_UA.contains("runtime/bun/"),
+            "AI SDK / runtime fragments missing from the composite UA"
+        );
     }
 }
 

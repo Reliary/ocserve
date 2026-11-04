@@ -16,8 +16,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Freeze (PLAN §3): version reported by `/global/health`.
-pub const FREEZE_VERSION: &str = "1.18.31";
+/// Freeze (PLAN §3): version reported by `/global/health`. Re-exported from
+/// `ocserve-llm` (the lowest crate that needs it — see the pin test there).
+pub use ocserve_llm::FREEZE_VERSION;
 
 /// Pre-assembled payloads for config-derived routes (built by ocserve's
 /// `Runtime::load()`; kept crate-local so http doesn't depend on cli).
