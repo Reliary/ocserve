@@ -190,13 +190,13 @@ def selftest() -> int:
     if src and "." in src[0] and not _has_source(unsourced):
         failures.append("plant 4 undetected: unsourced writer reads as wired")
 
-    # Plant 5: drift-watch's cleanup trap stops calling the receipt trap. This
-    # is the bug the first live run exposed; it must never pass silently.
+    # Plant 5: a later cleanup trap overwrites the receipt trap (bash keeps
+    # only the newest). This was the real first-live-run bug; the 2026-11-03
+    # drift-watch rewrite removed the workdir trap, so the plant now simulates
+    # the regression the future will actually produce — someone appends a
+    # cleanup trap after the receipt trap.
     drift = (ROOT / "scripts/drift-watch.sh").read_text()
-    overwritten = drift.replace(
-        "trap 'gate_exit_trap; _rc=$?; cleanup; rm -rf \"$WORK\"; exit $_rc' EXIT",
-        "trap 'cleanup; rm -rf \"$WORK\"' EXIT",
-    )
+    overwritten = drift + "\ntrap 'cleanup; rm -rf \"$WORK\"' EXIT\n"
     traps = [
         ln.strip()
         for ln in overwritten.splitlines()

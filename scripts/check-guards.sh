@@ -14,9 +14,9 @@
 #      messages route must stream via for_each_message_json [suite]
 #   4. msg_part INSERT/UPDATE outside ocserve-store — every part write must
 #      carry its part_search projection companion (W1 FTS invariant) [suite]
-#   5. upstream drift watch broken (version compare / replay-output parse /
-#      set-difference / report writer) — the nightly watch would go silently
-#      wrong (PLAN §6/§8, K-DRIFT) [suite: drift-watch.sh --selftest]
+#   5. upstream drift watch broken (version compare / pin read / registry-output
+#      validation / report writer) — the nightly watch would go silently wrong
+#      (PLAN §6/§8, K-DRIFT) [suite: drift-watch.sh --selftest]
 #   6. non-ocserve systemd units mutated from repo scripts (drop-ins/restarts —
 #      the 2026-10-05 incident class; only ocserve* units are mutable, TESTING §1.6) [suite]
 #   7. exact assertions on process-global counters inside src/ (parallel in-crate

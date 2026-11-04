@@ -157,11 +157,17 @@ Differential testing (McKeeman 1998; Roseau ICSME 2025):
    - TUI attach flows 100%; oc-remote nine flows 100%
    - provider stream fuzz: 10 k seeded chunk-boundary splits of recorded streams → assembled
      output byte-matches upstream
-5. **Ongoing**: every PR replays corpus against ocserve vs upstream container; nightly replays
-   against **latest** upstream release (triage report — adopt/ignore, never auto-merge) —
-   **implemented by `scripts/drift-watch.sh`** (freeze control ×2 + latest npm arm, same
-   config mounts, warmup-replayed first, drift/noise/anomaly set classification; nondeter-
-   ministic control aborts the run so drift is never claimed from noise);
+5. **Ongoing**: every PR replays corpus against ocserve vs upstream container; nightly
+   probes **latest** upstream releases for version drift (triage report — adopt/ignore,
+   never auto-merge) — **implemented by `scripts/drift-watch.sh` (v1) + `scripts/v2-drift.sh`
+   (v2 + plugin-hook surface)**. CORRECTION 2026-11-03: drift-watch's original corpus
+   replay (freeze control ×2 vs npm-latest arm) was retired with evidence — the control
+   arm never exceeded 19/31 (corpus rode `testdata/fixture`, the containers mounted
+   `bench/parity/config`), so ~11 routes were permanently misclassified as noise and every
+   drift verdict inherited that blindness. Behavioral drift of a candidate upstream
+   release is owned by `bump.sh`'s battery A/B **at adoption time** (that replay boots the
+   actual new pin, seeded, with pair/capdiff alongside — a stronger comparison than the
+   nightly container ever provided); the nightly keeps the cheap half: has upstream moved?
    kill criterion for the whole strategy: if >20% of divergences found are unrecordable by
    the harness, shift to contract-by-probe.
 
@@ -202,11 +208,12 @@ tool-output compression before compaction; durable event log + checkpoints for r
 **Adoption posture on major upstream lines (recorded 2026-10-03, evidence below):**
 
 - **v1 freeze remains the contract.** `PLAN.md §3` wire/API/plugin surfaces are pinned to
-  1.18.31; upstream v1 patch/minor releases (1.18.32–34) are watched via the nightly byte-
-  golden container replay — **implemented by `scripts/drift-watch.sh`** (dual-arm: freeze
-  control image replayed ×2 for determinism, npm `latest` arm, drift = set difference of
-  failure sets; selftest wired as `check-guards` rule 5; reports under `bench/drift/`,
-  gitignored); any change to a live freeze artifact (§3 tables) is its own
+  1.18.31; upstream v1 releases are watched nightly by **`scripts/drift-watch.sh`** — since
+  2026-11-03 a version probe only (npm `opencode-ai` latest vs the `FREEZE_VERSION`
+  constant read from source; the old dual-arm corpus replay is retired, see §6);
+  behavioral drift of a candidate release is caught by `bump.sh`'s battery A/B at
+  adoption time; reports under `bench/drift/`, gitignored; `check-guards` rule 5 proves
+  the selftest; changes to a live freeze artifact (§3 tables) remain their own
   `test(corpus): …` commit. This keeps the maintenance load at the "30–60 min per minor"
   level already designed for.
 - **v2 is adopted, not chased.** CORRECTION 2026-10-16: the "pre-release" premise

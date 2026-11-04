@@ -21,12 +21,16 @@ mkdir -p "$REPORT_DIR"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 REPORT="$REPORT_DIR/$STAMP-v2-drift.md"
 
-vendored="$(grep -o 'SPEC_V2_TAG[^;]*' crates/ocserve-core/src/spec.rs 2>/dev/null | head -1 || true)"
+# The pin is read from the REAL constant (`spec.rs` exports `V2_TAG`), never
+# from a filename scan: the old fallback listed asset files and would break
+# the moment assets become slot-named (PARITY-SYNC-PLAN P1). A missing or
+# unparseable pin is a harness failure, not a silent "unknown".
+vendored="$(sed -n 's/.*pub const V2_TAG[[:space:]]*:[[:space:]]*&str = "\([^"]*\)".*/\1/p' crates/ocserve-core/src/spec.rs 2>/dev/null | head -n 1)"
 if [ -z "$vendored" ]; then
-  # fallback: the embedded asset filename
-  vendored="$(ls crates/ocserve-core/assets/openapi/ | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.json$' | grep -v '^1\.' | sort -V | tail -1 | sed 's/\.json//')"
+  echo "harness failure: cannot read V2_TAG from crates/ocserve-core/src/spec.rs" >&2
+  exit 1
 fi
-echo "vendored v2 tag: ${vendored:-unknown}"
+echo "vendored v2 tag: $vendored"
 
 latest="$(npm view @opencode/cli version 2>/dev/null || true)"
 if [ -z "$latest" ]; then
