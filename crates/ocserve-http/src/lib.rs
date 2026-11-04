@@ -3332,6 +3332,46 @@ fn resolve_model(
     st.llm.read().default_model.clone()
 }
 
+/// `provider.<pid>.models.<mid>.variants.<variant>` from the served provider
+/// payload. Reads the per-reload wire cache, so no disk or catalog work.
+fn provider_variant_options(
+    st: &Arc<AppState>,
+    pid: &str,
+    mid: &str,
+    variant: &str,
+) -> Option<serde_json::Value> {
+    let p = st.payloads.read();
+    p.provider
+        .get("providers")
+        .and_then(|a| a.as_array())
+        .and_then(|list| {
+            list.iter()
+                .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(pid))
+        })
+        .and_then(|e| e.pointer(&format!("/models/{mid}/variants/{variant}")))
+        .cloned()
+}
+
+/// The session's stored variant (upstream `currentModel` returns
+/// `variant` only when it is set and not "default", prompt.ts:625). `None`
+/// when there is no stored model, no variant, or the variant is the default.
+fn stored_variant(db: &std::path::Path, session_id: &str) -> Option<String> {
+    let conn = ocserve_store::pragma::open_reader(db).ok()?;
+    let raw: String = conn
+        .query_row(
+            "SELECT model FROM session WHERE id = ?1",
+            [session_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("variant")
+        .and_then(|x| x.as_str())
+        .filter(|x| !x.is_empty() && *x != "default")
+        .map(String::from)
+}
+
 /// Agent permission rules (v1 wire shape → evaluator Rule list). One owner so
 /// the prompt loop and the v2 permission oracle cannot drift.
 pub(crate) fn agent_rules(st: &Arc<AppState>, agent: &str) -> Vec<ocserve_tools::Rule> {
@@ -3412,6 +3452,19 @@ pub(crate) fn build_prompt_context(
         .cloned()
         .unwrap_or_default();
     let (pid, mid) = resolve_model(st, req.model.as_ref(), session_id);
+    // Upstream prompt.ts:654: request variant wins; otherwise the SESSION's
+    // stored variant (its "default" is the same as absent, prompt.ts:625).
+    let variant = req
+        .variant
+        .clone()
+        .filter(|v| !v.is_empty())
+        .or_else(|| stored_variant(&st.db, session_id));
+    // model.variants[variant] from the served provider payload — upstream
+    // merges exactly this object into the request options (request.ts:82).
+    let variant_options = variant
+        .as_deref()
+        .and_then(|v| provider_variant_options(st, &pid, &mid, v))
+        .unwrap_or(serde_json::Value::Null);
     let (base_url, api_key) =
         st.llm
             .read()
@@ -3510,6 +3563,8 @@ pub(crate) fn build_prompt_context(
         },
         model_id: mid,
         provider_id: pid,
+        variant,
+        variant_options,
         rules,
         gate: st.gate.clone(),
         mcp: st.mcp.get().cloned(),

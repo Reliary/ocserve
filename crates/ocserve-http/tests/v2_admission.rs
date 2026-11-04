@@ -154,16 +154,26 @@ async fn wait_drain(st: &Arc<AppState>) {
     panic!("v2 drain did not complete");
 }
 
+/// The flag MUST NOT gate an operation that exists in the frozen v1 contract.
+/// `POST /api/session/{id}/prompt` is in 1.18.31, so with the flag off it is
+/// served by its handler — here it answers the legitimate unknown-session
+/// error, NOT the gate's bare `NotFoundError`. (It used to be handler-gated,
+/// which 404'd a v1-contract operation in production; the generated v2-only
+/// table is the single authority. See `v2_gate.rs`.)
 #[tokio::test]
-async fn v2_gate_dark_by_default() {
-    // OCSERVE_V2 unset → the route 404s (D2: dark until acceptance).
-    // NOTE: env is process-global; this test unsets, runs, and restores.
+async fn v2_gate_dark_by_default_does_not_gate_v1_operations() {
     let addr = spawn_stub_provider();
     let st = setup_with_v2(addr, false);
     let app = ocserve_http::router(st.clone());
-    let (status, _) = post_prompt(&app, json!({"text": "hi"})).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    // CONTROL: delete the gate check in v2.rs → this test reds (200 admit).
+    let (status, v) = post_prompt(&app, json!({"text": "hi"})).await;
+    assert_ne!(
+        v["_tag"], "NotFoundError",
+        "the v2 gate must not intercept a v1-contract operation: {v}"
+    );
+    // The fixture session exists, so the handler admits it: the 1.18.31 TUI
+    // calls this `client.v2.*` method on mount, and the frozen contract
+    // contains it — gating it would break the shipped v1 client.
+    assert_eq!(status, StatusCode::OK, "admitted (v1-contract op): {v}");
 }
 
 #[tokio::test]
@@ -978,10 +988,21 @@ async fn v2_session_remove_update_agent_model() {
     )
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT);
+    // Model.Ref is an OBJECT {id, providerID, variant?} in both frozen
+    // contracts; the old string form was the handler's bug (it rejected the
+    // correct object and accepted a string). Probed against 2.0.28:
+    // string -> 400 Expected Model.Ref, object -> 204.
     let (s, _) = post(
         &app,
         "/api/session/ses_v2a/model",
         json!({"model": "fake/m"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = post(
+        &app,
+        "/api/session/ses_v2a/model",
+        json!({"model": {"id": "m", "providerID": "fake", "variant": "high"}}),
     )
     .await;
     assert_eq!(s, StatusCode::NO_CONTENT);

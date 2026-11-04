@@ -76,6 +76,72 @@ fn concrete(path: &str) -> String {
         .replace("{sessionId}", "ses_missing")
 }
 
+/// Shared operations (present in BOTH frozen contracts) must serve with the
+/// flag off. Their handlers used to self-gate, which made the five routes the
+/// 1.18.31 contract guarantees answer `SessionNotFoundError` on a flag-off
+/// production server. The generated v2-only table is the only authority.
+#[tokio::test]
+async fn flag_off_serves_operations_shared_by_both_contracts() {
+    let app = app_with_v2(false);
+    // (method, uri, body) — all five used to end in `v2_not_found`.
+    let cases: [(&str, &str, Option<serde_json::Value>); 5] = [
+        (
+            "POST",
+            "/api/session/ses_missing/agent",
+            Some(serde_json::json!({"agent": "build"})),
+        ),
+        (
+            "POST",
+            "/api/session/ses_missing/model",
+            Some(serde_json::json!({"model": {"id": "m", "providerID": "p"}})),
+        ),
+        (
+            "POST",
+            "/api/session/ses_missing/prompt",
+            Some(serde_json::json!({"text": "hi"})),
+        ),
+        (
+            "PATCH",
+            "/api/credential/cred_missing",
+            Some(serde_json::json!({"label": "renamed"})),
+        ),
+        ("DELETE", "/api/credential/cred_missing", None),
+    ];
+    for (method, uri, body) in cases {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        let req = match body {
+            Some(v) => req.body(Body::from(v.to_string())).unwrap(),
+            None => req.body(Body::empty()).unwrap(),
+        };
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&bytes);
+        // A legitimate unknown-session 404 (`SessionNotFoundError`) is the
+        // handler answering; the GATE answers `{"_tag":"NotFoundError"}`.
+        // Distinguish by the exact tag, not the status.
+        let tag = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v.get("_tag").and_then(|t| t.as_str()).map(String::from));
+        assert_ne!(
+            tag.as_deref(),
+            Some("NotFoundError"),
+            "{method} {uri} was intercepted by the v2 gate: {text}"
+        );
+        assert!(
+            !text.contains("v2 runtime disabled"),
+            "{method} {uri} answered through a handler self-gate: {text}"
+        );
+        assert!(
+            !(status == StatusCode::NOT_FOUND && text.trim().is_empty()),
+            "unrouted (no handler) — the route must be bound: {method} {uri}"
+        );
+    }
+}
+
 /// With the flag off, every v2-only operation is a clean JSON 404.
 #[tokio::test]
 async fn flag_off_every_v2_only_operation_is_404() {

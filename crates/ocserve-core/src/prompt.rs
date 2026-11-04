@@ -38,6 +38,14 @@ pub struct PromptContext {
     pub endpoint: LlmEndpoint,
     pub model_id: String,
     pub provider_id: String,
+    /// Selected variant (upstream Session.model.variant), resolved at request
+    /// time. `None` and `"default"` are equivalent (upstream's `?? "default"`
+    /// comparison and its `!== "default"` gate for the provider options).
+    pub variant: Option<String>,
+    /// `model.variants[variant]` from the provider payload — the exact options
+    /// upstream merges LAST into the request (llm/request.ts:82,111-118).
+    /// Empty when the variant is absent or the model declares none.
+    pub variant_options: serde_json::Value,
     /// Agent permission rules (v1 {permission, pattern, action}, last wins).
     pub rules: Vec<ocserve_tools::Rule>,
     /// Permission rendezvous (ask → event → reply).
@@ -1247,6 +1255,16 @@ fn skill_exec(
     })
 }
 
+/// Effective variant for this turn: request > session (ctx) > "default"
+/// (upstream prompt.ts:654 `input.variant ?? …`, persisted at 683-685).
+fn resolve_variant(ctx: &PromptContext, requested: Option<&str>) -> String {
+    requested
+        .filter(|v| !v.is_empty())
+        .map(String::from)
+        .or_else(|| ctx.variant.clone().filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| "default".to_string())
+}
+
 /// v1 `task` tool (tool/task.ts) — subagent launcher (K-TASK). Spawns a child
 /// session (`parent_id = ctx.sessionID`), derives the child's permission
 /// ruleset (parent deny + external_directory rules, plus todowrite/task denies
@@ -1711,12 +1729,17 @@ pub async fn run_prompt_with(
     // payload-less send. Churn-free UPDATE (0 rows when unchanged).
     // Transient runs have no session row — nothing to persist to.
     if !opts.transient {
+        // Upstream session.ts:683-685 writes `variant: info.model.variant ??
+        // "default"`; an explicit request variant wins, else the session's
+        // stored selection, else "default".
+        let session_variant = resolve_variant(ctx, req.variant.as_deref());
         ocserve_store::persist_prompt_model(
             writer,
             session_id,
             &ctx.agent,
-            &json!({"id": ctx.model_id, "providerID": ctx.provider_id, "variant": "default"})
-                .to_string(),
+            &json!({"id": ctx.model_id, "providerID": ctx.provider_id,
+                    "variant": session_variant})
+            .to_string(),
         )?;
     }
     // K-EFFICIENCY: RSS + reader-open probe — Drop-based so BAIL exits
@@ -1874,7 +1897,8 @@ pub async fn run_prompt_with(
             writer,
             session_id,
             json!({
-                "model": {"id": model, "providerID": ctx.provider_id, "variant": "default"},
+                "model": {"id": model, "providerID": ctx.provider_id,
+                          "variant": resolve_variant(ctx, req.variant.as_deref())},
                 "agent": agent,
             }),
             &mut seq,
@@ -2324,11 +2348,26 @@ pub async fn run_prompt_with(
                     params_out.get("maxOutputTokens").and_then(|v| v.as_u64()),
                     ctx.model_limit["output"].as_u64().unwrap_or(0),
                 )),
-                options: params_out
-                    .get("options")
-                    .cloned()
-                    .filter(Value::is_object)
-                    .unwrap_or(Value::Null),
+                // Upstream merges the selected variant's options last
+                // (request.ts:82,111-118); the chat.params plugin receives the
+                // computed options and its output replaces them, so a plugin
+                // key wins over the variant's.
+                options: {
+                    let mut merged = match ctx.variant_options.as_object() {
+                        Some(o) => o.clone(),
+                        None => serde_json::Map::new(),
+                    };
+                    if let Some(o) = params_out.get("options").and_then(|v| v.as_object()) {
+                        for (k, v) in o {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                    }
+                    if merged.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::Object(merged)
+                    }
+                },
                 headers: headers_out
                     .get("headers")
                     .and_then(|h| h.as_object())
@@ -3682,7 +3721,7 @@ pub async fn run_prompt_with(
                 model_json: &json!({
                     "id": model,
                     "providerID": ctx.provider_id,
-                    "variant": "default"
+                    "variant": resolve_variant(ctx, req.variant.as_deref()),
                 })
                 .to_string(),
                 time_updated: t_end,

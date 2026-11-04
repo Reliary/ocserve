@@ -762,9 +762,7 @@ pub async fn fs_read(
 
 /// GET /api/worktree — `Worktree.List` from `git worktree list`.
 pub async fn worktree_list_api(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    if !st.v2_enabled {
-        return v2_not_found("global").into_response();
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
     let list = run_blocking(&st.db, move |_db| {
         Ok::<_, anyhow::Error>(crate::vcs::worktrees(&dir))
@@ -782,9 +780,7 @@ pub async fn worktree_create_api(
     Json(body): Json<Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if !st.v2_enabled {
-        return v2_not_found("global").into_response();
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let obj = body.as_object().cloned().unwrap_or_default();
     if let Some(bad) = obj
         .keys()
@@ -829,9 +825,7 @@ pub async fn worktree_remove_api(
     Json(body): Json<Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if !st.v2_enabled {
-        return v2_not_found("global").into_response();
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let obj = body.as_object().cloned().unwrap_or_default();
     let (Some(_pid), Some(directory), force) = (
         obj.get("projectID").and_then(|v| v.as_str()),
@@ -856,13 +850,11 @@ pub async fn worktree_remove_api(
 /// POST /api/worktree/refresh — re-scan (stateless: the list is always live
 /// from git, so refresh is an honest 204 no-op, not a fake rebuild).
 pub async fn worktree_refresh_api(
-    State(st): State<Arc<AppState>>,
+    State(_st): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if !st.v2_enabled {
-        return v2_not_found("global").into_response();
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     if body.get("projectID").and_then(|v| v.as_str()).is_none() {
         return bad_request("Missing key\n  at [\"projectID\"]").into_response();
     }
@@ -870,10 +862,13 @@ pub async fn worktree_refresh_api(
 }
 
 fn bad_request(msg: &str) -> HttpError {
+    // Freeze emits `kind` on payload decode errors (probed 2.0.28:
+    // `{"_tag":"InvalidRequestError","message":…,"kind":"Payload"}`); the
+    // contract marks it optional, the client-visible bytes make it real.
     crate::HttpError::TaggedData {
         status: StatusCode::BAD_REQUEST,
         tag: "InvalidRequestError",
-        fields: json!({"message": msg.to_string()}),
+        fields: json!({"message": msg.to_string(), "kind": "Payload"}),
     }
 }
 
@@ -1066,9 +1061,7 @@ pub async fn session_export_api(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let sid = id.clone();
     let info = run_blocking(&st.db, move |db| ocserve_store::load_session_wire(db, &sid))
         .await
@@ -1111,9 +1104,7 @@ pub async fn session_import_api(
     State(st): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found("global"));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let data = body.get("data").unwrap_or(&body);
     let info = data.get("info").cloned().unwrap_or(json!({}));
     let messages = data
@@ -1165,9 +1156,7 @@ pub async fn instruction_list(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
         return Err(session_not_found(&id));
     }
@@ -1191,9 +1180,7 @@ pub async fn instruction_put(
     Path((id, key)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let obj = body.as_object().cloned().unwrap_or_default();
     if let Some(bad) = obj.keys().find(|k| *k != "value") {
         return Err(bad_request(&format!("unknown key {bad}")));
@@ -1213,9 +1200,7 @@ pub async fn instruction_remove(
     State(st): State<Arc<AppState>>,
     Path((id, key)): Path<(String, String)>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
         return Err(session_not_found(&id));
     }
@@ -1234,9 +1219,7 @@ pub async fn mcp_exp_upsert(
     Path(name): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&name));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let hub = st
         .mcp
         .get()
@@ -1297,9 +1280,7 @@ pub async fn mcp_exp_remove(
     State(st): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&name));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     if let Some(hub) = st.mcp.get().cloned() {
         let _ = hub.disconnect(&name).await;
         hub.drop_cfg(&name);
@@ -1313,9 +1294,7 @@ pub async fn mcp_exp_connect(
     State(st): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&name));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     match st.mcp.get().cloned() {
         Some(hub) if hub.known(&name) => {
             let _ = hub.connect(&name).await;
@@ -1333,9 +1312,7 @@ pub async fn mcp_exp_disconnect(
     State(st): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&name));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     match st.mcp.get().cloned() {
         Some(hub) if hub.known(&name) => {
             let _ = hub.disconnect(&name).await;
@@ -1380,9 +1357,7 @@ pub async fn integration_command_connect(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let method = body.get("methodID").and_then(|v| v.as_str()).unwrap_or("");
     if method.is_empty() {
         return Err(bad_request("Missing key\n  at [\"methodID\"]"));
@@ -1398,9 +1373,7 @@ pub async fn integration_external_connect(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let method = body.get("methodID").and_then(|v| v.as_str()).unwrap_or("");
     if method.is_empty() {
         return Err(bad_request("Missing key\n  at [\"methodID\"]"));
@@ -1420,9 +1393,7 @@ pub async fn integration_attempt_poll(
     State(st): State<Arc<AppState>>,
     Path((_id, aid)): Path<(String, String)>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&_id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     match st.attempt_gate.get(&aid) {
         Some(req) => Ok(Json(json!({"data": req}))),
         None => Err(crate::HttpError::TaggedData {
@@ -1439,9 +1410,7 @@ pub async fn integration_attempt_abort(
     State(st): State<Arc<AppState>>,
     Path((_id, aid)): Path<(String, String)>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&_id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     if st.attempt_gate.cancel(&aid) {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -1459,9 +1428,7 @@ pub async fn integration_oauth_complete(
     Path((_id, aid)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&_id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     if st.attempt_gate.complete(&aid, body) {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -1480,9 +1447,7 @@ pub async fn integration_wellknown(
     State(st): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found("global"));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let Some(url) = body.get("url").and_then(|v| v.as_str()) else {
         return Err(bad_request("Missing key\n  at [\"url\"]"));
     };
@@ -1495,22 +1460,14 @@ pub async fn integration_wellknown(
 // /api/pty; the persistent prefix is upstream's durability namespace)
 // ---------------------------------------------------------------------------
 
-/// Shared v2 gate for the persistent-pty family.
-fn pty_v2_gate(st: &Arc<AppState>) -> Result<(), HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found("global"));
-    }
-    Ok(())
-}
+// (The persistent-pty family's per-handler gate was removed: `v2_gate` over
+// the generated v2-only table is the only flag authority.)
 
 /// GET /api/experimental/persistent-pty/{ptyID} — get.
 pub async fn ppty_get(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if pty_v2_gate(&st).is_err() {
-        return v2_not_found(&id).into_response();
-    }
     pty_get(State(st), Path(id)).await.into_response()
 }
 
@@ -1520,9 +1477,6 @@ pub async fn ppty_update(
     Path(id): Path<String>,
     body: Option<Json<Value>>,
 ) -> impl IntoResponse {
-    if pty_v2_gate(&st).is_err() {
-        return v2_not_found(&id).into_response();
-    }
     pty_update(State(st), Path(id), body).await.into_response()
 }
 
@@ -1531,9 +1485,6 @@ pub async fn ppty_remove(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if pty_v2_gate(&st).is_err() {
-        return v2_not_found(&id).into_response();
-    }
     pty_remove(State(st), Path(id)).await.into_response()
 }
 
@@ -1543,9 +1494,6 @@ pub async fn ppty_connect_info(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if pty_v2_gate(&st).is_err() {
-        return v2_not_found(&id).into_response();
-    }
     pty_get(State(st), Path(id)).await.into_response()
 }
 
@@ -1554,9 +1502,6 @@ pub async fn ppty_snapshot(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if pty_v2_gate(&st).is_err() {
-        return v2_not_found(&id).into_response();
-    }
     match st.pty.get_running(&id).ok() {
         Some(info) => Json(json!({"location": api_location(&st), "data": info})).into_response(),
         None => (
@@ -1572,9 +1517,6 @@ pub async fn ppty_connect_token(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if pty_v2_gate(&st).is_err() {
-        return v2_not_found(&id).into_response();
-    }
     pty_connect_token(State(st), Path(id)).await.into_response()
 }
 
@@ -1582,13 +1524,10 @@ pub async fn ppty_connect_token(
 /// session (recorded; the pty registry is global, so handoff is an honest
 /// 204 — no per-session ownership to transfer).
 pub async fn ppty_handoff(
-    State(st): State<Arc<AppState>>,
+    State(_st): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if pty_v2_gate(&st).is_err() {
-        return v2_not_found("global").into_response();
-    }
     if body.get("ptyID").and_then(|v| v.as_str()).is_none() {
         return bad_request("Missing key\n  at [\"ptyID\"]").into_response();
     }
@@ -1599,9 +1538,6 @@ pub async fn ppty_handoff(
 /// (bounded: removes every running pty, then 204).
 pub async fn ppty_shutdown(State(st): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if pty_v2_gate(&st).is_err() {
-        return v2_not_found("global").into_response();
-    }
     for pty in st.pty.list_running() {
         if let Some(id) = pty.get("id").and_then(|v| v.as_str()) {
             let _ = st.pty.remove(id);
@@ -1615,11 +1551,8 @@ pub async fn ppty_shutdown(State(st): State<Arc<AppState>>) -> axum::response::R
 /// else the full list — honestly unfiltered, not fabricated).
 pub async fn ppty_session_list(
     State(st): State<Arc<AppState>>,
-    Path(id): Path<String>,
+    Path(_id): Path<String>,
 ) -> impl IntoResponse {
-    if pty_v2_gate(&st).is_err() {
-        return v2_not_found(&id).into_response();
-    }
     // Contract-exact: `{data}` with NO location (v2-only route).
     Json(json!({"data": st.pty.list_running()})).into_response()
 }
@@ -1631,9 +1564,6 @@ pub async fn ppty_session_create(
     Path(id): Path<String>,
     body: Option<Json<Value>>,
 ) -> impl IntoResponse {
-    if pty_v2_gate(&st).is_err() {
-        return v2_not_found(&id).into_response();
-    }
     let mut input = body.map(|b| b.0).unwrap_or_else(|| json!({}));
     if let Some(obj) = input.as_object_mut() {
         obj.insert("sessionID".into(), json!(id));
@@ -1649,9 +1579,6 @@ pub async fn ppty_session_read(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if pty_v2_gate(&st).is_err() {
-        return v2_not_found(&id).into_response();
-    }
     match st.pty.list_running().into_iter().next() {
         // Contract-exact: `{data}` with NO location (v2-only route).
         Some(info) => Json(json!({"data": info})).into_response(),
@@ -1669,9 +1596,7 @@ pub async fn ppty_session_read(
 
 /// GET /api/shell — `{location, data: Shell.Info[]}` status snapshot.
 pub async fn shell_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    if !st.v2_enabled {
-        return v2_not_found("global").into_response();
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     Json(json!({"location": api_location(&st), "data": st.shells.list()})).into_response()
 }
 
@@ -1682,9 +1607,7 @@ pub async fn shell_create(
     Json(body): Json<Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if !st.v2_enabled {
-        return v2_not_found("global").into_response();
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let Some(command) = body.get("command").and_then(|v| v.as_str()) else {
         return bad_request("Missing key\n  at [\"command\"]").into_response();
     };
@@ -1713,9 +1636,7 @@ pub async fn shell_get(
     Path(id): Path<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if !st.v2_enabled {
-        return v2_not_found(&id).into_response();
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     match st.shells.poll(&id) {
         Some(info) => Json(json!({"location": api_location(&st), "data": info})).into_response(),
         None => (
@@ -1733,9 +1654,7 @@ pub async fn shell_remove(
     Path(id): Path<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if !st.v2_enabled {
-        return v2_not_found(&id).into_response();
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     st.shells.remove(&id);
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1746,9 +1665,7 @@ pub async fn shell_output(
     Path(id): Path<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if !st.v2_enabled {
-        return v2_not_found(&id).into_response();
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     match st.shells.output(&id) {
         Some(out) => Json(json!({"location": api_location(&st), "data": out})).into_response(),
         None => (
@@ -1768,9 +1685,7 @@ pub async fn session_skill_api(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let skill = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
     if skill.is_empty() {
         return Err(bad_request("Missing key\n  at [\"id\"]"));
@@ -1812,9 +1727,7 @@ pub async fn session_remove_api(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     if let Some((_, handle)) = st.prompt_tasks.lock().remove(&id) {
         handle.abort();
     }
@@ -1840,9 +1753,7 @@ pub async fn session_update_api(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let obj = body.as_object().cloned().unwrap_or_default();
     if let Some(bad) = obj
         .keys()
@@ -1899,9 +1810,7 @@ pub async fn session_revert_clear_api(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
         return Err(session_not_found(&id));
     }
@@ -1919,9 +1828,8 @@ pub async fn session_agent_api(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // In BOTH frozen contracts (v1 1.18.31 included): gating lives in
+    // `v2_gate` over the generated v2-only table, never in the handler.
     let Some(agent) = body.get("agent").and_then(|v| v.as_str()) else {
         return Err(bad_request("Missing key\n  at [\"agent\"]"));
     };
@@ -1940,22 +1848,53 @@ pub async fn session_model_api(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
-    let Some(model) = body.get("model").and_then(|v| v.as_str()) else {
-        return Err(bad_request("Missing key\n  at [\"model\"]"));
-    };
+    // In BOTH frozen contracts: no handler self-gate (v2_gate owns the flag).
+    // Ordering is probed from 2.0.28: the session 404 wins over body decode
+    // (a bogus id with `{}` or `{"model":null}` answers 404, not 400), and the
+    // gate precedes both.
     if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
         return Err(session_not_found(&id));
     }
-    let parsed = ocserve_core::wire::parse_model_str(model);
+    // `{model: Model.Ref}` — an OBJECT `{id, providerID, variant?}`. The old
+    // `as_str()` parse rejected every correct client with a misleading
+    // "Missing key" while the key was present (issue #29 follow-up, 2026-11-04);
+    // both frozen contracts declare the object shape.
+    let Some(model) = body.get("model") else {
+        return Err(bad_request("Missing key\n  at [\"model\"]"));
+    };
+    let Some(obj) = model.as_object() else {
+        return Err(bad_request("Expected Model.Ref\n  at [\"model\"]"));
+    };
+    let Some(id_v) = obj.get("id") else {
+        return Err(bad_request("Missing key\n  at [\"model\"][\"id\"]"));
+    };
+    let Some(model_id) = id_v.as_str() else {
+        return Err(bad_request("Expected string\n  at [\"model\"][\"id\"]"));
+    };
+    let Some(pid_v) = obj.get("providerID") else {
+        return Err(bad_request("Missing key\n  at [\"model\"][\"providerID\"]"));
+    };
+    let Some(provider_id) = pid_v.as_str() else {
+        return Err(bad_request(
+            "Expected string\n  at [\"model\"][\"providerID\"]",
+        ));
+    };
+    let variant = match obj.get("variant") {
+        None => "default".to_string(),
+        Some(v) => match v.as_str() {
+            Some(v) => v.to_string(),
+            None => {
+                return Err(bad_request(
+                    "Expected string\n  at [\"model\"][\"variant\"]",
+                ));
+            }
+        },
+    };
     ocserve_store::persist_prompt_model(
         &st.writer,
         &id,
         &st.llm.read().default_agent.clone(),
-        &json!({"id": parsed.model_id, "providerID": parsed.provider_id, "variant": "default"})
-            .to_string(),
+        &json!({"id": model_id, "providerID": provider_id, "variant": variant}).to_string(),
     )
     .map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
@@ -1968,9 +1907,7 @@ pub async fn session_model_api(
 /// nothing v1 requires here, so no union keys).
 pub async fn credential_list_api(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     use axum::response::IntoResponse;
-    if !st.v2_enabled {
-        return v2_not_found("global").into_response();
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     match ocserve_store::credential_list(&st.db) {
         Ok(rows) => Json(json!({"data": rows.iter().map(|c| c.to_wire()).collect::<Vec<_>>()}))
             .into_response(),
@@ -1987,9 +1924,7 @@ pub async fn credential_create_api(
     State(st): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found("global"));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let obj = body.as_object().cloned().unwrap_or_default();
     let Some(integration_id) = obj.get("integrationID").and_then(|v| v.as_str()) else {
         return Err(bad_request("Missing key\n  at [\"integrationID\"]"));
@@ -2059,9 +1994,7 @@ pub async fn credential_activate_api(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     ocserve_store::credential_activate(&st.writer, &st.db, &id, now_ms()).map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2076,9 +2009,7 @@ pub async fn session_environment_api(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let Some(variables) = body.get("variables") else {
         return Err(bad_request("Missing key\n  at [\"variables\"]"));
     };
@@ -2098,9 +2029,7 @@ pub async fn experimental_config_patch(
     State(st): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found("global"));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     crate::patch_config(State(st), Json(body))
         .await
         .map_err(crate::HttpError::Api)
@@ -2117,9 +2046,7 @@ pub async fn experimental_generate_api(
     State(st): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found("global"));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let Some(prompt) = body.get("prompt").and_then(|v| v.as_str()) else {
         return Err(bad_request("Missing key\n  at [\"prompt\"]"));
     };
@@ -2187,9 +2114,7 @@ pub async fn experimental_generate_api(
 /// request (no cache), so there is nothing stale to refresh; the
 /// observable state is identical before and after. Recorded, not hidden.
 pub async fn location_reload_api(State(st): State<Arc<AppState>>) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found("global"));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let _ = crate::emit_durable_http(&st, "global", "location.reload", json!({}));
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2201,21 +2126,17 @@ pub async fn plugin_check_api(
     State(st): State<Arc<AppState>>,
     Json(_body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found("global"));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     Ok(Json(json!({"location": api_location(&st), "data": []})))
 }
 
 /// POST /api/plugin/update — 204 no-op over the empty inventory (same
 /// vacuous-truth discipline as check; re-verify on first inventory).
 pub async fn plugin_update_api(
-    State(st): State<Arc<AppState>>,
+    State(_st): State<Arc<AppState>>,
     Json(_body): Json<Value>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found("global"));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2225,9 +2146,7 @@ pub async fn vcs_init_api(
     State(st): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found("global"));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let dir = body
         .get("directory")
         .and_then(|v| v.as_str())
@@ -2274,9 +2193,7 @@ pub async fn rpc_unimplemented(
     axum::extract::Path((rpc_id, method)): axum::extract::Path<(String, String)>,
     body: Option<Json<Value>>,
 ) -> Result<axum::response::Response, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&rpc_id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let Some(Json(body)) = body else {
         return Err(crate::HttpError::TaggedData {
             status: StatusCode::BAD_REQUEST,
@@ -2345,11 +2262,9 @@ pub async fn rpc_unimplemented(
 /// provider/plumbing exists and no caller needs it. Explicit 503 (service,
 /// not route — the route exists, the backend does not) with the trigger.
 pub async fn websearch_unimplemented(
-    State(st): State<Arc<AppState>>,
+    State(_st): State<Arc<AppState>>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found("global"));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     Err(crate::HttpError::TaggedData {
         status: StatusCode::SERVICE_UNAVAILABLE,
         tag: "ServiceUnavailableError",
@@ -2362,9 +2277,7 @@ pub async fn websearch_unimplemented(
 /// (verified live — Instance.directory, not session-scoped).
 pub async fn websearch_providers_api(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     use axum::response::IntoResponse;
-    if !st.v2_enabled {
-        return v2_not_found("global").into_response();
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let data: Vec<Value> = crate::websearch::PROVIDERS
         .iter()
         .map(|(id, name)| json!({"id": id, "name": name}))
@@ -2388,9 +2301,7 @@ pub async fn websearch_api(
     State(st): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found("global"));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let obj = body.as_object().cloned().unwrap_or_default();
     let Some(query) = obj.get("query").and_then(|v| v.as_str()) else {
         return Err(bad_request("Missing key\n  at [\"query\"]"));
@@ -2460,9 +2371,7 @@ pub async fn agent_detail_api(
     State(st): State<Arc<AppState>>,
     Path(agent): Path<String>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&agent));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let payloads = st.payloads.read();
     let found = payloads
         .api_agent
@@ -2504,10 +2413,8 @@ fn now_ms() -> i64 {
 }
 
 /// POST /api/pair — mint a pairing code (`{code, expires_in}`).
-pub async fn pair_mint(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    if !st.v2_enabled {
-        return v2_not_found("global").into_response();
-    }
+pub async fn pair_mint(State(_st): State<Arc<AppState>>) -> impl IntoResponse {
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     use axum::response::IntoResponse;
     let mut map = PAIRING_CODES.lock();
     let now = now_ms();
@@ -2610,9 +2517,7 @@ pub async fn session_command_api(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let obj = body.as_object().cloned().unwrap_or_default();
     let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
     // Unknown command fails BEFORE admission (upstream Command.NotFoundError).
@@ -2661,9 +2566,7 @@ pub async fn session_shell_api(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let obj = body.as_object().cloned().unwrap_or_default();
     let Some(command) = obj.get("command").and_then(|v| v.as_str()) else {
         return Err(bad_request("Missing key\n  at [\"command\"]"));
@@ -2696,9 +2599,7 @@ pub async fn session_move_api(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let obj = body.as_object().cloned().unwrap_or_default();
     let Some(directory) = obj.get("directory").and_then(|v| v.as_str()) else {
         return Err(bad_request("Missing key\n  at [\"directory\"]"));
@@ -2738,9 +2639,7 @@ pub async fn session_synthetic_api(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let obj = body.as_object().cloned().unwrap_or_default();
     let Some(text) = obj.get("text").and_then(|v| v.as_str()) else {
         return Err(bad_request("Missing key\n  at [\"text\"]"));
@@ -2800,9 +2699,7 @@ pub async fn session_view_api(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     if body.get("idle").and_then(|v| v.as_f64()).is_none() {
         return Err(bad_request("Missing key\n  at [\"idle\"]"));
     }
@@ -2823,9 +2720,7 @@ pub async fn session_generate_api(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let Some(prompt) = body.get("prompt").and_then(|v| v.as_str()) else {
         return Err(bad_request("Missing key\n  at [\"prompt\"]"));
     };
@@ -2900,9 +2795,7 @@ pub async fn session_background_api(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
         return Err(session_not_found(&id));
     }
@@ -2919,9 +2812,7 @@ pub async fn session_fork_api(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let obj = body.as_object().cloned().unwrap_or_default();
     if let Some(bad) = obj.keys().find(|k| *k != "before") {
         return Err(crate::HttpError::TaggedData {
@@ -3074,16 +2965,10 @@ fn session_not_found(id: &str) -> crate::HttpError {
     }
 }
 
-/// v2 404 for routes that do not exist until acceptance (V2-PLAN.md D2:
-/// `/api/info` and the v2 runtime stay dark behind OCSERVE_V2=1). Distinct
-/// from `session_not_found` (unknown session) — this is unknown CAPABILITY.
-fn v2_not_found(id: &str) -> crate::HttpError {
-    crate::HttpError::TaggedData {
-        status: StatusCode::NOT_FOUND,
-        tag: "SessionNotFoundError",
-        fields: json!({"sessionID": id, "message": "v2 runtime disabled".to_string()}),
-    }
-}
+// `v2_not_found` was removed with the handler self-gates: the flag's 404 is
+// produced centrally by `v2_gate` with the honest `NotFoundError` body. The
+// old helper answered `SessionNotFoundError: "v2 runtime disabled"`, which
+// read as a session bug and invited client retry loops.
 
 // ---------------------------------------------------------------------------
 // session core
@@ -3447,9 +3332,8 @@ pub async fn prompt(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // `POST /api/session/{id}/prompt` exists in BOTH frozen contracts; the
+    // flag is enforced centrally by `v2_gate`, never here.
     // boundary decode FIRST with the v2 envelope (`_tag:InvalidRequestError`,
     // field-probes.md) — session/endpoint checks follow.
     let mut input = crate::decode_v2(ocserve_core::wire::V2PromptInput::decode(&body))?;
@@ -3947,14 +3831,8 @@ fn v2_payload_parts(payload: &Value) -> Vec<Value> {
 /// capabilities}`). DARK until P5 acceptance: JSON 404 while `v2_enabled`
 /// is false (never SPA fallthrough — a client probing the version must get
 /// a version signal, not HTML).
-pub async fn server_info(State(st): State<Arc<AppState>>) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(crate::HttpError::TaggedData {
-            status: StatusCode::NOT_FOUND,
-            tag: "SessionNotFoundError",
-            fields: json!({"message": "v2 runtime disabled".to_string()}),
-        });
-    }
+pub async fn server_info(State(_st): State<Arc<AppState>>) -> Result<Json<Value>, HttpError> {
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     Ok(Json(json!({
         "version": ocserve_core::spec::V2_TAG,
         "pid": std::process::id(),
@@ -4173,9 +4051,7 @@ pub async fn form_create(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
         return Err(session_not_found(&id));
     }
@@ -4228,9 +4104,7 @@ pub async fn form_list(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
         return Err(session_not_found(&id));
     }
@@ -4246,9 +4120,7 @@ pub async fn form_get(
     State(st): State<Arc<AppState>>,
     Path((id, fid)): Path<(String, String)>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     match ocserve_store::form::get(&st.db, &fid).map_err(internal)? {
         Some((sid, title, meta, fields, state, _answer)) if sid == id => Ok(Json(
             json!({"data": form_info(&id, &fid, &title, &meta, &fields, Some(&state))}),
@@ -4269,9 +4141,7 @@ pub async fn form_reply(
     Path((id, fid)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let answer = body.get("answer").cloned().unwrap_or(Value::Null);
     match ocserve_store::form::get(&st.db, &fid).map_err(internal)? {
         Some((sid, _, _, _, state, _)) if sid == id => {
@@ -4305,9 +4175,7 @@ pub async fn form_cancel(
     State(st): State<Arc<AppState>>,
     Path((id, fid)): Path<(String, String)>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     match ocserve_store::form::get(&st.db, &fid).map_err(internal)? {
         Some((sid, _, _, _, _, _)) if sid == id => {
             let _ = ocserve_store::form::settle(&st.writer, &fid, "cancelled", None)
@@ -4323,9 +4191,7 @@ pub async fn form_cancel(
 /// GET /api/form — pending asks across sessions (gate-backed, location
 ///-agnostic; the durable rows scope per session via the session routes).
 pub async fn form_list_global(State(st): State<Arc<AppState>>) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found("global"));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     // v2 `form.list` is a Location.response — envelope required.
     Ok(Json(
         json!({"location": api_location(&st), "data": st.form_gate.list()}),
@@ -4366,9 +4232,7 @@ pub async fn session_log(
 ) -> Result<axum::response::Response, HttpError> {
     use axum::response::sse::{Event, Sse};
     use futures_util::stream::{self, StreamExt};
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
         return Err(session_not_found(&id));
     }
@@ -4472,9 +4336,7 @@ pub async fn inbox_list(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
         return Err(session_not_found(&id));
     }
@@ -4491,9 +4353,7 @@ pub async fn inbox_cancel(
     State(st): State<Arc<AppState>>,
     Path((id, inbox_id)): Path<(String, String)>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
         return Err(session_not_found(&id));
     }
@@ -4515,9 +4375,7 @@ pub async fn inbox_update(
     Path((id, inbox_id)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let delivery = body
         .get("delivery")
         .and_then(|v| v.as_str())
@@ -5248,9 +5106,7 @@ pub async fn credential_update(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // In BOTH frozen contracts: no handler self-gate.
     let label = match body.get("label") {
         Some(Value::String(s)) => s.clone(),
         Some(_) => {
@@ -5285,9 +5141,7 @@ pub async fn credential_remove(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // In BOTH frozen contracts: no handler self-gate.
     ocserve_store::credential_delete(&st.writer, &id).map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -5301,9 +5155,7 @@ pub async fn integration_connect_key(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, HttpError> {
-    if !st.v2_enabled {
-        return Err(v2_not_found(&id));
-    }
+    // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     if !integration_is_known(&st, &id) {
         return Err(crate::HttpError::TaggedData {
             status: StatusCode::NOT_FOUND,

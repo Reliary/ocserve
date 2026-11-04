@@ -15,7 +15,14 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 fn app() -> axum::Router {
-    ocserve_http::router(ocserve_http::AppState::new())
+    // Explicit v2=true: `AppState::new()` reads the process-global env, so
+    // these tests only passed when the environment happened to set it (and a
+    // gate-off run made the model-shape assertions reach the wrong parser).
+    ocserve_http::router(ocserve_http::AppState::with_payloads_and_v2(
+        None,
+        ocserve_http::Payloads::default(),
+        true,
+    ))
 }
 
 async fn req(

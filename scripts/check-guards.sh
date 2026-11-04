@@ -14,6 +14,8 @@
 #      messages route must stream via for_each_message_json [suite]
 #   4. msg_part INSERT/UPDATE outside ocserve-store — every part write must
 #      carry its part_search projection companion (W1 FTS invariant) [suite]
+#   67. handler-level `v2_enabled` checks in v2.rs (flag authority is the gate
+#      table; the five v1∩v2 routes broke with the flag off) [plant]
 #   5. upstream drift watch broken (version compare / pin read / registry-output
 #      validation / report writer) — the nightly watch would go silently wrong
 #      (PLAN §6/§8, K-DRIFT) [suite: drift-watch.sh --selftest]
@@ -2071,5 +2073,34 @@ else
   echo "FAIL: install.sh --render-to failed (rule 53b)"; fail=1
 fi
 rm -f "$_r_good" "$_r_un" "$_r_plant"
+
+echo "== guard: the v2 flag has exactly one authority (rule 67) =="
+# 2026-11-04: 52 handlers in v2.rs carried `if !st.v2_enabled` self-gates. Five
+# of those routes exist in BOTH frozen contracts (prompt, agent, model,
+# credential PATCH/DELETE), so a flag-off production server answered the
+# 1.18.31 TUI's own calls with a SessionNotFoundError. The generated v2-only
+# table in `v2_gate` is the single authority; a handler-local check can only
+# drift from it (too dark on shared routes, or unexpectedly on for v2-only).
+v2_selfgate() {
+  local hits
+  # Match the exact gate expression, not a comment mentioning it.
+  hits=$(grep -nE 'st\.v2_enabled' "$@" 2>/dev/null | grep -vE '^[^:]+:[0-9]+: *//' || true)
+  printf '%s' "$hits"
+}
+if [ -n "$(v2_selfgate crates/ocserve-http/src/v2.rs)" ]; then
+  v2_selfgate crates/ocserve-http/src/v2.rs | head -5
+  echo "FAIL: handler-level v2_enabled check (rule 67) — the gate table is the only authority"; fail=1
+else
+  echo "ok (no handler self-gates; v2_gate + the generated table decide)"
+fi
+# Planted control: the predicate must flag the exact expression when present.
+_v2p=/var/tmp/ocserve-rule67-planted.rs
+printf 'pub async fn f(st: State<()>) {\n    if !st.v2_enabled {\n        return;\n    }\n}\n' > "$_v2p"
+if [ -z "$(v2_selfgate "$_v2p")" ]; then
+  echo "FAIL: rule 67 planted self-gate not detected (vacuous predicate)"; fail=1
+else
+  echo "ok (planted handler self-gate detected)"
+fi
+rm -f "$_v2p"
 
 exit $fail
