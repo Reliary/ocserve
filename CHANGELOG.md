@@ -7,6 +7,21 @@ differs is a named `D-*` row in the ledger at `PLAN.md §18`.
 ## Unreleased
 
 ### Fixed
+- **A provider's `options.apiKey` was never used as the credential (issue #28).**
+  The endpoint builder read `auth.json`/`auth-overlay.json` only, so every
+  provider whose key lived in the documented `options.apiKey` slot sent
+  `Authorization: Bearer ` (empty) to the upstream, which answers
+  `missing_api_key` and reads like a client bug. opencode 2.x no longer writes
+  `auth.json` (keys live in the `credential` table), so this hit every
+  config-declared provider on a 2.x install. A literal key was dropped as
+  silently as a `{env:...}` reference. Config `options.apiKey` now follows
+  upstream precedence (config first, auth layer as the fallback) and is
+  interpolated: `{env:NAME}` and `{file:PATH}`, with `{file:}` resolved relative
+  to the declaring config. `options/baseURL` is interpolated too. An unset
+  `{env:NAME}` still expands to the empty string (upstream parity) but logs the
+  field path, and a provider whose configured key resolves empty is named at
+  boot without the secret. `OCSERVE_CONFIG_INTERPOLATE=0` restores the old
+  verbatim behaviour for operators sharing one config with another server.
 - **Credential rename and delete were no-ops.** `PATCH /api/credential/{id}` and
   `DELETE /api/credential/{id}` returned 204 without touching the store, so a
   client renaming a credential saw success and no change. Both now edit the

@@ -456,6 +456,13 @@ pub const CONTRACT: &[Var] = &[
         "Budget for one sift compression.",
     ),
     op(
+        "Prompts and providers",
+        "OCSERVE_CONFIG_INTERPOLATE",
+        "on",
+        "0 disables",
+        "Expand `{env:NAME}` and `{file:PATH}` in config provider `options` values (upstream config.ts substitution). With this off a `{env:...}` apiKey reaches the provider verbatim, which is the issue #28 failure mode.",
+    ),
+    op(
         "Config, sync and platform",
         "OCSERVE_SHELL",
         "platform default",

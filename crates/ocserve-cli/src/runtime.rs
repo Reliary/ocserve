@@ -48,6 +48,136 @@ fn read_json(path: &Path) -> Result<Value> {
     serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
 }
 
+/// `OCSERVE_CONFIG_INTERPOLATE=0` kill switch (env contract, rule 58).
+///
+/// A kill switch rather than a feature flag on purpose: interpolation turns a
+/// config file into code (any `{file:…}` becomes readable to the provider
+/// boundary), so an operator needs a way to keep ocserve from resolving
+/// references without patching the config every other server shares. Unset
+/// means ON, matching the contract's "on, 0 disables" convention.
+fn interpolation_enabled() -> bool {
+    !matches!(
+        std::env::var("OCSERVE_CONFIG_INTERPOLATE").as_deref(),
+        Ok("0")
+    )
+}
+
+/// Expand `{env:NAME}` and `{file:PATH}` in a config string, upstream
+/// config.ts substitution semantics (issue #28).
+///
+/// Upstream resolves these in EVERY config value before the provider is built,
+/// so a config-declared provider can keep its key out of the file:
+///
+/// ```json
+/// "options": { "apiKey": "{env:OPENROUTER_API_KEY}" }
+/// ```
+///
+/// Without this, ocserve forwarded the placeholder verbatim as the bearer
+/// token (the provider then answers 401) or handed back an empty key, and the
+/// failure looked like a client bug rather than a dropped config key.
+///
+/// Deviations from upstream, all deliberate and all fail-loud:
+/// - an unset variable expands to the empty string exactly as upstream, but it
+///   also logs a warning naming the path — a silently empty credential was the
+///   whole 2026-11-03 debugging session behind #28;
+/// - `{file:}` is read relative to the config that declared it, so a relative
+///   path works (upstream resolves against the process cwd);
+/// - only the two documented forms are expanded. A stray `{env:` is left
+///   verbatim rather than silently truncated.
+pub(crate) fn expand_config_value(
+    raw: &str,
+    base: Option<&Path>,
+    field: &str,
+    warnings: &mut Vec<String>,
+) -> String {
+    if !interpolation_enabled() {
+        return raw.to_string();
+    }
+    if !raw.contains("{env:") && !raw.contains("{file:") {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let Some(end) = tail.find('}') else {
+            out.push_str(tail);
+            return out;
+        };
+        let token = &tail[..=end];
+        let inner = &tail[1..end];
+        if let Some(name) = inner.strip_prefix("env:") {
+            match std::env::var(name) {
+                Ok(v) => out.push_str(&v),
+                Err(_) => {
+                    warnings.push(format!(
+                        "{field}: environment variable {name} is not set — expanding {{env:{name}}} to an empty string"
+                    ));
+                }
+            }
+        } else if let Some(path) = inner.strip_prefix("file:") {
+            // Relative paths resolve against the declaring config's directory
+            // (upstream uses the process cwd there; the config-relative form is
+            // the one that keeps a repo-local config working from any cwd).
+            let resolved = match base {
+                Some(b) if !Path::new(path).is_absolute() => b.join(path),
+                _ => std::path::PathBuf::from(path),
+            };
+            match std::fs::read_to_string(&resolved) {
+                Ok(v) => out.push_str(v.trim_end_matches(['\n', '\r'])),
+                Err(_) => warnings.push(format!(
+                    "{field}: config file reference {path} is missing or unreadable ({}) — expanding {{file:{path}}} to an empty string",
+                    resolved.display()
+                )),
+            }
+        } else {
+            out.push_str(token);
+        }
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The config-provider credential, in upstream precedence order:
+/// explicit `options.apiKey` (interpolated) wins, then the auth layer
+/// (`auth.json` / `auth-overlay.json`, which W5 lets the overlay win).
+///
+/// Issue #28: this used to read the auth layer ONLY, so every provider whose
+/// key lived in `options.apiKey` — the documented shape, and the one opencode
+/// 2.x installs emit because it no longer writes auth.json — reached the
+/// upstream with an empty bearer token while `/config/providers` happily
+/// showed the key. A literal key was dropped just as silently as `{env:…}`.
+fn config_provider_key(
+    pid: &str,
+    provider: &Value,
+    auth: &Value,
+    base: Option<&Path>,
+    warnings: &mut Vec<String>,
+) -> String {
+    let from_config = provider
+        .pointer("/options/apiKey")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|raw| {
+            expand_config_value(
+                raw,
+                base,
+                &format!("provider.{pid}.options.apiKey"),
+                warnings,
+            )
+        })
+        .filter(|s| !s.is_empty());
+    if from_config.is_some() {
+        return from_config.unwrap_or_default();
+    }
+    auth.pointer(&format!("/{pid}/key"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Global config read with upstream parity (config.ts: missing file → empty,
 /// unreadable/corrupt → "using defaults" + continue). Found by CI 2026-10-08:
 /// `serve` on a bare machine (no `~/.config/opencode/opencode.json`) died at
@@ -1221,18 +1351,66 @@ impl Runtime {
             }
         }
         // config providers without auth entries (baseURL + env-less key)
+        //
+        // Issue #28: the key now follows upstream precedence —
+        // `options.apiKey` (interpolated: `{env:…}` / `{file:…}`) first, then
+        // the auth layer. Reading the auth layer ONLY meant a provider whose key
+        // lived in the documented `options.apiKey` slot sent `Bearer ` (empty)
+        // to the upstream, which reads as a client bug (`missing_api_key`), not
+        // as a config key that was dropped.
+        let mut key_warnings: Vec<String> = Vec::new();
+        let cfg_dir = Path::new(&home).join(".config/opencode");
         if let Some(provs) = cfg.get("provider").and_then(|v| v.as_object()) {
             for (pid, p) in provs {
+                // `{env:…}` in baseURL is upstream-supported too (a gateway host
+                // per environment); interpolate before the contains_key guard so
+                // an auth-less provider with an env baseURL is not skipped.
+                let base = p
+                    .pointer("/options/baseURL")
+                    .and_then(|v| v.as_str())
+                    .map(|raw| {
+                        expand_config_value(
+                            raw,
+                            Some(&cfg_dir),
+                            &format!("provider.{pid}.options.baseURL"),
+                            &mut key_warnings,
+                        )
+                    });
                 if endpoints.contains_key(pid) {
+                    // Still interpolate the key when auth already supplied a base
+                    // URL: the auth arm above only stores the raw auth key, and a
+                    // config `options.apiKey` must win over it (upstream
+                    // precedence) — leaving the raw `{env:…}` on the wire is the
+                    // #28 bug in its other branch.
+                    let key = config_provider_key(pid, p, &auth, Some(&cfg_dir), &mut key_warnings);
+                    if !key.is_empty()
+                        && let Some(ep) = endpoints.get_mut(pid)
+                    {
+                        ep.1 = key;
+                    }
                     continue;
                 }
-                if let Some(base) = p.pointer("/options/baseURL").and_then(|v| v.as_str()) {
-                    let key = auth
-                        .pointer(&format!("/{pid}/key"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    endpoints.insert(pid.clone(), (base.to_string(), key.to_string()));
+                if let Some(base) = base {
+                    let key = config_provider_key(pid, p, &auth, Some(&cfg_dir), &mut key_warnings);
+                    endpoints.insert(pid.clone(), (base, key));
                 }
+            }
+        }
+        for w in key_warnings {
+            tracing::warn!("{w}");
+        }
+        // A base URL with no credential used to be indistinguishable from a
+        // provider that never had one, and the turn died at the upstream. Name
+        // it at boot instead (no secret in the message).
+        for (pid, (_, key)) in &endpoints {
+            if key.is_empty()
+                && cfg
+                    .pointer(&format!("/provider/{pid}/options/apiKey"))
+                    .is_some()
+            {
+                tracing::warn!(
+                    "provider {pid} has a configured apiKey but it resolved to an empty credential — requests will be sent unauthenticated (check the {{{{env:…}}}} variable it references)"
+                );
             }
         }
 
@@ -1960,5 +2138,169 @@ mod registry_catalog_tests {
             .expect("keyless endpoint installs");
         assert_eq!(ep.0, "https://from-stored.invalid", "stored catalog wins");
         assert_eq!(ep.1, "public", "keyless default");
+    }
+}
+
+#[cfg(test)]
+mod provider_key_tests {
+    use super::*;
+
+    /// Issue #28: a config-declared provider kept its key in the documented
+    /// `options.apiKey` slot and ocserve sent `Bearer ` (empty) to the
+    /// upstream, because the endpoint builder read the auth layer only.
+    /// The literal form goes first: it isolates "auth-only lookup" from
+    /// "no interpolation", which are two different bugs that presented
+    /// identically at the provider (2026-11-03 live repro).
+    #[test]
+    fn literal_config_apikey_reaches_the_endpoint() {
+        let mut warnings = Vec::new();
+        let provider = json!({"options": {"baseURL": "http://x/v1", "apiKey": "sk-literal"}});
+        let key = config_provider_key("p", &provider, &json!({}), None, &mut warnings);
+        assert_eq!(key, "sk-literal", "config key must win over an empty auth");
+        assert!(warnings.is_empty(), "a literal key warns about nothing");
+    }
+
+    /// The shape every opencode 2.x install uses: the file holds a reference,
+    /// the secret lives in the environment.
+    #[test]
+    fn env_reference_in_config_apikey_is_interpolated() {
+        let name = format!("FAKE_TEST_KEY_{}", std::process::id());
+        // SAFETY: edition 2024 marks set_var unsafe (parallel-test race); the
+        // value is namespaced by pid and immediately consumed below.
+        unsafe { std::env::set_var(&name, "sk-from-env") };
+        let mut warnings = Vec::new();
+        let provider = json!({"options": {"apiKey": format!("{{env:{name}}}")}});
+        let key = config_provider_key("p", &provider, &json!({}), None, &mut warnings);
+        unsafe { std::env::remove_var(&name) };
+        assert_eq!(key, "sk-from-env", "the placeholder must not ride the wire");
+        assert!(warnings.is_empty());
+    }
+
+    /// An unset variable still expands to "" (upstream parity) but must be
+    /// visible: silence here is what made #28 an afternoon instead of a minute.
+    #[test]
+    fn unset_env_reference_warns_and_expands_empty() {
+        let mut warnings = Vec::new();
+        let provider = json!({"options": {"apiKey": "{env:FAKE_TEST_VAR_DEFINITELY_UNSET}"}});
+        let key = config_provider_key("p", &provider, &json!({}), None, &mut warnings);
+        assert_eq!(key, "", "upstream expands an unset variable to empty");
+        assert_eq!(warnings.len(), 1, "but never silently: {:?}", warnings);
+        assert!(
+            warnings[0].contains("FAKE_TEST_VAR_DEFINITELY_UNSET"),
+            "the warning must name the variable: {}",
+            warnings[0]
+        );
+    }
+
+    /// Only the two documented forms are expanded. A key written in some other
+    /// `{form:…}` dialect is passed through byte-for-byte rather than truncated:
+    /// mangling it would hide the mistake, and the upstream's 401 is a clearer
+    /// signal than a half-eaten credential.
+    #[test]
+    fn other_placeholder_forms_are_left_verbatim() {
+        let mut warnings = Vec::new();
+        let provider = json!({"options": {"apiKey": "{vault:path/secret}"}});
+        assert_eq!(
+            config_provider_key("p", &provider, &json!({}), None, &mut warnings),
+            "{vault:path/secret}",
+            "an unknown form is neither expanded nor truncated"
+        );
+        assert!(
+            warnings.is_empty(),
+            "nothing to warn about: we never claimed it"
+        );
+    }
+
+    /// `{file:}` keeps the secret out of the config file; relative paths resolve
+    /// against the declaring config, not the process cwd.
+    #[test]
+    fn file_reference_resolves_relative_to_the_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("creds"), "sk-from-file\n").unwrap();
+        let mut warnings = Vec::new();
+        let provider = json!({"options": {"apiKey": "{file:creds}"}});
+        let key = config_provider_key("p", &provider, &json!({}), Some(dir.path()), &mut warnings);
+        assert_eq!(
+            key, "sk-from-file",
+            "trailing newline trimmed, path relative"
+        );
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn missing_file_reference_warns_with_the_resolved_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut warnings = Vec::new();
+        let out = expand_config_value("{file:nope}", Some(dir.path()), "f", &mut warnings);
+        assert_eq!(out, "");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("nope"), "{}", warnings[0]);
+    }
+
+    #[test]
+    fn plain_strings_are_returned_untouched() {
+        let mut warnings = Vec::new();
+        assert_eq!(
+            expand_config_value("sk-plain{}", None, "f", &mut warnings),
+            "sk-plain{}",
+            "a stray brace outside a known form is preserved"
+        );
+        assert_eq!(
+            expand_config_value("{env:truncated", None, "f", &mut warnings),
+            "{env:truncated"
+        );
+        assert!(warnings.is_empty());
+    }
+
+    /// The kill switch must restore the pre-fix behaviour for an operator who
+    /// shares one config file with another server and does not want ocserve
+    /// resolving references out of it.
+    #[test]
+    fn interpolation_kill_switch_returns_the_raw_value() {
+        let name = format!("FAKE_TEST_SWITCH_{}", std::process::id());
+        // SAFETY: edition 2024 marks set_var unsafe (parallel-test race).
+        // The name is namespaced by pid and both vars are restored below.
+        unsafe {
+            std::env::set_var(&name, "sk-from-env");
+            std::env::set_var("OCSERVE_CONFIG_INTERPOLATE", "0");
+        }
+        let mut warnings = Vec::new();
+        let raw = format!("{{env:{name}}}");
+        let out = expand_config_value(&raw, None, "f", &mut warnings);
+        unsafe {
+            std::env::remove_var("OCSERVE_CONFIG_INTERPOLATE");
+            std::env::remove_var(&name);
+        }
+        assert_eq!(out, raw, "kill switch must not resolve anything");
+        assert!(warnings.is_empty());
+    }
+
+    /// The auth layer is still the fallback, and config still wins — that is the
+    /// W5 precedence the admin `PUT /auth/{providerID}` route relies on.
+    #[test]
+    fn auth_layer_is_the_fallback_and_config_wins() {
+        let mut warnings = Vec::new();
+        let provider = json!({"options": {"apiKey": "sk-config"}});
+        assert_eq!(
+            config_provider_key(
+                "p",
+                &provider,
+                &json!({"p": {"key": "sk-auth"}}),
+                None,
+                &mut warnings
+            ),
+            "sk-config"
+        );
+        let bare = json!({"options": {"baseURL": "http://x"}});
+        assert_eq!(
+            config_provider_key(
+                "p",
+                &bare,
+                &json!({"p": {"key": "sk-auth"}}),
+                None,
+                &mut warnings
+            ),
+            "sk-auth"
+        );
     }
 }
