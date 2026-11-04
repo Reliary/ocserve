@@ -530,6 +530,7 @@ current anywhere.
 | `D-CREDENTIAL` | The credential store is implemented (`GET`/`POST`/`PATCH`/`DELETE /api/credential`); only the OAuth code exchange is absent, so `connect/oauth` answers the probe's 401. | open (OAuth only) |
 | `D-ENV` | Session environment variables are stored and injected into the bash tool's child env; they are never sent to the provider. | accepted |
 | `D-EVENT-ALWAYSON` | The durable event log is on by default; upstream needs `persist: true` per session. | accepted |
+| `D-HEADERS-FAMILY` | The provider session-header family is chosen by `is_zen()` (the only `opencode*` endpoint the registry installs). A config provider whose id starts with `opencode` but whose baseURL points elsewhere would get the `x-session-affinity` family, where upstream keys off `providerID.startsWith("opencode")` (request.ts:187). | accepted |
 | `D-FIND-IGNORE` | `/find` uses an explicit exclude list where upstream discovers ignores from `.gitignore`. | open |
 | `D-FORK-1` | `session.created` fires after the copy completes; upstream publishes before cloning, so a client reacting to the event can read a partial session. | accepted |
 | `D-FS-CONTAIN` | Filesystem routes resolve and verify through a handle (`openat2`/`F_GETPATH`/`GetFinalPathNameByHandleW`); a path outside the allowed root is refused rather than lexically rewritten. | accepted |

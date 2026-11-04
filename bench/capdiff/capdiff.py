@@ -253,6 +253,25 @@ def is_title_gen(req):
             return True
     return False
 
+# Provider headers that carry meaning. Values are compared for all but
+# `authorization`, which is presence-only (a secret must never reach a diff
+# file, a report, or a log). 2026-11-04: headers were CAPTURED but never
+# COMPARED, so the zen user-agent divergence (a hand-written version literal
+# vs upstream deriving it from the binary) was invisible to every oracle.
+COMPARED_HEADERS = ("user-agent", "x-opencode-session", "x-opencode-client",
+                    "x-opencode-request", "x-opencode-project")
+PRESENCE_HEADERS = ("authorization",)
+
+
+def header_view(req):
+    h = {k.lower(): v for k, v in (req.get("headers") or {}).items()}
+    out = {k: h.get(k) for k in COMPARED_HEADERS if k in h}
+    for k in PRESENCE_HEADERS:
+        if k in h:
+            out[k] = "<present>" if h[k] else "<empty>"
+    return out
+
+
 def provider_view(req):
     b = req.get("body", {})
     if not isinstance(b, dict):
@@ -274,6 +293,7 @@ def provider_view(req):
                                      "params": t.get("params")} for t in tools}
     return {
         "path": req.get("path"),
+        "headers": header_view(req),
         "model": b.get("model"),
         "stream": b.get("stream"),
         "stream_options": norm_obj(b.get("stream_options")),
@@ -585,6 +605,17 @@ def selftest(arm_results, allow):
     # cost: inflate bytes
     fc = first["cost"][0]["bytes"] if first["cost"] else 1
     checks.append(("cost", fc + 1 > fc))
+    # headers: mutate the compared UA; the difference must surface. This is
+    # the dimension that was captured-but-never-compared until 2026-11-04,
+    # which is why a stale zen UA could ship with every gate green.
+    if fm and fm[0].get("headers"):
+        planted = json.loads(json.dumps(fm))
+        # Any +1 header difference must be caught, not just the UA: a future
+        # compared header must not silently join the blind set.
+        h = planted[0]["headers"]
+        key = next(iter(h))
+        h[key] = "PLANTED"
+        checks.append(("headers", bool(diff(fm, planted))))
     ok = all(v for _, v in checks)
     for name, v in checks:
         print(f"selftest[{name}]: {'caught' if v else 'MISSED'}")
@@ -617,7 +648,9 @@ def main():
     if args.reverse:
         scenarios = list(reversed(scenarios))
 
-    tmp = pathlib.Path(tempfile.mkdtemp(prefix="ocserve-capdiff."))
+    tmp = pathlib.Path(tempfile.mkdtemp(
+        prefix="ocserve-capdiff.", dir=os.environ.get("TMPDIR", "/var/tmp")))
+    print(f"capdiff: artifacts under {tmp}")
     wf, wr = SseWatcher(PORT_F), SseWatcher(PORT_R)
     wf.start(); wr.start()
     try:

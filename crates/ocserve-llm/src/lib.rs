@@ -552,8 +552,11 @@ pub const FREEZE_VERSION: &str = "1.18.31";
 /// version, so a stale literal here breaks the keyless free tier while every
 /// other gate stays green (no oracle compared provider headers before
 /// PARITY-SYNC-PLAN P2).
-pub const ZEN_FREE_TIER_UA: &str =
+pub const PROVIDER_USER_AGENT: &str =
     "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
+
+/// Historical name kept as an alias (bench/probe scripts + docs reference it).
+pub const ZEN_FREE_TIER_UA: &str = PROVIDER_USER_AGENT;
 
 impl Client {
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
@@ -598,21 +601,32 @@ impl Client {
                 Err(_) => tracing::warn!("chat.headers: invalid header name {k:?}"),
             }
         }
-        // zen free-tier gate: composite UA is load-bearing (P5 passes with
-        // it, P7 fails without — FINDINGS). Plugin-set UA wins if present.
-        if self.is_zen()
-            && !opts
-                .headers
-                .iter()
-                .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+        // Upstream sends the composite UA to EVERY provider: request.ts:187-203
+        // spreads `User-Agent: USER_AGENT` into both header families, and the
+        // live capture (capdiff 2026-11-04) shows the identical value on a
+        // plain openai-compatible endpoint. The old code sent it only on the
+        // zen lane — a real divergence the header oracle was built to find.
+        // Plugin-set UA wins.
+        if !opts
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
         {
-            req = req.header("user-agent", ZEN_FREE_TIER_UA);
+            req = req.header("user-agent", PROVIDER_USER_AGENT);
         }
-        // opencode-go gateway requires it for routing (live 400:
-        // MissingSessionID — user's oc-remote send hit this 2026-10-02);
-        // direct providers ignore unknown headers.
+        // Session headers follow upstream's provider family split (same
+        // capture): `opencode*` gets the x-opencode-* set; every other
+        // provider gets x-session-affinity + X-Session-Id. Our zen lane is
+        // the only `opencode*` endpoint the registry installs, so `is_zen`
+        // is the family marker (a config provider literally id'd
+        // `opencode-*` with a custom base is D-HEADERS-FAMILY).
         if let Some(sid) = session_id {
-            req = req.header("x-opencode-session", sid);
+            if self.is_zen() {
+                req = req.header("x-opencode-session", sid);
+            } else {
+                req = req.header("x-session-affinity", sid);
+                req = req.header("X-Session-Id", sid);
+            }
         }
         // K-EFFICIENCY (bytehound phase 1): pre-size the serialization
         // buffer — serde_json::to_vec grows by doubling (≈log2(N) reallocs
@@ -649,7 +663,7 @@ impl Client {
                     .map(|(_, v)| v.clone());
                 push(
                     "user-agent",
-                    plugin_ua.as_deref().unwrap_or(ZEN_FREE_TIER_UA),
+                    plugin_ua.as_deref().unwrap_or(PROVIDER_USER_AGENT),
                 );
                 for (k, v) in &opts.headers {
                     if !k.eq_ignore_ascii_case("user-agent") {
@@ -802,12 +816,40 @@ mod tests {
             .expect("captured request")
             .unwrap();
         let lower = req.to_ascii_lowercase();
+        // Upstream family split (request.ts:187-203, live capture 2026-11-04):
+        // a non-`opencode*` provider carries x-session-affinity + X-Session-Id,
+        // NOT x-opencode-session. The old assertion encoded our divergence
+        // (we sent the opencode header to everyone and no headers at all on
+        // plain HTTP providers).
         assert!(
-            lower.contains("x-opencode-session: ses_hdr_test"),
-            "session header missing from request head:\n{req}"
+            lower.contains("x-session-affinity: ses_hdr_test"),
+            "non-opencode provider must carry x-session-affinity:\n{req}"
         );
-        // Authorization still present alongside it
+        assert!(
+            lower.contains("x-session-id: ses_hdr_test"),
+            "non-opencode provider must carry X-Session-Id:\n{req}"
+        );
+        assert!(
+            !lower.contains("x-opencode-session:"),
+            "the opencode header belongs to the opencode* family only:\n{req}"
+        );
         assert!(lower.contains("authorization: bearer"), "auth header gone");
+    }
+
+    /// The family rule upstream applies (request.ts:187-203): `opencode*`
+    /// providers get x-opencode-session; all others get x-session-affinity +
+    /// X-Session-Id. `is_zen()` stands in for the provider-id prefix because
+    /// it is the only `opencode*` endpoint the registry installs
+    /// (D-HEADERS-FAMILY).
+    #[test]
+    fn session_header_family_follows_is_zen() {
+        let zen = Client::new("https://opencode.ai/zen/v1", "public");
+        assert!(zen.is_zen(), "opencode.ai base is the opencode family");
+        let other = Client::new("https://api.deepseek.com/v1", "k");
+        assert!(!other.is_zen(), "plain provider is the affinity family");
+        // The composite UA is provider-independent upstream (both branches
+        // spread the same User-Agent), pinned here once.
+        assert!(PROVIDER_USER_AGENT.starts_with(&format!("opencode/{FREEZE_VERSION} ")));
     }
 
     /// chat.params → body mapping (v1 llm/request.ts:115 shape: topP/topK/
@@ -1288,9 +1330,13 @@ mod estimate_tests {
             "zen base must carry the composite UA (P5/P7 — gate rejects plain UA): {zen}"
         );
         let other = capture("/v1").await.to_ascii_lowercase();
+        // CORRECTED 2026-11-04 by the capdiff header oracle + a live capture:
+        // upstream sends the composite UA to EVERY provider (request.ts:187
+        // both families spread `User-Agent: USER_AGENT`), so the old
+        // "non-zen must not carry it" assertion encoded our bug.
         assert!(
-            !other.contains("opencode/1.18.31"),
-            "non-zen base must NOT carry the composite UA: {other}"
+            other.contains(&format!("user-agent: {ua}")),
+            "every provider carries the composite UA upstream: {other}"
         );
     }
 
