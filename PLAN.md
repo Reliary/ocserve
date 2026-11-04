@@ -525,6 +525,7 @@ current anywhere.
 | `D-AGENT-MODEL` | Compaction runs on the request's model; upstream honors a per-agent model pin (`agent.model`). | open |
 | `D-BACKGROUND-NOOP` | `POST /api/session/{id}/background` records the request and returns 204; turns run tools inline, so there is nothing to background. | accepted |
 | `D-BASH-SPLIT` | `bash_patterns::split_commands` approximates the shell (quote-aware only). Heredocs, `$( )`, backticks, `&>` and `2>&1` can split a sub-command, which can produce a slightly-off external-directory or arity ask. The tool still runs the whole command. | accepted |
+| `D-CONFIG-VAR` | A `{env:…}`/`{file:…}` that cannot be resolved degrades the load to defaults with a named warning; upstream aborts the config load with `InvalidError`. `{env:}` is honoured, literal keys pass through, `{file:}` resolves relative to the config dir and is JSON-escaped (issue #28). | accepted |
 | `D-CONFIG-1` | Upstream has no config file watcher (invalidated only on its own write), so an external edit needs a restart there. ocserve applies it within one poll interval. | accepted |
 | `D-CREDENTIAL` | The credential store is implemented (`GET`/`POST`/`PATCH`/`DELETE /api/credential`); only the OAuth code exchange is absent, so `connect/oauth` answers the probe's 401. | open (OAuth only) |
 | `D-ENV` | Session environment variables are stored and injected into the bash tool's child env; they are never sent to the provider. | accepted |

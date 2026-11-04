@@ -48,28 +48,120 @@ fn read_json(path: &Path) -> Result<Value> {
     serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
 }
 
-/// Global config read with upstream parity (config.ts: missing file → empty,
-/// unreadable/corrupt → "using defaults" + continue). Found by CI 2026-10-08:
-/// `serve` on a bare machine (no `~/.config/opencode/opencode.json`) died at
-/// boot — a fresh install of the drop-in server must start with defaults, and
-/// upstream treats both cases as defaults, never as fatal. Per-user errors
-/// stay loud: the missing/corrupt file is logged with its path.
-fn read_global_config(path: &Path) -> Value {
-    match std::fs::read_to_string(path) {
-        Ok(raw) => match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    "global config unreadable ({}), using defaults: {e}",
-                    path.display()
-                );
-                json!({})
+/// JSON string escaping matching `JSON.stringify(s).slice(1, -1)` — the way
+/// upstream splices a `{file:…}` payload into the raw config text before parse
+/// (config/variable.ts:52).
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Upstream `ConfigVariable.substitute` (config/variable.ts:33-72): applied to
+/// the RAW config text before parsing. `{env:NAME}` expands to the raw value
+/// (upstream parity — not escaped); `{file:path}` reads a file relative to the
+/// config's directory (`~/` expanded), trims it and JSON-escapes it. A missing
+/// referenced file is an error (upstream's default `missing:"error"`); the
+/// caller degrades to defaults loudly rather than server-defaults silently.
+///
+/// Issue #28: without this, a documented `"apiKey": "{env:VAR}"` reached the
+/// provider as an empty Bearer token, because the token was stored verbatim
+/// and no layer ever expanded it.
+fn expand_config_vars(
+    text: &str,
+    base_dir: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> std::result::Result<String, String> {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while let Some(rest) = text.get(i..) {
+        let env_at = rest.find("{env:");
+        let file_at = rest.find("{file:");
+        let (at, is_env) = match (env_at, file_at) {
+            (Some(e), Some(f)) if f < e => (f, false),
+            (Some(e), _) => (e, true),
+            (None, Some(f)) => (f, false),
+            (None, None) => {
+                out.push_str(rest);
+                break;
             }
-        },
+        };
+        out.push_str(&rest[..at]);
+        let start = i + at;
+        let prefix = if is_env { 5 } else { 6 };
+        let after = &text[start + prefix..];
+        let Some(close) = after.find('}') else {
+            out.push_str(&text[start..]);
+            break;
+        };
+        let name = &after[..close];
+        if is_env {
+            out.push_str(&env(name).unwrap_or_default());
+        } else {
+            let mut raw = name.to_string();
+            if let Some(tail) = raw.strip_prefix("~/") {
+                let home = std::env::var("HOME").unwrap_or_default();
+                raw = format!("{home}/{tail}");
+            }
+            let path = if Path::new(&raw).is_absolute() {
+                std::path::PathBuf::from(&raw)
+            } else {
+                base_dir.join(&raw)
+            };
+            let content = std::fs::read_to_string(&path).map_err(|e| {
+                format!(
+                    "bad file reference \"{{file:{name}}}\": {} ({e})",
+                    path.display()
+                )
+            })?;
+            out.push_str(&json_escape(content.trim()));
+        }
+        i = start + prefix + close + 1;
+    }
+    Ok(out)
+}
+
+/// Read + expand + parse one config file. `{file:…}` failure is loud and
+/// degrades to defaults (same contract as a corrupt config — the drop-in must
+/// still boot; the bad reference is named in the log). Upstream aborts the
+/// load with InvalidError; named divergence `D-CONFIG-VAR` (PLAN §18).
+fn read_config_resolved(path: &Path) -> Value {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!("no global config at {} — using defaults", path.display());
-            json!({})
+            return json!({});
         }
+        Err(e) => {
+            tracing::warn!(
+                "global config unreadable ({}), using defaults: {e}",
+                path.display()
+            );
+            return json!({});
+        }
+    };
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let text = match expand_config_vars(&raw, base, &|n| std::env::var(n).ok()) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("global config {}: {e}; using defaults", path.display());
+            return json!({});
+        }
+    };
+    match serde_json::from_str(&text) {
+        Ok(v) => v,
         Err(e) => {
             tracing::warn!(
                 "global config unreadable ({}), using defaults: {e}",
@@ -78,6 +170,16 @@ fn read_global_config(path: &Path) -> Value {
             json!({})
         }
     }
+}
+
+/// Global config read with upstream parity (config.ts: missing file → empty,
+/// unreadable/corrupt → "using defaults" + continue). Found by CI 2026-10-08:
+/// `serve` on a bare machine (no `~/.config/opencode/opencode.json`) died at
+/// boot — a fresh install of the drop-in server must start with defaults, and
+/// upstream treats both cases as defaults, never as fatal. Per-user errors
+/// stay loud: the missing/corrupt file is logged with its path.
+fn read_global_config(path: &Path) -> Value {
+    read_config_resolved(path)
 }
 
 /// models catalog read with upstream self-heal semantics (models-dev.ts
@@ -555,6 +657,36 @@ pub(crate) fn first_catalog_model(config_providers: &Value, cfg: &Value, pid: &s
         .and_then(|o| o.keys().next())
         .cloned()
         .unwrap_or_default()
+}
+
+/// Active key credentials from OUR `credential` table (issue #28). Values
+/// follow the 2.x tagged union (`{"type":"key","key":...}`); OAuth entries and
+/// unparseable values are skipped. Fail-soft: the registry must build even if
+/// the database is locked/absent (fresh install before first write).
+fn credential_keys(data_dir: &Path) -> std::collections::HashMap<String, String> {
+    let db = ocserve_store::writer::db_path(data_dir);
+    if !db.exists() {
+        return std::collections::HashMap::new();
+    }
+    match ocserve_store::credential_list(&db) {
+        Ok(list) => list
+            .into_iter()
+            .filter(|c| c.active)
+            .filter_map(|c| {
+                let integration = c.integration_id.clone()?;
+                let v: Value = serde_json::from_str(&c.value).ok()?;
+                if v.get("type").and_then(|t| t.as_str()) == Some("oauth") {
+                    return None;
+                }
+                let key = v.get("key").and_then(|k| k.as_str())?;
+                (!key.is_empty()).then(|| (integration, key.to_string()))
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!("credential store unreadable ({e:#}) — not used as an auth source");
+            std::collections::HashMap::new()
+        }
+    }
 }
 
 impl Runtime {
@@ -1183,8 +1315,11 @@ impl Runtime {
         // layered (legacy + overlay) — same rule as load_for; Result so a
         // broken overlay fails the whole reload (fail-safe: keep old registry)
         let auth = load_auth(&self.data_dir)?;
-        let cfg = read_json(&format!("{home}/.config/opencode/opencode.json"))
-            .unwrap_or_else(|| json!({}));
+        // One derivation source: the Runtime's OWN parsed config (which the
+        // plugin `config` hook may have replaced via `from_config`). Reading
+        // the file again here silently discarded hook-mutated providers and
+        // duplicated a disk read (issue #28's test exposed it).
+        let cfg = self.config.clone();
         // A1: reuse the catalog load_for already parsed (never re-read —
         // double-parsing the 5.3 MB file per reload was the proven spike).
         let cache = &self.catalog;
@@ -1227,10 +1362,25 @@ impl Runtime {
                     continue;
                 }
                 if let Some(base) = p.pointer("/options/baseURL").and_then(|v| v.as_str()) {
+                    // issue #28: auth layer first, then the provider's own
+                    // config key. `{env:}`/`{file:}` are already expanded by
+                    // the loader, so this is the literal secret here.
                     let key = auth
                         .pointer(&format!("/{pid}/key"))
                         .and_then(|v| v.as_str())
+                        .filter(|k| !k.is_empty())
+                        .or_else(|| {
+                            p.pointer("/options/apiKey")
+                                .and_then(|v| v.as_str())
+                                .filter(|k| !k.is_empty())
+                        })
                         .unwrap_or("");
+                    if key.is_empty() {
+                        tracing::warn!(
+                            "provider {pid} has a baseURL but resolves to an empty API key \
+                             (checked auth.json, auth-overlay, credential store, provider.options.apiKey)"
+                        );
+                    }
                     endpoints.insert(pid.clone(), (base.to_string(), key.to_string()));
                 }
             }
@@ -1239,6 +1389,24 @@ impl Runtime {
         // B2 (K-MODEL-STATE): opencode public-tier endpoint (pure fn below).
         if let Some(pair) = opencode_public_endpoint(&cfg, &auth, cache) {
             endpoints.insert("opencode".into(), pair);
+        }
+
+        // Third auth source (issue #28, 2.x): active `credential`-table keys in
+        // OUR database, layered over auth.json/auth-overlay. opencode 2.x does
+        // not write auth.json, so config-declared providers otherwise had no
+        // path to a key at all. `credential_list` is a read-only handle; a
+        // read failure is loud but never fails the registry (boot must survive).
+        for (pid, key) in credential_keys(&self.data_dir) {
+            if let Some(slot) = endpoints.get_mut(&pid) {
+                slot.1 = key;
+                continue;
+            }
+            if let Some(base) = cfg
+                .pointer(&format!("/provider/{pid}/options/baseURL"))
+                .and_then(|v| v.as_str())
+            {
+                endpoints.insert(pid, (base.to_string(), key));
+            }
         }
 
         // pricing from models cache: (in, out, cache_read) USD per MTok
@@ -1857,6 +2025,249 @@ mod bare_machine_tests {
         let good = dir.path().join("opencode.json");
         std::fs::write(&good, r#"{"theme":"dark"}"#).unwrap();
         assert_eq!(read_global_config(&good)["theme"], "dark");
+    }
+}
+
+#[cfg(test)]
+mod config_variable_tests {
+    use super::*;
+
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    /// Issue #28: `{env:VAR}` in the RAW config text is expanded before parse
+    /// (upstream config/variable.ts:33). The reported symptom was a config
+    /// provider reaching the upstream with `Authorization: Bearer ` because
+    /// the token was never expanded.
+    #[test]
+    fn env_substitution_expands_before_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("opencode.json");
+        // Tests may mutate process env (the crate forbids unsafe only outside
+        // cfg(test)); the variable name is unique to this test.
+        unsafe { std::env::set_var("OCSERVE_TEST_FAKE_KEY", "secret-from-env") };
+        std::fs::write(
+            &p,
+            r#"{"provider":{"fakeprov":{"options":{"baseURL":"http://127.0.0.1:4999/v1","apiKey":"{env:OCSERVE_TEST_FAKE_KEY}"}}}}"#,
+        )
+        .unwrap();
+        let cfg = read_global_config(&p);
+        assert_eq!(
+            cfg.pointer("/provider/fakeprov/options/apiKey")
+                .and_then(|v| v.as_str()),
+            Some("secret-from-env"),
+            "the raw text must be expanded before serde parses it"
+        );
+    }
+
+    /// Literal keys pass through untouched (the issue's control: it is not
+    /// only about `{env:}`).
+    #[test]
+    fn literal_keys_survive_expansion() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("opencode.json");
+        std::fs::write(
+            &p,
+            r#"{"provider":{"p":{"options":{"apiKey":"secret-literal"}}}}"#,
+        )
+        .unwrap();
+        let cfg = read_global_config(&p);
+        assert_eq!(
+            cfg.pointer("/provider/p/options/apiKey")
+                .and_then(|v| v.as_str()),
+            Some("secret-literal")
+        );
+    }
+
+    /// `{file:path}` is resolved relative to the CONFIG's directory and the
+    /// content is JSON-escaped, so quotes/newlines survive the parse (upstream
+    /// JSON.stringify(content.trim()).slice(1,-1)).
+    #[test]
+    fn file_substitution_is_relative_and_escaped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("key.txt"), "  line1\"quoted\"\nline2  ").unwrap();
+        let p = dir.path().join("opencode.json");
+        std::fs::write(
+            &p,
+            r#"{"provider":{"p":{"options":{"apiKey":"{file:key.txt}"}}}}"#,
+        )
+        .unwrap();
+        let cfg = read_global_config(&p);
+        assert_eq!(
+            cfg.pointer("/provider/p/options/apiKey")
+                .and_then(|v| v.as_str()),
+            Some("line1\"quoted\"\nline2"),
+            "trimmed, JSON-escaped file content"
+        );
+    }
+
+    /// Negative control that proves the expansion is load-bearing: the SAME
+    /// bytes parsed without expansion resolve to the literal token, which is
+    /// exactly the empty-Bearer symptom when the token is `{env:…}`.
+    #[test]
+    fn without_expansion_the_token_is_the_raw_placeholder() {
+        let raw = r#"{"apiKey":"{env:OCSERVE_TEST_FAKE_KEY}"}"#;
+        let unexpanded: Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            unexpanded.get("apiKey").and_then(|v| v.as_str()),
+            Some("{env:OCSERVE_TEST_FAKE_KEY}")
+        );
+        let expanded = expand_config_vars(
+            raw,
+            Path::new("."),
+            &env_of(&[("OCSERVE_TEST_FAKE_KEY", "secret-from-env")]),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&expanded).unwrap();
+        assert_eq!(
+            v.get("apiKey").and_then(|v| v.as_str()),
+            Some("secret-from-env")
+        );
+    }
+
+    /// A bad `{file:}` reference degrades to defaults loudly (same contract as
+    /// a corrupt config: the drop-in boots; the reference is named). Named
+    /// divergence D-CONFIG-VAR — upstream aborts the load.
+    #[test]
+    fn bad_file_reference_degrades_to_defaults_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("opencode.json");
+        std::fs::write(
+            &p,
+            r#"{"provider":{"p":{"options":{"apiKey":"{file:missing.txt}"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_global_config(&p), json!({}));
+        assert!(p.exists(), "never deletes the user's config");
+    }
+
+    /// `~/` expands to HOME (upstream variable.ts:44).
+    #[test]
+    fn home_relative_file_reference_expands() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("k"), "homed").unwrap();
+        let out = expand_config_vars("{file:~/k-not-here}", dir.path(), &|_| None);
+        // unreadable -> Err naming the resolved HOME path
+        let err = out.unwrap_err();
+        assert!(err.contains("bad file reference"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod provider_key_tests {
+    use super::*;
+
+    /// Issue #28 root cause at the endpoint layer: a config provider with a
+    /// baseURL and `options.apiKey` and NO auth-layer entry used to be built
+    /// with `("", …)`. The registry must carry the config key.
+    #[test]
+    fn config_provider_key_reaches_the_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = json!({
+            "provider": {"fakeprov": {
+                "npm": "@ai-sdk/openai-compatible",
+                "options": {"baseURL": "http://127.0.0.1:4999/v1", "apiKey": "secret-literal"},
+                "models": {"m1": {"name": "M1"}}
+            }}
+        });
+        let rt = Runtime::from_parts(dir.path(), cfg, json!({}), json!({})).unwrap();
+        let reg = rt.llm_registry().unwrap();
+        let (base, key) = reg.endpoints.get("fakeprov").expect("endpoint present");
+        assert_eq!(base, "http://127.0.0.1:4999/v1");
+        assert_eq!(key, "secret-literal", "config options.apiKey must be used");
+    }
+
+    /// Auth-layer keys still win over the config key (overlay > file > config).
+    #[test]
+    fn auth_layer_key_wins_over_config_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = json!({
+            "provider": {"p": {"options": {"baseURL": "http://x.invalid/v1", "apiKey": "from-config"}}}
+        });
+        // llm_registry layers auth via load_auth(data_dir): auth.json + the
+        // overlay in the data dir. Use the real path, not a struct field.
+        std::fs::write(
+            dir.path().join("auth-overlay.json"),
+            r#"{"p":{"type":"api","key":"from-auth"}}"#,
+        )
+        .unwrap();
+        let rt = Runtime::from_parts(dir.path(), cfg, json!({}), json!({})).unwrap();
+        let reg = rt.llm_registry().unwrap();
+        assert_eq!(reg.endpoints.get("p").unwrap().1, "from-auth");
+    }
+
+    /// Third source (2.x): an ACTIVE key credential in OUR database feeds the
+    /// provider, because opencode 2.x no longer writes auth.json.
+    #[test]
+    fn active_credential_table_key_is_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ocserve_store::writer::db_path(dir.path());
+        let w = ocserve_store::Writer::spawn(db.clone()).unwrap();
+        ocserve_store::credential_create(
+            &w,
+            "cred_test",
+            Some("fakeprov"),
+            "default",
+            &json!({"type": "key", "key": "from-credential-table"}).to_string(),
+            true,
+            1,
+        )
+        .unwrap();
+        let cfg =
+            json!({"provider": {"fakeprov": {"options": {"baseURL": "http://127.0.0.1:4999/v1"}}}});
+        let rt = Runtime::from_parts(dir.path(), cfg, json!({}), json!({})).unwrap();
+        let reg = rt.llm_registry().unwrap();
+        assert_eq!(
+            reg.endpoints.get("fakeprov").map(|(_, k)| k.as_str()),
+            Some("from-credential-table")
+        );
+    }
+
+    /// OAuth-typed credentials are not bearer keys and must be skipped.
+    #[test]
+    fn oauth_credential_is_not_treated_as_a_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ocserve_store::writer::db_path(dir.path());
+        let w = ocserve_store::Writer::spawn(db.clone()).unwrap();
+        ocserve_store::credential_create(
+            &w,
+            "cred_oauth",
+            Some("fakeprov"),
+            "default",
+            &json!({"type": "oauth", "access": "a", "refresh": "r", "expires": 0}).to_string(),
+            true,
+            1,
+        )
+        .unwrap();
+        let keys = credential_keys(dir.path());
+        assert!(keys.is_empty(), "oauth entries are skipped");
+    }
+
+    /// The exact reported shape end-to-end at the registry boundary:
+    /// `{env:VAR}` in config, env set, no auth file, no overlay.
+    #[test]
+    fn env_token_from_config_reaches_the_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("OCSERVE_TEST_ISSUE28", "secret-from-env") };
+        let p = dir.path().join("opencode.json");
+        std::fs::write(
+            &p,
+            r#"{"provider":{"fakeprov":{"options":{"baseURL":"http://127.0.0.1:4999/v1","apiKey":"{env:OCSERVE_TEST_ISSUE28}"}}}}"#,
+        )
+        .unwrap();
+        let cfg = read_global_config(&p);
+        let rt = Runtime::from_parts(dir.path(), cfg, json!({}), json!({})).unwrap();
+        let reg = rt.llm_registry().unwrap();
+        assert_eq!(
+            reg.endpoints.get("fakeprov").map(|(_, k)| k.as_str()),
+            Some("secret-from-env")
+        );
     }
 }
 
