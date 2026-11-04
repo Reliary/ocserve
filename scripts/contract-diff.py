@@ -2,8 +2,8 @@
 """P1 — v2 contract differ (V2-PLAN.md P1, guard rule 31).
 
 Compares the two vendored contracts — the frozen v1
-(`crates/ocserve-core/assets/openapi/1.18.31.json`) and the regenerated v2
-(`crates/ocserve-core/assets/openapi/2.0.28.json`) — plus ocserve's router, and
+(`crates/ocserve-core/assets/openapi/v1.json`) and the regenerated v2
+(`crates/ocserve-core/assets/openapi/v2.json`) — plus ocserve's router, and
 classifies every operation into exactly one bucket:
 
   identical          — same method+path in both contracts, wire-equal 200 schema
@@ -52,8 +52,8 @@ import copy
 import json
 import sys
 
-V1 = "crates/ocserve-core/assets/openapi/1.18.31.json"
-V2 = "crates/ocserve-core/assets/openapi/2.0.28.json"
+V1 = "crates/ocserve-core/assets/openapi/v1.json"
+V2 = "crates/ocserve-core/assets/openapi/v2.json"
 ROUTER = "crates/ocserve-http/src/lib.rs"
 
 METHODS = ("get", "post", "put", "delete", "patch")

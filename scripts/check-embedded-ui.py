@@ -23,6 +23,7 @@ Usage: check-embedded-ui.py [--selftest]
 import hashlib
 import importlib.util
 import json
+import re
 import pathlib
 import shutil
 import struct
@@ -59,14 +60,42 @@ def check(root: pathlib.Path = ROOT) -> list[str]:
         from compression import zstd
     except ImportError:
         zstd = None
-    for tag, meta in sorted(parts_doc.items()):
-        index = (webui / f"{tag}.index.bin").read_bytes()
+    # The slot's declared tag must equal the Rust pin. Without this, slot
+    # naming makes the skew guard compare a slot against itself: a stale pack
+    # could sit under `v1` while the server reports a newer FREEZE_VERSION.
+    pins = {}
+    for slot, rel, const in [
+        ("v1", "crates/ocserve-llm/src/lib.rs", "FREEZE_VERSION"),
+        ("v2", "crates/ocserve-core/src/spec.rs", "V2_TAG"),
+    ]:
+        try:
+            txt = (root / rel).read_text()
+            m = re.search(
+                rf'pub\s+const\s+{const}\s*:\s*&str\s*=\s*"([^"]+)"', txt
+            )
+            pins[slot] = m.group(1) if m else None
+        except OSError:
+            pins[slot] = None
+    for slot, meta in sorted(parts_doc.items()):
+        if slot in pins:
+            if pins[slot] is None:
+                errors.append(f"{slot}: cannot read the Rust pin (const missing)")
+            elif meta.get("tag") != pins[slot]:
+                errors.append(
+                    f"{slot}: parts/manifest tag {meta.get('tag')!r} != Rust pin {pins[slot]!r}"
+                )
+        index = (webui / f"{slot}.index.bin").read_bytes()
         if hashlib.sha256(index).hexdigest() != meta["index_sha256"]:
-            errors.append(f"{tag}: index hash mismatch")
+            errors.append(f"{slot}: index hash mismatch")
         entries = parse_index(index)
-        manifest = json.loads((webui / f"{tag}.manifest.json").read_text())["files"]
+        mdoc = json.loads((webui / f"{slot}.manifest.json").read_text())
+        if mdoc.get("tag") != meta.get("tag"):
+            errors.append(
+                f"{slot}: manifest tag {mdoc.get('tag')!r} != parts.json {meta.get('tag')!r}"
+            )
+        manifest = mdoc["files"]
         if len(entries) != len(manifest):
-            errors.append(f"{tag}: index {len(entries)} != manifest {len(manifest)}")
+            errors.append(f"{slot}: index {len(entries)} != manifest {len(manifest)}")
         blobs = []
         for part in meta["parts"]:
             p = root / "crates" / part["crate"] / "assets" / "part.bin"
@@ -83,26 +112,26 @@ def check(root: pathlib.Path = ROOT) -> list[str]:
             blobs.append(data)
         blob = b"".join(blobs)
         if len(blob) != meta["total"]:
-            errors.append(f"{tag}: concatenated parts {len(blob):,} != {meta['total']:,}")
+            errors.append(f"{slot}: concatenated parts {len(blob):,} != {meta['total']:,}")
             continue
         if zstd is None:
             continue
         for path, off, raw, comp in entries:
             frame = blob[off : off + comp]
             if len(frame) != comp:
-                errors.append(f"{tag}: {path} overruns the parts")
+                errors.append(f"{slot}: {path} overruns the parts")
                 break
             try:
                 data = zstd.decompress(frame)
             except Exception as exc:  # noqa: BLE001 - report as a finding
-                errors.append(f"{tag}: {path} does not decompress: {exc}")
+                errors.append(f"{slot}: {path} does not decompress: {exc}")
                 break
             m = manifest.get("/" + path)
             if m is None:
-                errors.append(f"{tag}: {path} absent from the manifest")
+                errors.append(f"{slot}: {path} absent from the manifest")
                 break
             if len(data) != m["bytes"] or hashlib.sha256(data).hexdigest() != m["sha256"]:
-                errors.append(f"{tag}: {path} content mismatch")
+                errors.append(f"{slot}: {path} content mismatch")
                 break
     return errors
 
@@ -113,6 +142,14 @@ def selftest() -> int:
         tmp = pathlib.Path(td)
         shutil.copytree(ROOT / "crates", tmp / "crates",
                         ignore=shutil.ignore_patterns("src", "tests", "Cargo.toml"))
+        # The pin check reads two source files; `src` is excluded above to keep
+        # the copy small, so plant them explicitly. Without this every plant
+        # below would "pass" on a pin error instead of on the defect it names
+        # (the copy would be flagged even when restored).
+        for rel in ("crates/ocserve-llm/src/lib.rs", "crates/ocserve-core/src/spec.rs"):
+            dst = tmp / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ROOT / rel, dst)
         webui = tmp / "crates/ocserve-http/assets/webui"
         parts_doc = json.loads((webui / "parts.json").read_text())
         tag = sorted(parts_doc)[0]
@@ -139,7 +176,19 @@ def selftest() -> int:
         if check(tmp):
             print("FAIL(selftest): restored tree flagged")
             return 1
-    print("selftest: PASS (swap, truncation, oversize detected; restored clean)")
+        # Pin plant: a slot whose declared tag disagrees with the Rust pin must
+        # be flagged (slot naming would otherwise compare the slot to itself).
+        pj = webui / "parts.json"
+        saved = pj.read_text()
+        doc = json.loads(saved)
+        first = sorted(doc)[0]
+        doc[first]["tag"] = "0.0.0"
+        pj.write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n")
+        if not check(tmp):
+            print("FAIL(selftest): pin/slot tag mismatch not detected")
+            return 1
+        pj.write_text(saved)
+    print("selftest: PASS (swap, truncation, oversize, pin mismatch detected; restored clean)")
     return 0
 
 

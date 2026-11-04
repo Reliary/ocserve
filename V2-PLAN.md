@@ -64,7 +64,7 @@ requirement land here as edits, never silently in code.
 
 - Branch `feat/v2-engine` off `main`.
 - Vendor regenerated 2.0.28 contract as second embedded asset
-  (`crates/ocserve-core/assets/openapi/2.0.28.json`) via `scripts/extract-spec.sh`
+  (`crates/ocserve-core/assets/openapi/v2.json`) via `scripts/extract-spec.sh`
   (new target; regen in scratch from npm tarballs, never the worktree).
 - Fix stale `PLAN.md:206-230` (v2 "pre-release/gated" is false; `latest=2.0.28`).
 - Kill: vendored asset byte-equals fresh regen; `git status` clean in worktree.

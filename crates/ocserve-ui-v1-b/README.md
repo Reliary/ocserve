@@ -1,4 +1,4 @@
-# ocserve-ui-11831-a
+# ocserve-ui-v1-b
 
 One byte-range part of the pinned 1.18.31 web-UI pack embedded in
 [`ocserve`](https://crates.io/crates/ocserve). Split by

@@ -40,6 +40,10 @@ esac
 ASSET_DIR="crates/ocserve-http/assets/webui"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/ocserve-extract.XXXXXX")"
 OUT="$TMP/app.$TAG"
+case "$TAG" in
+  1.*) SLOT=v1 ;;
+  *)   SLOT=v2 ;;
+esac
 cleanup() {
   [ -n "${PID:-}" ] && kill -- -"$PID" 2>/dev/null || true
   pkill -f "opencode serve --port $PORT" 2>/dev/null || true
@@ -165,9 +169,9 @@ mv "$TMP/out" "$OUT"
 # Pack the closure, then shard it. The loose files are dropped after packing
 # (vendored third-party assets must not live in git); the committed source of
 # truth is the index + parts + manifest:
-#   crates/ocserve-http/assets/webui/<tag>.index.bin      — index (include_bytes!)
-#   crates/ocserve-ui-<tag>-<letter>/assets/part.bin      — frame bytes per part
-#   crates/ocserve-http/assets/webui/<tag>.manifest.json  — path → sha256 → bytes
+#   crates/ocserve-http/assets/webui/<slot>.index.bin      — index (include_bytes!)
+#   crates/ocserve-ui-<slot>-<letter>/assets/part.bin      — frame bytes per part
+#   crates/ocserve-http/assets/webui/<slot>.manifest.json  — path → sha256 → bytes
 #   crates/ocserve-http/assets/webui/parts.json           — order + sizes
 #
 # Format (OCAP2, per-file zstd frames). OCAP2 exists so the loader can decompress ONE file
@@ -179,10 +183,10 @@ mv "$TMP/out" "$OUT"
 #     count * (u16 pathlen, path, u64 offset, u32 raw_len, u32 comp_len) |
 #     count * (comp_len bytes: an independent zstd frame)
 mkdir -p "$ASSET_DIR"
-python3 - "$OUT" "$TMP/app.pack" "$ASSET_DIR/$TAG.manifest.json" <<'PY'
+python3 - "$OUT" "$TMP/app.pack" "$ASSET_DIR/$SLOT.manifest.json" "$TAG" <<'PY'
 import hashlib, json, os, struct, sys
 
-src, pack_path, manifest_path = sys.argv[1], sys.argv[2], sys.argv[3]
+src, pack_path, manifest_path, tag = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 entries = []
 for root, _dirs, files in os.walk(src):
     for name in sorted(files):
@@ -228,7 +232,7 @@ for frame in frames:
 with open(pack_path, "wb") as f:
     f.write(bytes(blob))
 with open(manifest_path, "w") as f:
-    json.dump({"tag": os.path.basename(src), "files": manifest}, f, indent=1, sort_keys=True)
+    json.dump({"tag": tag, "files": manifest}, f, indent=1, sort_keys=True)
 print(f"packed {len(entries)} files: raw {sum(len(d) for _,d in entries)} bytes, pack {len(blob)} bytes")
 PY
 
@@ -240,8 +244,8 @@ cp "$TMP/app.pack" "$ASSET_DIR/$TAG.pack.zst"
 PARTS="${PARTS:-}"
 if [ -z "$PARTS" ]; then
   case "$TAG" in
-    1.18.31) PARTS=2 ;;
-    *)       PARTS=4 ;;
+    1.*) PARTS=2 ;;
+    *)   PARTS=4 ;;
   esac
 fi
 python3 "$REPO/scripts/shard-pack.py" "$TAG" "$PARTS"
@@ -251,4 +255,4 @@ rm -f "$ASSET_DIR/$TAG.pack.zst"
 # the tree small. The committed source of truth is <tag>.index.bin + the
 # ocserve-ui-* parts + <tag>.manifest.json + parts.json.
 rm -rf "$OUT"
-echo "extract-app: wrote $TAG.index.bin + $PARTS parts + $TAG.manifest.json"
+echo "extract-app: wrote slot index + parts + manifest for tag $TAG"

@@ -30,7 +30,7 @@ import json
 import sys
 from pathlib import Path
 
-SPEC = "crates/ocserve-core/assets/openapi/1.18.31.json"
+SPEC = "crates/ocserve-core/assets/openapi/v1.json"
 EFFECTS = "bench/sidefx/effects.tsv"
 MUTATING = ("post", "put", "patch", "delete")
 

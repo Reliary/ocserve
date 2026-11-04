@@ -62,8 +62,8 @@ def render(v1: dict, v2: dict) -> str:
 
 def main() -> int:
     check = "--check" in sys.argv
-    v1 = json.load(open(SPECS / "1.18.31.json"))
-    v2 = json.load(open(SPECS / "2.0.28.json"))
+    v1 = json.load(open(SPECS / "v1.json"))
+    v2 = json.load(open(SPECS / "v2.json"))
     body = render(v1, v2)
     if check:
         # Guard mode: the committed table must equal what the specs imply.

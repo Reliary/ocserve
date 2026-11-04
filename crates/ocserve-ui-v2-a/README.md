@@ -1,4 +1,4 @@
-# ocserve-ui-2028-d
+# ocserve-ui-v2-a
 
 One byte-range part of the pinned 2.0.28 web-UI pack embedded in
 [`ocserve`](https://crates.io/crates/ocserve). Split by

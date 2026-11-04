@@ -2,7 +2,7 @@
 """P4 — calibrated spec validation (bench/openapi/SPEC-DRIVEN-PLAN.md).
 
 Validates every JSON 200 response from a running server against the frozen
-OpenAPI 3.1.0 contract (`crates/ocserve-core/assets/openapi/1.18.31.json`). This is the layer the
+OpenAPI 3.1.0 contract (`crates/ocserve-core/assets/openapi/v1.json`). This is the layer the
 generated coverage guard (rule 16) cannot provide: rule 16 proves a route is
 BOUND; this proves the response SHAPE matches the contract (type drift,
 missing required, bad enums, unexpected extra properties).
@@ -32,7 +32,7 @@ import jsonschema
 
 SPEC = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "../../crates/ocserve-core/assets/openapi/1.18.31.json",
+    "../../crates/ocserve-core/assets/openapi/v1.json",
 )
 
 # Per-base allowlist of path -> reason. A route here is a NAMED divergence,

@@ -33,4 +33,4 @@ curl -s --max-time 2 "http://127.0.0.1:$PORT/global/health" >/dev/null \
   || { echo "spec-validate-v2: server did not start"; tail -5 "$HOME2/serve.log"; exit 1; }
 
 python3 bench/openapi/spec-validate.py "http://127.0.0.1:$PORT" \
-  --spec crates/ocserve-core/assets/openapi/2.0.28.json
+  --spec crates/ocserve-core/assets/openapi/v2.json

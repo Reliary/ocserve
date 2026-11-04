@@ -1,5 +1,5 @@
 [package]
-name = "ocserve-ui-2028-d"
+name = "ocserve-ui-v1-b"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Embedded web-UI pack part (2.0.28, part d) for ocserve"
+description = "Embedded web-UI pack part (1.18.31, part b) for ocserve"
 include = ["src/**", "assets/**", "README.md"]
 
 [dependencies]

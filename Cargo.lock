@@ -1807,12 +1807,12 @@ dependencies = [
  "ocserve-pty",
  "ocserve-store",
  "ocserve-tools",
- "ocserve-ui-11831-a",
- "ocserve-ui-11831-b",
- "ocserve-ui-2028-a",
- "ocserve-ui-2028-b",
- "ocserve-ui-2028-c",
- "ocserve-ui-2028-d",
+ "ocserve-ui-v1-a",
+ "ocserve-ui-v1-b",
+ "ocserve-ui-v2-a",
+ "ocserve-ui-v2-b",
+ "ocserve-ui-v2-c",
+ "ocserve-ui-v2-d",
  "parking_lot 0.13.0",
  "regex",
  "reqwest",
@@ -1961,27 +1961,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "ocserve-ui-11831-a"
+name = "ocserve-ui-v1-a"
 version = "0.6.10"
 
 [[package]]
-name = "ocserve-ui-11831-b"
+name = "ocserve-ui-v1-b"
 version = "0.6.10"
 
 [[package]]
-name = "ocserve-ui-2028-a"
+name = "ocserve-ui-v2-a"
 version = "0.6.10"
 
 [[package]]
-name = "ocserve-ui-2028-b"
+name = "ocserve-ui-v2-b"
 version = "0.6.10"
 
 [[package]]
-name = "ocserve-ui-2028-c"
+name = "ocserve-ui-v2-c"
 version = "0.6.10"
 
 [[package]]
-name = "ocserve-ui-2028-d"
+name = "ocserve-ui-v2-d"
 version = "0.6.10"
 
 [[package]]

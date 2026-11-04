@@ -6,7 +6,7 @@
 //! dropped and the app rendered both its optimistic row and the server row.
 //! This module closes that class: every prompt-family request body decodes
 //! ONCE at the boundary into a typed struct whose serde/wire names are
-//! compile-checked against the frozen spec (`assets/openapi/1.18.31.json`,
+//! compile-checked against the frozen spec (`assets/openapi/v1.json`,
 //! pinned test), with byte-exact Effect decode-error messages captured from
 //! freeze in `bench/openapi/field-probes.md`.
 //!
@@ -1178,7 +1178,7 @@ mod wire_tests {
     }
 
     /// B4: wire key sets are pinned to the frozen spec. Generated from
-    /// `assets/openapi/1.18.31.json` — upstream adds/renames a field → spec
+    /// `assets/openapi/v1.json` — upstream adds/renames a field → spec
     /// refresh → red here → struct updated in lockstep. The v2 prompt pin
     /// reads the REGENERATED 2.0.28 contract (SPEC_V2_JSON), not the v1 doc.
     #[test]

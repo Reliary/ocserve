@@ -27,20 +27,20 @@ use std::sync::OnceLock;
 
 /// Index (paths + frame offsets) for the v1 pack. `include_bytes!` keeps `/`
 /// working on a bare machine with no network and no data dir (the "boots with
-/// defaults" invariant). The frame bytes live in `ocserve-ui-11831-*` because
+/// defaults" invariant). The frame bytes live in `ocserve-ui-v1-*` because
 /// crates.io caps one crate at 10 MiB; the index is small (42 KB).
-static PACK_INDEX: &[u8] = include_bytes!("../assets/webui/1.18.31.index.bin");
-static PACK_V2_INDEX: &[u8] = include_bytes!("../assets/webui/2.0.28.index.bin");
+static PACK_INDEX: &[u8] = include_bytes!("../assets/webui/v1.index.bin");
+static PACK_V2_INDEX: &[u8] = include_bytes!("../assets/webui/v2.index.bin");
 
 /// Frame bytes for v1, in pack order.
-static PACK_V1_PARTS: &[&[u8]] = &[ocserve_ui_11831_a::PART, ocserve_ui_11831_b::PART];
+static PACK_V1_PARTS: &[&[u8]] = &[ocserve_ui_v1_a::PART, ocserve_ui_v1_b::PART];
 
 /// Frame bytes for v2 (the 2.0.28 closure), in pack order.
 static PACK_V2_PARTS: &[&[u8]] = &[
-    ocserve_ui_2028_a::PART,
-    ocserve_ui_2028_b::PART,
-    ocserve_ui_2028_c::PART,
-    ocserve_ui_2028_d::PART,
+    ocserve_ui_v2_a::PART,
+    ocserve_ui_v2_b::PART,
+    ocserve_ui_v2_c::PART,
+    ocserve_ui_v2_d::PART,
 ];
 
 /// The freeze tag the v1 pack was built from — the same pin `/global/health`
@@ -51,10 +51,12 @@ pub const APP_TAG: &str = ocserve_llm::FREEZE_VERSION;
 /// was vendored under.
 pub const APP_TAG_V2: &str = ocserve_core::spec::V2_TAG;
 
-/// Which pack serves `/`. `OCSERVE_UI_PACK=2.0.28` selects the v2 shell
-/// (natural pair with `OCSERVE_V2=1`); anything else serves v1. Explicit
-/// flag, never sniffed: both packs claim `/`, so first-load auto-detect is
-/// impossible.
+/// Which pack serves `/`. `OCSERVE_UI_PACK` accepts the v2 line's tag
+/// (`2.0.28`, or any `2.*` after a bump) or the slot name `v2`; anything else
+/// serves v1. Matching the LINE, not one literal, is what keeps this knob
+/// working across a pin bump (slots name the pack, the tag only selects it).
+/// Explicit flag, never sniffed: both packs claim `/`, so first-load
+/// auto-detect is impossible.
 pub fn active_tag() -> &'static str {
     tag_for(std::env::var("OCSERVE_UI_PACK").ok().as_deref())
 }
@@ -63,7 +65,7 @@ pub fn active_tag() -> &'static str {
 /// mutation in parallel tests is a flake class, TESTING §1.6).
 fn tag_for(value: Option<&str>) -> &'static str {
     match value {
-        Some("2.0.28") => APP_TAG_V2,
+        Some(v) if v == "v2" || v.starts_with("2.") => APP_TAG_V2,
         _ => APP_TAG,
     }
 }
@@ -390,6 +392,13 @@ mod tests {
         assert_eq!(tag_for(None), APP_TAG);
         assert_eq!(tag_for(Some("9.9.9")), APP_TAG);
         assert_eq!(tag_for(Some("2.0.28")), APP_TAG_V2);
+        assert_eq!(
+            tag_for(Some("2.2.5")),
+            APP_TAG_V2,
+            "line match survives a bump"
+        );
+        assert_eq!(tag_for(Some("v2")), APP_TAG_V2);
+        assert_eq!(tag_for(Some("1.19.5")), APP_TAG);
         // CONTROL: default that selects v2 → first assert fails, red.
     }
 

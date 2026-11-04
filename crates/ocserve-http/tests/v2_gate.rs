@@ -220,8 +220,8 @@ fn gate_table_matches_the_vendored_contract_difference() {
         )
         .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
     };
-    let v1 = read("1.18.31.json");
-    let v2 = read("2.0.28.json");
+    let v1 = read("v1.json");
+    let v2 = read("v2.json");
     let ops = |spec: &serde_json::Value| -> std::collections::HashSet<(String, String)> {
         let mut out = std::collections::HashSet::new();
         for (path, item) in spec["paths"].as_object().expect("paths") {

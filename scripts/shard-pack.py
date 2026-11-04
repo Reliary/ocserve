@@ -8,11 +8,19 @@ frame boundaries** keeps the format, the loader, the 16 MiB cache and the
 binary size identical; only the bytes live in several crates.
 
 Input:  crates/ocserve-http/assets/webui/<tag>.pack.zst  (OCAP2 monolith)
-Output: crates/ocserve-http/assets/webui/<tag>.index.bin (index only)
-        crates/ocserve-ui-<tag>-<letter>/assets/part.bin (raw frames)
+Output: crates/ocserve-http/assets/webui/<slot>.index.bin (index only)
+        crates/ocserve-ui-<slot>-<letter>/assets/part.bin (raw frames)
         crates/ocserve-http/assets/webui/parts.json (order + sizes + hashes)
 
-Usage: shard-pack.py <tag> <parts> [--check]
+SLOT NAMING (2026-11-04): artifacts and crates are named by SLOT (`v1`/`v2`),
+not by tag. A tag bump then republishes the same crate names instead of
+creating six new ones, and the `include_bytes!` paths stay literal-stable.
+The real tag lives INSIDE `parts.json` and each manifest, so the skew guard can
+prove the slot's content came from the pin (a slot compared against itself
+would be vacuous).
+
+Usage: shard-pack.py <tag> [parts] [--check]
+  `parts` is optional: when omitted it is derived from the byte budget.
   `--check` verifies the committed artifacts are consistent and exits non-zero
   otherwise (used by the guard); it writes nothing.
 """
@@ -40,8 +48,13 @@ pub static PART: &[u8] = include_bytes!("../assets/part.bin");
 """
 
 
-def crate_name(tag: str, letter: str) -> str:
-    return f"ocserve-ui-{tag.replace('.', '')}-{letter}"
+def slot_of(tag: str) -> str:
+    """v1 for the 1.x line, v2 for 2.x (the two frozen contracts)."""
+    return "v1" if tag.startswith("1.") else "v2"
+
+
+def crate_name(slot: str, letter: str) -> str:
+    return f"ocserve-ui-{slot}-{letter}"
 
 
 def letters(n: int) -> list[str]:
@@ -99,17 +112,24 @@ def balanced_cuts(entries: list, n: int) -> list[int]:
     return cuts
 
 
-def split(tag: str, n: int) -> dict:
+def split(tag: str, n: int | None) -> dict:
+    slot = slot_of(tag)
     pack = WEBUI / f"{tag}.pack.zst"
     blob = pack.read_bytes()
     entries, base = parse_index(blob)
+    total = sum(e["comp"] for e in entries)
+    if n is None:
+        # Budget-derived: the smallest part count whose even cut fits the
+        # safety margin. `balanced_cuts` minimises the max, so ceil(total /
+        # SAFETY) is sufficient and sufficient-by-construction.
+        n = max(1, -(-total // SAFETY))
     cuts = balanced_cuts(entries, n)
     groups = [entries[cuts[k] : cuts[k + 1]] for k in range(n)]
 
     # The index keeps ABSOLUTE offsets into the concatenated frames region, so
     # the loader is unchanged: it maps an offset to the part that contains it.
     idx_blob = index_bytes(entries)
-    (WEBUI / f"{tag}.index.bin").write_bytes(idx_blob)
+    (WEBUI / f"{slot}.index.bin").write_bytes(idx_blob)
 
     parts = []
     for k, group in enumerate(groups):
@@ -119,7 +139,7 @@ def split(tag: str, n: int) -> dict:
         data = blob[base + first : base + end]
         if len(data) != end - first:
             raise SystemExit(f"{tag}: part {k} slice short")
-        name = crate_name(tag, letters(n)[k])
+        name = crate_name(slot, letters(n)[k])
         dest = ROOT / "crates" / name / "assets"
         dest.mkdir(parents=True, exist_ok=True)
         (dest / "part.bin").write_bytes(data)
@@ -138,7 +158,8 @@ def split(tag: str, n: int) -> dict:
 
     return {
         "tag": tag,
-        "total": sum(e["comp"] for e in entries),
+        "slot": slot,
+        "total": total,
         "index_bytes": len(idx_blob),
         "index_sha256": hashlib.sha256(idx_blob).hexdigest(),
         "parts": parts,
@@ -166,10 +187,11 @@ def check() -> int:
     except ImportError:
         zstd = None
         print("note: compression.zstd unavailable; checking hashes/sizes only")
-    for tag, meta in sorted(doc.items()):
-        idx_path = WEBUI / f"{tag}.index.bin"
+    for slot, meta in sorted(doc.items()):
+        tag = meta.get("tag", "")
+        idx_path = WEBUI / f"{slot}.index.bin"
         if not idx_path.exists():
-            print(f"FAIL: {tag}: index missing")
+            print(f"FAIL: {slot}: index missing")
             bad = 1
             continue
         idx_blob = idx_path.read_bytes()
@@ -200,7 +222,11 @@ def check() -> int:
             print(f"FAIL: {tag}: concatenated parts {len(blob):,} != {meta['total']:,}")
             bad = 1
         if zstd is not None and not bad:
-            manifest = json.loads((WEBUI / f"{tag}.manifest.json").read_text())["files"]
+            mdoc = json.loads((WEBUI / f"{slot}.manifest.json").read_text())
+            if mdoc.get("tag") != tag:
+                print(f"FAIL: {slot}: manifest tag {mdoc.get('tag')!r} != parts.json {tag!r}")
+                bad = 1
+            manifest = mdoc["files"]
             if len(manifest) != len(entries):
                 print(f"FAIL: {tag}: index {len(entries)} != manifest {len(manifest)}")
                 bad = 1
@@ -241,20 +267,23 @@ def check() -> int:
 def main() -> int:
     if "--check" in sys.argv:
         return check()
-    if len(sys.argv) < 3:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if not args:
         print(__doc__)
         return 2
-    tag, n = sys.argv[1], int(sys.argv[2])
-    if n < 1:
+    tag = args[0]
+    n = int(args[1]) if len(args) > 1 else None
+    if n is not None and n < 1:
         print("parts must be >= 1")
         return 2
     meta = split(tag, n)
     doc = read_parts_json()
-    doc[tag] = {k: v for k, v in meta.items() if k != "tag"}
+    doc[meta["slot"]] = meta
     write_parts_json(doc)
     for p in meta["parts"]:
         print(f"  {p['crate']:22s} {p['bytes']:>10,} B")
-    print(f"index {meta['index_bytes']:,} B; total {meta['total']:,} B in {n} parts")
+    print(f"index {meta['index_bytes']:,} B; total {meta['total']:,} B "
+          f"in {len(meta['parts'])} parts (slot {meta['slot']}, tag {meta['tag']})")
     return 0
 
 

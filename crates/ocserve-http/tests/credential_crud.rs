@@ -3,7 +3,7 @@
 //! client renaming a credential saw success and no change. Every status and
 //! body below was captured from the reference before this test was written.
 //!
-//! Reference behaviour (probed, `bench/openapi/1.18.31.json` is the v1 wire;
+//! Reference behaviour (probed, `crates/ocserve-core/assets/openapi/v1.json` is the v1 wire;
 //! these shapes are v2-only and live in the 2.0.28 contract):
 //!   PATCH {label} -> 204, missing label -> 400 Payload
 //!                    "Missing key\n  at [\"label\"]"

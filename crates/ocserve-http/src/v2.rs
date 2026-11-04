@@ -9,7 +9,7 @@
 //! 2026-10-08).
 //!
 //! Shapes are taken from the vendored OpenAPI contract
-//! (`assets/openapi/1.18.31.json`, served at `/doc`) and probed live from the
+//! (`assets/openapi/v1.json`, served at `/doc`) and probed live from the
 //! freeze. Envelope rules captured live:
 //!   - `{location, data}` for location-scoped collections (agent/model/…),
 //!   - `{data: …}` for single resources,

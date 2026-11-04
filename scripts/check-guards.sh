@@ -403,17 +403,17 @@ fi
 
 echo "== guard: full API coverage (rule 16, spec-driven) =="
 # Supersedes rules 14 + 15 + the web-bundle extractor with ONE generated check
-# over the frozen server's own OpenAPI contract (crates/ocserve-core/assets/openapi/1.18.31.json,
+# over the frozen server's own OpenAPI contract (crates/ocserve-core/assets/openapi/v1.json,
 # served at /doc). Every operation must be bound in the router or carry an
 # exact `METHOD /path` citation in PLAN.md. Citations match on whole-token
 # boundaries (a substring test vacuously cited `POST /mcp` as a prefix of
 # `POST /mcp/{name}/connect`). Cannot drift the way three hand-maintained
 # route lists did (the /pty/shells and /session/{id}/diff gaps).
-if [ -f crates/ocserve-core/assets/openapi/1.18.31.json ]; then
+if [ -f crates/ocserve-core/assets/openapi/v1.json ]; then
   # NB: check-coverage.py exits 1 when gaps exist; with `set -o pipefail`
   # a `if $(... | grep)` construct would inherit that nonzero and report ok
   # vacuously. Capture full output and test for the GAP marker explicitly.
-  cov_out=$(python3 bench/openapi/check-coverage.py crates/ocserve-core/assets/openapi/1.18.31.json crates/ocserve-http/src/lib.rs PLAN.md 2>&1) || true
+  cov_out=$(python3 bench/openapi/check-coverage.py crates/ocserve-core/assets/openapi/v1.json crates/ocserve-http/src/lib.rs PLAN.md 2>&1) || true
   gaps=$(printf '%s\n' "$cov_out" | grep '^  GAP' || true)
   if [ -n "$gaps" ]; then
     echo "$gaps"; echo "FAIL: spec operation unbound and uncited (rule 16)"; fail=1
@@ -429,8 +429,8 @@ echo "== guard: v2 API coverage (rule 16b, spec-driven) =="
 # op must be bound in the router or carry an exact `METHOD /path` citation
 # in V2-PARITY-PLAN.md (all 142 currently bound; citations remain as fallback
 # for future verdicts). Planted control: remove a binding → GAP → red.
-if [ -f crates/ocserve-core/assets/openapi/2.0.28.json ]; then
-  cov2_out=$(python3 bench/openapi/check-coverage.py crates/ocserve-core/assets/openapi/2.0.28.json crates/ocserve-http/src/lib.rs V2-PARITY-PLAN.md 2>&1) || true
+if [ -f crates/ocserve-core/assets/openapi/v2.json ]; then
+  cov2_out=$(python3 bench/openapi/check-coverage.py crates/ocserve-core/assets/openapi/v2.json crates/ocserve-http/src/lib.rs V2-PARITY-PLAN.md 2>&1) || true
   gaps2=$(printf '%s\n' "$cov2_out" | grep '^  GAP' || true)
   if [ -n "$gaps2" ]; then
     echo "$gaps2"; echo "FAIL: v2 spec operation unbound and uncited (rule 16b)"; fail=1
@@ -443,7 +443,7 @@ if [ -f crates/ocserve-core/assets/openapi/2.0.28.json ]; then
   _cov16b_plant="crates/ocserve-http/src/.lib.guard-plant.rs"
   _cov16b_restore() { rm -f "$_cov16b_plant"; }
   trap '_cov16b_restore' EXIT
-  python3 - crates/ocserve-core/assets/openapi/2.0.28.json crates/ocserve-http/src/lib.rs "$_cov16b_plant" <<'PYEOF' || true
+  python3 - crates/ocserve-core/assets/openapi/v2.json crates/ocserve-http/src/lib.rs "$_cov16b_plant" <<'PYEOF' || true
 import json, re, sys
 spec = json.load(open(sys.argv[1], encoding="utf-8"))
 paths = set(spec.get("paths", {}))
@@ -464,7 +464,7 @@ for m in re.finditer(r'\.route\(\s*"([^"]+)"', text):
 else:
     sys.exit("no spec-bound .route( found to drop")
 PYEOF
-  _plant_gaps=$(python3 bench/openapi/check-coverage.py crates/ocserve-core/assets/openapi/2.0.28.json "$_cov16b_plant" V2-PARITY-PLAN.md 2>&1 | grep '^  GAP' || true)
+  _plant_gaps=$(python3 bench/openapi/check-coverage.py crates/ocserve-core/assets/openapi/v2.json "$_cov16b_plant" V2-PARITY-PLAN.md 2>&1 | grep '^  GAP' || true)
   _cov16b_restore
   trap - EXIT
   if [ -z "$_plant_gaps" ]; then
@@ -495,17 +495,17 @@ if python3 scripts/check-embedded-ui.py --selftest >/dev/null 2>&1; then
 else
   echo "FAIL: embedded web-UI planted controls not detected (rule 17 vacuous)"; fail=1
 fi
-for _tag in 1.18.31 2.0.28; do
-  _pack="crates/ocserve-http/assets/webui/$_tag.index.bin"
-  _spec="crates/ocserve-core/assets/openapi/$_tag.json"
+for _slot in v1 v2; do
+  _pack="crates/ocserve-http/assets/webui/$_slot.index.bin"
+  _spec="crates/ocserve-core/assets/openapi/$_slot.json"
   if [ -f "$_pack" ] && [ -f "$_spec" ]; then
     if out=$(python3 bench/webui/check-app-skew.py "$_pack" "$_spec" 2>&1); then
-      echo "ok ($_tag)"
+      echo "ok ($_slot)"
     else
-      echo "$out"; echo "FAIL: $_tag embedded UI calls a route absent from its spec (rule 17)"; fail=1
+      echo "$out"; echo "FAIL: $_slot embedded UI calls a route absent from its spec (rule 17)"; fail=1
     fi
   else
-    echo "ok ($_tag: no embedded app pack)"
+    echo "ok ($_slot: no embedded app pack)"
   fi
 done
 
@@ -590,7 +590,7 @@ echo "== guard: handler request keys are contract-valid (rule 20) =="
 # scanner is vacuous and the gate fails.
 if out=$(python3 bench/openapi/check-request-keys.py --selftest 2>&1) \
   && scan=$(python3 bench/openapi/check-request-keys.py \
-      crates/ocserve-core/assets/openapi/1.18.31.json crates/ocserve-core/assets/openapi/2.0.28.json crates/ocserve-http/src 2>&1); then
+      crates/ocserve-core/assets/openapi/v1.json crates/ocserve-core/assets/openapi/v2.json crates/ocserve-http/src 2>&1); then
   echo "ok (selftest + scan: $(echo "$scan" | tail -1))"
 else
   echo "$out"; echo "$scan"
@@ -877,7 +877,7 @@ echo "== guard: v2 contract-differ (rule 32) =="
 # bucket. Selftest proves both detectors non-vacuous (planted new op +
 # planted type change). Calibration: must reproduce the hand-verified counts
 # (142 v2 ops, 0 conflicts) — drift means re-verify by hand (V2-PLAN A6).
-if [ -f scripts/contract-diff.py ] && [ -f crates/ocserve-core/assets/openapi/2.0.28.json ]; then
+if [ -f scripts/contract-diff.py ] && [ -f crates/ocserve-core/assets/openapi/v2.json ]; then
   if python3 scripts/contract-diff.py --selftest >/dev/null 2>&1; then
     if out=$(python3 scripts/contract-diff.py 2>&1); then
       echo "$out" | tail -9

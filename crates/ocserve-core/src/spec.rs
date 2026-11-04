@@ -22,7 +22,7 @@ pub use ocserve_llm::FREEZE_VERSION as TAG;
 /// The frozen 1.18.31 OpenAPI document, byte-identical to the upstream tag's
 /// `packages/sdk/openapi.json` and to freeze's live `GET /doc` (verified
 /// 2026-10-08; re-verified per release).
-pub const SPEC_JSON: &str = include_str!("../assets/openapi/1.18.31.json");
+pub const SPEC_JSON: &str = include_str!("../assets/openapi/v1.json");
 
 /// Reference pin for the v2 line (see `V2-PLAN.md` D3).
 pub const V2_TAG: &str = "2.0.28";
@@ -35,4 +35,4 @@ pub const V2_TAG: &str = "2.0.28";
 /// `@opencode/protocol@2.0.28` + `@opencode/schema@2.0.28`. Regenerate with
 /// `scripts/extract-spec.sh 2.0.28 --regen` (proven byte-reproducible
 /// 2026-10-16: 118 paths / 142 ops / 303 schemas).
-pub const SPEC_V2_JSON: &str = include_str!("../assets/openapi/2.0.28.json");
+pub const SPEC_V2_JSON: &str = include_str!("../assets/openapi/v2.json");

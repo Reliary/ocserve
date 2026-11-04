@@ -12,12 +12,12 @@ members = [
     "crates/ocserve-metrics",
     "crates/ocserve-pty",
     "crates/ocserve-cli",
-    "crates/ocserve-ui-11831-a",
-    "crates/ocserve-ui-11831-b",
-    "crates/ocserve-ui-2028-a",
-    "crates/ocserve-ui-2028-b",
-    "crates/ocserve-ui-2028-c",
-    "crates/ocserve-ui-2028-d",
+    "crates/ocserve-ui-v1-a",
+    "crates/ocserve-ui-v1-b",
+    "crates/ocserve-ui-v2-a",
+    "crates/ocserve-ui-v2-b",
+    "crates/ocserve-ui-v2-c",
+    "crates/ocserve-ui-v2-d",
 ]
 # The cargo-fuzz crate has its own [workspace] (cargo-fuzz requirement) and
 # depends on nightly libfuzzer-sys; keep it out of the normal build graph.
@@ -45,12 +45,12 @@ ocserve-plugin = { path = "crates/ocserve-plugin", version = "0.6.10" }
 ocserve-metrics = { path = "crates/ocserve-metrics", version = "0.6.10" }
 ocserve-pty = { path = "crates/ocserve-pty", version = "0.6.10" }
 ocserve-importer = { path = "crates/ocserve-importer", version = "0.6.10" }
-ocserve-ui-11831-a = { path = "crates/ocserve-ui-11831-a", version = "0.6.10" }
-ocserve-ui-11831-b = { path = "crates/ocserve-ui-11831-b", version = "0.6.10" }
-ocserve-ui-2028-a = { path = "crates/ocserve-ui-2028-a", version = "0.6.10" }
-ocserve-ui-2028-b = { path = "crates/ocserve-ui-2028-b", version = "0.6.10" }
-ocserve-ui-2028-c = { path = "crates/ocserve-ui-2028-c", version = "0.6.10" }
-ocserve-ui-2028-d = { path = "crates/ocserve-ui-2028-d", version = "0.6.10" }
+ocserve-ui-v1-a = { path = "crates/ocserve-ui-v1-a", version = "0.6.10" }
+ocserve-ui-v1-b = { path = "crates/ocserve-ui-v1-b", version = "0.6.10" }
+ocserve-ui-v2-a = { path = "crates/ocserve-ui-v2-a", version = "0.6.10" }
+ocserve-ui-v2-b = { path = "crates/ocserve-ui-v2-b", version = "0.6.10" }
+ocserve-ui-v2-c = { path = "crates/ocserve-ui-v2-c", version = "0.6.10" }
+ocserve-ui-v2-d = { path = "crates/ocserve-ui-v2-d", version = "0.6.10" }
 
 # runtime / web
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs", "io-util", "net"] }

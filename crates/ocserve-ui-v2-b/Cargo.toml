@@ -1,5 +1,5 @@
 [package]
-name = "ocserve-ui-2028-b"
+name = "ocserve-ui-v2-b"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
