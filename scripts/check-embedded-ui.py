@@ -76,6 +76,19 @@ def check(root: pathlib.Path = ROOT) -> list[str]:
             pins[slot] = m.group(1) if m else None
         except OSError:
             pins[slot] = None
+    # The permission rules asset embeds a tag too; it must match the v1 pin
+    # for the same reason the packs do (slot naming removed the filename).
+    try:
+        rules = json.loads(
+            (root / "crates/ocserve-tools/assets/permission/v1.rules.json").read_text()
+        )
+        if pins.get("v1") and rules.get("tag") != pins["v1"]:
+            errors.append(
+                f"rules v1: tag {rules.get('tag')!r} != Rust pin {pins['v1']!r}"
+            )
+    except OSError:
+        errors.append("rules v1: asset missing")
+
     for slot, meta in sorted(parts_doc.items()):
         if slot in pins:
             if pins[slot] is None:

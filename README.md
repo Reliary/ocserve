@@ -8,14 +8,14 @@ the web UI, and anything else that talks to the API.
 Both contracts are covered, and both are verified against real upstream
 binaries rather than described:
 
-- the **1.18.x server API** (frozen at 1.18.31), used by today's clients:
+- the **1.x server API** (frozen at 1.19.5), used by today's clients:
   **188 of 188** operations implemented
 - the **opencode 2 API** (`/api/*`, pinned at 2.0.28), used by the current 2.x
   TUI and web UI: **142 of 142** operations implemented, including every route
   a 2.x TUI calls at boot
 
 The v2-only operations are opt-in, because `/api/*` also carries 58 operations
-that 1.18.31 clients use. Run with `OCSERVE_V2=1` to serve the full 2.x surface;
+that 1.x clients use. Run with `OCSERVE_V2=1` to serve the full 2.x surface;
 without it those 96 v2-only operations answer a clean JSON 404. Details and the
 exact gate are in [v2](#v2-opencode-2) below.
 
@@ -34,7 +34,9 @@ ring, so its file tracks its data.
 
 ## At a glance
 
-This laptop, both servers up with the same config and no traffic:
+This laptop, both servers up with the same config and no traffic (measured
+against 1.18.31; the 1.19.5 contract is byte-identical apart from two schema
+descriptions, so the numbers carry over, but they are not a 1.19.5 re-run):
 
 | | ocserve | upstream 1.18.31 |
 |---|---:|---:|
@@ -185,7 +187,7 @@ tuning knobs are there when you need them.
 
 ## Compatibility
 
-### v1 (frozen at 1.18.31)
+### v1 (frozen at 1.19.5)
 
 Verified by differential replay against the frozen upstream binary and a live
 A/B pair harness. Working: sessions and messages with cursor paging, the SSE
@@ -220,9 +222,9 @@ OCSERVE_V2=1 ocserve serve --port 4096
 ```
 
 The gate is derived mechanically from the two contracts, not by path prefix:
-`/api/*` is part of the frozen 1.18.31 contract too (58 operations, and the
-1.18.31 TUI calls them), so those keep working. What the flag actually gates is
-the 96 operations present in 2.0.28 and absent from 1.18.31: the run engine
+`/api/*` is part of the frozen 1.x contract too (58 operations, and the
+1.x TUI calls them), so those keep working. What the flag actually gates is
+the 96 operations present in 2.0.28 and absent from the 1.x contract: the run engine
 (inbox admission, write-ahead claims, `content[]` projection, dual-grammar
 events, `log?after&follow` replay, form service) plus the v2-only
 administration surface.
@@ -265,7 +267,7 @@ hosted bundle instead.
 
 ### Contract
 
-Wire-compatible with upstream 1.18.31 and opencode 2.x. Upstream changes are
+Wire-compatible with upstream 1.19.5 and opencode 2.x. Upstream changes are
 tracked by a nightly drift watch and adopted deliberately, not automatically. A
 future release may change the API; when it does, `ocserve` pins the new version
 and re-runs every oracle before claiming compatibility.
@@ -282,7 +284,7 @@ same one Linux serves.
 
 **Windows** runs the server, the shell tool, the terminal routes and the frozen
 wire contract. The wire is verified in a Windows 11 LTSC VM (`pair-check` 18
-compared / 0 divergent against `opencode-windows-x64@1.18.31`); the terminal
+compared / 0 divergent against `opencode-windows-x64@1.19.5`); the terminal
 routes use ConPTY and are verified on the Windows CI runner by a test that
 spawns a real shell and requires its output back through the PTY. Building that
 found four bugs no compile check could, all fixed (child environment, std
@@ -371,3 +373,5 @@ git config core.hooksPath .githooks    # enables the commit gate
 
 Host services other than ocserve's own are read-only to scripts in this repo
 (`AGENTS.md` section 2.11).
+
+CANARY2

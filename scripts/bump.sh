@@ -160,6 +160,16 @@ case "$LINE" in
     run scripts/extract-prompts.sh "$VER"
     run scripts/extract-rules.sh "$VER"
 
+    echo "=== step 3b: re-extract the v1 web-UI pack ==="
+    # The pack is upstream's own app build; it changes with the release even
+    # when the wire is inert. Skipping it left the slot at the OLD tag while
+    # the pin moved, which rule 17 correctly flags (2026-11-04 first real run).
+    if [ "$DRY" = 0 ] && [ -x bench/parity/vendor/opencode ]; then
+      run scripts/extract-app.sh bench/parity/vendor/opencode "$VER"
+    else
+      echo "  [dry-run] scripts/extract-app.sh bench/parity/vendor/opencode $VER"
+    fi
+
     echo "=== step 4: provider-boundary capture (needs a booted freeze) ==="
     if [ "$DRY" = 0 ] && [ -x bench/parity/vendor/opencode ]; then
       run scripts/capture-provider-contract.sh

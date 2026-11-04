@@ -29,7 +29,9 @@ command -v npm >/dev/null 2>&1 || { echo "acquire-freeze: npm not found" >&2; ex
 host="$(command -v opencode 2>/dev/null || true)"
 if [ -n "$host" ] && [ "$("$host" --version 2>/dev/null | head -1)" = "$WANT" ]; then
   mkdir -p "$(dirname "$VENDOR")"
-  cp "$host" "$VENDOR" && chmod +x "$VENDOR"
+  rm -f "$VENDOR"
+  cp "$host" "$VENDOR"
+  chmod 555 "$VENDOR" 2>/dev/null || chmod +x "$VENDOR"
   echo "acquire-freeze: staged from host $host"
   exit 0
 fi
@@ -47,6 +49,10 @@ got="$("$src" --version 2>/dev/null | head -1)"
 [ "$got" = "$WANT" ] || { echo "acquire-freeze: got '$got', want '$WANT'" >&2; rm -rf "$prefix"; exit 2; }
 
 mkdir -p "$(dirname "$VENDOR")"
-cp "$src" "$VENDOR" && chmod +x "$VENDOR"
+# `cp` onto a 555 file fails; and a failing `cp` in an `&&` list is exempt
+# from `set -e`, so the old one-liner printed success after a failed copy.
+rm -f "$VENDOR"
+cp "$src" "$VENDOR"
+chmod 555 "$VENDOR" 2>/dev/null || chmod +x "$VENDOR"
 rm -rf "$prefix"
 echo "acquire-freeze: staged $VENDOR ($WANT)"

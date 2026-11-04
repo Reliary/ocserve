@@ -14,6 +14,8 @@
 #      messages route must stream via for_each_message_json [suite]
 #   4. msg_part INSERT/UPDATE outside ocserve-store — every part write must
 #      carry its part_search projection companion (W1 FTS invariant) [suite]
+#   68. a revert/snapshot test whose session directory defaults to the repo cwd
+#      (unrevert checkout-indexes over the working tree; UI-part drift, 2026-11-04)
 #   67. handler-level `v2_enabled` checks in v2.rs (flag authority is the gate
 #      table; the five v1∩v2 routes broke with the flag off) [plant]
 #   5. upstream drift watch broken (version compare / pin read / registry-output
@@ -2114,5 +2116,68 @@ else
   echo "ok (planted handler self-gate detected)"
 fi
 rm -f "$_v2p"
+
+echo "== guard: revert/snapshot tests never target the repo worktree (rule 68) =="
+# 2026-11-04: compat_batch's revert test used `AppState::new()`, whose default
+# session directory is the process cwd (this repo). `unrevert` then ran the
+# snapshot engine's `checkout-index -a -f` INSIDE the repository and silently
+# reverted uncommitted files — it looked like a stale web-UI shard for an
+# hour. A test that can mutate the checkout is a defect, not a test.
+revert_repo_hit() {
+  local bad=""
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if grep -q 'AppState::new()' "$f"; then
+      # revert/unrevert ALWAYS reach the restore path. `/vcs/apply` only does
+      # when the body carries a patch; an empty-body 400 test never runs git
+      # (v2_surface asserts the payload shape and is exempt).
+      # The file may share an `app()` helper with non-mutating tests; what
+      # matters is that the MUTATING test pins the session directory rather
+      # than inheriting the cwd. v2_surface's only `/vcs/apply` use asserts
+      # the empty-body 400 (no patch truthy → no git), so it is not a
+      # mutating call at all.
+      # v1 session create takes `directory` as a QUERY PARAMETER; a body key
+      # is ignored. Requiring only the word "directory" was vacuous — the
+      # first fix to this exact test used a body key and kept restoring over
+      # the repo (proven by a git shim logging CWD, 2026-11-04). Require the
+      # query form.
+      if grep -qE '/(revert|unrevert)' "$f"; then
+        if ! grep -qE 'directory=' "$f"; then bad="$bad $f"; fi
+      elif grep -q 'vcs/apply' "$f" && grep -qE '"patch":"---|"patch": *"---|patch.*\+\+\+ b/' "$f"; then
+        if ! grep -qE 'directory=' "$f"; then bad="$bad $f"; fi
+      fi
+    fi
+  done < <(grep -rlE 'unrevert|/revert|vcs/apply' "$@" 2>/dev/null || true)
+  printf '%s' "$bad"
+}
+_hits=$(revert_repo_hit crates/*/tests/*.rs)
+if [ -n "$_hits" ]; then
+  echo "revert/apply test on default app state (repo cwd):$_hits"
+  echo "FAIL: revert test can restore over the repository worktree (rule 68)"; fail=1
+else
+  echo "ok (every revert/apply test pins an isolated session directory)"
+fi
+_p68=/var/tmp/ocserve-rule68-planted.rs
+printf 'fn app() -> X { AppState::new() }\n// /session/x/unrevert\n' > "$_p68"
+if [ -z "$(revert_repo_hit "$_p68")" ]; then
+  echo "FAIL: rule 68 planted revert-on-cwd test not detected (vacuous)"; fail=1
+else
+  echo "ok (planted revert-on-cwd test detected)"
+fi
+# Plant B: the shape that actually shipped — directory in the BODY only.
+printf 'fn app() -> X { AppState::new() }\n// /session/x/unrevert\njson!({"directory": "/tmp/x"})\n' > "$_p68"
+if [ -z "$(revert_repo_hit "$_p68")" ]; then
+  echo "FAIL: rule 68 body-only directory not detected (the vacuous-fix shape)"; fail=1
+else
+  echo "ok (planted body-only directory detected)"
+fi
+# Plant C (negative control): the query form must PASS.
+printf 'fn app() -> X { AppState::new() }\n// /session/x/unrevert\n"/session?directory=/tmp/x"\n' > "$_p68"
+if [ -n "$(revert_repo_hit "$_p68")" ]; then
+  echo "FAIL: rule 68 flags the correct query form (false positive)"; fail=1
+else
+  echo "ok (planted query-form directory accepted)"
+fi
+rm -f "$_p68"
 
 exit $fail

@@ -63,7 +63,13 @@ if [ ! -x "$VENDOR" ]; then
   cp "$src" "$VENDOR" && chmod +x "$VENDOR"
 fi
 ver=$("$VENDOR" --version 2>/dev/null | head -1)
-[ "$ver" = "1.18.31" ] || die2 "freeze binary reports '$ver', want 1.18.31"
+# The expected freeze is the PIN, read from source — a hardcoded literal here
+# made the first real bump unrunnable (2026-11-04) and is exactly the
+# third-truth class the pin consolidation removed.
+EXPECT="$(sed -n 's/.*pub const FREEZE_VERSION: &str = "\([^"]*\)".*/\1/p' crates/ocserve-llm/src/lib.rs | head -1)"
+export PAIR_EXPECT="$EXPECT"
+[ -n "$EXPECT" ] || die2 "cannot read FREEZE_VERSION from crates/ocserve-llm/src/lib.rs"
+[ "$ver" = "$EXPECT" ] || die2 "freeze binary reports '$ver', want $EXPECT"
 
 python3 - "$PORT_F" "$PORT_R" <<'PY' || die2 "ports busy (4926/4927 required)"
 import socket, sys
@@ -121,15 +127,16 @@ PID_R=$!
 
 wait_health() { # $1 port $2 label
   python3 - "$1" "$2" <<'PY' || { echo "pair-check: $2 never healthy" >&2; exit 2; }
-import sys, time, urllib.request
+import os, sys, time, urllib.request
 port, label = sys.argv[1], sys.argv[2]
+want = os.environ["PAIR_EXPECT"]
 for _ in range(90):
     try:
         r = urllib.request.urlopen(f"http://127.0.0.1:{port}/global/health", timeout=2)
         import json
         v = json.loads(r.read()).get("version")
-        if v != "1.18.31":
-            print(f"pair-check: {label} reports version {v}, want 1.18.31", file=sys.stderr)
+        if v != want:
+            print(f"pair-check: {label} reports version {v}, want {want}", file=sys.stderr)
             sys.exit(2)
         sys.exit(0)
     except SystemExit:
@@ -141,7 +148,7 @@ PY
 }
 wait_health "$PORT_F" freeze || { tail -20 "$HF/freeze.log" >&2; exit 2; }
 wait_health "$PORT_R" ocserve || { tail -20 "$HR/ocserve.log" >&2; exit 2; }
-say "both arms healthy on 1.18.31"
+say "both arms healthy on $EXPECT"
 
 seed() { # $1 port — identical seed on both (recorded corpus assumed sessions)
   python3 - "$1" <<'PY'

@@ -20,16 +20,25 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 TAG="${1:?usage: extract-rules.sh <tag>}"
-OUT="crates/ocserve-tools/assets/permission/${TAG}.rules.json"
+# Slot output (same rule as extract-spec): the crate embeds a literal path, so
+# a bump must overwrite the SLOT file. The tag is recorded inside the JSON.
+case "$TAG" in
+  1.*) SLOT=v1 ;;
+  2.*) SLOT=v2 ;;
+  *) echo "extract-rules: tag must start with 1. or 2. (got $TAG)" >&2; exit 2 ;;
+esac
+OUT="crates/ocserve-tools/assets/permission/${SLOT}.rules.json"
 mkdir -p "$(dirname "$OUT")"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/ocserve-rules.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
-src_file() { # $1 = repo path -> writes to $2
+src_file() { # $1 = repo path -> writes to $2 (tag with v prefix, both local and remote)
   local SRC="${OPENCODE_SRC:-$HOME/src/opencode-v1}"
   if [ -d "$SRC/.git" ] && git -C "$SRC" rev-parse -q --verify "refs/tags/v${TAG}" >/dev/null 2>&1; then
     git -C "$SRC" show "v${TAG}:$1" > "$2"
+  elif [ -d "$SRC/.git" ] && git -C "$SRC" rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+    git -C "$SRC" show "${TAG}:$1" > "$2"
   else
     curl -fsS --max-time 30 "https://raw.githubusercontent.com/sst/opencode/v${TAG}/$1" > "$2"
   fi

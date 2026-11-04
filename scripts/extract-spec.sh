@@ -133,18 +133,32 @@ NODEEOF
   ( cd "$WORK/pkgs/protocol" && OCSERVE_OUT="$OLDPWD/$OUT" node regen.ocserve.mjs )
 elif [ "${2:-}" = "--from-live" ]; then
   URL="${3:?--from-live needs a base URL, e.g. --from-live http://127.0.0.1:4901}"
-  echo "fetching ${URL}/doc -> ${OUT}"
-  curl -fsS --max-time 30 "${URL}/doc" | python3 -m json.tool > "${OUT}"
+  # VERIFY the server is the tag we are about to name the artifact after.
+  # 2026-11-04: a silently-failed acquire left the OLD freeze staged, so this
+  # step wrote 1.18.31's /doc under the new tag name. The artifact's provenance
+  # is only as true as this check.
+  LIVE_VER="$(curl -fsS --max-time 10 "${URL}/global/health" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version",""))' 2>/dev/null || true)"
+  if [ "$LIVE_VER" != "$TAG" ]; then
+    echo "extract-spec: $URL reports version '${LIVE_VER:-unreachable}', expected $TAG" >&2
+    echo "  (refusing to write ${OUT} with another version's contract)" >&2
+    exit 2
+  fi
+  echo "fetching ${URL}/doc (verified ${LIVE_VER}) -> ${OUT}"
+  # VERBATIM, no json.tool: /doc's contract is byte parity with the tag's
+  # packages/sdk/openapi.json. Pretty-printing here silently changed the
+  # served bytes (2026-11-04 first real v1 bump: 1 line -> 42k lines).
+  curl -fsS --max-time 30 "${URL}/doc" -o "${OUT}"
 else
   SRC="${OPENCODE_SRC:-$HOME/src/opencode-v1}"
   if [ -d "$SRC/.git" ] && git -C "$SRC" rev-parse -q --verify "refs/tags/v${TAG}" >/dev/null 2>&1; then
     echo "reading ${SRC}@v${TAG}:packages/sdk/openapi.json -> ${OUT}"
-    git -C "$SRC" show "v${TAG}:packages/sdk/openapi.json" | python3 -m json.tool > "${OUT}"
+    git -C "$SRC" show "v${TAG}:packages/sdk/openapi.json" > "${OUT}"
   else
     echo "no local tag v${TAG} in ${SRC}; fetching raw from GitHub"
     curl -fsS --max-time 30 \
       "https://raw.githubusercontent.com/sst/opencode/v${TAG}/packages/sdk/openapi.json" \
-      | python3 -m json.tool > "${OUT}"
+      -o "${OUT}"
   fi
 fi
 

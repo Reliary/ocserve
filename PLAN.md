@@ -86,8 +86,8 @@ Workspace crates (rust ≥1.86, edition 2024; release profile per `SRE.md §5`):
 
 | Artifact | Freeze | Verification |
 |---|---|---|
-| Upstream server | opencode **1.18.31** (Homebrew, the version serving today) | `/global/health` → `{"healthy":true,"version":"1.18.31"}` (probed live) |
-| TUI | same Homebrew 1.18.31 | attach against ocserve in CI |
+| Upstream server | opencode **1.19.5** (moved 2026-11-04 from 1.18.31; contract byte-identical apart from two schema descriptions, `timeoutFetch` refactor, and prompt-file churn) | `/global/health` → `{"healthy":true,"version":"1.19.5"}` (probed live) |
+| TUI | same Homebrew 1.19.5 | attach against ocserve in CI |
 | oc-remote | commit `bb43e7b` (v1.9.0 tree) | instrumented build in CI |
 | Wire surface | 162 paths in v1 tree `packages/sdk/openapi.json` ∩ 74 oc-remote calls; TUI-only `/tui/*` hit-set **captured** behind proxy at M1 (not assumed) | mechanical diff report |
 | SSE wire | raw bytes + headers: **no `id:`, no `retry:`**, `server.connected` then 10 s JSON `server.heartbeat` (first tick dropped), exact header set (`Cache-Control: no-cache, no-transform`, `X-Accel-Buffering: no`, `X-Content-Type-Options: nosniff`), `server.instance.disposed` on teardown | byte-golden capture |
@@ -208,7 +208,7 @@ tool-output compression before compaction; durable event log + checkpoints for r
 **Adoption posture on major upstream lines (recorded 2026-10-03, evidence below):**
 
 - **v1 freeze remains the contract.** `PLAN.md §3` wire/API/plugin surfaces are pinned to
-  1.18.31; upstream v1 releases are watched nightly by **`scripts/drift-watch.sh`** — since
+  1.19.5; upstream v1 releases are watched nightly by **`scripts/drift-watch.sh`** — since
   2026-11-03 a version probe only (npm `opencode-ai` latest vs the `FREEZE_VERSION`
   constant read from source; the old dual-arm corpus replay is retired, see §6);
   behavioral drift of a candidate release is caught by `bump.sh`'s battery A/B at

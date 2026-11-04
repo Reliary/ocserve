@@ -12,6 +12,19 @@ fn app() -> axum::Router {
     ocserve_http::router(ocserve_http::AppState::new())
 }
 
+/// Minimal percent-encoding for the directory query value.
+fn urlencoding(p: &std::path::Path) -> String {
+    p.to_string_lossy()
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
@@ -127,10 +140,29 @@ async fn session_diff_is_not_a_route() {
 #[tokio::test]
 async fn revert_unrevert_marker_lifecycle() {
     let app = app();
+    // ISOLATION (2026-11-04): a session's `directory` is the worktree the
+    // snapshot engine restores. With the default (`AppState::new()` uses the
+    // process cwd = this repo), `unrevert` ran `checkout-index -a -f` in the
+    // REPOSITORY worktree and silently discarded uncommitted changes — the
+    // UI-part drift that looked like a stale shard. Marker semantics need no
+    // real worktree, so point the session at a temp dir (non-git → the
+    // snapshot engine is a correct no-op).
+    let dir = std::env::temp_dir().join(format!(
+        "ocserve-compat-revert-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    // v1 takes the directory as a QUERY parameter (freeze semantics); a
+    // body key is ignored, which is exactly why the first fix still restored
+    // over the repo (proven by a git shim logging CWD, 2026-11-04).
     let resp = req(
         &app,
         "POST",
-        "/session",
+        &format!("/session?directory={}", urlencoding(&dir)),
         Some(serde_json::json!({"title": "t"})),
     )
     .await;

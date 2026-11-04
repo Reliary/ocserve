@@ -248,7 +248,7 @@ if [ -z "$PARTS" ]; then
     *)   PARTS=4 ;;
   esac
 fi
-python3 "$REPO/scripts/shard-pack.py" "$TAG" "$PARTS"
+python3 scripts/shard-pack.py "$TAG" "$PARTS"
 rm -f "$ASSET_DIR/$TAG.pack.zst"
 
 # Loose extracted files are regenerable from the pack via the manifest; keep

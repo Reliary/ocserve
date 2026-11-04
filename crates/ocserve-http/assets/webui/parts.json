@@ -1,21 +1,22 @@
 {
  "v1": {
   "index_bytes": 42422,
-  "index_sha256": "16972b588e986a654215932198916a193af4a0dca107135f39aebf3a48dc04bb",
+  "index_sha256": "dc308cd00469662d70d5456c091ca508c55ba4d243565b4c58c5f6bc085f5ed0",
   "parts": [
    {
-    "bytes": 5007967,
+    "bytes": 5008006,
     "crate": "ocserve-ui-v1-a",
-    "sha256": "86579a8f0e9e14d7d22b0b96acef1d20a7e2dd208e217644df19bec5eb1faf3b"
+    "sha256": "ed3c714926e98ea947e73c55b212d9722eaa184d38a340e5a9ed66e69777ceec"
    },
    {
-    "bytes": 5115988,
+    "bytes": 5115627,
     "crate": "ocserve-ui-v1-b",
-    "sha256": "12471caf9f40c2c05d0561b8fa1207b52b9ee3a92848a442e3bdd89afcf190b8"
+    "sha256": "0b7c1d7b64052c8fada301b2ad36e2d107562f05294b99b236ccbf40c21ef05a"
    }
   ],
-  "tag": "1.18.31",
-  "total": 10123955
+  "slot": "v1",
+  "tag": "1.19.5",
+  "total": 10123633
  },
  "v2": {
   "index_bytes": 74993,

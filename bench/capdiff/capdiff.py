@@ -180,9 +180,24 @@ class SseWatcher(threading.Thread):
         self.port, self.events, self.stop_flag = port, [], False
 
     def run(self):
+        # RETRY the connect: the watcher is started before its arm's server, so
+        # a single attempt loses the race on whichever arm boots slower (proven
+        # 2026-11-04: freeze won, ocserve's thread died with ECONNREFUSED and
+        # every ocserve turn looked event-less — a harness bug masquerading as
+        # a contract divergence).
+        deadline = time.time() + 60
+        r = None
+        while time.time() < deadline and not self.stop_flag:
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{self.port}/global/event")
+                r = urllib.request.urlopen(req, timeout=60)
+                break
+            except Exception:
+                time.sleep(0.2)
+        if r is None:
+            return
         try:
-            req = urllib.request.Request(f"http://127.0.0.1:{self.port}/global/event")
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with r:
                 for line in r:
                     if self.stop_flag:
                         break
@@ -258,14 +273,25 @@ def is_title_gen(req):
 # file, a report, or a log). 2026-11-04: headers were CAPTURED but never
 # COMPARED, so the zen user-agent divergence (a hand-written version literal
 # vs upstream deriving it from the binary) was invisible to every oracle.
-COMPARED_HEADERS = ("user-agent", "x-opencode-session", "x-opencode-client",
+COMPARED_HEADERS = ("user-agent", "x-opencode-session", "x-opencode-session-id",
+                    "x-opencode-client",
                     "x-opencode-request", "x-opencode-project")
 PRESENCE_HEADERS = ("authorization",)
 
 
 def header_view(req):
     h = {k.lower(): v for k, v in (req.get("headers") or {}).items()}
-    out = {k: h.get(k) for k in COMPARED_HEADERS if k in h}
+    out = {}
+    for k in COMPARED_HEADERS:
+        if k not in h:
+            continue
+        v = h[k]
+        # Session/request ids differ BY CONSTRUCTION between the arms (each
+        # creates its own session). Normalise them, or every run reports a
+        # fake divergence (2026-11-04, the x-opencode-session-id header).
+        if k.startswith("x-opencode-session"):
+            v = "<SID>"
+        out[k] = v
     for k in PRESENCE_HEADERS:
         if k in h:
             out[k] = "<present>" if h[k] else "<empty>"

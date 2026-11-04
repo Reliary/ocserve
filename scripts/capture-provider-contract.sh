@@ -53,12 +53,28 @@ python3 - "$TMP" "$OUT" "$ver" <<'PY'
 import json, glob, sys, pathlib
 tmp, out, ver = sys.argv[1], sys.argv[2], sys.argv[3]
 tools = None
+ua = None
 for f in sorted(glob.glob(f"{tmp}/req-*.json")):
-    b = json.load(open(f))["body"]
-    if b.get("tools"):
+    rec = json.load(open(f))
+    b = rec["body"]
+    # The composite UA is assembled by upstream's AI SDK at fetch time; the
+    # only mechanical source is the wire. Captured here so a bump cannot
+    # leave our constant naming an older runtime (2026-11-04: runtime/bun
+    # moved 1.3.14 -> 1.4.4 between 1.18.31 and 1.19.5 and only the header
+    # oracle noticed).
+    h = {k.lower(): v for k, v in (rec.get("headers") or {}).items()}
+    if h.get("user-agent"):
+        ua = h["user-agent"]
+    if b.get("tools") and tools is None:
         tools = b["tools"]
 if not tools:
     sys.exit("capture: no tools-bearing request captured")
+if not ua:
+    sys.exit("capture: no user-agent captured")
+ua_path = pathlib.Path("crates/ocserve-llm/assets/freeze-user-agent.txt")
+ua_path.parent.mkdir(parents=True, exist_ok=True)
+ua_path.write_text(ua + "\n")
+print(f"captured user-agent: {ua}")
 pathlib.Path(out).write_text(json.dumps(tools, indent=2) + "\n")
 prov = pathlib.Path(out).with_suffix("").with_suffix(".PROVENANCE")
 prov.write_text(

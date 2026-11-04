@@ -11,12 +11,16 @@
 //! They are normalized here; everything else must be byte-identical.
 
 fn normalize(mut s: String, tmp: &str) -> String {
-    // The capture baked the RECORDING host's temp dir; this host may use a
-    // different TMPDIR (this box is /var/tmp). Both sides get the same token.
-    // Longest first: this host's tmp is /var/tmp/opencode, and replacing
-    // /tmp/opencode first would leave a dangling `/var` prefix.
+    // Both sides may have baked a different temp root: the capture recorded
+    // whatever TMPDIR the capture run used, and this test runs under whatever
+    // TMPDIR the suite has. Replace the KNOWN literal roots longest-first and
+    // then this host's path, so neither direction leaves a dangling prefix
+    // (`/var<tmp>` — observed 2026-11-04 when the 1.19.5 capture ran under
+    // /var/tmp but cargo test defaulted to /tmp).
+    for known in ["/var/tmp/opencode", "/tmp/opencode"] {
+        s = s.replace(known, "<tmp>");
+    }
     s = s.replace(tmp, "<tmp>");
-    s = s.replace("/tmp/opencode", "<tmp>");
     s
 }
 

@@ -541,7 +541,7 @@ fn zen_http() -> &'static ZenHttp {
 /// needs it (the zen UA embeds the opencode version), so the constant lives
 /// here and `ocserve-http` re-exports it — one truth, no third copy. A bump
 /// edits this line and `crates/ocserve-core/src/spec.rs` (the v2 pin).
-pub const FREEZE_VERSION: &str = "1.18.31";
+pub const FREEZE_VERSION: &str = "1.19.5";
 
 /// Free-tier zen gate (bench/zen-probe/FINDINGS: probes P5 vs P7 — the
 /// composite UA is load-bearing; the client/project/request headers are not).
@@ -552,11 +552,38 @@ pub const FREEZE_VERSION: &str = "1.18.31";
 /// version, so a stale literal here breaks the keyless free tier while every
 /// other gate stays green (no oracle compared provider headers before
 /// PARITY-SYNC-PLAN P2).
-pub const PROVIDER_USER_AGENT: &str =
-    "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
+/// CAPTURED from the freeze's own provider request, not hand-written.
+///
+/// History: this was a hand-written literal, then derived only from
+/// `FREEZE_VERSION`. The first real bump (1.18.31 -> 1.19.5, 2026-11-04) proved
+/// the other segments move too: the freeze binary's bundled runtime went
+/// from `runtime/bun/1.3.14` to `1.4.4`, and capdiff's header oracle caught
+/// the staleness. Upstream's composite UA is assembled by its AI SDK at fetch
+/// time, so no source file states it — the only mechanical source is the
+/// wire itself. `scripts/capture-provider-contract.sh` boots the freeze and
+/// writes this asset on every bump; the pin test below fails if it still
+/// names an older opencode version.
+const FREEZE_USER_AGENT: &str = include_str!("../assets/freeze-user-agent.txt");
 
-/// Historical name kept as an alias (bench/probe scripts + docs reference it).
-pub const ZEN_FREE_TIER_UA: &str = PROVIDER_USER_AGENT;
+/// The composite user agent upstream sends to EVERY provider
+/// (request.ts:187-203) — captured verbatim, trailing newline trimmed.
+pub fn provider_user_agent() -> &'static str {
+    FREEZE_USER_AGENT.trim_end_matches(['\n', '\r'])
+}
+
+/// `&str`-valued alias so existing `header("user-agent", …)` call sites keep
+/// reading naturally.
+pub struct ProviderUserAgent;
+impl std::ops::Deref for ProviderUserAgent {
+    type Target = str;
+    fn deref(&self) -> &str {
+        provider_user_agent()
+    }
+}
+pub const PROVIDER_USER_AGENT: ProviderUserAgent = ProviderUserAgent;
+
+/// Historical name (bench/probe scripts + docs); same derived value.
+pub const ZEN_FREE_TIER_UA: ProviderUserAgent = ProviderUserAgent;
 
 impl Client {
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
@@ -612,7 +639,7 @@ impl Client {
             .iter()
             .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
         {
-            req = req.header("user-agent", PROVIDER_USER_AGENT);
+            req = req.header("user-agent", provider_user_agent());
         }
         // Session headers follow upstream's provider family split (same
         // capture): `opencode*` gets the x-opencode-* set; every other
@@ -621,6 +648,11 @@ impl Client {
         // is the family marker (a config provider literally id'd
         // `opencode-*` with a custom base is D-HEADERS-FAMILY).
         if let Some(sid) = session_id {
+            // 1.18.31: family split only. 1.19.5 (request.ts:187) additionally
+            // sends the canonical `x-opencode-session-id` to EVERY provider;
+            // capdiff's header oracle found the first request missing it
+            // (superset header — additive, but the live capture is the truth).
+            req = req.header("x-opencode-session-id", sid);
             if self.is_zen() {
                 req = req.header("x-opencode-session", sid);
             } else {
@@ -663,7 +695,9 @@ impl Client {
                     .map(|(_, v)| v.clone());
                 push(
                     "user-agent",
-                    plugin_ua.as_deref().unwrap_or(PROVIDER_USER_AGENT),
+                    plugin_ua
+                        .as_deref()
+                        .unwrap_or_else(|| provider_user_agent()),
                 );
                 for (k, v) in &opts.headers {
                     if !k.eq_ignore_ascii_case("user-agent") {
@@ -671,6 +705,7 @@ impl Client {
                     }
                 }
                 if let Some(sid) = session_id {
+                    push("x-opencode-session-id", sid);
                     push("x-opencode-session", sid);
                 }
             }
@@ -759,20 +794,20 @@ impl Client {
 mod pin_tests {
     use super::*;
 
-    /// Load-bearing: the UA names the same opencode version the server
-    /// reports. Built with format! because `concat!` cannot read a const —
-    /// the assertion is the point, and it is what a bump must satisfy.
+    /// The UA is DERIVED from the pin (2026-11-04: the hand-written literal
+    /// went stale on the first real bump; the pin test caught it). This asserts
+    /// the derivation, so a future edit that reintroduces a literal fails.
     #[test]
-    fn zen_ua_carries_the_freeze_version() {
+    fn ua_is_derived_from_the_freeze_pin() {
+        let ua = provider_user_agent();
         let expected = format!("opencode/{FREEZE_VERSION} ");
         assert!(
-            ZEN_FREE_TIER_UA.starts_with(&expected),
-            "ZEN_FREE_TIER_UA (`{ZEN_FREE_TIER_UA}`) must start with `{expected}` —              re-derive it when bumping FREEZE_VERSION"
+            ua.starts_with(&expected),
+            "provider UA (`{ua}`) must be built from FREEZE_VERSION (`{expected}`)"
         );
         assert!(
-            ZEN_FREE_TIER_UA.contains("ai-sdk/provider-utils/")
-                && ZEN_FREE_TIER_UA.contains("runtime/bun/"),
-            "AI SDK / runtime fragments missing from the composite UA"
+            ua.contains("ai-sdk/provider-utils/") && ua.contains("runtime/bun/"),
+            "captured UA is missing its SDK/runtime segments: {ua}"
         );
     }
 }
@@ -849,7 +884,7 @@ mod tests {
         assert!(!other.is_zen(), "plain provider is the affinity family");
         // The composite UA is provider-independent upstream (both branches
         // spread the same User-Agent), pinned here once.
-        assert!(PROVIDER_USER_AGENT.starts_with(&format!("opencode/{FREEZE_VERSION} ")));
+        assert!(provider_user_agent().starts_with(&format!("opencode/{FREEZE_VERSION} ")));
     }
 
     /// chat.params → body mapping (v1 llm/request.ts:115 shape: topP/topK/
@@ -1324,7 +1359,7 @@ mod estimate_tests {
         }
 
         let zen = capture("/opencode.ai/zen/v1").await.to_ascii_lowercase();
-        let ua = ZEN_FREE_TIER_UA.to_ascii_lowercase();
+        let ua = provider_user_agent().to_ascii_lowercase();
         assert!(
             zen.contains(&format!("user-agent: {ua}")),
             "zen base must carry the composite UA (P5/P7 — gate rejects plain UA): {zen}"

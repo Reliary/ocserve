@@ -6,6 +6,49 @@ differs is a named `D-*` row in the ledger at `PLAN.md §18`.
 
 ## Unreleased
 
+### Changed
+- **The v1 freeze moved to upstream 1.19.5** (from 1.18.31), adopted through the
+  `bump.sh v1` pipeline rather than by hand. The wire contract is unchanged:
+  188 operations over the same 162 paths, two schema descriptions, one additive
+  `reasoning_options` property, and identical tool/prompt text for everything
+  the server sends. The measurable deltas were the composite user-agent's
+  runtime segment and provider header routing (below), both caught by capdiff's
+  header oracle, not by any shape gate.
+- The web-UI pack, ARITY rules table, prompt assets and provider tool capture
+  were re-extracted from 1.19.5 and are now slot-named (`v1.*`), so the six
+  `ocserve-ui-v1-*` shard crates keep their names across bumps.
+- The bash tool's description template and its command section were the last
+  hand-vendored prompt files; `extract-prompts.sh` now derives both from the
+  pinned tag (`tool/shell/shell.txt` plus the `bashCommandSection` TS literal),
+  so they cannot silently go stale on the next bump.
+
+### Fixed
+- **Config-declared providers could not authenticate** ([issue #28]): the API
+  key was read only from the auth layer, so a key in `opencode.json` reached
+  the provider as a bare `Bearer `. Three sources are now honoured in upstream's
+  order: `{env:VAR}`/`{file:path}` substitution on the raw config text, the
+  provider's config `options.apiKey`, and the credential table. A config
+  provider resolving to an empty key logs a warning naming it.
+- `switchModel` (v2) decoded `model` as a string while both contracts and the
+  2.x client send `{id, providerID, variant?}`; the reasoning variant was then
+  persisted as `"default"` on every switch and never applied. The object form
+  is decoded, the variant is stored, and `model.variants[variant]` now reaches
+  the provider request.
+- 65 handler-level `OCSERVE_V2` checks are gone; the generated v2-only table is
+  the single authority. Five of those handlers were operations that exist in
+  the v1 contract too, so they returned `SessionNotFoundError` on a server with
+  the flag unset.
+- The composite user-agent is sent to every provider, not only the Zen lane,
+  and session headers follow upstream's provider-family split
+  (`x-opencode-session` for opencode providers, `x-session-affinity` +
+  `X-Session-Id` otherwise).
+- A revert test created its session with the repository as the worktree, so
+  `unrevert` ran the snapshot engine's `checkout-index` over the checkout and
+  silently discarded uncommitted changes. It now pins a temp directory, and
+  **guard 68** requires the query-parameter form that actually sets it.
+
+[issue #28]: https://github.com/Reliary/ocserve/issues/28
+
 ### Fixed
 - **Credential rename and delete were no-ops.** `PATCH /api/credential/{id}` and
   `DELETE /api/credential/{id}` returned 204 without touching the store, so a

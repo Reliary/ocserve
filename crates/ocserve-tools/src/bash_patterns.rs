@@ -10,7 +10,7 @@
 //! to one resource.
 //!
 //! The ARITY table is pinned data extracted from the freeze
-//! (`assets/permission/1.18.31.rules.json`, `scripts/extract-rules.sh`) — the
+//! (`assets/permission/v1.rules.json`, `scripts/extract-rules.sh`) — the
 //! same discipline as the OpenAPI spec and web bundle. No table is
 //! hand-maintained here. It lives INSIDE this crate so it is packaged and
 //! published with it (embedding from `bench/`, outside the crate root, is not
@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-const RULES_JSON: &str = include_str!("../assets/permission/1.18.31.rules.json");
+const RULES_JSON: &str = include_str!("../assets/permission/v1.rules.json");
 
 fn arity_table() -> &'static BTreeMap<String, usize> {
     static TABLE: OnceLock<BTreeMap<String, usize>> = OnceLock::new();
