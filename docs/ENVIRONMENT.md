@@ -46,6 +46,7 @@ for the normal behaviour.
 | `OCSERVE_ZEN_KEYLESS` | on | 0 disables | Install the keyless `Bearer public` endpoint for opencode free models. |
 | `OCSERVE_CONTINUE_ON_DENY` | off (a deny stops the turn) | 1 enables | Keep the turn going after a denied tool call. |
 | `OCSERVE_LOOP_GUARD` | on | 0 disables | Repeated/oscillating tool-call detection and its permission ask. |
+| `OCSERVE_CONFIG_INTERPOLATE` | on | 0 disables | Expand `{env:NAME}` and `{file:PATH}` in config provider `options` values (upstream config.ts substitution). With this off a `{env:...}` apiKey reaches the provider verbatim, which is the issue #28 failure mode. |
 
 ## Plugins and MCP
 
