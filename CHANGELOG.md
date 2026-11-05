@@ -4,7 +4,11 @@ All notable changes to ocserve. The wire contract targets the frozen
 openccode 1.18.31 release and the v2 surface the 2.0.28 client; anything that
 differs is a named `D-*` row in the ledger at `PLAN.md §18`.
 
-## Unreleased
+## 0.7.0
+
+Both API surfaces moved to the current upstream releases: the v1 freeze to
+**1.19.5**, the v2 contract to **2.2.5**. Everything below is in this release.
+
 
 ### Added
 - **Attachments reach the provider.** A user turn with an image or PDF was
