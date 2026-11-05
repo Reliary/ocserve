@@ -65,6 +65,9 @@ step "crash fuzz (SIGKILL blob/DB)" cargo test -p ocserve-store --test crash_fuz
 step "corpus: splice byte-parity over live db" \
   env OCSERVE_SPLICE_DB="${OCSERVE_DATA_DIR:-$HOME/.local/share/ocserve}/ocserve.db" \
       cargo test -p ocserve-store --test splice_parity -- --nocapture
+step "corpus: media-part provider encoding over live db" \
+  env OCSERVE_MEDIA_DB="${OCSERVE_DATA_DIR:-$HOME/.local/share/ocserve}/ocserve.db" \
+      cargo test -p ocserve-core --lib media_corpus --offline -- --nocapture
 step "corpus: session-list wire parity over live db" \
   env OCSERVE_LIST_PARITY_DB="${OCSERVE_DATA_DIR:-$HOME/.local/share/ocserve}/ocserve.db" \
       cargo test -p ocserve-store --test list_wire_parity -- --nocapture
@@ -166,13 +169,19 @@ step "backup drill (VACUUM INTO + integrity + counts)" bash -c "$(declare -f dri
 #      linked for the opencode.ai fingerprint gate; +~2.1 MB over rustls).
 #      → ceiling 66,000,000 B (provenance rule; still ~2.9x smaller than
 #      upstream's 185 MB ELF).
+#     V2 2.2.5 pack: 67,184,912 B measured 2026-11-05 (the 2.2.5 web app's
+#      closure is 2,865 files / 88.0 MB raw, packed to 27.2 MB in 4 shards —
+#      up from 2.0.28's 22 MB because the app grew; the Rust side added ~7
+#      route handlers and a schedule table, no new embedded assets beyond the
+#      pack) → ceiling 70,000,000 B (provenance rule; still ~2.6x smaller than
+#      upstream's 185 MB ELF).
 size_gate() {
   local bin="target/release/ocserve"
   if [ ! -x "$bin" ]; then
     echo "release binary missing — building"
     cargo build --release || return 1
   fi
-  local sz ceiling=66000000
+  local sz ceiling=70000000
   sz="$(stat -c%s "$bin")"
   echo "size=${sz} ceiling=${ceiling}"
   [ "$sz" -le "$ceiling" ] || { echo "OVER SIZE CEILING"; return 1; }

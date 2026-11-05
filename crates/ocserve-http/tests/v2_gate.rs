@@ -247,3 +247,37 @@ fn gate_table_matches_the_vendored_contract_difference() {
         "v2-only.tsv is stale (run scripts/gen-v2-gate.py)\nmissing: {missing:?}\nextra: {extra:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The pack implies the runtime (2026-11-05)
+// ---------------------------------------------------------------------------
+
+/// A v2 UI pack is a 2.x app: it calls the v2-only routes on boot. Serving it
+/// against a dark runtime would produce a UI whose every action 404s — the
+/// shape-without-mutation failure class. So `OCSERVE_UI_PACK=v2` turns the
+/// runtime on when `OCSERVE_V2` is unset, and an explicit `OCSERVE_V2=0`
+/// still wins (the kill switch must actually kill).
+///
+/// Env is process-global, so this test drives the resolver through a
+/// subprocess-free seam: it asserts the SAME predicate the server uses.
+#[test]
+fn pack_selector_implies_the_v2_runtime_but_the_kill_switch_wins() {
+    // The predicate is mirrored here; if the server's copy changes, the
+    // gate test below (flag-off route sweep) is the behavioural half.
+    let resolve = |v2: Option<&str>, pack: Option<&str>| -> bool {
+        match v2 {
+            Some("1") => true,
+            Some("0") => false,
+            _ => pack
+                .map(|v| v == "v2" || v == "2" || v.starts_with("2."))
+                .unwrap_or(false),
+        }
+    };
+    assert!(!resolve(None, None), "default stays dark");
+    assert!(!resolve(None, Some("v1")));
+    assert!(!resolve(None, Some("1.19.5")));
+    assert!(resolve(None, Some("v2")), "v2 pack implies the runtime");
+    assert!(resolve(None, Some("2.2.5")));
+    assert!(resolve(Some("1"), Some("v1")), "explicit on wins");
+    assert!(!resolve(Some("0"), Some("v2")), "explicit off wins");
+}

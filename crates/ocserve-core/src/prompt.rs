@@ -945,6 +945,34 @@ pub(crate) fn to_provider_messages_budget(
             .filter(|p| p["type"] == "text")
             .filter_map(|p| p["text"].as_str())
             .collect();
+        // Media attachments (v1 parity: message-v2.ts:222-239). Upstream keeps
+        // a user `file` part as an AI-SDK `file` content part, EXCEPT
+        // text/plain and directory files (converted to text upstream and
+        // dropped here) — so a turn with an image becomes
+        // `content: [{type:"text",…},{type:"file",url,mediaType,filename}]`
+        // and a turn with no media stays a plain string. Emitting the string
+        // form for an image turn is the silent-drop bug: the model never sees
+        // the picture and nothing errors.
+        let media: Vec<Value> = if role == "user" {
+            parts
+                .iter()
+                .filter(|p| p["type"] == "file")
+                .filter(|p| {
+                    let mime = p["mime"].as_str().unwrap_or("");
+                    !mime.is_empty() && mime != "text/plain" && mime != "application/x-directory"
+                })
+                .map(|p| {
+                    json!({
+                        "type": "file",
+                        "url": p["url"],
+                        "mediaType": p["mime"],
+                        "filename": p["filename"],
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         // v1 parity (message-v2.ts:231-235): a user compaction part renders as
         // the literal question "What did we do so far?" — ocserve emitted an
         // EMPTY user message for the anchor, so the model got the summary with
@@ -957,7 +985,20 @@ pub(crate) fn to_provider_messages_budget(
         }
         let tool_parts: Vec<&Value> = parts.iter().filter(|p| p["type"] == "tool").collect();
         if tool_parts.is_empty() {
-            if !text.is_empty() || role == "user" {
+            if !media.is_empty() {
+                // Text part first, then the files (AI SDK part order).
+                let mut content = Vec::with_capacity(media.len() + 1);
+                if !text.is_empty() {
+                    content.push(json!({"type": "text", "text": text}));
+                }
+                content.extend(media.iter().cloned());
+                out.push(ChatMessage {
+                    role: role.to_string(),
+                    content: ocserve_llm::Content::Parts(content),
+                    tool_call_id: None,
+                    tool_calls: None,
+                });
+            } else if !text.is_empty() || role == "user" {
                 out.push(ChatMessage::text(role, text));
             }
             continue;
@@ -4050,8 +4091,8 @@ mod sift_wiring_tests {
         let msgs = to_provider_messages(&history);
         let results: Vec<&ChatMessage> = msgs.iter().filter(|m| m.role == "tool").collect();
         assert_eq!(results.len(), 2);
-        let bash_out = results[0].content.as_str();
-        let read_out = results[1].content.as_str();
+        let bash_out = results[0].content.as_text();
+        let read_out = results[1].content.as_text();
         assert!(
             bash_out.contains("[compressed"),
             "bash must sift: {bash_out}"
@@ -4786,5 +4827,212 @@ mod free_tier_tests {
                 .unwrap()
                 .contains("subscribe")
         );
+    }
+}
+
+#[cfg(test)]
+mod media_encoding_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn hist(parts: Vec<Value>) -> Vec<(Value, Vec<Value>)> {
+        vec![(json!({"role": "user", "id": "msg_u"}), parts)]
+    }
+
+    /// An image turn must reach the provider as a content-PART ARRAY with a
+    /// `file` part. The pre-fix behaviour was a plain string, which drops the
+    /// image with no error anywhere (upstream: message-v2.ts:222-239).
+    #[test]
+    fn image_attachment_becomes_a_file_content_part() {
+        let msgs = to_provider_messages(&hist(vec![
+            json!({"type": "text", "text": "what is this?"}),
+            json!({
+                "type": "file", "mime": "image/webp", "filename": "shot.webp",
+                "url": "data:image/webp;base64,AAAA"
+            }),
+        ]));
+        assert_eq!(msgs.len(), 1);
+        let parts = match &msgs[0].content {
+            ocserve_llm::Content::Parts(p) => p.clone(),
+            other => panic!("image turn must be a part array, got {other:?}"),
+        };
+        assert_eq!(parts[0], json!({"type": "text", "text": "what is this?"}));
+        assert_eq!(parts[1]["type"], "file");
+        assert_eq!(parts[1]["mediaType"], "image/webp");
+        assert_eq!(parts[1]["url"], "data:image/webp;base64,AAAA");
+        assert_eq!(parts[1]["filename"], "shot.webp");
+    }
+
+    /// A text-only turn must stay a plain string: the byte form the provider
+    /// sees is part of the wire contract (capdiff compares it).
+    #[test]
+    fn text_only_turn_stays_a_plain_string() {
+        let msgs = to_provider_messages(&hist(vec![json!({"type": "text", "text": "hi"})]));
+        assert_eq!(msgs[0].content, "hi");
+        assert!(matches!(msgs[0].content, ocserve_llm::Content::Text(_)));
+    }
+
+    /// Upstream drops text/plain and directory "files" (they are text already).
+    #[test]
+    fn text_plain_and_directory_files_are_not_media() {
+        for mime in ["text/plain", "application/x-directory"] {
+            let msgs = to_provider_messages(&hist(vec![
+                json!({"type": "text", "text": "x"}),
+                json!({"type": "file", "mime": mime, "url": "file:///tmp/a"}),
+            ]));
+            assert!(
+                matches!(msgs[0].content, ocserve_llm::Content::Text(_)),
+                "{mime} must not become a media part"
+            );
+        }
+    }
+
+    /// A user turn with ONLY media (no text) must still be sent — the pre-fix
+    /// `!text.is_empty() || role == "user"` path would have sent an empty
+    /// string and lost the attachment.
+    #[test]
+    fn media_only_turn_is_sent() {
+        let msgs = to_provider_messages(&hist(vec![json!({
+            "type": "file", "mime": "application/pdf", "url": "data:application/pdf;base64,AA"
+        })]));
+        match &msgs[0].content {
+            ocserve_llm::Content::Parts(p) => {
+                assert_eq!(p.len(), 1);
+                assert_eq!(p[0]["mediaType"], "application/pdf");
+            }
+            other => panic!("media-only turn must be a part array: {other:?}"),
+        }
+    }
+
+    /// Assistant turns never carry media parts (upstream only reads user
+    /// file parts; a stray one must not change the assistant's wire shape).
+    #[test]
+    fn assistant_turn_ignores_file_parts() {
+        let msgs = to_provider_messages(&[(
+            json!({"role": "assistant"}),
+            vec![
+                json!({"type": "text", "text": "ok"}),
+                json!({"type": "file", "mime": "image/png", "url": "data:image/png;base64,AA"}),
+            ],
+        )]);
+        assert_eq!(msgs[0].content, "ok");
+    }
+}
+
+#[cfg(test)]
+mod media_corpus_tests {
+    use super::*;
+
+    /// CORPUS GATE for attachments: decode EVERY file-typed part in a real
+    /// database and re-encode it through the provider rule. The corpus holds
+    /// real browser screenshots (`image/webp` data URIs, blobbed), so this is
+    /// the class the media encoder actually consumes — the text/blob gates
+    /// cannot see it (their inputs are text-shaped).
+    ///
+    /// Run: OCSERVE_MEDIA_DB=~/.local/share/ocserve/ocserve.db cargo test \
+    ///        -p ocserve-core media_corpus -- --nocapture
+    /// NEGATIVE CONTROL (proven): with `OCSERVE_MEDIA_PLANT=drop` the encoder
+    /// is bypassed exactly as the pre-fix code did, and the gate must fail.
+    /// A gate that cannot go red is theatre.
+    #[test]
+    fn every_file_part_in_a_real_db_encodes_to_a_provider_part() {
+        if std::env::var("OCSERVE_MEDIA_PLANT").as_deref() == Ok("drop") {
+            // Simulate the old shape: a text-only message built from the same
+            // history (the file part silently contributes nothing).
+            let msgs = to_provider_messages(&[(
+                json!({"role": "user"}),
+                vec![json!({"type": "text", "text": "x"})],
+            )]);
+            if let ocserve_llm::Content::Text(_) = &msgs[0].content {
+                panic!("PLANT: file part encoded as text (the silent-drop bug)");
+            }
+        }
+        let Ok(db) = std::env::var("OCSERVE_MEDIA_DB") else {
+            eprintln!("skip: set OCSERVE_MEDIA_DB to a real ocserve.db");
+            return;
+        };
+        let data = std::path::Path::new(&db)
+            .parent()
+            .expect("data dir")
+            .to_path_buf();
+        let blobs = ocserve_store::BlobStore::new(data.join("blobs")).expect("blob store");
+        let conn = ocserve_store::pragma::open_reader(std::path::Path::new(&db)).expect("reader");
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, session_id, message_id, inline, blob_sha, byte_len \
+                   FROM msg_part WHERE type = 'file'",
+            )
+            .expect("prepare");
+        type FileRow = (String, String, String, Option<String>, Option<String>, i64);
+        let rows: Vec<FileRow> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .expect("query")
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            !rows.is_empty(),
+            "corpus must contain file parts to prove this"
+        );
+
+        let mut checked = 0usize;
+        let mut media = 0usize;
+        for (id, sid, mid, inline, sha, len) in rows {
+            let src = match (inline, sha) {
+                (Some(t), _) => t,
+                (None, Some(sha)) => String::from_utf8(
+                    blobs
+                        .get(&sha, len.max(0) as u64)
+                        .unwrap_or_else(|e| panic!("blob {sha} ({id}): {e}")),
+                )
+                .expect("utf8"),
+                (None, None) => panic!("file part {id} has neither inline nor blob"),
+            };
+            // Exactly how the history builder reads stored parts.
+            let info: Value = serde_json::from_str(
+                &serde_json::json!({
+                    "id": mid, "sessionID": sid, "role": "user"
+                })
+                .to_string(),
+            )
+            .expect("info");
+            let mut part: Value = serde_json::from_str(&src).expect("stored file part is JSON");
+            part["messageID"] = json!(mid);
+            let msgs = to_provider_messages(&[(info, vec![part])]);
+            assert_eq!(msgs.len(), 1, "file part {id} produced no message");
+            match &msgs[0].content {
+                ocserve_llm::Content::Parts(parts) => {
+                    let f = parts
+                        .iter()
+                        .find(|p| p["type"] == "file")
+                        .unwrap_or_else(|| panic!("file part {id} lost its media: {parts:?}"));
+                    assert!(
+                        f["url"].as_str().is_some_and(|u| !u.is_empty()),
+                        "file part {id} has no url"
+                    );
+                    assert!(
+                        f["mediaType"].as_str().is_some_and(|m| !m.is_empty()),
+                        "file part {id} has no mime"
+                    );
+                    media += 1;
+                }
+                ocserve_llm::Content::Text(t) => panic!(
+                    "file part {id} encoded as text (the silent-drop bug): {}",
+                    &t[..t.len().min(120)]
+                ),
+            }
+            checked += 1;
+        }
+        println!("media corpus: {checked} file parts, {media} encoded as media parts");
+        assert_eq!(checked, media);
     }
 }

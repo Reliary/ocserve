@@ -538,11 +538,7 @@ impl AppState {
     /// Build from pre-assembled route payloads with a temp-backed store
     /// (tests / simple construction — real pieces, no placeholders).
     pub fn with_payloads(auth: Option<(String, String)>, p: Payloads) -> Arc<Self> {
-        Self::with_payloads_and_v2(
-            auth,
-            p,
-            std::env::var("OCSERVE_V2").unwrap_or_default() == "1",
-        )
+        Self::with_payloads_and_v2(auth, p, v2_flag())
     }
 
     /// `with_payloads` with an explicit v2 flag (contract tests: hermetic
@@ -587,12 +583,7 @@ impl AppState {
 
     /// One-shot construction with real runtime wiring (CLI path).
     pub fn with_wiring(auth: Option<(String, String)>, p: Payloads, w: Wires) -> Arc<Self> {
-        Self::with_wiring_and_v2(
-            auth,
-            p,
-            w,
-            std::env::var("OCSERVE_V2").unwrap_or_default() == "1",
-        )
+        Self::with_wiring_and_v2(auth, p, w, v2_flag())
     }
 
     /// Construction with an explicit v2 flag (tests: hermetic per-state gate,
@@ -886,6 +877,23 @@ async fn get_capabilities(
             &[],
         )
     })
+}
+
+/// `OCSERVE_V2` resolution — ONE place, because the flag now has two owners.
+///
+/// Rule: explicit env wins (`1` on, `0` off). When it is UNSET, a v2 UI pack
+/// (`OCSERVE_UI_PACK=v2` or `2.x`) implies the v2 runtime: the 2.2.5 app calls
+/// the v2-only routes, so serving it against a dark runtime would render a UI
+/// whose every action 404s (the shape-without-mutation failure class). The
+/// v1 pack leaves the runtime dark, exactly as before.
+fn v2_flag() -> bool {
+    match std::env::var("OCSERVE_V2").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => std::env::var("OCSERVE_UI_PACK")
+            .map(|v| v == "v2" || v == "2" || v.starts_with("2."))
+            .unwrap_or(false),
+    }
 }
 
 /// v2-style location envelope shared by /api/* routes (captured live).

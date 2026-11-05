@@ -12,10 +12,88 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::OnceLock;
 
+/// A provider-facing message body: plain text, or OpenAI-style content parts
+/// when the message carries media.
+///
+/// Upstream (AI SDK `convertToModelMessages`) emits `content` as an ARRAY of
+/// `{type:"text"}` / `{type:"file"}` parts whenever a user turn has an
+/// attachment, and a plain STRING otherwise. Emitting a string for an image
+/// turn silently drops the image; emitting an array for a text turn changes
+/// the bytes the provider sees. The enum makes that choice explicit at the
+/// construction site instead of at serialization time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum Content {
+    Text(String),
+    Parts(Vec<Value>),
+}
+
+impl Content {
+    /// The text a caller can reason about. Part arrays concatenate their text
+    /// blocks (media parts contribute nothing) — used by metrics/estimators,
+    /// never sent to a provider.
+    pub fn as_text(&self) -> String {
+        match self {
+            Content::Text(t) => t.clone(),
+            Content::Parts(parts) => parts
+                .iter()
+                .filter(|p| p.get("type").and_then(|v| v.as_str()) == Some("text"))
+                .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+                .collect(),
+        }
+    }
+
+    /// Serialized byte length, the unit every budget in this crate uses.
+    pub fn len(&self) -> usize {
+        match self {
+            Content::Text(t) => t.len(),
+            Content::Parts(_) => serde_json::to_string(self).map(|s| s.len()).unwrap_or(0),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl std::ops::Deref for Content {
+    type Target = str;
+    fn deref(&self) -> &str {
+        match self {
+            Content::Text(t) => t.as_str(),
+            // Part arrays have no single str; callers that need one use
+            // `as_text()`. Deref serves the common text case (starts_with,
+            // len on text) without allocating.
+            Content::Parts(_) => "",
+        }
+    }
+}
+
+impl PartialEq<&str> for Content {
+    fn eq(&self, other: &&str) -> bool {
+        match self {
+            Content::Text(t) => t == other,
+            Content::Parts(_) => false,
+        }
+    }
+}
+
+impl From<String> for Content {
+    fn from(v: String) -> Self {
+        Content::Text(v)
+    }
+}
+
+impl From<&str> for Content {
+    fn from(v: &str) -> Self {
+        Content::Text(v.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    pub content: Content,
     /// OpenAI tool-result linkage (role="tool").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -28,7 +106,7 @@ impl ChatMessage {
     pub fn text(role: &str, content: impl Into<String>) -> Self {
         Self {
             role: role.to_string(),
-            content: content.into(),
+            content: Content::from(content.into()),
             tool_call_id: None,
             tool_calls: None,
         }
@@ -37,7 +115,7 @@ impl ChatMessage {
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: "tool".to_string(),
-            content: content.into(),
+            content: Content::from(content.into()),
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: None,
         }
@@ -46,7 +124,7 @@ impl ChatMessage {
     pub fn assistant_with_tools(content: impl Into<String>, tool_calls: Vec<Value>) -> Self {
         Self {
             role: "assistant".to_string(),
-            content: content.into(),
+            content: Content::from(content.into()),
             tool_call_id: None,
             tool_calls: Some(tool_calls),
         }
@@ -1258,7 +1336,7 @@ pub fn free_tier_limit(err_msg: &str) -> Option<&'static str> {
 pub(crate) fn estimate_request_bytes(messages: &[ChatMessage], tools: Option<&[Value]>) -> usize {
     let mut n = 4096;
     for m in messages {
-        n += m.content.len() + m.role.len() + 64;
+        n += Content::len(&m.content) + m.role.len() + 64;
         if let Some(id) = &m.tool_call_id {
             n += id.len();
         }

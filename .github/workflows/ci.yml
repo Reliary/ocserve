@@ -133,7 +133,7 @@ jobs:
           # fingerprint gate; 64,330,256 measured 2026-10-25; see
           # scripts/nightly.sh). Headroom is intentional: rolldown +
           # embedded UI + BoringSSL are the large static contributors.
-          MAX=66000000
+          MAX=70000000
           if [ "$SIZE" -gt "$MAX" ]; then
             echo "FAIL: binary $SIZE exceeds ceiling $MAX — re-baseline with provenance";
             exit 1

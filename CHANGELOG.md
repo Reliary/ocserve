@@ -6,6 +6,27 @@ differs is a named `D-*` row in the ledger at `PLAN.md §18`.
 
 ## Unreleased
 
+### Added
+- **Attachments reach the provider.** A user turn with an image or PDF was
+  stored and then silently flattened to text at the provider boundary: the
+  model never saw the picture and nothing reported it. User `file` parts now
+  encode as OpenAI content parts (`{type:"file", url, mediaType, filename}`)
+  exactly where upstream's AI-SDK conversion does, with `text/plain` and
+  directory files still dropped as upstream drops them. A turn with no media
+  stays a plain string, so text-only provider bytes are unchanged.
+  `GET /api/experimental/media/{hash}` serves content-addressed attachments.
+  The gate is a corpus differential over every file part in a real database
+  (decoded from blobs exactly as production does), with a planted
+  encoder-drop control proven red.
+- **Scheduled session wake-ups** (v2 `experimental.schedule.*`, schema v16):
+  create/list/get/pause/resume/delete, with due times computed for `in`,
+  `at` and `every` specs. Gated on `experimental.schedules` in config with
+  the reference's own `ForbiddenError` when off. A `cron` spec is stored
+  without a due time (`D-SCHEDULE-CRON`) rather than guessed at.
+- A v2 UI pack now implies the v2 runtime: `OCSERVE_UI_PACK=v2` (or `2.x`)
+  turns the `/api/*` surface on when `OCSERVE_V2` is unset, because the 2.2.5
+  app calls those routes on boot. An explicit `OCSERVE_V2=0` still wins.
+
 ### Changed
 - **The v1 freeze moved to upstream 1.19.5** (from 1.18.31), adopted through the
   `bump.sh v1` pipeline rather than by hand. The wire contract is unchanged:

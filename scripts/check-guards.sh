@@ -223,7 +223,7 @@ uncontracted_reads() {
   # is narrow on purpose: if an allowlisted name ever appears on a line that
   # reads the environment (`env::var`/`var_os`), it is still a runtime knob and
   # the check below flags it.
-  local test_only=" OCSERVE_PTY_ENV_TEST OCSERVE_PTY_OK OCSERVE_PTY_OVERRIDE OCSERVE_UNIT_PROBE OCSERVE_PORTX OCSERVE_TEST_FAKE_KEY OCSERVE_TEST_ISSUE28 "
+  local test_only=" OCSERVE_PTY_ENV_TEST OCSERVE_PTY_OK OCSERVE_PTY_OVERRIDE OCSERVE_UNIT_PROBE OCSERVE_PORTX OCSERVE_TEST_FAKE_KEY OCSERVE_TEST_ISSUE28 OCSERVE_MEDIA_DB OCSERVE_MEDIA_PLANT "
   # `rg` is not installed on the GitHub macOS runner and is not guaranteed on
   # any dev box; a missing binary makes this predicate return EMPTY, which is
   # exactly what "no uncontracted reads" looks like — the guard then reported
