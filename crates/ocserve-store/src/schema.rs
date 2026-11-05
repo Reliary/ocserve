@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -201,6 +201,25 @@ CREATE TABLE session_environment (
     variables    TEXT NOT NULL DEFAULT '{}',
     time_updated INTEGER NOT NULL
 ) STRICT;
+CREATE TABLE schedule (
+    id             TEXT PRIMARY KEY,
+    session_id     TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+    name           TEXT NOT NULL DEFAULT '',
+    prompt         TEXT NOT NULL,
+    when_json      TEXT NOT NULL,
+    tz             TEXT NOT NULL DEFAULT '',
+    condition_json TEXT,
+    ends_json      TEXT,
+    status         TEXT NOT NULL DEFAULT 'active',
+    next_due_ms    INTEGER,
+    ends_at_ms     INTEGER,
+    remaining_runs INTEGER,
+    run_count      INTEGER NOT NULL DEFAULT 0,
+    time_created   INTEGER NOT NULL,
+    time_updated   INTEGER NOT NULL
+) STRICT;
+CREATE INDEX idx_schedule_due ON schedule(status, next_due_ms);
+CREATE INDEX idx_schedule_session ON schedule(session_id, time_created);
 
 -- legacy-delta sync state (dev bridge: legacy -> ocserve additive pulls;
 -- dropped relevance once the final migration lands — PLAN §17)
@@ -817,7 +836,7 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                         time_created   INTEGER NOT NULL,
                         time_updated   INTEGER NOT NULL
                     ) STRICT;
-                    CREATE TABLE IF NOT EXISTS session_environment (
+CREATE TABLE IF NOT EXISTS session_environment (
                         session_id   TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
                         variables    TEXT NOT NULL DEFAULT '{}',
                         time_updated INTEGER NOT NULL
@@ -845,6 +864,35 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
                     if !has_col {
                         conn.execute_batch("ALTER TABLE session ADD COLUMN subagent_rules TEXT;")?;
                     }
+                }
+                15 => {
+                    // v15->v16 (v2 2.2.5 tier): scheduled session wake-ups.
+                    // Pure CREATE, no data movement. A schedule names a session,
+                    // a prompt, a `when` spec and a status; the runner reads
+                    // `next_due_ms` to decide when to dispatch.
+                    conn.execute_batch(
+                        "CREATE TABLE IF NOT EXISTS schedule (
+                        id           TEXT PRIMARY KEY,
+                        session_id   TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+                        name         TEXT NOT NULL DEFAULT '',
+                        prompt       TEXT NOT NULL,
+                        when_json    TEXT NOT NULL,
+                        tz           TEXT NOT NULL DEFAULT '',
+                        condition_json TEXT,
+                        ends_json    TEXT,
+                        status       TEXT NOT NULL DEFAULT 'active',
+                        next_due_ms  INTEGER,
+                        ends_at_ms   INTEGER,
+                        remaining_runs INTEGER,
+                        run_count    INTEGER NOT NULL DEFAULT 0,
+                        time_created INTEGER NOT NULL,
+                        time_updated INTEGER NOT NULL
+                    ) STRICT;
+                    CREATE INDEX IF NOT EXISTS idx_schedule_due
+                        ON schedule(status, next_due_ms);
+                    CREATE INDEX IF NOT EXISTS idx_schedule_session
+                        ON schedule(session_id, time_created);",
+                    )?;
                 }
                 other => {
                     bail!(

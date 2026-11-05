@@ -25,7 +25,7 @@ pub use ocserve_llm::FREEZE_VERSION as TAG;
 pub const SPEC_JSON: &str = include_str!("../assets/openapi/v1.json");
 
 /// Reference pin for the v2 line (see `V2-PLAN.md` D3).
-pub const V2_TAG: &str = "2.0.28";
+pub const V2_TAG: &str = "2.2.5";
 
 /// The regenerated 2.0.28 OpenAPI document. Unlike the v1 asset this is NOT a
 /// verbatim upstream file: the checked-in `packages/protocol/openapi.json` is

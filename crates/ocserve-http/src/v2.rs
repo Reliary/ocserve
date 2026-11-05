@@ -5328,3 +5328,922 @@ pub async fn create_session(
     let info = crate::create_session_record(&st, &body, resolved)?;
     Ok(Json(json!({"data": info})))
 }
+
+// ---------------------------------------------------------------------------
+// 2.2.5 additions (probed live against @opencode/cli 2.2.5, 2026-11-05)
+// ---------------------------------------------------------------------------
+
+/// GET /api/experimental/usage/limits — `{location, data: UsageLimits.Info|null}`.
+/// Live 2.2.5 with no GPU/workspace auth answers `{"data":null}`; the schema
+/// requires `workspace`+`budgets` when non-null, so null is the honest empty.
+pub async fn usage_limits(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(json!({"location": api_location(&st), "data": null}))
+}
+
+/// GET /api/experimental/voice/models — `{data:{models:[…], default?}}`.
+/// These are upstream's four built-in voice models, captured verbatim from a
+/// live 2.2.5 (`available:false` without provider keys). This is provider
+/// capability data, not a route we can derive from config; mirroring it keeps
+/// a 2.2.5 client's voice menu populated. `POST /experimental/voice/session`
+/// stays cited: opening a realtime voice session needs an audio transport we
+/// do not implement (D-VOICE-TRANSPORT).
+pub async fn voice_models() -> impl IntoResponse {
+    Json(json!({"data": {"models": [
+        {"model": "gpt-live-1", "provider": "openai", "transports": ["webrtc"], "available": false},
+        {"model": "gpt-realtime-2.1", "provider": "openai", "transports": ["webrtc", "websocket"], "available": false},
+        {"model": "grok-voice-3.0", "provider": "xai", "transports": ["websocket"], "available": false},
+        {"model": "gemini-3.8-live", "provider": "google", "transports": ["websocket"], "available": false}
+    ]}}))
+}
+
+/// POST /api/experimental/fs/watch — register a watched path (204).
+/// Upstream pushes `file.watch` events when it changes; we have no watcher,
+/// so the registration is accepted and recorded in memory but emits nothing.
+/// Named `D-FS-WATCH` in the ledger.
+pub async fn fs_watch(
+    State(st): State<Arc<AppState>>,
+    body: Option<Json<Value>>,
+) -> Result<StatusCode, crate::HttpError> {
+    let path = body
+        .as_ref()
+        .and_then(|Json(v)| v.get("path"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"path\"]", "kind": "Payload"}),
+        })?;
+    st.fs_watches.lock().insert(path.to_string());
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// DELETE /api/experimental/fs/watch — deregister (204, always).
+pub async fn fs_unwatch(State(st): State<Arc<AppState>>, body: Option<Json<Value>>) -> StatusCode {
+    if let Some(Json(v)) = body
+        && let Some(p) = v.get("path").and_then(|v| v.as_str())
+    {
+        st.fs_watches.lock().remove(p);
+    }
+    StatusCode::NO_CONTENT
+}
+
+/// GET /api/experimental/artifacts* — upstream gates the whole family on
+/// `experimental.artifacts` in config and answers `ForbiddenError` when it is
+/// off (probed live). ocserve has no artifacts store, so the same envelope is
+/// the honest answer regardless of config: shape-without-mutation is worse
+/// than a named refusal. `D-ARTIFACTS` in the ledger.
+fn artifacts_disabled() -> crate::HttpError {
+    crate::HttpError::TaggedData {
+        status: StatusCode::FORBIDDEN,
+        tag: "ForbiddenError",
+        fields: json!({"message": "Artifacts are disabled; set experimental.artifacts in config"}),
+    }
+}
+
+/// GET /api/experimental/artifacts
+pub async fn artifacts_list() -> Result<Json<Value>, crate::HttpError> {
+    Err(artifacts_disabled())
+}
+
+/// POST /api/experimental/artifacts
+pub async fn artifacts_create() -> Result<Json<Value>, crate::HttpError> {
+    Err(artifacts_disabled())
+}
+
+/// GET /api/experimental/artifacts/providers
+pub async fn artifacts_providers() -> Result<Json<Value>, crate::HttpError> {
+    Err(artifacts_disabled())
+}
+
+/// GET|PATCH|DELETE /api/experimental/artifacts/{artifactID}
+pub async fn artifacts_one() -> Result<Json<Value>, crate::HttpError> {
+    Err(artifacts_disabled())
+}
+
+/// GET /api/experimental/artifacts/{artifactID}/view/*
+pub async fn artifacts_view() -> Result<Json<Value>, crate::HttpError> {
+    Err(artifacts_disabled())
+}
+
+/// GET /api/experimental/media/{hash} — content-addressed blob read.
+/// Upstream validates the hash shape FIRST (probed: `deadbeef` →
+/// `InvalidRequestError` `Expected a string matching the RegExp ^[0-9a-f]{64}$`
+/// kind Params). ocserve's blob store is sha256-keyed, so a stored hash serves
+/// the bytes and an unknown one 404s (`FileNotFoundError`).
+pub async fn media_get(
+    State(st): State<Arc<AppState>>,
+    Path(hash): Path<String>,
+) -> Result<axum::response::Response, crate::HttpError> {
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({
+                "message": "Expected a string matching the RegExp ^[0-9a-f]{64}$\n  at [\"hash\"]",
+                "kind": "Params"
+            }),
+        });
+    }
+    // The blob store is keyed by sha256 and needs the expected length, which
+    // lives in `blob_object`. An unknown hash (no row) is the 404, matching
+    // upstream's `FileNotFoundError` shape.
+    let len = {
+        let r = ocserve_store::pragma::open_reader(&st.db).map_err(|e| {
+            crate::HttpError::TaggedData {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                tag: "ServiceUnavailableError",
+                fields: json!({"message": e.to_string()}),
+            }
+        })?;
+        r.query_row(
+            "SELECT byte_len FROM blob_object WHERE sha = ?1",
+            [&hash],
+            |x| x.get::<_, i64>(0),
+        )
+        .ok()
+        .filter(|n| *n >= 0)
+        .map(|n| n as u64)
+    };
+    match len.map(|l| st.blobs.get(&hash, l)) {
+        Some(Ok(bytes)) => Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+            bytes,
+        )
+            .into_response()),
+        _ => Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "FileNotFoundError",
+            fields: json!({"path": hash, "message": format!("File not found: {hash}")}),
+        }),
+    }
+}
+
+/// POST /api/debug/heap-dump — upstream writes a V8 `.heapsnapshot` and
+/// returns `{path, pid, memory}` (probed live). Rust has no JS heap; writing
+/// a zero-byte file with a plausible name and reporting real process memory
+/// would be a lie about the file's contents, so the route answers with the
+/// process numbers and an explicit marker. `D-HEAP-DUMP` in the ledger.
+pub async fn heap_dump(State(_st): State<Arc<AppState>>) -> impl IntoResponse {
+    let pid = std::process::id();
+    let rss = ocserve_store::platform::rss_of_pid(pid).unwrap_or(0);
+    Json(json!({
+        "path": Value::Null,
+        "pid": pid,
+        "memory": {"rss": rss},
+        "unsupported": "rust process: no V8 heap snapshot",
+    }))
+}
+
+/// GET /api/plugin/gui?id= — `{location, data: Plugin.GuiBundle}`.
+/// Upstream serves the registered GUI bundle code for a plugin id. Our sidecar
+/// loads plugins but does not compile GUI bundles (v2 `gui` capability is not
+/// bridged), so an unknown id is the honest `PluginNotFoundError`.
+pub async fn plugin_gui(
+    State(_st): State<Arc<AppState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, crate::HttpError> {
+    let id = q
+        .get("id")
+        .cloned()
+        .ok_or_else(|| crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"id\"]", "kind": "Query"}),
+        })?;
+    Err(crate::HttpError::TaggedData {
+        status: StatusCode::NOT_FOUND,
+        tag: "PluginNotFoundError",
+        fields: json!({"pluginID": id, "message": format!("Plugin not found: {id}")}),
+    })
+}
+
+/// PATCH /api/permission/saved/{id} — update a saved permission.
+/// ocserve's always-grants are per-session string keys, and
+/// `GET /api/permission/saved` is honestly `[]`. Upstream's update on an id
+/// that is not in that set is `PermissionSavedNotFoundError` (probed live),
+/// which is the truthful answer here: there is nothing to edit.
+pub async fn permission_saved_update(
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, crate::HttpError> {
+    let body = body.map(|Json(v)| v).unwrap_or(Value::Null);
+    if !body.is_object() {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Expected an object\n  at [\"body\"]", "kind": "Payload"}),
+        });
+    }
+    Err(crate::HttpError::TaggedData {
+        status: StatusCode::NOT_FOUND,
+        tag: "PermissionSavedNotFoundError",
+        fields: json!({"id": id, "message": format!("Saved permission not found: {id}")}),
+    })
+}
+
+/// POST /api/experimental/generate/text — `{prompt, model?}` → `{data:{text}}`.
+/// Same transient executor as `/api/experimental/generate` (no session, no
+/// history, no tools), with the text-only response envelope.
+pub async fn generate_text_api(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    let Some(prompt) = body.get("prompt").and_then(|v| v.as_str()) else {
+        return Err(bad_request("Missing key\n  at [\"prompt\"]"));
+    };
+    let model = body.get("model").and_then(|m| {
+        let id = m.get("id")?.as_str()?;
+        let provider_id = m.get("providerID")?.as_str()?;
+        Some(ocserve_core::wire::ModelRef {
+            provider_id: provider_id.to_string(),
+            model_id: id.to_string(),
+        })
+    });
+    let req = ocserve_core::wire::PromptRequest {
+        message_id: None,
+        model,
+        parts: vec![json!({ "type": "text", "text": prompt })],
+        ..Default::default()
+    };
+    const EPHEMERAL: &str = "ses_transient_generate_text";
+    let mut ctx = crate::build_prompt_context(&st, &req, EPHEMERAL).map_err(|e| {
+        crate::HttpError::TaggedData {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            tag: "ServiceUnavailableError",
+            fields: json!({"message": format!("{} {}", e.name, e.message), "service": "experimental generation"}),
+        }
+    })?;
+    ctx.compaction.auto = false;
+    let writer = st.writer.clone();
+    let (_info, parts) = ocserve_core::prompt::run_prompt_with(
+        &ctx,
+        &writer,
+        EPHEMERAL,
+        &req,
+        ocserve_core::prompt::RunOpts {
+            persist_user: false,
+            skip_history: true,
+            tools_enabled: false,
+            auto_title: false,
+            transient: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|_| crate::HttpError::TaggedData {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        tag: "ServiceUnavailableError",
+        fields: json!({"message": "generation failed", "service": "experimental generation"}),
+    })?;
+    let text = parts
+        .iter()
+        .find(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+        .and_then(|p| p.get("text").and_then(|t| t.as_str()))
+        .unwrap_or("")
+        .to_string();
+    Ok(Json(json!({"data": {"text": text}})))
+}
+
+// ---------------------------------------------------------------------------
+// schedules (2.2.5 `experimental.schedule.*`, probed live)
+// ---------------------------------------------------------------------------
+
+/// Upstream gates the whole family on `experimental.schedules` in config and
+/// answers this exact envelope when it is off (probed live).
+fn schedules_disabled() -> crate::HttpError {
+    crate::HttpError::TaggedData {
+        status: StatusCode::FORBIDDEN,
+        tag: "ForbiddenError",
+        fields: json!({"message": "Scheduled tasks are disabled; set experimental.schedules in config"}),
+    }
+}
+
+/// The schedule statuses upstream reports.
+fn schedule_info(row: &serde_json::Value) -> Value {
+    let mut out = json!({
+        "id": row["id"],
+        "sessionID": row["session_id"],
+        "when": row["when_json"],
+        "status": row["status"],
+        "runCount": row["run_count"],
+        "time": {"created": row["time_created"], "updated": row["time_updated"]},
+        "action": {"type": "prompt", "prompt": row["prompt"]},
+    });
+    let m = out.as_object_mut().expect("object");
+    for (src, dst) in [
+        ("name", "name"),
+        ("tz", "tz"),
+        ("condition_json", "if"),
+        ("next_due_ms", "nextDueAt"),
+        ("ends_at_ms", "endsAt"),
+        ("remaining_runs", "remainingRuns"),
+    ] {
+        let v = &row[src];
+        if !v.is_null() {
+            m.insert(dst.to_string(), v.clone());
+        }
+    }
+    out
+}
+
+/// Parsed `when` spec plus the first due time. Upstream accepts `in`, `at`,
+/// `every` and `cron`; we cannot compute a full cron calendar without a cron
+/// library, so a cron schedule is accepted and stored with NO due time and a
+/// named divergence (D-SCHEDULE-CRON) rather than guessed at.
+fn schedule_when(when: &Value, now_ms: i64) -> Result<(Value, Option<i64>), crate::HttpError> {
+    let kind = when.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let num = |k: &str| when.get(k).and_then(|v| v.as_i64());
+    let due = match kind {
+        "in" => num_duration_ms(when.get("in")),
+        "at" => when
+            .get("at")
+            .and_then(|v| v.as_str())
+            .and_then(parse_rfc3339_ms),
+        "every" => num_duration_ms(when.get("every")),
+        "cron" => None,
+        _ => {
+            return Err(crate::HttpError::TaggedData {
+                status: StatusCode::BAD_REQUEST,
+                tag: "InvalidRequestError",
+                fields: json!({
+                    "message": "Missing key\n  at [\"when\"][\"in\"]\nMissing key\n  at [\"when\"][\"at\"]\nMissing key\n  at [\"when\"][\"every\"]\nMissing key\n  at [\"when\"][\"cron\"]",
+                    "kind": "Payload"
+                }),
+            });
+        }
+    };
+    let _ = num;
+    Ok((
+        when.clone(),
+        due.map(|d| if kind == "at" { d } else { now_ms + d }),
+    ))
+}
+
+/// `"90 seconds"` / `"5 minutes"` / `"2 hours"` → milliseconds.
+fn num_duration_ms(v: Option<&Value>) -> Option<i64> {
+    let s = v?.as_str()?;
+    let mut it = s.split_whitespace();
+    let n: i64 = it.next()?.parse().ok()?;
+    let unit = it.next()?.trim_end_matches('s').to_ascii_lowercase();
+    let per = match unit.as_str() {
+        "second" | "sec" | "" => 1_000,
+        "minute" | "min" => 60_000,
+        "hour" | "hr" => 3_600_000,
+        "day" => 86_400_000,
+        _ => return None,
+    };
+    Some(n.saturating_mul(per))
+}
+
+/// Minimal RFC3339 → epoch ms (`2026-11-05T03:00:00Z`), UTC only.
+fn parse_rfc3339_ms(s: &str) -> Option<i64> {
+    let s = s.trim_end_matches('Z');
+    let (date, time) = s.split_once('T')?;
+    let mut d = date.split('-');
+    let (y, mo, dy): (i64, i64, i64) = (
+        d.next()?.parse().ok()?,
+        d.next()?.parse().ok()?,
+        d.next()?.parse().ok()?,
+    );
+    let mut t = time.split(':');
+    let (h, mi, se): (i64, i64, i64) = (
+        t.next()?.parse().ok()?,
+        t.next()?.parse().ok()?,
+        t.next().unwrap_or("0").split('.').next()?.parse().ok()?,
+    );
+    // days from civil (Howard Hinnant's algorithm), then seconds.
+    let y2 = y - i64::from(mo <= 2);
+    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
+    let yoe = y2 - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + dy - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some((days * 86_400 + h * 3_600 + mi * 60 + se) * 1000)
+}
+
+/// Map upstream's config knob: `experimental.schedules` truthy enables the
+/// family. Off (the default) → `ForbiddenError`, matching the live 2.2.5.
+fn schedules_enabled(st: &AppState) -> bool {
+    st.payloads
+        .read()
+        .config
+        .pointer("/experimental/schedules")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// POST /api/experimental/schedule — `{sessionID, prompt, when, …}` → `{data}`.
+pub async fn schedule_create(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, crate::HttpError> {
+    if !schedules_enabled(&st) {
+        return Err(schedules_disabled());
+    }
+    let Some(session_id) = body.get("sessionID").and_then(|v| v.as_str()) else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"sessionID\"]", "kind": "Payload"}),
+        });
+    };
+    let Some(prompt) = body.get("prompt").and_then(|v| v.as_str()) else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"prompt\"]", "kind": "Payload"}),
+        });
+    };
+    let when = body.get("when").cloned().unwrap_or(Value::Null);
+    let now = now_ms_http();
+    let (when_json, next_due) = schedule_when(&when, now)?;
+    let id = format!("sch_{:013x}{:010x}", now, std::process::id());
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let tz = when.get("tz").and_then(|v| v.as_str()).unwrap_or("");
+    let row = json!({
+        "id": id, "session_id": session_id, "name": name, "prompt": prompt,
+        "when_json": when_json, "tz": tz,
+        "condition_json": body.get("if").cloned().unwrap_or(Value::Null),
+        "next_due_ms": next_due, "run_count": 0,
+        "status": "active", "time_created": now, "time_updated": now,
+    });
+    store_schedule(&st, &row).await?;
+    Ok(Json(json!({"data": schedule_info(&row)})))
+}
+
+/// GET /api/experimental/schedule?sessionID= → `{data:[…]}`.
+pub async fn schedule_list(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, crate::HttpError> {
+    if !schedules_enabled(&st) {
+        return Err(schedules_disabled());
+    }
+    let Some(sid) = q.get("sessionID") else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"sessionID\"]", "kind": "Query"}),
+        });
+    };
+    let rows = read_schedules(&st, Some(sid)).unwrap_or_default();
+    Ok(Json(
+        json!({"data": rows.iter().map(schedule_info).collect::<Vec<_>>()}),
+    ))
+}
+
+/// GET /api/experimental/schedule/{scheduleID} → `{data}`.
+pub async fn schedule_get(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, crate::HttpError> {
+    if !schedules_enabled(&st) {
+        return Err(schedules_disabled());
+    }
+    let row = read_schedules(&st, None)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|r| r["id"].as_str() == Some(id.as_str()));
+    match row {
+        Some(r) => Ok(Json(json!({"data": schedule_info(&r)}))),
+        None => Err(schedule_not_found(&id)),
+    }
+}
+
+fn schedule_not_found(id: &str) -> crate::HttpError {
+    crate::HttpError::TaggedData {
+        status: StatusCode::NOT_FOUND,
+        tag: "ScheduleNotFoundError",
+        fields: json!({"scheduleID": id, "message": format!("Schedule not found: {id}")}),
+    }
+}
+
+/// POST /api/experimental/schedule/{scheduleID}/pause
+pub async fn schedule_pause(
+    st: State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, crate::HttpError> {
+    schedule_transition(st, Path(id), ScheduleAction::Pause).await
+}
+
+/// POST /api/experimental/schedule/{scheduleID}/resume
+pub async fn schedule_resume(
+    st: State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, crate::HttpError> {
+    schedule_transition(st, Path(id), ScheduleAction::Resume).await
+}
+
+/// DELETE /api/experimental/schedule/{scheduleID}
+pub async fn schedule_delete(
+    st: State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, crate::HttpError> {
+    schedule_transition(st, Path(id), ScheduleAction::Delete).await
+}
+
+/// POST pause | resume | DELETE — the three transitions upstream exposes.
+async fn schedule_transition(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    action: ScheduleAction,
+) -> Result<axum::response::Response, crate::HttpError> {
+    if !schedules_enabled(&st) {
+        return Err(schedules_disabled());
+    }
+    let exists = read_schedules(&st, None)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|r| r["id"].as_str() == Some(id.as_str()));
+    let Some(mut row) = exists else {
+        return Err(schedule_not_found(&id));
+    };
+    match action {
+        ScheduleAction::Pause => {
+            row["status"] = json!("paused");
+            row["time_updated"] = json!(now_ms_http());
+            store_schedule(&st, &row).await?;
+            Ok(Json(json!({"data": schedule_info(&row)})).into_response())
+        }
+        ScheduleAction::Resume => {
+            row["status"] = json!("active");
+            row["time_updated"] = json!(now_ms_http());
+            store_schedule(&st, &row).await?;
+            Ok(Json(json!({"data": schedule_info(&row)})).into_response())
+        }
+        ScheduleAction::Delete => {
+            delete_schedule(&st, &id).await?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+    }
+}
+
+/// Which transition a route performs.
+#[derive(Clone, Copy)]
+pub enum ScheduleAction {
+    Pause,
+    Resume,
+    Delete,
+}
+
+fn read_schedules(st: &AppState, session: Option<&String>) -> anyhow::Result<Vec<Value>> {
+    let r = ocserve_store::pragma::open_reader(&st.db)?;
+    let sql = if session.is_some() {
+        "SELECT id, session_id, name, prompt, when_json, tz, condition_json, ends_json, status, \
+                next_due_ms, ends_at_ms, remaining_runs, run_count, time_created, time_updated \
+           FROM schedule WHERE session_id = ?1 ORDER BY time_created"
+    } else {
+        "SELECT id, session_id, name, prompt, when_json, tz, condition_json, ends_json, status, \
+                next_due_ms, ends_at_ms, remaining_runs, run_count, time_created, time_updated \
+           FROM schedule ORDER BY time_created"
+    };
+    let mut stmt = r.prepare(sql)?;
+    let map = |x: &rusqlite::Row<'_>| -> rusqlite::Result<Value> {
+        Ok(json!({
+            "id": x.get::<_, String>(0)?,
+            "session_id": x.get::<_, String>(1)?,
+            "name": x.get::<_, String>(2)?,
+            "prompt": x.get::<_, String>(3)?,
+            "when_json": serde_json::from_str::<Value>(&x.get::<_, String>(4)?).unwrap_or(Value::Null),
+            "tz": x.get::<_, String>(5)?,
+            "condition_json": x.get::<_, Option<String>>(6)?.map(|s| serde_json::from_str::<Value>(&s).unwrap_or(Value::Null)),
+            "ends_json": x.get::<_, Option<String>>(7)?.map(|s| serde_json::from_str::<Value>(&s).unwrap_or(Value::Null)),
+            "status": x.get::<_, String>(8)?,
+            "next_due_ms": x.get::<_, Option<i64>>(9)?,
+            "ends_at_ms": x.get::<_, Option<i64>>(10)?,
+            "remaining_runs": x.get::<_, Option<i64>>(11)?,
+            "run_count": x.get::<_, i64>(12)?,
+            "time_created": x.get::<_, i64>(13)?,
+            "time_updated": x.get::<_, i64>(14)?,
+        }))
+    };
+    let rows: Vec<Value> = match session {
+        Some(sid) => stmt.query_map([sid], map)?.filter_map(|r| r.ok()).collect(),
+        None => stmt.query_map([], map)?.filter_map(|r| r.ok()).collect(),
+    };
+    Ok(rows)
+}
+
+async fn store_schedule(st: &AppState, row: &Value) -> Result<(), crate::HttpError> {
+    let sql = "INSERT OR REPLACE INTO schedule \
+        (id, session_id, name, prompt, when_json, tz, condition_json, ends_json, status, \
+         next_due_ms, ends_at_ms, remaining_runs, run_count, time_created, time_updated) \
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)";
+    let ops = vec![ocserve_store::writer::WriteOp::Sql {
+        sql: sql.to_string(),
+        params: vec![
+            json!(row["id"].as_str().unwrap_or("")),
+            json!(row["session_id"].as_str().unwrap_or("")),
+            json!(row["name"].as_str().unwrap_or("")),
+            json!(row["prompt"].as_str().unwrap_or("")),
+            json!(row["when_json"].to_string()),
+            json!(row["tz"].as_str().unwrap_or("")),
+            json!(row["condition_json"].as_str()),
+            json!(row["ends_json"].as_str()),
+            json!(row["status"].as_str().unwrap_or("active")),
+            json!(row["next_due_ms"].as_i64()),
+            json!(row["ends_at_ms"].as_i64()),
+            json!(row["remaining_runs"].as_i64()),
+            json!(row["run_count"].as_i64().unwrap_or(0)),
+            json!(row["time_created"].as_i64().unwrap_or(0)),
+            json!(row["time_updated"].as_i64().unwrap_or(0)),
+        ],
+    }];
+    st.writer
+        .write(ops)
+        .map_err(|e| crate::HttpError::TaggedData {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            tag: "ServiceUnavailableError",
+            fields: json!({"message": e.to_string()}),
+        })?;
+    Ok(())
+}
+
+async fn delete_schedule(st: &AppState, id: &str) -> Result<(), crate::HttpError> {
+    let ops = vec![ocserve_store::writer::WriteOp::Sql {
+        sql: "DELETE FROM schedule WHERE id = ?1".to_string(),
+        params: vec![json!(id)],
+    }];
+    st.writer
+        .write(ops)
+        .map_err(|e| crate::HttpError::TaggedData {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            tag: "ServiceUnavailableError",
+            fields: json!({"message": e.to_string()}),
+        })?;
+    Ok(())
+}
+
+/// POST /api/experimental/generate/decisions — structured decisions.
+///
+/// Upstream asks the model one structured-output question per entry and
+/// returns `answers[]` in question order. We reuse the transient executor:
+/// the questions are rendered into a strict-JSON instruction, the model's
+/// reply is parsed, and an unparsable answer becomes an `error` answer for
+/// that question (upstream's own ErrorAnswer contract: "the other answers
+/// still came back"). There is no per-question probability calibration here,
+/// which is a named divergence rather than an invented number.
+pub async fn generate_decisions_api(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    let Some(model) = body.get("model") else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"model\"]", "kind": "Payload"}),
+        });
+    };
+    let mid = model.get("id").and_then(|v| v.as_str());
+    let pid = model.get("providerID").and_then(|v| v.as_str());
+    let (Some(mid), Some(pid)) = (mid, pid) else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"model\"][\"id\"]", "kind": "Payload"}),
+        });
+    };
+    let Some(input) = body.get("input").and_then(|v| v.as_array()) else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"input\"]", "kind": "Payload"}),
+        });
+    };
+    let Some(questions) = body.get("questions").and_then(|v| v.as_array()) else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"questions\"]", "kind": "Payload"}),
+        });
+    };
+    // Upstream requires `instructions` on every question (probed live: the
+    // first-fail is `["questions"][0]["instructions"]`).
+    for q in questions {
+        if q.get("instructions").and_then(|v| v.as_str()).is_none() {
+            return Err(crate::HttpError::TaggedData {
+                status: StatusCode::BAD_REQUEST,
+                tag: "InvalidRequestError",
+                fields: json!({"message": "Missing key\n  at [\"questions\"][0][\"instructions\"]", "kind": "Payload"}),
+            });
+        }
+    }
+    // Render the questions as a single strict-JSON instruction.
+    let q_json = json!(questions);
+    let prompt = format!(
+        "You are answering structured questions about the evidence below.\n\
+         Return ONLY a JSON array with one object per question, in order.\n\
+         For a predicate question return {{\"type\":\"predicate\",\"name\":..,\"probability\":0..1}}.\n\
+         For a choice question return {{\"type\":\"choice\",\"name\":..,\"choice\":<one of the values>}}.\n\
+         For a score question return {{\"type\":\"score\",\"name\":..,\"score\":<level index 0..n-1>}}.\n\
+         Questions: {q_json}\n\
+         Evidence: {}",
+        json!(input)
+    );
+    let req = ocserve_core::wire::PromptRequest {
+        message_id: None,
+        model: Some(ocserve_core::wire::ModelRef {
+            provider_id: pid.to_string(),
+            model_id: mid.to_string(),
+        }),
+        parts: vec![json!({ "type": "text", "text": prompt })],
+        ..Default::default()
+    };
+    const EPHEMERAL: &str = "ses_transient_generate_decisions";
+    let mut ctx = crate::build_prompt_context(&st, &req, EPHEMERAL).map_err(|e| {
+        crate::HttpError::TaggedData {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            tag: "ServiceUnavailableError",
+            fields: json!({"message": format!("{} {}", e.name, e.message), "service": "experimental generation"}),
+        }
+    })?;
+    ctx.compaction.auto = false;
+    let writer = st.writer.clone();
+    let (_info, parts) = ocserve_core::prompt::run_prompt_with(
+        &ctx,
+        &writer,
+        EPHEMERAL,
+        &req,
+        ocserve_core::prompt::RunOpts {
+            persist_user: false,
+            skip_history: true,
+            tools_enabled: false,
+            auto_title: false,
+            transient: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|_| crate::HttpError::TaggedData {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        tag: "ServiceUnavailableError",
+        fields: json!({"message": "generation failed", "service": "experimental generation"}),
+    })?;
+    let text = parts
+        .iter()
+        .find(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+        .and_then(|p| p.get("text").and_then(|t| t.as_str()))
+        .unwrap_or("");
+    // Tolerant parse: strip a code fence, slice to the outermost array.
+    let parsed: Option<Vec<Value>> = {
+        let t = text.trim();
+        let t = t
+            .strip_prefix("```json")
+            .or_else(|| t.strip_prefix("```"))
+            .unwrap_or(t);
+        let t = t.strip_suffix("```").unwrap_or(t).trim();
+        let (start, end) = (t.find('['), t.rfind(']'));
+        match (start, end) {
+            (Some(s), Some(e)) if e > s => serde_json::from_str::<Vec<Value>>(&t[s..=e]).ok(),
+            _ => None,
+        }
+    };
+    let answers: Vec<Value> = questions
+        .iter()
+        .enumerate()
+        .map(|(i, q)| {
+            let name = q.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let qtype = q
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("predicate");
+            match parsed.as_ref().and_then(|a| a.get(i)) {
+                Some(a) => json!({
+                    "type": qtype,
+                    "name": name,
+                    "probability": a.get("probability"),
+                    "choice": a.get("choice"),
+                    "score": a.get("score"),
+                }),
+                None => json!({
+                    "type": "error",
+                    "name": name,
+                    "reason": "unparsable",
+                    "message": "the model did not return a parsable decision",
+                }),
+            }
+        })
+        .collect();
+    Ok(Json(json!({"data": {"answers": answers}})))
+}
+
+/// POST /api/experimental/generate/image — needs an image-generation provider.
+/// Upstream resolves the model first and returns `ModelNotFoundError` for an
+/// unknown provider/model (probed live). We resolve against the same registry
+/// so a bad ref answers identically; a KNOWN model then gets an honest
+/// `UnsupportedModelError` because ocserve does not implement image synthesis
+/// (no provider client, no bytes to store). `D-GENERATE-IMAGE` in the ledger.
+pub async fn generate_image_api(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, HttpError> {
+    let model = body
+        .get("model")
+        .ok_or_else(|| crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"model\"]", "kind": "Payload"}),
+        })?;
+    let id = model.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let provider = model
+        .get("providerID")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let known = st.llm.read().endpoints.contains_key(provider);
+    if !known {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "ModelNotFoundError",
+            fields: json!({
+                "providerID": provider, "modelID": id,
+                "message": format!("Model not found: {provider}/{id}")
+            }),
+        });
+    }
+    Err(crate::HttpError::TaggedData {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        tag: "UnsupportedModelError",
+        fields: json!({
+            "providerID": provider, "modelID": id,
+            "message": "image generation is not supported by this server"
+        }),
+    })
+}
+
+/// POST /api/experimental/voice/session — realtime voice needs an audio
+/// transport (WebRTC/WebSocket) that ocserve does not implement. Shape is
+/// validated first (probed: `{"model":{...}}` → `Expected string at ["model"]`),
+/// then the honest service answer. `D-VOICE-TRANSPORT` in the ledger.
+pub async fn voice_session_api(Json(body): Json<Value>) -> Result<Json<Value>, HttpError> {
+    if !body.get("model").map(|v| v.is_string()).unwrap_or(false) {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Expected string\n  at [\"model\"]", "kind": "Payload"}),
+        });
+    }
+    if body.get("transport").is_none() {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"transport\"]", "kind": "Payload"}),
+        });
+    }
+    Err(crate::HttpError::TaggedData {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        tag: "ServiceUnavailableError",
+        fields: json!({
+            "message": "voice sessions are not available on this server",
+            "service": "experimental.voice"
+        }),
+    })
+}
+
+/// GET /api/experimental/client-mcp?name= — hands a browser-side MCP client
+/// the tool surface for a server. The whole feature depends on a client-side
+/// transport (the browser connects to the MCP server itself); ocserve runs
+/// MCP server-side, so there is nothing to hand out. `name` is still required
+/// (probed: missing → 400 Query envelope) and admission is refused with the
+/// same ForbiddenError the reference uses for an invalid connect token.
+/// `D-CLIENT-MCP` in the ledger.
+pub async fn client_mcp_get(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, HttpError> {
+    let _ = st;
+    if !q.contains_key("name") {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"name\"]", "kind": "Query"}),
+        });
+    }
+    Err(client_mcp_refused())
+}
+
+/// POST /api/experimental/client-mcp/token?name= — same story: minting a
+/// browser connect token has no meaning without the client transport.
+pub async fn client_mcp_token(
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, HttpError> {
+    if !q.contains_key("name") {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"name\"]", "kind": "Query"}),
+        });
+    }
+    Err(client_mcp_refused())
+}
+
+/// The reference's exact refusal for a client-MCP request it will not serve
+/// (probed live: 403 with this message).
+fn client_mcp_refused() -> crate::HttpError {
+    crate::HttpError::TaggedData {
+        status: StatusCode::FORBIDDEN,
+        tag: "ForbiddenError",
+        fields: json!({"message": "Invalid client MCP connect token request"}),
+    }
+}

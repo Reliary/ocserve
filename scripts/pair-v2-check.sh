@@ -20,9 +20,20 @@ cd "$(dirname "$0")/.."
 PORT_F=4944
 PORT_R=4945
 OCSERVE_BIN="${OCSERVE_BIN:-$PWD/target/release/ocserve}"
-# The 2.0.28 CLI binary (201 MB ELF, from @opencode/cli-linux-x64@2.0.28).
-# Default: the scratch copy outside /tmp (tmpfs fills); override with V2_BIN.
-V2BIN="${V2_BIN:-/var/tmp/ocserve-scratch/ocli/node_modules/@opencode/cli-linux-x64/bin/opencode}"
+# The v2 CLI binary (201 MB ELF, from @opencode/cli-linux-x64@$V2_VER).
+# SLOT-BASED (2026-11-05): the bump moves the pin, so this resolves the NEW
+# version's tarball (staged by `bump.sh v2` in /var/tmp/ocserve-bump-<ver>)
+# before falling back to the pinned scratch install. A hardcoded 2.0.28 path
+# made the differential silently test the OLD binary after a bump — the same
+# class as `acquire-freeze` printing success while `cp` failed.
+V2_VER="${V2_VER:-$(sed -n 's/.*pub const V2_TAG: &str = "\([^"]*\)".*/\1/p' crates/ocserve-core/src/spec.rs | head -1)}"
+V2_MAJOR="${V2_VER%.*}"
+V2BIN="${V2_BIN:-}"
+if [ -z "$V2BIN" ]; then
+  _staged="/var/tmp/ocserve-bump-$V2_VER/cli/package/bin/opencode"
+  if [ -x "$_staged" ]; then V2BIN="$_staged"
+  else V2BIN="/var/tmp/ocserve-scratch/ocli/node_modules/@opencode/cli-linux-x64/bin/opencode"; fi
+fi
 
 HF=""; HR=""; PID_F=""; PID_R=""
 cleanup() {
@@ -38,7 +49,7 @@ say() { printf '%s\n' "$*"; }
 die2() { echo "pair-v2-check: $*" >&2; exit 2; }
 
 [ -x "$OCSERVE_BIN" ] || die2 "$OCSERVE_BIN missing (cargo build --release)"
-[ -x "$V2BIN" ] || die2 "2.0.28 binary missing at $V2BIN"
+[ -x "$V2BIN" ] || die2 "v2 binary for $V2_VER missing at $V2BIN"
 
 python3 - "$PORT_F" "$PORT_R" <<'PY' || die2 "ports busy (4944/4945 required)"
 import socket, sys
@@ -80,10 +91,12 @@ for _ in $(seq 1 30); do
   [ -n "$PW" ] && break
   sleep 1
 done
-[ -n "$PW" ] || { tail -20 "$HF/v2.log" >&2; die2 "2.0.28 never printed a password"; }
+[ -n "$PW" ] || { tail -20 "$HF/v2.log" >&2; die2 "$V2_VER never printed a password"; }
 export PAIR_V2_PW="$PW"
-python3 - "$PORT_F" <<'PY' || { tail -20 "$HF/v2.log" >&2; die2 "freeze arm never healthy"; }
+python3 - "$PORT_F" "$V2_MAJOR" <<'PY' || { tail -20 "$HF/v2.log" >&2; die2 "freeze arm never healthy"; }
 import base64, json, os, sys, time, urllib.request
+sys.argv[2] and None
+EXPECT_MAJOR = sys.argv[2]
 pw = os.environ["PAIR_V2_PW"]
 auth = base64.b64encode(f"opencode:{pw}".encode()).decode()
 for _ in range(30):
@@ -91,7 +104,7 @@ for _ in range(30):
         req = urllib.request.Request(f"http://127.0.0.1:{sys.argv[1]}/api/info",
                                      headers={"Authorization": f"Basic {auth}"})
         v = json.loads(urllib.request.urlopen(req, timeout=3).read())
-        assert v["version"].startswith("2.0."), v
+        assert v["version"].startswith(EXPECT_MAJOR), v
         print(f"freeze arm: {v['version']}")
         sys.exit(0)
     except SystemExit:
@@ -114,8 +127,9 @@ PY
 say "both arms healthy"
 
 export PAIR_V2_F="http://127.0.0.1:$PORT_F" PAIR_V2_R="http://127.0.0.1:$PORT_R"
-python3 - <<'PY'
+python3 - "$V2_MAJOR" <<'PY'
 import base64, json, os, sys, urllib.request, urllib.error
+V2_MAJOR = sys.argv[1]
 
 AUTH = base64.b64encode(f"opencode:{os.environ['PAIR_V2_PW']}".encode()).decode()
 F, R = os.environ["PAIR_V2_F"], os.environ["PAIR_V2_R"]
@@ -160,10 +174,10 @@ if not (sid_f and sid_r):
 # answer with the pinned contract tag — the DARK gate is proven by the
 # `v2_gate_dark_by_default` unit e2e, not by this enabled arm).
 st_f, info = call(F, "GET", "/api/info", auth=AUTH)
-check("info-freeze", st_f == 200 and info.get("version", "").startswith("2.0."),
+check("info-freeze", st_f == 200 and str(info.get("version", "")).startswith(V2_MAJOR),
       f"{st_f} {str(info)[:120]}")
 st_r, infor = call(R, "GET", "/api/info")
-check("info-enabled", st_r == 200 and infor.get("version") == "2.0.28",
+check("info-enabled", st_r == 200 and str(infor.get("version", "")).startswith(V2_MAJOR),
       f"{st_r} {str(infor)[:160]}")
 
 # Prompt admission: flat body on both. Freeze runs a real turn (may need a

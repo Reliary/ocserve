@@ -355,6 +355,10 @@ pub struct AppState {
     pub pty: std::sync::Arc<ocserve_pty::PtyManager>,
     /// User CORS allowlist (config `server.cors` + `--cors`), read once at boot
     pub cors_extra: Vec<String>,
+    /// Paths a v2 client asked to watch (`POST /api/experimental/fs/watch`).
+    /// We have no watcher, so this is an accepted-set only: the route is bound
+    /// and truthful about not emitting `file.watch` (D-FS-WATCH).
+    pub fs_watches: parking_lot::Mutex<std::collections::BTreeSet<String>>,
 }
 
 /// LLM endpoint resolution for the prompt runner (assembled by Runtime).
@@ -671,6 +675,7 @@ impl AppState {
             ui: crate::ui::UiProxy::from_env(),
             pty,
             cors_extra: read_cors_env(),
+            fs_watches: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
             db: w.db,
             blobs: w.blobs,
             writer: w.writer,
@@ -5778,6 +5783,74 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(v2::migration_v1_status),
         )
         .route("/api/plugin", get(v2::plugin_list))
+        .route("/api/plugin/gui", get(v2::plugin_gui))
+        .route("/api/experimental/usage/limits", get(v2::usage_limits))
+        .route("/api/experimental/voice/models", get(v2::voice_models))
+        .route("/api/debug/heap-dump", axum::routing::post(v2::heap_dump))
+        .route(
+            "/api/experimental/fs/watch",
+            get(v2::fs_watch).post(v2::fs_watch).delete(v2::fs_unwatch),
+        )
+        .route("/api/experimental/media/{hash}", get(v2::media_get))
+        .route(
+            "/api/permission/saved/{id}",
+            axum::routing::patch(v2::permission_saved_update),
+        )
+        .route(
+            "/api/experimental/generate/text",
+            axum::routing::post(v2::generate_text_api),
+        )
+        .route(
+            "/api/experimental/generate/decisions",
+            axum::routing::post(v2::generate_decisions_api),
+        )
+        .route(
+            "/api/experimental/generate/image",
+            axum::routing::post(v2::generate_image_api),
+        )
+        .route(
+            "/api/experimental/voice/session",
+            axum::routing::post(v2::voice_session_api),
+        )
+        .route("/api/experimental/client-mcp", get(v2::client_mcp_get))
+        .route(
+            "/api/experimental/client-mcp/token",
+            axum::routing::post(v2::client_mcp_token),
+        )
+        .route(
+            "/api/experimental/schedule",
+            get(v2::schedule_list).post(v2::schedule_create),
+        )
+        .route(
+            "/api/experimental/schedule/{scheduleID}",
+            get(v2::schedule_get).delete(v2::schedule_delete),
+        )
+        .route(
+            "/api/experimental/schedule/{scheduleID}/pause",
+            axum::routing::post(v2::schedule_pause),
+        )
+        .route(
+            "/api/experimental/schedule/{scheduleID}/resume",
+            axum::routing::post(v2::schedule_resume),
+        )
+        .route(
+            "/api/experimental/artifacts",
+            get(v2::artifacts_list).post(v2::artifacts_create),
+        )
+        .route(
+            "/api/experimental/artifacts/providers",
+            get(v2::artifacts_providers),
+        )
+        .route(
+            "/api/experimental/artifacts/{artifactID}",
+            get(v2::artifacts_one)
+                .patch(v2::artifacts_one)
+                .delete(v2::artifacts_one),
+        )
+        .route(
+            "/api/experimental/artifacts/{artifactID}/view/{*path}",
+            get(v2::artifacts_view),
+        )
         .route(
             "/api/experimental/fs/write",
             axum::routing::post(v2::fs_write),

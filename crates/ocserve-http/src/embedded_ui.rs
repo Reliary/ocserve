@@ -362,11 +362,18 @@ mod tests {
                 .any(|k| k.starts_with("_assets/") && k.ends_with(".js")),
             "no v2 _assets entry"
         );
-        // lazy decompression works: the entry bundle decompresses to valid bytes
-        let entry = files_v2()
-            .get("_assets/index-Bn6xbm4C.js")
+        // Lazy decompression works: the entry bundle decompresses to valid
+        // bytes. The hashed filename changes on EVERY upstream release (the
+        // 2.0.28 pin's `index-Bn6xbm4C.js` became a different hash at 2.2.5),
+        // so the test resolves the entry by shape rather than by a literal —
+        // pinning the literal would make a bump red for the wrong reason.
+        let (name, entry) = files_v2()
+            .index
+            .keys()
+            .filter(|k| k.starts_with("_assets/index-") && k.ends_with(".js"))
+            .find_map(|k| files_v2().get(k).map(|v| (k.clone(), v)))
             .expect("v2 entry present");
-        assert!(entry.len() > 1000, "entry bundle too small");
+        assert!(entry.len() > 1000, "entry bundle too small: {name}");
     }
 
     /// The frame region is split across crates; an offset near a part

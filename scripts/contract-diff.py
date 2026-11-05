@@ -50,6 +50,7 @@ still cover ocserve", same-line answers "what did upstream change 2.0.28→2.0.3
 """
 import copy
 import json
+import os
 import sys
 
 V1 = "crates/ocserve-core/assets/openapi/v1.json"
@@ -80,6 +81,23 @@ V1_ONLY_PREFIXES = (
 def load(p):
     with open(p) as f:
         return json.load(f)
+
+
+def resolve_v2_arg(tag):
+    """Map `--v2 <tag>` to a vendored contract.
+
+    Assets are SLOT-named (`v1.json`/`v2.json`) so a bump does not rename
+    files. The pre-slot form `<tag>.json` is still accepted for a worktree
+    that holds an extra contract beside the slots.
+    """
+    slot = f"crates/ocserve-core/assets/openapi/v2.json"
+    tagged = f"crates/ocserve-core/assets/openapi/{tag}.json"
+    now = load(slot)
+    if os.path.exists(tagged):
+        return tagged
+    if tag and f'"{tag}"' in json.dumps(now.get("info", {})):
+        return slot
+    return slot
 
 
 def deref(doc, node, depth=0):
@@ -239,7 +257,7 @@ def main():
     # --v2 <tag>: cross-line classification against a non-default v2 asset.
     v2path = V2
     if "--v2" in args:
-        v2path = f"crates/ocserve-core/assets/openapi/{args[args.index('--v2') + 1]}.json"
+        v2path = resolve_v2_arg(args[args.index("--v2") + 1])
 
     v1doc, v2doc = load(V1), load(v2path)
     if selftest:
