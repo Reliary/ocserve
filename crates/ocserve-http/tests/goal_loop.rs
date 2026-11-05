@@ -8,10 +8,22 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 fn app() -> axum::Router {
+    // PRODUCTION SHAPE: the advertised goal entry exists with `template: ""`
+    // (the v1 Command schema requires the field). An empty command list would
+    // make the dispatcher's predicate look different from production — the
+    // exact way the 2026-11-05 `/goal` regression stayed green in tests.
+    let payloads = ocserve_http::Payloads {
+        command: vec![serde_json::json!({
+            "name": "goal",
+            "description": "keep working until an objective is met [pause|resume|clear]",
+            "source": "command",
+            "template": "",
+            "hints": [],
+        })],
+        ..Default::default()
+    };
     ocserve_http::router(ocserve_http::AppState::with_payloads_and_v2(
-        None,
-        ocserve_http::Payloads::default(),
-        true,
+        None, payloads, true,
     ))
 }
 
@@ -190,7 +202,13 @@ async fn pause_and_resume_transitions() {
     )
     .await;
     assert_eq!(r.status(), StatusCode::OK);
-    assert_eq!(json(r).await["info"]["status"], "paused");
+    let v = json(r).await;
+    // The response is `SessionV1.WithParts`: a real AssistantMessage plus
+    // parts, and the goal state alongside under `goal` (it used to be the
+    // goal object AS `info`, which no strict Message parser accepts).
+    assert_eq!(v["info"]["role"], "assistant");
+    assert!(v["parts"].as_array().is_some_and(|p| !p.is_empty()));
+    assert_eq!(v["goal"]["status"], "paused");
 
     let r = req(
         &a,
@@ -201,8 +219,9 @@ async fn pause_and_resume_transitions() {
     .await;
     assert_eq!(r.status(), StatusCode::OK);
     let v = json(r).await;
-    assert_eq!(v["info"]["status"], "active");
-    assert_eq!(v["info"]["rounds"], 1, "resume is round 1 of a new budget");
+    assert_eq!(v["info"]["role"], "assistant");
+    assert_eq!(v["goal"]["status"], "active");
+    assert_eq!(v["goal"]["rounds"], 1, "resume is round 1 of a new budget");
 
     // clear drops it entirely
     let r = req(
@@ -297,4 +316,42 @@ async fn goals_are_per_session() {
     )
     .await;
     assert!(json(r).await["data"].is_null());
+}
+
+/// The v2 surface admits `/goal` too (204 + inbox), and the drain arms the
+/// goal before the kickoff turn runs. Pre-fix this path bailed with
+/// "command disappeared between admit and run" because the built-in entry has
+/// an empty template.
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_admission_arms_the_goal() {
+    let a = app();
+    let sid = new_session(&a).await;
+    let r = req(
+        &a,
+        "POST",
+        &format!("/api/session/{sid}/command"),
+        Some(serde_json::json!({"name": "goal", "text": "ship it"})),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    // The drain is spawned; poll briefly for the armed state.
+    let mut armed = None;
+    for _ in 0..100 {
+        let g = req(
+            &a,
+            "POST",
+            "/api/rpc/opencode.goal/get",
+            Some(serde_json::json!({"input": {"sessionID": sid}})),
+        )
+        .await;
+        let v = json(g).await;
+        if !v["data"].is_null() {
+            armed = Some(v["data"].clone());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let goal = armed.expect("v2 admission must arm the goal");
+    assert_eq!(goal["objective"], "ship it");
+    assert_eq!(goal["status"], "active");
 }

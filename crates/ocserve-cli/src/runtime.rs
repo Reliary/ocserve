@@ -1559,6 +1559,28 @@ mod goal_command_tests {
         assert_eq!(goals[0]["template"], "mine $ARGUMENTS");
     }
 
+    /// A built-in command is advertised with `template: ""` because the v1
+    /// `Command` schema requires the field — so empty-template means "handled
+    /// by name, not expandable". Every such entry must be one the HTTP
+    /// dispatcher actually special-cases; an accidental empty template would
+    /// advertise a command that expands to an empty prompt (the 2026-11-05
+    /// `/goal` regression). This pins the set so adding one is a deliberate
+    /// two-place change.
+    #[test]
+    fn empty_template_commands_are_the_handled_builtins() {
+        let cmds = super::build_commands_with(&serde_json::json!({}), true).expect("commands");
+        let empty: Vec<&str> = cmds
+            .iter()
+            .filter(|c| c["template"].as_str() == Some(""))
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        assert_eq!(
+            empty,
+            vec!["goal"],
+            "only the built-in goal command may advertise an empty template"
+        );
+    }
+
     #[test]
     fn kill_switch_hides_the_command() {
         let cmds = super::build_commands_with(&serde_json::json!({}), false).expect("commands");

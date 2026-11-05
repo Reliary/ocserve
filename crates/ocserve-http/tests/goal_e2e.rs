@@ -103,9 +103,24 @@ fn setup(addr: std::net::SocketAddr, sid: &str) -> Arc<AppState> {
         systems: Default::default(),
         default_agent: "build".into(),
     };
+    // PRODUCTION SHAPE (regression: this fixture used `Payloads::default()`,
+    // whose empty command list made `template` None, so the dispatcher's
+    // `template.is_none()` test fired here but never in production, where the
+    // advertised goal entry carries `template: ""` because the v1 Command
+    // schema requires it. The fixture must match what `build_commands` serves.)
+    let payloads = Payloads {
+        command: vec![json!({
+            "name": "goal",
+            "description": "keep working until an objective is met [pause|resume|clear]",
+            "source": "command",
+            "template": "",
+            "hints": [],
+        })],
+        ..Payloads::default()
+    };
     let st = AppState::with_wiring(
         None,
-        Payloads::default(),
+        payloads,
         Wires {
             db,
             blobs,
@@ -390,5 +405,100 @@ async fn unknown_command_falls_through_without_writing_goal_state() {
         ocserve_store::get_goal(&st.db, "ses_goalunk")
             .unwrap()
             .is_none()
+    );
+}
+
+/// THE REGRESSION (2026-11-05, found from a real client): the built-in goal
+/// entry is advertised with `template: ""` because the v1 `Command` schema
+/// requires the field, and the dispatcher tested `template.is_none()` — true
+/// only in the old fixture, never in production. A real `/goal <objective>`
+/// therefore fell through to template expansion, produced an EMPTY prompt,
+/// and the model call failed.
+///
+/// This test is the contract the fixture above now enforces: the response is
+/// `SessionV1.WithParts` (assistant info + parts), not a goal-state object.
+#[tokio::test(flavor = "multi_thread")]
+async fn v1_goal_command_returns_with_parts_not_a_goal_state() {
+    let addr = spawn_provider(r#"{"verdict":"done","reason":"x"}"#);
+    let st = setup(addr, "ses_goalwithparts");
+    let a = router(&st);
+    let r = req(
+        &a,
+        "POST",
+        "/session/ses_goalwithparts/command",
+        Some(json!({"command": "goal", "arguments": "get the tests green"})),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let v = json(r).await;
+    // A strict client parses `info` as an AssistantMessage.
+    assert_eq!(v["info"]["role"], "assistant");
+    assert!(
+        v["info"]["id"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("msg_")),
+        "info must be a real message: {v}"
+    );
+    // The kickoff turn ran synchronously: it produced content, not an empty
+    // parts array.
+    assert!(
+        v["parts"].as_array().is_some_and(|p| !p.is_empty()),
+        "the kickoff turn must return its parts: {v}"
+    );
+    assert!(
+        v["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["type"] == "text" && p["text"].as_str().is_some_and(|t| !t.is_empty())),
+        "the response must carry the turn's text: {v}"
+    );
+    // The goal is armed and the continuation message is goal-tagged.
+    let g = ocserve_store::get_goal(&st.db, "ses_goalwithparts")
+        .unwrap()
+        .expect("goal armed");
+    assert!(g.status == "active" || g.status == "complete");
+    let msgs = ocserve_store::load_messages(&st.db, "ses_goalwithparts", None).unwrap();
+    assert!(
+        msgs.iter().any(|(_, parts)| parts
+            .iter()
+            .any(|p| p["metadata"]["source"].as_str() == Some("goal"))),
+        "the kickoff must be tagged on the PART"
+    );
+}
+
+/// The negative control for the dispatch predicate: with a NON-EMPTY user
+/// template named `goal`, the built-in must NOT fire — the user's command runs
+/// as an ordinary template command. (If the predicate regresses to name-only,
+/// this test goes red: the built-in would swallow the user's template.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_user_goal_template_beats_the_builtin() {
+    let addr = spawn_provider(r#"{"verdict":"done","reason":"x"}"#);
+    let st = setup(addr, "ses_goaluser");
+    // Replace the command list through the SAME store the production reload
+    // writes to (there is no dedicated setter; the reload owns this lock).
+    st.payloads.write().command = vec![json!({
+        "name": "goal",
+        "description": "mine",
+        "source": "command",
+        "template": "USER TEMPLATE $ARGUMENTS",
+        "hints": ["$ARGUMENTS"],
+    })];
+    let a = router(&st);
+    let r = req(
+        &a,
+        "POST",
+        "/session/ses_goaluser/command",
+        Some(json!({"command": "goal", "arguments": "args"})),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK);
+    // No goal state was written: the user's command won, exactly as upstream's
+    // command.transform ordering implies.
+    assert!(
+        ocserve_store::get_goal(&st.db, "ses_goaluser")
+            .unwrap()
+            .is_none(),
+        "a user template named goal must not arm the built-in loop"
     );
 }

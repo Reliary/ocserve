@@ -18,11 +18,12 @@
 //! usage to the session row (a transient call never touches it), and the
 //! divergence row says so.
 
-use crate::AppState;
+use crate::{ApiError, AppState, HttpError};
+use axum::http::StatusCode;
 use ocserve_core::goal::{
     MAX_STALLS, Status, VerdictKind, continuation, is_stalled, judge_prompt, kickoff, parse_verdict,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 /// This process's boot id. A goal armed by an earlier process comes back
@@ -193,7 +194,7 @@ pub async fn after_turn(st: &Arc<AppState>, sid: &str) -> bool {
             })
             .await;
             let text = continuation(&latest.objective, &verdict);
-            continue_turn(st, sid, &text, &latest.id)
+            continue_turn(st, sid, &text, &latest.id, true)
         }
     }
 }
@@ -315,9 +316,216 @@ async fn review(
     v
 }
 
+/// The kickoff/continuation part: a synthetic text part carrying the goal
+/// tag. `TextPart.metadata` is where the tag lives (a `UserMessage` has no
+/// metadata field), and `synthetic` is what makes a timeline render it as a
+/// notice row instead of something the user typed.
+pub(crate) fn goal_part(text: &str, goal_id: &str, synthetic: bool) -> Value {
+    json!({
+        "type": "text",
+        "text": text,
+        "synthetic": synthetic,
+        "metadata": {"source": "goal", "goalID": goal_id},
+    })
+}
+
+/// Result of arming a goal, before any turn runs.
+pub(crate) enum Arm {
+    /// A control word ran (pause/resume/clear): the new state, or Null for
+    /// clear. No turn is started for these.
+    Control(Value),
+    /// A new objective was persisted; the caller decides how to deliver the
+    /// kickoff (v2 spawns, v1 runs it inside the command request).
+    Armed {
+        row: ocserve_store::GoalRow,
+        text: String,
+    },
+}
+
+/// Run one goal turn IN THE CALLER'S REQUEST and hand back its
+/// `(assistant info, parts)`.
+///
+/// The v1 command route must answer `SessionV1.WithParts`, so it cannot spawn
+/// the kickoff and reply with a goal-state object (the pre-fix behaviour: the
+/// response's `info` was a Goal.State, not an AssistantMessage, so any strict
+/// client parse failed, and the parts array was empty). The turn is the same
+/// one the spawned path runs; only the joiner differs.
+///
+/// The caller must NOT already hold the session lock (this acquires it).
+pub(crate) async fn run_turn_now(
+    st: &Arc<AppState>,
+    sid: &str,
+    text: &str,
+    goal_id: &str,
+    extra_parts: Vec<Value>,
+    model: Option<ocserve_core::wire::ModelRef>,
+) -> anyhow::Result<(Value, Vec<Value>)> {
+    let release = crate::lock_session(st, sid)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    let guard = release.arc().lock().await;
+    // With attachments the kickoff rides as the user's own message (upstream's
+    // `attached` branch); a bare kickoff is a synthetic notice.
+    let attached = !extra_parts.is_empty();
+    let mut parts = vec![goal_part(text, goal_id, !attached)];
+    parts.extend(extra_parts);
+    let req = ocserve_core::wire::PromptRequest {
+        message_id: None,
+        // The v1 command payload carries the client's model selection; the
+        // kickoff must honor it or a command sent with `model` runs on a
+        // different provider than the button the user pressed.
+        model,
+        parts,
+        ..Default::default()
+    };
+    let ctx =
+        crate::build_prompt_context(st, &req, sid).map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    let writer = st.writer.clone();
+    let out = ocserve_core::prompt::run_prompt_with(
+        &ctx,
+        &writer,
+        sid,
+        &req,
+        ocserve_core::prompt::RunOpts {
+            auto_title: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    drop(guard);
+    match out {
+        Ok((info, parts)) => {
+            // Judge again (this is the loop), but do NOT await it here: the
+            // reviewer is a real model call, and the v1 command response must
+            // not wait on a second completion. Upstream's command returns once
+            // the synthetic kickoff is delivered, for the same reason.
+            spawn_wake(st, sid);
+            Ok((info, parts))
+        }
+        Err(e) => {
+            // A failed kickoff must not leave an active goal that can never
+            // make progress; upstream pauses on a session error.
+            if let Ok(Some(mut goal)) = ocserve_store::get_goal(&st.db, sid)
+                && goal.status == Status::Active.as_str()
+            {
+                settle(
+                    st,
+                    sid,
+                    &mut goal,
+                    Status::Paused,
+                    &format!("The goal stopped after an error: {e:#}"),
+                )
+                .await;
+            }
+            spawn_wake(st, sid);
+            Err(e)
+        }
+    }
+}
+
+/// Fire the idle hook on the runtime without making the caller wait for the
+/// reviewer completion.
+fn spawn_wake(st: &Arc<AppState>, sid: &str) {
+    let st2 = st.clone();
+    let sid2 = sid.to_string();
+    tokio::spawn(async move {
+        crate::wake_inbox_after_turn(&st2, &sid2).await;
+    });
+}
+
+/// A short assistant notice for a control word (`pause`/`resume`/`clear`).
+///
+/// The command route must return `WithParts`; persisting a real assistant
+/// message keeps that contract even though no model ran. Returns the GOAL
+/// STATE alongside it under `goal`, so a client that wants the state can read
+/// it without an RPC round-trip.
+pub(crate) async fn goal_control_notice(
+    st: &Arc<AppState>,
+    sid: &str,
+    which: &str,
+) -> Result<Value, HttpError> {
+    let state = match ocserve_store::get_goal(&st.db, sid) {
+        Ok(v) => v.map(|g| g.to_json()).unwrap_or(Value::Null),
+        Err(_) => Value::Null,
+    };
+    let notice = match which {
+        "pause" => "Goal paused.",
+        "resume" => "Goal resumed.",
+        "clear" => "Goal cleared.",
+        _ => "Goal updated.",
+    };
+    let text = match &state {
+        Value::Null => notice.to_string(),
+        s => format!("{notice}\n{}", s["objective"].as_str().unwrap_or("")),
+    };
+    let now = now_ms();
+    // Attribute the notice to the session's own model so a client that shows
+    // a model badge does not render an empty provider (no model call runs).
+    let (pid, mid) = crate::resolve_model(st, None, sid);
+    let info = json!({
+        "id": ocserve_core::ids::msg_id(),
+        "sessionID": sid,
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "path": {"cwd": st.paths["directory"].clone(), "root": "/"},
+        "cost": 0.0,
+        "tokens": {"total": 0, "input": 0, "output": 0, "reasoning": 0,
+                   "cache": {"write": 0, "read": 0}},
+        "modelID": mid,
+        "providerID": pid,
+        "time": {"created": now, "completed": now},
+        "finish": "stop",
+    });
+    let part = json!({
+        "type": "text",
+        "id": ocserve_core::ids::prt_id(),
+        "sessionID": sid,
+        "messageID": info["id"],
+        "text": text,
+        "synthetic": true,
+    });
+    let writer = st.writer.clone();
+    ocserve_store::insert_message(
+        &writer,
+        Some(&*st.blobs),
+        sid,
+        &info,
+        std::slice::from_ref(&part),
+    )
+    .map_err(|e| {
+        HttpError::from(ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("{e:#}"),
+        })
+    })?;
+    crate::emit_durable_http(
+        st,
+        sid,
+        "message.updated",
+        json!({"sessionID": sid, "info": info.clone()}),
+    )
+    .map_err(HttpError::from)?;
+    crate::emit_durable_http(
+        st,
+        sid,
+        "message.part.updated",
+        json!({"sessionID": sid, "part": part.clone()}),
+    )
+    .map_err(HttpError::from)?;
+    Ok(json!({"info": info, "parts": [part], "goal": state}))
+}
+
 /// Start a continuation turn on the session (synthetic user message with the
 /// goal metadata, then a normal prompt turn through the shared executor).
-fn continue_turn(st: &Arc<AppState>, sid: &str, text: &str, goal_id: &str) -> bool {
+fn continue_turn(
+    st: &Arc<AppState>,
+    sid: &str,
+    text: &str,
+    goal_id: &str,
+    synthetic: bool,
+) -> bool {
     let st2 = st.clone();
     let sid2 = sid.to_string();
     let text2 = text.to_string();
@@ -331,12 +539,7 @@ fn continue_turn(st: &Arc<AppState>, sid: &str, text: &str, goal_id: &str) -> bo
         let req = ocserve_core::wire::PromptRequest {
             message_id: None,
             model: None,
-            parts: vec![json!({
-                "type": "text",
-                "text": text2,
-                "synthetic": true,
-                "metadata": {"source": "goal", "goalID": goal_id2},
-            })],
+            parts: vec![goal_part(&text2, &goal_id2, synthetic)],
             ..Default::default()
         };
         let ctx = match crate::build_prompt_context(&st2, &req, &sid2) {
@@ -375,19 +578,21 @@ fn continue_turn(st: &Arc<AppState>, sid: &str, text: &str, goal_id: &str) -> bo
 /// Start `/goal <objective>`: persist the state and send the kickoff prompt
 /// the same way the command surface would. Used by BOTH the v1 command route
 /// and the v2 command admission, so the two surfaces cannot drift.
-pub async fn start_goal(
-    st: &Arc<AppState>,
-    sid: &str,
-    objective: &str,
-    attached: bool,
-) -> Result<serde_json::Value, String> {
+/// Validate the argument and persist the state, WITHOUT starting a turn.
+///
+/// Split out of `start_goal` because the two surfaces deliver the kickoff
+/// differently: the v2 command route admits and returns 204, so it spawns the
+/// turn; the v1 command route must answer `SessionV1.WithParts`, so it runs
+/// the kickoff inside the request and returns the turn's real assistant
+/// message. Both must share the state machine (and the control words).
+pub(crate) async fn arm(st: &Arc<AppState>, sid: &str, objective: &str) -> Result<Arm, String> {
     let objective = ocserve_core::goal::unquote(objective);
     if objective.is_empty() {
         return Err(usage(None));
     }
     let lower = objective.to_lowercase();
     if matches!(lower.as_str(), "pause" | "resume" | "clear") {
-        return control(st, sid, &lower).await;
+        return control(st, sid, &lower).await.map(Arm::Control);
     }
     if objective.chars().count() > ocserve_core::goal::MAX_OBJECTIVE {
         return Err(format!(
@@ -448,12 +653,31 @@ pub async fn start_goal(
         })
         .await;
     }
-    let text = kickoff(&objective);
-    // A prompt can carry attachments; a synthetic notice cannot. With
-    // attachments the kickoff goes through as the user's own message
-    // (upstream's `attached` branch).
-    continue_with_text(st, sid, &text, &row.id, attached);
-    Ok(row.to_json())
+    Ok(Arm::Armed {
+        row,
+        text: kickoff(&objective),
+    })
+}
+
+/// v2 command path: persist + spawn the kickoff, returning the goal state.
+/// Upstream's command `execute` is asynchronous (`session.synthetic` wakes
+/// the loop) and the HTTP caller already has its 204, so this must not block.
+pub async fn start_goal(
+    st: &Arc<AppState>,
+    sid: &str,
+    objective: &str,
+    attached: bool,
+) -> Result<serde_json::Value, String> {
+    match arm(st, sid, objective).await? {
+        Arm::Control(v) => Ok(v),
+        Arm::Armed { row, text } => {
+            // A prompt can carry attachments; a synthetic notice cannot. With
+            // attachments the kickoff goes through as the user's own message
+            // (upstream's `attached` branch).
+            continue_with_text(st, sid, &text, &row.id, attached);
+            Ok(row.to_json())
+        }
+    }
 }
 
 async fn control(st: &Arc<AppState>, sid: &str, which: &str) -> Result<serde_json::Value, String> {
@@ -554,7 +778,9 @@ fn usage(goal: Option<&ocserve_store::GoalRow>) -> String {
 /// notice row), or a real user message when the command carried attachments.
 fn continue_with_text(st: &Arc<AppState>, sid: &str, text: &str, goal_id: &str, as_user: bool) {
     if as_user {
-        continue_turn(st, sid, text, goal_id);
+        // Upstream's `attached` branch: with attachments only a real prompt
+        // can carry them, so the kickoff is a USER message, not a notice.
+        continue_turn(st, sid, text, goal_id, false);
         return;
     }
     let st2 = st.clone();
@@ -570,12 +796,7 @@ fn continue_with_text(st: &Arc<AppState>, sid: &str, text: &str, goal_id: &str, 
         let req = ocserve_core::wire::PromptRequest {
             message_id: None,
             model: None,
-            parts: vec![json!({
-                "type": "text",
-                "text": text2,
-                "synthetic": true,
-                "metadata": {"source": "goal", "goalID": goal_id2},
-            })],
+            parts: vec![goal_part(&text2, &goal_id2, true)],
             ..Default::default()
         };
         let ctx = match crate::build_prompt_context(&st2, &req, &sid2) {

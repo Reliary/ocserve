@@ -56,6 +56,22 @@ Both API surfaces moved to the current upstream releases: the v1 freeze to
   so they cannot silently go stale on the next bump.
 
 ### Fixed
+- **`/goal` was unreachable from every real client.** The built-in entry is
+  advertised with `template: ""` because the v1 `Command` schema requires the
+  field, but the dispatcher tested `template.is_none()`. That predicate is true
+  only for the empty command list used by the old fixture, so in production a
+  `/goal <objective>` fell through to template expansion, produced an EMPTY
+  prompt, and failed the model call; zero goal rows were ever written. The
+  predicate is now "missing OR empty", a user command of the same name still
+  wins, and the v2 command path matches the built-in by name before its
+  template lookup (it previously bailed `command disappeared`). The v1
+  response is now a real `SessionV1.WithParts`: the kickoff turn runs inside
+  the request and its assistant message is returned, instead of a goal-state
+  object masquerading as `info` with an empty `parts` array. Control words
+  (`pause`/`resume`/`clear`) persist a short assistant notice and return the
+  goal state under `goal`. The command payload's `model` is honored by the
+  kickoff, and the post-kickoff review is fired in the background so the
+  request does not wait on a second completion.
 - **CI: the musl build broke on a `cargo-zigbuild` regression.** 0.24.1 ships a
   cmake toolchain whose ASM compiler points at the 0.24.0 wrapper path, which
   does not exist in a fresh cache, so BoringSSL's `enable_language(ASM)` failed.

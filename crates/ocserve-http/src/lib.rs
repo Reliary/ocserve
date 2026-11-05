@@ -4834,7 +4834,7 @@ pub fn expand_command(template: &str, arguments: &str) -> String {
 
 /// v1 Session.Event.Error on unknown commands (oc-remote toast via
 /// session.error SSE) + durable+s twin.
-fn emit_session_error_event(st: &Arc<AppState>, sid: &str, message: &str) {
+pub(crate) fn emit_session_error_event(st: &Arc<AppState>, sid: &str, message: &str) {
     let props = json!({
         "sessionID": sid,
         "error": {"name": "UnknownError", "data": {"message": message}},
@@ -4907,12 +4907,54 @@ async fn post_command(
     let available: Vec<&str> = available_owned.iter().map(String::as_str).collect();
 
     // `/goal` is built in (upstream adds it through command.transform, not a
-    // template). It is checked only when the user has NOT defined a `goal`
-    // command: a user's template always wins, as it does upstream.
-    if template.is_none() && name == "goal" && st.goals_enabled {
-        let objective = arguments.trim();
-        return match crate::goal_loop::start_goal(&st, &id, objective, false).await {
-            Ok(v) => Ok(Json(json!({"info": v, "parts": []}))),
+    // template). A user-defined `goal` command has a NON-EMPTY template and
+    // wins, as it does upstream.
+    //
+    // The built-in entry is advertised with `template: ""` because the v1
+    // `Command` schema requires a string template, so the predicate must be
+    // "missing OR empty", never `is_none()` alone: the latter is unreachable
+    // in production (2026-11-05 regression — `/goal` from a real client fell
+    // through to `expand_command("")` and sent the model an EMPTY prompt).
+    let is_builtin_goal = name == "goal"
+        && st.goals_enabled
+        && template.as_deref().map(str::is_empty).unwrap_or(true);
+    if is_builtin_goal {
+        return match crate::goal_loop::arm(&st, &id, arguments).await {
+            // Control words change state and start no turn. The response is
+            // still a valid `SessionV1.WithParts`: a persisted assistant
+            // notice, so a strict Message parser cannot choke on a goal-state
+            // object masquerading as an AssistantMessage.
+            Ok(crate::goal_loop::Arm::Control(_)) => {
+                let text =
+                    crate::goal_loop::goal_control_notice(&st, &id, arguments.trim()).await?;
+                Ok(Json(text))
+            }
+            // A new objective: run the KICKOFF TURN inside this request and
+            // return its real assistant message. (The v2 surface returns 204
+            // instead and spawns; the state machine is shared via `arm`.)
+            Ok(crate::goal_loop::Arm::Armed { row, text }) => {
+                let extra: Vec<Value> = cmd
+                    .parts
+                    .iter()
+                    .filter(|p| p["type"].as_str().is_some_and(|t| t != "text"))
+                    .cloned()
+                    .collect();
+                match crate::goal_loop::run_turn_now(
+                    &st,
+                    &id,
+                    &text,
+                    &row.id,
+                    extra,
+                    cmd.model
+                        .as_deref()
+                        .map(ocserve_core::wire::parse_model_str),
+                )
+                .await
+                {
+                    Ok((info, parts)) => Ok(Json(json!({"info": info, "parts": parts}))),
+                    Err(e) => Err(HttpError::from(prompt_err(e))),
+                }
+            }
             Err(msg) => {
                 emit_session_error_event(&st, &id, &msg);
                 Err(ApiError {

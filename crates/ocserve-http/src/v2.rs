@@ -3687,6 +3687,27 @@ async fn run_v2_command_turn(
             .and_then(|c| c.get("template").and_then(|v| v.as_str()))
             .map(str::to_string)
     };
+    // `/goal` is a BUILT-IN command (upstream: a command.transform entry from
+    // the built-in plugin, not a template). Its advertised entry has
+    // `template: ""` because the v1 Command schema requires the field, so it
+    // must be matched here by name — before the template lookup, which would
+    // otherwise treat the empty template as a vanished command and fail every
+    // `/goal` admitted through this surface.
+    let is_builtin_goal = name == "goal"
+        && st.goals_enabled
+        && template.as_deref().map(str::is_empty).unwrap_or(true);
+    if is_builtin_goal {
+        st.writer
+            .write(vec![ocserve_store::inbox::deliver_ops(item_id)])?;
+        if let Err(msg) = crate::goal_loop::start_goal(st, sid, text, false).await {
+            // Upstream's command execute failure surfaces as an error to the
+            // caller; our v2 admission already returned 204, so the honest
+            // equivalent is the session error event clients already render.
+            crate::emit_session_error_event(st, sid, &msg);
+            anyhow::bail!("goal command failed: {msg}");
+        }
+        return Ok(());
+    }
     let Some(template) = template else {
         // Command vanished between admit and run: deliver + loud error part.
         st.writer
