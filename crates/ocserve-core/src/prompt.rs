@@ -1843,13 +1843,23 @@ pub async fn run_prompt_with(
     for p in &req.parts {
         if p["type"] == "text" {
             let text = p["text"].as_str().unwrap_or("").to_string();
-            user_parts.push(json!({
+            let mut part = json!({
                 "id": prt_id(),
                 "sessionID": session_id,
                 "messageID": user_msg_id,
                 "type": "text",
                 "text": text,
-            }));
+            });
+            // `TextPart` carries `synthetic` and `metadata` (sdk openapi
+            // 1.19.5). Dropping them lost the goal tag on every continuation,
+            // which is what the stall detector and the timeline both read.
+            if let Some(syn) = p.get("synthetic") {
+                part["synthetic"] = syn.clone();
+            }
+            if let Some(md) = p.get("metadata") {
+                part["metadata"] = md.clone();
+            }
+            user_parts.push(part);
         } else if p["type"] == "file" || p["type"] == "agent" {
             let ptype = p["type"].as_str().unwrap_or("file").to_string();
             user_parts.push(json!({
@@ -2076,11 +2086,21 @@ pub async fn run_prompt_with(
         };
         let mut messages = vec![ChatMessage::text("system", ctx.system.clone())];
         if opts.skip_history {
-            // transient instruction carries the serialized history (summarize)
-            messages.push(ChatMessage::text(
-                "user",
-                opts.prelude.clone().unwrap_or_default(),
-            ));
+            // Transient instruction carries the serialized history (summarize).
+            // With NO prelude the instruction is the request's own text — this
+            // was a real bug: `/api/experimental/generate`, the decisions
+            // route and the goal reviewer all set skip_history, so the model
+            // received an EMPTY user message and every caller silently got a
+            // reply to nothing.
+            let text = opts.prelude.clone().unwrap_or_else(|| {
+                req.parts
+                    .iter()
+                    .filter(|p| p["type"] == "text")
+                    .filter_map(|p| p["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+            messages.push(ChatMessage::text("user", text));
         } else {
             // Perf (bounded prompt load): a 56k-message session is 85 MB of
             // stored parts while the 8 MB history budget keeps only the tail
@@ -2138,6 +2158,22 @@ pub async fn run_prompt_with(
             // pretended.
             let history = transform_messages(ctx, session_id, &history).await;
             messages.extend(to_provider_messages(&history));
+            // A non-persisted prompt is still the instruction FOR THIS RUN:
+            // `persist_user: false` means "do not write a row", never "do not
+            // send it". The goal reviewer needs the conversation as evidence
+            // AND its judge question; without this it asked an empty question.
+            if !opts.persist_user {
+                let text: String = req
+                    .parts
+                    .iter()
+                    .filter(|p| p["type"] == "text")
+                    .filter_map(|p| p["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    messages.push(ChatMessage::text("user", text));
+                }
+            }
         }
         // NOTE: `tools_enabled=false` removes the tool SCHEMAS from the
         // request; it is not an execution boundary. A provider that emits an

@@ -231,10 +231,15 @@ async fn used_tools_since(st: &Arc<AppState>, sid: &str, goal_id: &str) -> bool 
         // messages in every real case, and when it is not, the fallback
         // below counts the round as progress (upstream semantics).
         let msgs = ocserve_store::tail_messages(db, &sid_owned, 200)?;
-        let start = msgs.iter().rposition(|(info, _)| {
+        // The goal tag lives on the PART (`TextPart.metadata`, sdk 1.19.5);
+        // `UserMessage` has no metadata field at all.
+        let start = msgs.iter().rposition(|(info, parts)| {
             let role = info["role"].as_str().unwrap_or("");
-            let gid = info["metadata"]["goalID"].as_str().unwrap_or("");
-            (role == "synthetic" || role == "user") && gid == goal_id
+            role == "user"
+                && parts.iter().any(|p| {
+                    p["metadata"]["source"].as_str() == Some("goal")
+                        && p["metadata"]["goalID"].as_str() == Some(goal_id.as_str())
+                })
         });
         let Some(start) = start else { return Ok(true) };
         Ok(msgs[start + 1..].iter().any(|(info, parts)| {

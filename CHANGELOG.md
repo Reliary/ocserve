@@ -44,6 +44,16 @@ differs is a named `D-*` row in the ledger at `PLAN.md §18`.
   so they cannot silently go stale on the next bump.
 
 ### Fixed
+- **Transient generation sent an empty prompt.** Every caller of the
+  transient executor (`/api/experimental/generate`, `generate/text`,
+  `generate/decisions` and the goal reviewer) set `skip_history`, and with no
+  prelude the model received a user message with an empty string: the
+  instruction was never sent. Fixed for both shapes (skip-history and a
+  history run with `persist_user: false`), which also un-hid the reviewer.
+- **Synthetic text parts lost their metadata.** A goal continuation is tagged
+  `{source:"goal", goalID}` on the PART (`TextPart.metadata`, per the 1.19.5
+  contract); persistence dropped it, so the stall detector and any timeline
+  saw an ordinary user message.
 - **Config-declared providers could not authenticate** ([issue #28]): the API
   key was read only from the auth layer, so a key in `opencode.json` reached
   the provider as a bare `Bearer `. Three sources are now honoured in upstream's
