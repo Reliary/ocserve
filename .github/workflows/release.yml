@@ -94,10 +94,18 @@ jobs:
           python3 -m pip install --quiet --user ziglang
           python3 -c "import ziglang,os;print(os.path.dirname(ziglang.__file__))" > /tmp/zigdir
           echo "PATH=$HOME/.local/bin:$(cat /tmp/zigdir):$PATH" >> "$GITHUB_ENV"
-          # Pinned for the same reason as ci.yml: cargo-zigbuild 0.24.1's cmake
-          # toolchain points ASM at a 0.24.0 wrapper path, which breaks
-          # BoringSSL's `enable_language(ASM)` in a fresh cache.
-          cargo install --quiet --locked cargo-zigbuild --version 0.24.0
+          cargo install --quiet --locked cargo-zigbuild
+          # CMake CACHES CMAKE_ASM_COMPILER in CMakeCache.txt inside
+          # boring-sys's build dir, and cargo-zigbuild records ABSOLUTE wrapper
+          # paths that are version-scoped. A restored target cache therefore
+          # pairs the NEW toolchain with the PREVIOUS run's wrapper path, and
+          # cmake fails with "CMAKE_ASM_COMPILER ... is not a full path to an
+          # existing compiler tool". On 2026-11-05 two consecutive runs failed
+          # with the two versions INVERTED, which is the signature of a cache
+          # one run behind - not of a broken cargo-zigbuild release, so the
+          # version is deliberately NOT pinned. Start both caches empty; the
+          # BoringSSL rebuild costs about a minute.
+          rm -rf "$HOME/.cache/cargo-zigbuild" "target/x86_64-unknown-linux-musl/release/build/boring-sys-"*
 
       - name: build
         shell: bash

@@ -190,13 +190,18 @@ jobs:
           python3 -m pip install --quiet --user ziglang
           python3 -c "import ziglang,os;print(os.path.dirname(ziglang.__file__))" > /tmp/zigdir
           echo "PATH=$HOME/.local/bin:$(cat /tmp/zigdir):$PATH" >> "$GITHUB_ENV"
-          # PIN (2026-11-05): cargo-zigbuild 0.24.1 ships a cmake toolchain
-          # whose ASM compiler still points at the 0.24.0 wrapper path, which
-          # does not exist in a fresh cache — BoringSSL's `enable_language(ASM)`
-          # then fails with "not a full path to an existing compiler tool".
-          # 0.24.0 is the last version where the musl build is green. Unpin only
-          # after verifying a newer release builds BoringSSL for musl.
-          cargo install --quiet --locked cargo-zigbuild --version 0.24.0
+          cargo install --quiet --locked cargo-zigbuild
+          # CMake CACHES CMAKE_ASM_COMPILER in CMakeCache.txt inside
+          # boring-sys's build dir, and cargo-zigbuild records ABSOLUTE wrapper
+          # paths that are version-scoped. A restored target cache therefore
+          # pairs the NEW toolchain with the PREVIOUS run's wrapper path, and
+          # cmake fails with "CMAKE_ASM_COMPILER ... is not a full path to an
+          # existing compiler tool". On 2026-11-05 two consecutive runs failed
+          # with the two versions INVERTED, which is the signature of a cache
+          # one run behind - not of a broken cargo-zigbuild release, so the
+          # version is deliberately NOT pinned. Start both caches empty; the
+          # BoringSSL rebuild costs about a minute.
+          rm -rf "$HOME/.cache/cargo-zigbuild" "target/x86_64-unknown-linux-musl/release/build/boring-sys-"*
       - name: cargo zigbuild
         run: RUSTFLAGS="-D warnings" cargo zigbuild --release -p ocserve --target x86_64-unknown-linux-musl
       - name: assert static
