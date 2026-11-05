@@ -292,10 +292,45 @@ export function makeV2Context({
     reference: readDomain("reference", state, {
       list: async () => (await fetchJson("GET", "/api/reference"))?.data,
     }),
-    vcs: unbridgedDomain("vcs", state, []),
-    websearch: unbridgedDomain("websearch", state, []),
-    worktree: unbridgedDomain("worktree", state, []),
-    generate: unbridgedDomain("generate", state, []),
+    // vcs / worktree / websearch: every verb ocserve serves is proxied. Each
+    // route is bound and pair-checked; a false divergence here would tell a
+    // plugin a present capability is absent (the class fixed for
+    // model/provider/agent). `transform`/`reload` are NOT bridged (upstream
+    // lets a plugin REPLACE the vcs/worktree provider); they stay throwing with
+    // the named divergence, because a plugin replacing git is not a route.
+    vcs: readDomain("vcs", state, {
+      info: async () => (await fetchJson("GET", "/api/vcs"))?.data,
+      base: async () => (await fetchJson("GET", "/api/vcs/base"))?.data,
+      branches: async (input) => {
+        const q = input && input.search ? `?search=${encodeURIComponent(input.search)}` : "";
+        return (await fetchJson("GET", `/api/vcs/branch${q}`))?.data;
+      },
+      status: async () => (await fetchJson("GET", "/api/vcs/status"))?.data,
+      diff: async (input) => {
+        const params = new URLSearchParams();
+        if (input && input.mode) params.set("mode", input.mode);
+        if (input && input.base) params.set("base", input.base);
+        if (input && input.context !== undefined) params.set("context", String(input.context));
+        if (input && input.untracked) params.set("untracked", input.untracked);
+        const q = params.toString();
+        return (await fetchJson("GET", `/api/vcs/diff${q ? "?" + q : ""}`))?.data;
+      },
+    }),
+    websearch: readDomain("websearch", state, {
+      list: async () => (await fetchJson("GET", "/api/websearch/provider"))?.data,
+    }),
+    worktree: readDomain("worktree", state, {
+      list: async () => (await fetchJson("GET", "/api/worktree"))?.data,
+      create: async (input) =>
+        (await fetchJson("POST", "/api/worktree", input))?.data,
+      remove: async (input) =>
+        (await fetchJson("DELETE", "/api/worktree", input))?.data,
+    }),
+    // Stateless generation: real (the transient executor). The deprecated
+    // `ctx.generate.text` alias and `ctx.experimental.generate` share it.
+    generate: readDomain("generate", state, {
+      text: async (input) => (await fetchJson("POST", "/api/experimental/generate/text", input))?.data,
+    }),
     // `experimental.terminal.read` is a real verb we do not implement; keep it
     // throwing on use (there is no registration form for it).
     experimental: {
@@ -343,7 +378,21 @@ function readDomain(name, state, verbs) {
     return registration(pending, callback);
   };
   base.reload = async () => {};
-  return base;
+  // Unknown verbs keep the honest named divergence. A plain object would make
+  // them `undefined`, so a plugin calling one crashes with
+  // "ctx.vcs.apply is not a function" — an unactionable TypeError instead of
+  // a named gap (the exact class this shim exists to remove). Known verbs and
+  // `then` (await-safety) pass through.
+  return new Proxy(base, {
+    get(target, prop) {
+      if (prop in target || typeof prop !== "string" || prop === "then") {
+        return target[prop];
+      }
+      return () => {
+        throw new Error(`D-V2-DOMAIN: ctx.${name}.${prop} is not bridged in ocserve`);
+      };
+    },
+  });
 }
 
 function unbridgedDomain(name, state, pending) {

@@ -59,7 +59,8 @@ domains are reported in the plugin inventory as `unbridged_transforms`.
 | `command.reload` / `skill.reload` | **bridged** — marks a reload; the next reconcile (or the boot-time pass) re-runs the pull |
 | `session`/`permission` (REST half) | **bridged** — each verb bound to the route that exists (`/api/session/{id}`, `/message`, `/context`, `/history`, `/inbox`, `/diff`; `/api/permission/saved`, `/request`). Unbound verbs throw `D-V2-DOMAIN`. |
 | `model` / `provider` / `agent` / `integration` / `reference` | **read half bridged** | `list`/`get` proxy the bound `/api/*` route through the verified table. The EDIT half (`transform`) is recorded and reported (`D-V2-TOOL-EDITOR` class, `unbridged_transforms`): these payloads feed registries and system-prompt assembly, so editing only the served list would be shape-without-mutation (A1 rule). |
-| `mcp` / `vcs` / `websearch` / `worktree` / `generate` / `aisdk` / `experimental` | **diverged** `D-V2-DOMAIN` — honest throwing proxies: a plugin that calls one gets a named error at the call site, never a crash at setup and never a fabricated success. `transform`/`reload` are still accepted and recorded so one gap cannot fail the whole plugin. |
+| `vcs` / `worktree` / `websearch` / `generate` | **bound** for every verb ocserve serves (`/api/vcs*`, `/api/worktree*`, `/api/websearch/provider`, `/api/experimental/generate/text`). `transform`/`reload` on vcs/worktree/websearch stay recorded-but-unbridged (`D-V2-DOMAIN-TRANSFORM`): upstream lets a plugin REPLACE the git/worktree/search provider, which is not a route. |
+| `mcp` / `aisdk` / `experimental` | **diverged** `D-V2-DOMAIN` — honest throwing proxies: a plugin that calls one gets a named error at the call site, never a crash at setup and never a fabricated success. `transform`/`reload` are still accepted and recorded so one gap cannot fail the whole plugin. |
 
 ## RPC dispatch
 

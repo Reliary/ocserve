@@ -28,6 +28,14 @@ differs is a named `D-*` row in the ledger at `PLAN.md §18`.
   app calls those routes on boot. An explicit `OCSERVE_V2=0` still wins.
 
 ### Changed
+- The v2 plugin `ctx` domains `vcs`, `worktree`, `websearch` and `generate` are
+  now bound to the routes ocserve already serves; they were honest throwing
+  proxies even though every verb worked, which told a plugin a present
+  capability was absent (the same class fixed earlier for model, provider and
+  agent). Their `transform`/`reload` editors stay recorded-but-inert with a
+  named row, because replacing the git/worktree/search provider is not a
+  route. Unknown verbs on any bridged domain still throw a NAMED error rather
+  than an undefined-function TypeError.
 - **The v1 freeze moved to upstream 1.19.5** (from 1.18.31), adopted through the
   `bump.sh v1` pipeline rather than by hand. The wire contract is unchanged:
   188 operations over the same 162 paths, two schema descriptions, one additive
