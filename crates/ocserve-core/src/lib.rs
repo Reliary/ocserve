@@ -13,6 +13,7 @@ pub mod coordinator;
 pub mod env_contract;
 pub mod event;
 pub mod form;
+pub mod goal;
 pub mod ids;
 pub mod loop_guard;
 pub mod permission;

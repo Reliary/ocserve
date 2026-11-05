@@ -109,6 +109,7 @@ where
 pub mod compress;
 pub mod doc;
 pub mod embedded_ui;
+pub mod goal_loop;
 pub mod pty;
 pub mod tui;
 pub mod ui;
@@ -355,6 +356,9 @@ pub struct AppState {
     pub pty: std::sync::Arc<ocserve_pty::PtyManager>,
     /// User CORS allowlist (config `server.cors` + `--cors`), read once at boot
     pub cors_extra: Vec<String>,
+    /// `/goal` loop master switch (upstream ships it built in; ours is on by
+    /// default with a kill switch, `OCSERVE_GOAL=0`).
+    pub goals_enabled: bool,
     /// Paths a v2 client asked to watch (`POST /api/experimental/fs/watch`).
     /// We have no watcher, so this is an accepted-set only: the route is bound
     /// and truthful about not emitting `file.watch` (D-FS-WATCH).
@@ -666,6 +670,7 @@ impl AppState {
             ui: crate::ui::UiProxy::from_env(),
             pty,
             cors_extra: read_cors_env(),
+            goals_enabled: std::env::var("OCSERVE_GOAL").as_deref() != Ok("0"),
             fs_watches: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
             db: w.db,
             blobs: w.blobs,
@@ -3766,6 +3771,13 @@ pub(crate) async fn lock_session(st: &Arc<AppState>, sid: &str) -> Result<LockRe
 /// session actually has queued work. A v1-only deployment pays one query per
 /// completed turn.
 pub(crate) async fn wake_inbox_after_turn(st: &Arc<AppState>, sid: &str) {
+    // `/goal` idle hook (upstream `experimental.idle`): fires whenever a turn
+    // finishes, BEFORE the v2-only inbox wake, because a goal is a v1-visible
+    // feature too. It either continues the loop (session busy again) or
+    // settles the goal.
+    if st.goals_enabled {
+        crate::goal_loop::after_turn(st, sid).await;
+    }
     if !st.v2_enabled {
         return;
     }
@@ -4877,14 +4889,42 @@ async fn post_command(
             .find(|c| c["name"].as_str() == Some(name))
             .and_then(|c| c["template"].as_str())
             .map(str::to_string);
-        let names = payloads
+        let mut names: Vec<String> = payloads
             .command
             .iter()
             .filter_map(|c| c["name"].as_str().map(str::to_string))
             .collect();
+        // Built-in command (upstream's built-in plugin adds it through
+        // command.transform; we add it at the same list so both surfaces see
+        // it). Additive: it never shadows a user command of the same name
+        // because the handler above checks `goal` first only when the user
+        // has not defined one — see the template lookup order.
+        if st.goals_enabled && !names.iter().any(|n| n == "goal") {
+            names.push("goal".to_string());
+        }
         (t, names)
     };
     let available: Vec<&str> = available_owned.iter().map(String::as_str).collect();
+
+    // `/goal` is built in (upstream adds it through command.transform, not a
+    // template). It is checked only when the user has NOT defined a `goal`
+    // command: a user's template always wins, as it does upstream.
+    if template.is_none() && name == "goal" && st.goals_enabled {
+        let objective = arguments.trim();
+        return match crate::goal_loop::start_goal(&st, &id, objective, false).await {
+            Ok(v) => Ok(Json(json!({"info": v, "parts": []}))),
+            Err(msg) => {
+                emit_session_error_event(&st, &id, &msg);
+                Err(ApiError {
+                    status: StatusCode::BAD_REQUEST,
+                    name: "BadRequest",
+                    message: msg,
+                }
+                .into())
+            }
+        };
+    }
+
     let Some(template) = template.as_deref() else {
         let msg = format!(
             "Command not found: \"{name}\".{}",

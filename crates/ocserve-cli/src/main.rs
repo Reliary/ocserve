@@ -1065,6 +1065,13 @@ async fn serve(
             }
         });
     }
+    // A goal armed by an EARLIER process comes back paused, never resuming on
+    // its own (upstream's boot scan; a goal shown as running while nothing
+    // drives it is worse than a paused one). Runs before the router so no
+    // request can observe a stale active goal.
+    if state.goals_enabled {
+        ocserve_http::goal_loop::pause_goals_from_earlier_boots(&state).await;
+    }
     let app = ocserve_http::router(state.clone());
 
     // W3 opt-in prewarm (default off): fetch the entry HTML's referenced

@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 16;
+pub const SCHEMA_VERSION: i64 = 17;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -201,6 +201,19 @@ CREATE TABLE session_environment (
     variables    TEXT NOT NULL DEFAULT '{}',
     time_updated INTEGER NOT NULL
 ) STRICT;
+CREATE TABLE session_goal (
+    session_id  TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+    id          TEXT NOT NULL,
+    objective   TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    reason      TEXT,
+    rounds      INTEGER NOT NULL DEFAULT 0,
+    max_rounds  INTEGER NOT NULL DEFAULT 50,
+    stalls      INTEGER,
+    boot        TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL
+) STRICT;
+CREATE INDEX idx_goal_status ON session_goal(status);
 CREATE TABLE schedule (
     id             TEXT PRIMARY KEY,
     session_id     TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
@@ -892,6 +905,29 @@ CREATE TABLE IF NOT EXISTS session_environment (
                         ON schedule(status, next_due_ms);
                     CREATE INDEX IF NOT EXISTS idx_schedule_session
                         ON schedule(session_id, time_created);",
+                    )?;
+                }
+                16 => {
+                    // v16->v17: the `/goal` loop's per-session state (a port of
+                    // upstream's v2 built-in `opencode.goal` plugin, which keeps
+                    // it in plugin storage). One row per session: children and
+                    // forks start without a goal, exactly as upstream's
+                    // per-session storage key does. Pure CREATE, no data move.
+                    conn.execute_batch(
+                        "CREATE TABLE IF NOT EXISTS session_goal (
+                        session_id  TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE,
+                        id          TEXT NOT NULL,
+                        objective   TEXT NOT NULL,
+                        status      TEXT NOT NULL,
+                        reason      TEXT,
+                        rounds      INTEGER NOT NULL DEFAULT 0,
+                        max_rounds  INTEGER NOT NULL DEFAULT 50,
+                        stalls      INTEGER,
+                        boot        TEXT NOT NULL,
+                        updated_at  INTEGER NOT NULL
+                    ) STRICT;
+                    CREATE INDEX IF NOT EXISTS idx_goal_status
+                        ON session_goal(status);",
                     )?;
                 }
                 other => {

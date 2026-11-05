@@ -1,0 +1,8 @@
+tag: 2.2.5
+source: packages/core/src/plugin/goal/*.txt
+files: 4
+sha256:
+a8c7cea3b1a984d25b598d1fb2bcc5a7d1d6d73f8fc07a265c48014733eea9ad  continuation.txt
+78882799017b598905f36e11f2670221bdb3a53a874e198c67af885ea3edf6ac  judge.txt
+fd51f6fefbaba5b774224e7228950582a6533efbd6632551523840c9aec59cdf  kickoff.txt
+ec5e34bf4e88ed1b0aac5683bfef627390f1ccedea09f578d59f24d72aaf2cb2  reminder.txt

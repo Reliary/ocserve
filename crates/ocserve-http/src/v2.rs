@@ -2211,6 +2211,36 @@ pub async fn rpc_unimplemented(
     // Phase 3: dispatch to a v2 plugin that registered {rpcID, method}. When a
     // plugin serves the id this is a real call; otherwise the exact
     // `rpc.unavailable` error (same behavior for the same state — parity).
+    // Built-in RPC ids are served from our own state BEFORE any plugin
+    // dispatch: `opencode.goal` is upstream's built-in goal plugin, and
+    // ocserve implements it natively (the same contract: `get` returns
+    // Goal.State or null). A user plugin registering the same id would shadow
+    // it upstream; here the built-in wins, recorded as D-GOAL-RPC-PRECEDENCE
+    // because no such plugin exists for either server today.
+    if rpc_id == "opencode.goal" && method == "get" {
+        let sid = input
+            .get("sessionID")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if sid.is_empty() {
+            return Err(crate::HttpError::TaggedData {
+                status: StatusCode::BAD_REQUEST,
+                tag: "InvalidRequestError",
+                fields: json!({"message": "Missing key\n  at [\"sessionID\"]", "kind": "Payload"}),
+            });
+        }
+        let db = st.db.clone();
+        let goal = crate::run_blocking(&db, move |db| ocserve_store::get_goal(db, &sid))
+            .await
+            .map_err(|e| crate::HttpError::TaggedData {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                tag: "ServiceUnavailableError",
+                fields: json!({"message": format!("{e:#}")}),
+            })?;
+        use axum::response::IntoResponse;
+        return Ok(Json(json!({"data": goal.map(|g| g.to_json())})).into_response());
+    }
     ocserve_metrics::labeled_counter("ocserve_rpc_calls_total", "result=\"dispatch\"", 1);
     if let Some(plug) = st.plugins.get() {
         let reg = match ocserve_core::prompt::plugin_handle(Some(plug)).await {

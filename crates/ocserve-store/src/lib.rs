@@ -7,6 +7,7 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 use rusqlite::OptionalExtension;
+use std::path::Path;
 
 pub mod blob;
 pub mod cgroup;
@@ -1573,6 +1574,20 @@ pub fn load_messages(
 /// the model sees at most the 8 MB budget). Ordering is `seq`, exactly like
 /// [`load_messages`], so a late-inserted legacy-sync row stays ordered by
 /// insertion — never by timestamp.
+/// A bounded TAIL of a session's messages, newest `n` (chronological order).
+///
+/// Use this instead of `load_messages(db, sid, Some(n))` from a request path:
+/// the bound is the point, and naming it makes the read auditable (guard rule
+/// 3 bans unbounded `load_messages` in HTTP). n is clamped to 1000 so a caller
+/// cannot turn this into the whole-session materialization the guard targets.
+pub fn tail_messages(
+    db: &std::path::Path,
+    session_id: &str,
+    n: usize,
+) -> anyhow::Result<Vec<(serde_json::Value, Vec<serde_json::Value>)>> {
+    load_messages(db, session_id, Some(n.clamp(1, 1000)))
+}
+
 pub fn load_messages_since(
     db: &std::path::Path,
     session_id: &str,
@@ -5172,4 +5187,165 @@ mod memo_switch_table {
         );
         assert!(!memo_enabled(Some(false), None), "override wins over unset");
     }
+}
+
+// ---------------------------------------------------------------------------
+// `/goal` state (schema v17) — one row per session, mirroring upstream's
+// per-session plugin-storage key. Reads go through the reader; writes go
+// through the single writer funnel like every other row.
+// ---------------------------------------------------------------------------
+
+/// The goal row, as stored. The wire shape is assembled by
+/// `ocserve_core::goal::Goal::to_json` so the field names live in one place.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoalRow {
+    pub id: String,
+    pub objective: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub rounds: i64,
+    pub max_rounds: i64,
+    pub stalls: Option<i64>,
+    pub boot: String,
+    pub updated_at: i64,
+}
+
+impl GoalRow {
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "id": self.id,
+            "objective": self.objective,
+            "status": self.status,
+            "rounds": self.rounds,
+            "maxRounds": self.max_rounds,
+            "boot": self.boot,
+            "updatedAt": self.updated_at,
+        });
+        if let Some(r) = &self.reason {
+            v["reason"] = serde_json::json!(r);
+        }
+        if let Some(s) = self.stalls {
+            v["stalls"] = serde_json::json!(s);
+        }
+        v
+    }
+}
+
+fn now_ms_store() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+pub fn get_goal(db: &Path, session_id: &str) -> anyhow::Result<Option<GoalRow>> {
+    let r = pragma::open_reader(db)?;
+    let row = r
+        .query_row(
+            "SELECT id, objective, status, reason, rounds, max_rounds, stalls, boot, updated_at \
+               FROM session_goal WHERE session_id = ?1",
+            [session_id],
+            |x| {
+                Ok(GoalRow {
+                    id: x.get(0)?,
+                    objective: x.get(1)?,
+                    status: x.get(2)?,
+                    reason: x.get(3)?,
+                    rounds: x.get(4)?,
+                    max_rounds: x.get(5)?,
+                    stalls: x.get(6)?,
+                    boot: x.get(7)?,
+                    updated_at: x.get(8)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Replace (or clear, with `None`) a session's goal. One statement, one
+/// commit: a goal write is never partially visible.
+pub fn set_goal(writer: &Writer, session_id: &str, row: Option<&GoalRow>) -> anyhow::Result<()> {
+    let ops = match row {
+        Some(g) => vec![
+            writer::WriteOp::Sql {
+                sql: "INSERT OR REPLACE INTO session_goal \
+                      (session_id, id, objective, status, reason, rounds, max_rounds, stalls, boot, updated_at) \
+                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"
+                    .into(),
+                params: vec![
+                    serde_json::json!(session_id),
+                    serde_json::json!(g.id),
+                    serde_json::json!(g.objective),
+                    serde_json::json!(g.status),
+                    serde_json::json!(g.reason),
+                    serde_json::json!(g.rounds),
+                    serde_json::json!(g.max_rounds),
+                    serde_json::json!(g.stalls),
+                    serde_json::json!(g.boot),
+                    serde_json::json!(g.updated_at),
+                ],
+            },
+            writer::WriteOp::Sql {
+                sql: "INSERT OR REPLACE INTO event \
+                      (session_id, type, payload, time_created, seq) \
+                      VALUES (?1, 'session.goal.updated', '{}', ?2, \
+                              (SELECT COALESCE(MAX(seq),0)+1 FROM event WHERE session_id = ?1))"
+                    .into(),
+                params: vec![
+                    serde_json::json!(session_id),
+                    serde_json::json!(now_ms_store()),
+                ],
+            },
+        ],
+        None => vec![
+            writer::WriteOp::Sql {
+                sql: "DELETE FROM session_goal WHERE session_id = ?1".into(),
+                params: vec![serde_json::json!(session_id)],
+            },
+            writer::WriteOp::Sql {
+                sql: "INSERT OR REPLACE INTO event \
+                      (session_id, type, payload, time_created, seq) \
+                      VALUES (?1, 'session.goal.updated', '{}', ?2, \
+                              (SELECT COALESCE(MAX(seq),0)+1 FROM event WHERE session_id = ?1))"
+                    .into(),
+                params: vec![
+                    serde_json::json!(session_id),
+                    serde_json::json!(now_ms_store()),
+                ],
+            },
+        ],
+    };
+    writer.write(ops)?;
+    Ok(())
+}
+
+/// Every ACTIVE goal, for the boot scan that pauses goals left by an earlier
+/// process (upstream: "a goal armed by an earlier process comes back paused").
+pub fn active_goals(db: &Path) -> anyhow::Result<Vec<(String, GoalRow)>> {
+    let r = pragma::open_reader(db)?;
+    let mut stmt = r.prepare(
+        "SELECT session_id, id, objective, status, reason, rounds, max_rounds, stalls, boot, updated_at \
+           FROM session_goal WHERE status = 'active'",
+    )?;
+    let rows = stmt
+        .query_map([], |x| {
+            Ok((
+                x.get::<_, String>(0)?,
+                GoalRow {
+                    id: x.get(1)?,
+                    objective: x.get(2)?,
+                    status: x.get(3)?,
+                    reason: x.get(4)?,
+                    rounds: x.get(5)?,
+                    max_rounds: x.get(6)?,
+                    stalls: x.get(7)?,
+                    boot: x.get(8)?,
+                    updated_at: x.get(9)?,
+                },
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
 }

@@ -165,6 +165,13 @@ pub const CONTRACT: &[Var] = &[
     ),
     op(
         "Prompts and providers",
+        "OCSERVE_GOAL",
+        "1 (on)",
+        "0 = off, any other value = on",
+        "Master switch for the built-in `/goal` autonomy loop (upstream ships it as a built-in v2 plugin). Off leaves the command undiscovered and the idle hook inert.",
+    ),
+    op(
+        "Prompts and providers",
         "OCSERVE_PROMPT_MAX_COST_USD",
         "0 (off)",
         "0 = off, else USD",

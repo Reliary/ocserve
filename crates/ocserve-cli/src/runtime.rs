@@ -1239,6 +1239,13 @@ fn merge_agent(item: &mut Value, value: &Value) {
 }
 
 fn build_commands(cfg: &Value) -> Result<Vec<Value>> {
+    build_commands_with(cfg, std::env::var("OCSERVE_GOAL").as_deref() != Ok("0"))
+}
+
+/// `build_commands` with the goal switch as a PARAMETER: env is process-global,
+/// this crate forbids `unsafe`, and `set_var` is unsafe since Rust 2024, so the
+/// switch must be injectable for testing.
+fn build_commands_with(cfg: &Value, goals: bool) -> Result<Vec<Value>> {
     let init = include_str!("../assets/initialize.txt");
     let review = include_str!("../assets/review.txt");
     // Built-in skill command (freeze parity): v1 skill/index.ts registers
@@ -1284,6 +1291,25 @@ fn build_commands(cfg: &Value) -> Result<Vec<Value>> {
             "template": customize, "hints": <Vec<String>>::new(),
         }),
     ];
+    // `/goal` is a built-in command (upstream: a command.transform entry from
+    // its built-in goal plugin, not a template). It has no template because
+    // its argument is state; the command handler branches on the name. Listed
+    // here so both surfaces can discover it. A user command named `goal`
+    // below replaces it (upstream's transform also lets a user command win).
+    if goals
+        && !cfg
+            .get("command")
+            .and_then(|v| v.as_object())
+            .is_some_and(|m| m.contains_key("goal"))
+    {
+        cmds.push(json!({
+            "name": "goal",
+            "description": "keep working until an objective is met [pause|resume|clear]",
+            "source": "command",
+            "template": "",
+            "hints": <Vec<String>>::new(),
+        }));
+    }
     if let Some(commands) = cfg.get("command").and_then(|v| v.as_object()) {
         for (name, c) in commands {
             let template = c
@@ -1501,6 +1527,45 @@ impl Runtime {
             systems,
             default_agent,
         })
+    }
+}
+
+#[cfg(test)]
+mod goal_command_tests {
+    #[test]
+    fn goal_is_advertised_with_no_template() {
+        let cmds = super::build_commands_with(&serde_json::json!({}), true).expect("commands");
+        let goal = cmds
+            .iter()
+            .find(|c| c["name"] == "goal")
+            .expect("goal advertised");
+        // No template: its argument is STATE, and the command handler branches
+        // on the name before template lookup.
+        assert_eq!(goal["template"], "");
+        assert_eq!(goal["source"], "command");
+    }
+
+    #[test]
+    fn a_user_goal_command_wins() {
+        let cmds = super::build_commands_with(
+            &serde_json::json!({
+                "command": {"goal": {"template": "mine $ARGUMENTS", "description": "user"}}
+            }),
+            true,
+        )
+        .expect("commands");
+        let goals: Vec<&serde_json::Value> = cmds.iter().filter(|c| c["name"] == "goal").collect();
+        assert_eq!(goals.len(), 1, "exactly one goal command");
+        assert_eq!(goals[0]["template"], "mine $ARGUMENTS");
+    }
+
+    #[test]
+    fn kill_switch_hides_the_command() {
+        let cmds = super::build_commands_with(&serde_json::json!({}), false).expect("commands");
+        assert!(
+            cmds.iter().all(|c| c["name"] != "goal"),
+            "the kill switch hides it"
+        );
     }
 }
 
