@@ -30,5 +30,6 @@ parking_lot.workspace = true
 futures-util.workspace = true
 
 [dev-dependencies]
+ocserve-llm.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"

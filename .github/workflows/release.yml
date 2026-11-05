@@ -94,7 +94,10 @@ jobs:
           python3 -m pip install --quiet --user ziglang
           python3 -c "import ziglang,os;print(os.path.dirname(ziglang.__file__))" > /tmp/zigdir
           echo "PATH=$HOME/.local/bin:$(cat /tmp/zigdir):$PATH" >> "$GITHUB_ENV"
-          cargo install --quiet --locked cargo-zigbuild
+          # Pinned for the same reason as ci.yml: cargo-zigbuild 0.24.1's cmake
+          # toolchain points ASM at a 0.24.0 wrapper path, which breaks
+          # BoringSSL's `enable_language(ASM)` in a fresh cache.
+          cargo install --quiet --locked cargo-zigbuild --version 0.24.0
 
       - name: build
         shell: bash

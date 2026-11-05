@@ -67,7 +67,7 @@ step "corpus: splice byte-parity over live db" \
       cargo test -p ocserve-store --test splice_parity -- --nocapture
 step "corpus: media-part provider encoding over live db" \
   env OCSERVE_MEDIA_DB="${OCSERVE_DATA_DIR:-$HOME/.local/share/ocserve}/ocserve.db" \
-      cargo test -p ocserve-core --lib media_corpus --offline -- --nocapture
+      cargo test -p ocserve-core --test media_corpus --offline -- --nocapture
 step "corpus: session-list wire parity over live db" \
   env OCSERVE_LIST_PARITY_DB="${OCSERVE_DATA_DIR:-$HOME/.local/share/ocserve}/ocserve.db" \
       cargo test -p ocserve-store --test list_wire_parity -- --nocapture

@@ -56,6 +56,17 @@ Both API surfaces moved to the current upstream releases: the v1 freeze to
   so they cannot silently go stale on the next bump.
 
 ### Fixed
+- **CI: the musl build broke on a `cargo-zigbuild` regression.** 0.24.1 ships a
+  cmake toolchain whose ASM compiler points at the 0.24.0 wrapper path, which
+  does not exist in a fresh cache, so BoringSSL's `enable_language(ASM)` failed.
+  Pinned to 0.24.0 in both `ci.yml` and `release.yml` with the reason recorded;
+  unpin only after a newer release builds BoringSSL for musl.
+- **CI: rule 58 flagged its own test knobs on macOS.** The media corpus gate
+  read `OCSERVE_MEDIA_DB`/`OCSERVE_MEDIA_PLANT` from `src/`, and the guard's
+  allowlist branch was itself broken (it flagged any env read on the same line
+  as a listed name). The gate now lives in `tests/media_corpus.rs` where a
+  test-only reader belongs, so the allowlist entries were removed rather than
+  widened.
 - **Transient generation sent an empty prompt.** Every caller of the
   transient executor (`/api/experimental/generate`, `generate/text`,
   `generate/decisions` and the goal reviewer) set `skip_history`, and with no
