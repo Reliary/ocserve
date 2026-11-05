@@ -106,7 +106,7 @@ jobs:
         run: cargo build --release -p ocserve
 
       - name: upload binary artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v4.6.0
         with:
           name: ocserve-linux-x86_64
           path: target/release/ocserve
@@ -272,7 +272,7 @@ jobs:
           exit 0
       - name: upload check log
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v4.6.0
         with:
           name: check-${{ matrix.os }}
           path: check.log
@@ -305,7 +305,7 @@ jobs:
           exit "$rc"
       - name: upload pty log
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v4.6.0
         with:
           name: pty-${{ matrix.os }}
           path: pty.log
