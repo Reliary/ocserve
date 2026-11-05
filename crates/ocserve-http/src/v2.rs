@@ -3595,6 +3595,11 @@ pub(crate) async fn drain_session(st: Arc<AppState>, sid: String) {
     drop(release);
     let _ = ocserve_store::claim::release(&st.writer, &sid);
     let _ = crate::emit_durable_http(&st, &sid, "session.execution.succeeded", json!({}));
+    // The idle hook must fire for the v2 grammar too: a goal armed through
+    // `/api/session/{id}/command` was advanced by the v1 prompt path only, so
+    // a v2-only deployment could arm a goal that never reviews (2026-11-05
+    // review). Deduplicated + non-blocking inside the hook.
+    crate::goal_loop::spawn_wake_public(&st, &sid);
 }
 
 /// Run one admitted inbox item through the shared executor: deliver (delete

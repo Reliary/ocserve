@@ -154,6 +154,11 @@ pub async fn after_turn(st: &Arc<AppState>, sid: &str) -> bool {
     }
     let mut latest = latest;
     match verdict.verdict {
+        // Unreachable by construction: `review` rejects `wait` when no shell
+        // is running, and this server's shell registry carries no session id,
+        // so the judge is always told "No background shells are running"
+        // (D-GOAL-NO-BACKGROUND-SHELLS). Kept for parity with the verdict
+        // union; it must not leave the goal active.
         VerdictKind::Wait => false,
         VerdictKind::Done => {
             settle(st, sid, &mut latest, Status::Complete, &verdict.reason).await;
@@ -194,7 +199,8 @@ pub async fn after_turn(st: &Arc<AppState>, sid: &str) -> bool {
             })
             .await;
             let text = continuation(&latest.objective, &verdict);
-            continue_turn(st, sid, &text, &latest.id, true)
+            spawn_driver(st, sid, text, latest.id.clone(), true);
+            true
         }
     }
 }
@@ -218,6 +224,7 @@ async fn settle(
     })
     .await;
     tracing::info!("goal {} session={sid}: {reason}", status.as_str());
+    announce(st, sid, &goal.to_json());
 }
 
 /// Whether the model called any tool since the goal's last kickoff or
@@ -279,11 +286,17 @@ async fn review(
         }
     };
     let writer = st.writer.clone();
-    const TRANSIENT_ID: &str = "ses_transient_goal_reviewer";
+    // THE SESSION'S OWN ID. The judge must read the conversation it is
+    // judging ("using only evidence in the conversation above", judge.txt);
+    // history is loaded by session id, so a synthetic id made every review
+    // run against an EMPTY conversation and the model could only guess.
+    // Upstream's `ctx.session.generate({sessionID})` runs against the real
+    // session for the same reason. `persist_user:false` + `transient` keep
+    // the judge turn out of history and off every session-scoped emission.
     let res = ocserve_core::prompt::run_prompt_with(
         &ctx,
         &writer,
-        TRANSIENT_ID,
+        sid,
         &req,
         ocserve_core::prompt::RunOpts {
             persist_user: false,
@@ -360,9 +373,16 @@ pub(crate) async fn run_turn_now(
     extra_parts: Vec<Value>,
     model: Option<ocserve_core::wire::ModelRef>,
 ) -> anyhow::Result<(Value, Vec<Value>)> {
-    let release = crate::lock_session(st, sid)
-        .await
-        .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    let release = match crate::lock_session(st, sid).await {
+        Ok(r) => r,
+        Err(e) => {
+            // The state was already persisted by `arm`. Without a turn the
+            // goal would sit ACTIVE with no driver (2026-11-05 review), so a
+            // refusal pauses it rather than pretending it is running.
+            pause_goal(st, sid, &format!("The goal could not start: {}", e.message)).await;
+            return Err(anyhow::anyhow!("{}", e.message));
+        }
+    };
     let guard = release.arc().lock().await;
     // With attachments the kickoff rides as the user's own message (upstream's
     // `attached` branch); a bare kickoff is a synthetic notice.
@@ -378,8 +398,14 @@ pub(crate) async fn run_turn_now(
         parts,
         ..Default::default()
     };
-    let ctx =
-        crate::build_prompt_context(st, &req, sid).map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    let ctx = match crate::build_prompt_context(st, &req, sid) {
+        Ok(c) => c,
+        Err(e) => {
+            drop(guard);
+            pause_goal(st, sid, &format!("The goal could not start: {}", e.message)).await;
+            return Err(anyhow::anyhow!("{}", e.message));
+        }
+    };
     let writer = st.writer.clone();
     let out = ocserve_core::prompt::run_prompt_with(
         &ctx,
@@ -399,7 +425,7 @@ pub(crate) async fn run_turn_now(
             // reviewer is a real model call, and the v1 command response must
             // not wait on a second completion. Upstream's command returns once
             // the synthetic kickoff is delivered, for the same reason.
-            spawn_wake(st, sid);
+            spawn_wake_public(st, sid);
             Ok((info, parts))
         }
         Err(e) => {
@@ -417,19 +443,35 @@ pub(crate) async fn run_turn_now(
                 )
                 .await;
             }
-            spawn_wake(st, sid);
+            spawn_wake_public(st, sid);
             Err(e)
         }
     }
 }
 
-/// Fire the idle hook on the runtime without making the caller wait for the
-/// reviewer completion.
-fn spawn_wake(st: &Arc<AppState>, sid: &str) {
+/// Fire the goal idle hook on the runtime without making the caller wait for
+/// the reviewer completion.
+///
+/// This MUST call `after_turn` directly. An earlier version called
+/// `wake_inbox_after_turn`, which calls this function again; the dedup guard
+/// then suppressed the inner call and the reviewer never ran (caught by the
+/// goal e2e on the first run).
+pub(crate) fn spawn_wake_public(st: &Arc<AppState>, sid: &str) {
+    // One pending review per session. Overlapping wakes (a user turn and a
+    // goal turn finishing together) would both call the reviewer and both
+    // spawn a continuation, doubling rounds and cost (2026-11-05 review).
+    {
+        let mut w = st.goal_wakes.lock();
+        if w.contains(sid) {
+            return;
+        }
+        w.insert(sid.to_string());
+    }
     let st2 = st.clone();
     let sid2 = sid.to_string();
     tokio::spawn(async move {
-        crate::wake_inbox_after_turn(&st2, &sid2).await;
+        after_turn(&st2, &sid2).await;
+        st2.goal_wakes.lock().remove(&sid2);
     });
 }
 
@@ -517,43 +559,78 @@ pub(crate) async fn goal_control_notice(
     Ok(json!({"info": info, "parts": [part], "goal": state}))
 }
 
-/// Start a continuation turn on the session (synthetic user message with the
-/// goal metadata, then a normal prompt turn through the shared executor).
-fn continue_turn(
-    st: &Arc<AppState>,
-    sid: &str,
-    text: &str,
-    goal_id: &str,
-    synthetic: bool,
-) -> bool {
+/// Spawn a goal continuation turn, TRACKED so `/abort`, session delete and
+/// `/goal pause|clear` actually stop it.
+///
+/// Before every turn the driver re-reads the goal and refuses to run unless it
+/// is still ACTIVE and still the same goal id. Without the status check a
+/// `/goal pause` sent during a reviewer call still ran the queued continuation
+/// to completion (2026-11-05 review); without the registry entry, `/abort`
+/// cancelled only the current prompt task, not the loop that respawns it.
+fn spawn_driver(st: &Arc<AppState>, sid: &str, text: String, goal_id: String, synthetic: bool) {
+    static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // One driver per session: replace (and cancel) a stale one.
+    if let Some((_, old)) = st.goal_tasks.lock().remove(sid) {
+        old.abort();
+    }
     let st2 = st.clone();
     let sid2 = sid.to_string();
-    let text2 = text.to_string();
-    let goal_id2 = goal_id.to_string();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
+        // Re-check right before the turn: the goal may have been paused,
+        // cleared or replaced while this task waited for the lock.
+        let current = crate::run_blocking(&st2.db, {
+            let db = st2.db.clone();
+            let sid3 = sid2.clone();
+            move |_| ocserve_store::get_goal(&db, &sid3)
+        })
+        .await
+        .ok()
+        .flatten();
+        let still_active = current.as_ref().is_some_and(|g| {
+            g.id == goal_id && g.status == Status::Active.as_str() && g.boot == boot_id()
+        });
+        if !still_active {
+            return;
+        }
         let release = match crate::lock_session(&st2, &sid2).await {
             Ok(r) => r,
             Err(_) => return,
         };
         let guard = release.arc().lock().await;
+        // Second check under the lock: a pause that landed between the read
+        // and the acquire must still win.
+        let current = crate::run_blocking(&st2.db, {
+            let db = st2.db.clone();
+            let sid3 = sid2.clone();
+            move |_| ocserve_store::get_goal(&db, &sid3)
+        })
+        .await
+        .ok()
+        .flatten();
+        let still_active = current.as_ref().is_some_and(|g| {
+            g.id == goal_id && g.status == Status::Active.as_str() && g.boot == boot_id()
+        });
+        if !still_active {
+            drop(guard);
+            return;
+        }
         let req = ocserve_core::wire::PromptRequest {
             message_id: None,
             model: None,
-            parts: vec![goal_part(&text2, &goal_id2, synthetic)],
+            parts: vec![goal_part(&text, &goal_id, synthetic)],
             ..Default::default()
         };
         let ctx = match crate::build_prompt_context(&st2, &req, &sid2) {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(
-                    "goal continuation context failed session={sid2}: {}",
-                    e.message
-                );
+                tracing::warn!("goal turn context failed session={sid2}: {}", e.message);
+                drop(guard);
                 return;
             }
         };
         let writer = st2.writer.clone();
-        match ocserve_core::prompt::run_prompt_with(
+        if let Err(e) = ocserve_core::prompt::run_prompt_with(
             &ctx,
             &writer,
             &sid2,
@@ -565,14 +642,57 @@ fn continue_turn(
         )
         .await
         {
-            Ok(_) => {}
-            Err(e) => tracing::error!("goal continuation failed session={sid2}: {e:#}"),
+            tracing::error!("goal turn failed session={sid2}: {e:#}");
         }
         drop(guard);
-        // The turn finished: judge again (this is the loop).
-        crate::wake_inbox_after_turn(&st2, &sid2).await;
+        // The turn finished: judge again (this is the loop). Only if the goal
+        // is still active; a paused/cleared goal must not be resurrected.
+        let current = crate::run_blocking(&st2.db, {
+            let db = st2.db.clone();
+            let sid3 = sid2.clone();
+            move |_| ocserve_store::get_goal(&db, &sid3)
+        })
+        .await
+        .ok()
+        .flatten();
+        let still_active = current.as_ref().is_some_and(|g| {
+            g.id == goal_id && g.status == Status::Active.as_str() && g.boot == boot_id()
+        });
+        // Unregister by TOKEN: a replacement driver spawned while this one
+        // was finishing must not be removed by the outgoing task.
+        {
+            let mut m = st2.goal_tasks.lock();
+            if m.get(&sid2).is_some_and(|(t, _)| *t == token) {
+                m.remove(&sid2);
+            }
+        }
+        if still_active {
+            crate::wake_inbox_after_turn(&st2, &sid2).await;
+        }
     });
-    true
+    st.goal_tasks
+        .lock()
+        .insert(sid.to_string(), (token, handle));
+}
+
+/// Pause the goal if it is still active, with `reason`. Used on the paths
+/// where a kickoff was requested but no turn could run.
+async fn pause_goal(st: &Arc<AppState>, sid: &str, reason: &str) {
+    let db = st.db.clone();
+    let sid_owned = sid.to_string();
+    if let Ok(Some(mut g)) =
+        crate::run_blocking(&db, move |db| ocserve_store::get_goal(db, &sid_owned)).await
+        && g.status == Status::Active.as_str()
+    {
+        settle(st, sid, &mut g, Status::Paused, reason).await;
+    }
+}
+
+/// Cancel a session's goal driver (abort / delete / pause / clear).
+pub fn cancel_driver(st: &Arc<AppState>, sid: &str) {
+    if let Some((_, h)) = st.goal_tasks.lock().remove(sid) {
+        h.abort();
+    }
 }
 
 /// Start `/goal <objective>`: persist the state and send the kickoff prompt
@@ -653,6 +773,8 @@ pub(crate) async fn arm(st: &Arc<AppState>, sid: &str, objective: &str) -> Resul
         })
         .await;
     }
+    let state = row.to_json();
+    announce(st, sid, &state);
     Ok(Arm::Armed {
         row,
         text: kickoff(&objective),
@@ -662,6 +784,19 @@ pub(crate) async fn arm(st: &Arc<AppState>, sid: &str, objective: &str) -> Resul
 /// v2 command path: persist + spawn the kickoff, returning the goal state.
 /// Upstream's command `execute` is asynchronous (`session.synthetic` wakes
 /// the loop) and the HTTP caller already has its 204, so this must not block.
+/// Publish a goal state change on the live bus. Uses `session.updated` with
+/// an additive `goal` member rather than a bespoke event type: the frozen
+/// Event union has no `session.goal.*` variant, and an unknown type is
+/// rejected by the nightly event validator (and ignored by every client).
+pub(crate) fn announce(st: &Arc<AppState>, sid: &str, goal: &Value) {
+    let dir = st.paths["directory"].as_str().unwrap_or("/");
+    st.bus.publish(ocserve_core::event::frame(
+        dir,
+        "session.updated",
+        json!({"sessionID": sid, "goal": goal}),
+    ));
+}
+
 pub async fn start_goal(
     st: &Arc<AppState>,
     sid: &str,
@@ -699,6 +834,7 @@ async fn control(st: &Arc<AppState>, sid: &str, which: &str) -> Result<serde_jso
             if goal.status != Status::Active.as_str() {
                 return Err("No active goal to pause.".to_string());
             }
+            cancel_driver(st, sid);
             goal.status = Status::Paused.as_str().to_string();
             goal.reason = Some("Paused by the user".to_string());
             goal.updated_at = now;
@@ -740,6 +876,7 @@ async fn control(st: &Arc<AppState>, sid: &str, which: &str) -> Result<serde_jso
             Ok(goal.to_json())
         }
         _ => {
+            cancel_driver(st, sid);
             let w = st.writer.clone();
             let sid_owned = sid.to_string();
             let _ =
@@ -777,51 +914,7 @@ fn usage(goal: Option<&ocserve_store::GoalRow>) -> String {
 /// Kickoff/resume delivery: synthetic by default (the timeline shows one
 /// notice row), or a real user message when the command carried attachments.
 fn continue_with_text(st: &Arc<AppState>, sid: &str, text: &str, goal_id: &str, as_user: bool) {
-    if as_user {
-        // Upstream's `attached` branch: with attachments only a real prompt
-        // can carry them, so the kickoff is a USER message, not a notice.
-        continue_turn(st, sid, text, goal_id, false);
-        return;
-    }
-    let st2 = st.clone();
-    let sid2 = sid.to_string();
-    let text2 = text.to_string();
-    let goal_id2 = goal_id.to_string();
-    tokio::spawn(async move {
-        let release = match crate::lock_session(&st2, &sid2).await {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-        let guard = release.arc().lock().await;
-        let req = ocserve_core::wire::PromptRequest {
-            message_id: None,
-            model: None,
-            parts: vec![goal_part(&text2, &goal_id2, true)],
-            ..Default::default()
-        };
-        let ctx = match crate::build_prompt_context(&st2, &req, &sid2) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("goal kickoff context failed session={sid2}: {}", e.message);
-                return;
-            }
-        };
-        let writer = st2.writer.clone();
-        if let Err(e) = ocserve_core::prompt::run_prompt_with(
-            &ctx,
-            &writer,
-            &sid2,
-            &req,
-            ocserve_core::prompt::RunOpts {
-                auto_title: false,
-                ..Default::default()
-            },
-        )
-        .await
-        {
-            tracing::error!("goal kickoff failed session={sid2}: {e:#}");
-        }
-        drop(guard);
-        crate::wake_inbox_after_turn(&st2, &sid2).await;
-    });
+    // Upstream's `attached` branch runs a real prompt; both are the same turn
+    // here except for the `synthetic` flag (a notice vs the user's message).
+    spawn_driver(st, sid, text.to_string(), goal_id.to_string(), !as_user);
 }

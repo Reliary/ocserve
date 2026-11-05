@@ -502,3 +502,125 @@ async fn a_user_goal_template_beats_the_builtin() {
         "a user template named goal must not arm the built-in loop"
     );
 }
+
+/// REGRESSION (2026-11-05 SRE review, HIGH): the reviewer ran against a
+/// SYNTHETIC session id (`ses_transient_goal_reviewer`), so the history loader
+/// found nothing and the judge was asked to judge a conversation it could not
+/// see. It must run against the REAL session so the evidence reaches the wire.
+#[tokio::test(flavor = "multi_thread")]
+async fn reviewer_sees_the_conversation_it_judges() {
+    // A provider that records whether the REVIEWER request carried the unique
+    // evidence marker the session history holds.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let saw_evidence = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw2 = saw_evidence.clone();
+    std::thread::spawn(move || {
+        for sock in listener.incoming().flatten() {
+            let saw = saw2.clone();
+            std::thread::spawn(move || {
+                let mut sock = sock;
+                let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut got = Vec::new();
+                let mut buf = [0u8; 8192];
+                let head_end = loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(k) => got.extend_from_slice(&buf[..k]),
+                    }
+                    if let Some(pos) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&got[..head_end]).to_string();
+                let clen = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while got.len() < head_end + clen {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(k) => got.extend_from_slice(&buf[..k]),
+                    }
+                }
+                let body = String::from_utf8_lossy(&got[head_end..]).to_string();
+                let is_reviewer = body.contains("You are now the reviewer");
+                if is_reviewer && body.contains("EVIDENCE-MARKER-9F3A") {
+                    saw.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let reply = if is_reviewer {
+                    r#"{"verdict":"done","reason":"evidence present"}"#
+                } else {
+                    "working on it"
+                };
+                let sse = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                     cache-control: no-cache\r\nconnection: close\r\n\r\n\
+                     data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n\
+                     data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n\
+                     data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":10,\
+                     \"completion_tokens\":2,\"total_tokens\":12}}}}\n\n\
+                     data: [DONE]\n\n",
+                    serde_json::to_string(reply).unwrap()
+                );
+                let _ = sock.write_all(sse.as_bytes());
+            });
+        }
+    });
+
+    let st = setup(addr, "ses_goalhistory");
+    // Put a real user+assistant exchange carrying the marker into the session.
+    let now = 1_790_000_000_000i64;
+    ocserve_store::insert_message(
+        &st.writer,
+        None,
+        "ses_goalhistory",
+        &json!({
+            "id": "msg_hist_user", "sessionID": "ses_goalhistory", "role": "user",
+            "time": {"created": now}, "summary": {"diffs": []},
+        }),
+        &[json!({"id": "prt_hist_u", "sessionID": "ses_goalhistory",
+                 "messageID": "msg_hist_user", "type": "text",
+                 "text": "earlier work EVIDENCE-MARKER-9F3A"})],
+    )
+    .unwrap();
+    ocserve_store::insert_message(
+        &st.writer,
+        None,
+        "ses_goalhistory",
+        &json!({
+            "id": "msg_hist_ai", "sessionID": "ses_goalhistory", "role": "assistant",
+            "time": {"created": now + 1, "completed": now + 2},
+            "parentID": "msg_hist_user", "finish": "stop",
+            "modelID": "m", "providerID": "fake", "mode": "build", "agent": "build",
+            "path": {"cwd": "/w", "root": "/"}, "cost": 0.0,
+            "tokens": {"total": 0, "input": 0, "output": 0, "reasoning": 0,
+                       "cache": {"write": 0, "read": 0}},
+        }),
+        &[json!({"id": "prt_hist_a", "sessionID": "ses_goalhistory",
+                 "messageID": "msg_hist_ai", "type": "text",
+                 "text": "checked: tests pass"})],
+    )
+    .unwrap();
+
+    let a = router(&st);
+    let _ = req(
+        &a,
+        "POST",
+        "/session/ses_goalhistory/command",
+        Some(json!({"command": "goal", "arguments": "finish it"})),
+    )
+    .await;
+    let g = wait_goal(&st, "ses_goalhistory", "complete", 20).await;
+    assert_eq!(g["reason"], "evidence present");
+    assert!(
+        saw_evidence.load(std::sync::atomic::Ordering::SeqCst),
+        "the reviewer request must carry the session's conversation \
+         (the judge ran against a synthetic id and saw nothing)"
+    );
+}

@@ -363,6 +363,14 @@ pub struct AppState {
     /// We have no watcher, so this is an accepted-set only: the route is bound
     /// and truthful about not emitting `file.watch` (D-FS-WATCH).
     pub fs_watches: parking_lot::Mutex<std::collections::BTreeSet<String>>,
+    /// The spawned goal driver per session (one at a time). `/abort`, session
+    /// delete and `/goal pause|clear` cancel it; without this the loop kept
+    /// running to completion after the user asked it to stop (2026-11-05
+    /// review). Bound: one entry per armed goal, removed by its own task.
+    pub goal_tasks:
+        parking_lot::Mutex<std::collections::HashMap<String, (u64, tokio::task::JoinHandle<()>)>>,
+    /// Sessions with a pending goal wake (dedup: one reviewer per idle point).
+    pub goal_wakes: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 /// LLM endpoint resolution for the prompt runner (assembled by Runtime).
@@ -672,6 +680,8 @@ impl AppState {
             cors_extra: read_cors_env(),
             goals_enabled: std::env::var("OCSERVE_GOAL").as_deref() != Ok("0"),
             fs_watches: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
+            goal_tasks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            goal_wakes: parking_lot::Mutex::new(std::collections::HashSet::new()),
             db: w.db,
             blobs: w.blobs,
             writer: w.writer,
@@ -3775,8 +3785,12 @@ pub(crate) async fn wake_inbox_after_turn(st: &Arc<AppState>, sid: &str) {
     // finishes, BEFORE the v2-only inbox wake, because a goal is a v1-visible
     // feature too. It either continues the loop (session busy again) or
     // settles the goal.
+    // FIRE AND FORGET: the goal hook ends in a REVIEWER model call. Awaiting
+    // it here made every `/message` and `/prompt_async` on a goal session wait
+    // for a second full completion (2026-11-05 review). `spawn_wake` runs the
+    // hook on the runtime; the hook itself already spawns the next turn.
     if st.goals_enabled {
-        crate::goal_loop::after_turn(st, sid).await;
+        crate::goal_loop::spawn_wake_public(st, sid);
     }
     if !st.v2_enabled {
         return;
@@ -4088,6 +4102,7 @@ async fn delete_session_route(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    crate::goal_loop::cancel_driver(&st, &id);
     if let Some((_, handle)) = st.prompt_tasks.lock().remove(&id) {
         handle.abort();
     }
@@ -4118,6 +4133,9 @@ async fn post_abort(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    // A goal loop re-spawns turns, so aborting the current prompt alone would
+    // let it continue: cancel the driver FIRST, then the turn.
+    crate::goal_loop::cancel_driver(&st, &id);
     if let Some((_, handle)) = st.prompt_tasks.lock().remove(&id) {
         handle.abort();
         tracing::info!("abort: cancelled prompt task for {id}");

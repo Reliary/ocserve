@@ -86,3 +86,55 @@ fn deleting_a_session_drops_its_goal() {
         "FK cascade must drop the goal with the session"
     );
 }
+
+/// REGRESSION (2026-11-05 SRE review, reproduced): the goal write used to
+/// compute `seq` as `MAX(seq)+1 WHERE session_id = ?` and `INSERT OR REPLACE`
+/// — a per-session aggregate written into a GLOBAL primary key. Arming a goal
+/// on session B could therefore REPLACE (delete) session A's event at the same
+/// seq. Both goal writes now use plain INSERT with AUTOINCREMENT.
+#[test]
+fn goal_writes_do_not_clobber_another_sessions_events() {
+    let (dir, w) = setup();
+    let db = db_path(dir.path());
+    w.write(vec![ocserve_store::writer::WriteOp::Sql {
+        sql: "INSERT INTO session (id, time_created, time_updated) VALUES ('ses_b', 1, 1)".into(),
+        params: vec![],
+    }])
+    .unwrap();
+    // Session A's FIRST event: global seq 1 (the collision target).
+    w.write(vec![ocserve_store::writer::WriteOp::Sql {
+        sql: "INSERT INTO event (session_id, project_id, type, payload, time_created) \
+              VALUES ('ses_g', 'global', 'session.updated@v1', '{\"a\":1}', 1)"
+            .into(),
+        params: vec![],
+    }])
+    .unwrap();
+    let before: i64 = {
+        let r = ocserve_store::pragma::open_reader(&db).unwrap();
+        r.query_row("SELECT count(*) FROM event", [], |x| x.get(0))
+            .unwrap()
+    };
+    // Arm goals on BOTH sessions: the OLD code computed seq=1 for each (its
+    // own session had none) and REPLACE deleted A's row.
+    ocserve_store::set_goal(&w, "ses_g", Some(&row("active", 0))).unwrap();
+    ocserve_store::set_goal(&w, "ses_b", Some(&row("active", 0))).unwrap();
+    let after: i64 = {
+        let r = ocserve_store::pragma::open_reader(&db).unwrap();
+        r.query_row("SELECT count(*) FROM event", [], |x| x.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        before, after,
+        "arming a goal must not insert or delete ANY event row"
+    );
+    let a_payload: String = {
+        let r = ocserve_store::pragma::open_reader(&db).unwrap();
+        r.query_row(
+            "SELECT payload FROM event WHERE session_id='ses_g' AND type LIKE 'session.updated%'",
+            [],
+            |x| x.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(a_payload, "{\"a\":1}", "session A's event survived intact");
+}

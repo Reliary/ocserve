@@ -56,6 +56,31 @@ Both API surfaces moved to the current upstream releases: the v1 freeze to
   so they cannot silently go stale on the next bump.
 
 ### Fixed
+- **Goal-loop reliability review findings (2026-11-05).** Six defects found by
+  a production-reliability review, all fixed and covered:
+  - The reviewer ran against a synthetic session id, so the history loader
+    found nothing and the judge could only guess. It now runs against the real
+    session (`persist_user:false` + `transient` keep it out of history).
+  - Goal writes computed `seq` as a per-session `MAX(seq)+1` into the GLOBAL
+    event primary key with `INSERT OR REPLACE`, so arming a goal on one session
+    could delete another session's event. Both writes are gone: nothing read
+    the row, and its type was not in the frozen Event union.
+  - Continuations were untracked spawns: `/abort`, session delete and
+    `/goal pause|clear` did not stop the loop, which re-spawned after each
+    turn. A tracked driver per session now re-checks the goal id and status
+    before every turn, and is cancelled by all four paths.
+  - The idle hook awaited the reviewer, so `/message` and `/prompt_async` on a
+    goal session waited for a second full model call. It is now fire-and-forget
+    with one pending review per session (overlapping wakes could double rounds).
+  - A kickoff that could not acquire the session lock or build its context left
+    an ACTIVE goal with no driver; it now pauses with the reason.
+  - The v2 drain never fired the idle hook, so a goal armed through the v2
+    command route could never be reviewed.
+  Goal state changes are now announced on the live bus as `session.updated`
+  with an additive `goal` member (the frozen union has no goal event type).
+  The unreachable 30-minute wait timer was NOT implemented: the shell registry
+  carries no session id, so the judge is never told about a running shell;
+  recorded as `D-GOAL-NO-BACKGROUND-SHELLS` rather than shipping dead code.
 - **`/goal` was unreachable from every real client.** The built-in entry is
   advertised with `template: ""` because the v1 `Command` schema requires the
   field, but the dispatcher tested `template.is_none()`. That predicate is true

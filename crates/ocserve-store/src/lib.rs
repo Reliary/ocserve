@@ -5231,13 +5231,6 @@ impl GoalRow {
     }
 }
 
-fn now_ms_store() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 pub fn get_goal(db: &Path, session_id: &str) -> anyhow::Result<Option<GoalRow>> {
     let r = pragma::open_reader(db)?;
     let row = r
@@ -5286,33 +5279,11 @@ pub fn set_goal(writer: &Writer, session_id: &str, row: Option<&GoalRow>) -> any
                     serde_json::json!(g.updated_at),
                 ],
             },
-            writer::WriteOp::Sql {
-                sql: "INSERT OR REPLACE INTO event \
-                      (session_id, type, payload, time_created, seq) \
-                      VALUES (?1, 'session.goal.updated', '{}', ?2, \
-                              (SELECT COALESCE(MAX(seq),0)+1 FROM event WHERE session_id = ?1))"
-                    .into(),
-                params: vec![
-                    serde_json::json!(session_id),
-                    serde_json::json!(now_ms_store()),
-                ],
-            },
         ],
         None => vec![
             writer::WriteOp::Sql {
                 sql: "DELETE FROM session_goal WHERE session_id = ?1".into(),
                 params: vec![serde_json::json!(session_id)],
-            },
-            writer::WriteOp::Sql {
-                sql: "INSERT OR REPLACE INTO event \
-                      (session_id, type, payload, time_created, seq) \
-                      VALUES (?1, 'session.goal.updated', '{}', ?2, \
-                              (SELECT COALESCE(MAX(seq),0)+1 FROM event WHERE session_id = ?1))"
-                    .into(),
-                params: vec![
-                    serde_json::json!(session_id),
-                    serde_json::json!(now_ms_store()),
-                ],
             },
         ],
     };
