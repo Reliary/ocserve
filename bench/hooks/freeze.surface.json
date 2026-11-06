@@ -1,6 +1,6 @@
 {
   "sdk_note": "payload surface captured from the reference implementation, not inferred from types",
-  "records": 278,
+  "records": 284,
   "sequence": [
     "chat.message",
     "chat.message",
@@ -30,6 +30,12 @@
     "tool.definition",
     "experimental.chat.messages.transform",
     "experimental.chat.messages.transform",
+    "experimental.chat.system.transform",
+    "experimental.chat.system.transform",
+    "chat.params",
+    "chat.params",
+    "chat.headers",
+    "chat.headers",
     "experimental.chat.system.transform",
     "experimental.chat.system.transform",
     "chat.params",

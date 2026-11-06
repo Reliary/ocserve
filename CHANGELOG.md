@@ -56,7 +56,18 @@ Both API surfaces moved to the current upstream releases: the v1 freeze to
   so they cannot silently go stale on the next bump.
 
 ### Fixed
-- **Goal loop: context hook, failure pause, observability (2026-11-05).**
+- **v2-only routes now serve the exact contract envelope (nightly gate).**
+  The nightly `spec-validate` caught `VIOL /api/experimental/usage/limits
+  [location] Additional properties are not allowed ('project' was unexpected)`.
+  Root cause was the D-V2-UNION envelope applied where no union is needed: the
+  `{directory, project}` location shape exists because a single port serves
+  both client families, but routes ABSENT from the frozen 1.18.31 contract have
+  no v1 caller at all. All 41 v2-only handlers now use `api_location_ref`
+  (`{directory}` only, the contract's `Location.PublicRef`), and the eight
+  allowlist entries that had been papering over the extra member were removed
+  rather than kept. Shared routes keep the union. Verified: spec-validate-v2
+  36 checked / 0 violations (was 36/1), pair-v2 0 divergences, 847 tests.
+
   - The non-persisted goal reminder (upstream `goal.ts:219-231`) was compiled
     into the binary and never used, so an overnight goal lost its objective as
     soon as a compaction dropped the kickoff from the filtered history. It is

@@ -19,7 +19,7 @@
 //! normalizes the v2 body and calls the same `ocserve_core::prompt::run_prompt`
 //! executor the v1 routes use (single owner of the state machine).
 
-use crate::{ApiError, AppState, HttpError, api_location, run_blocking};
+use crate::{ApiError, AppState, HttpError, api_location, api_location_ref, run_blocking};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -925,7 +925,7 @@ pub async fn model_default(State(st): State<Arc<AppState>>) -> impl IntoResponse
         .and_then(|m| m.get(&mid))
         .cloned();
     let data = found.map(|m| project_model_v2(&m)).unwrap_or(Value::Null);
-    Json(json!({"location": api_location(&st), "data": data}))
+    Json(json!({"location": api_location_ref(&st), "data": data}))
 }
 
 /// GET /api/debug/location — known location directories (the session
@@ -998,7 +998,7 @@ pub async fn plugin_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             }
         }
     }
-    Json(json!({"location": api_location(&st), "data": data}))
+    Json(json!({"location": api_location_ref(&st), "data": data}))
 }
 
 /// POST /api/experimental/fs/write?path= — write request body bytes to the
@@ -1597,7 +1597,7 @@ pub async fn ppty_session_read(
 /// GET /api/shell — `{location, data: Shell.Info[]}` status snapshot.
 pub async fn shell_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
-    Json(json!({"location": api_location(&st), "data": st.shells.list()})).into_response()
+    Json(json!({"location": api_location_ref(&st), "data": st.shells.list()})).into_response()
 }
 
 /// POST /api/shell — spawn (`{command!, cwd?, timeout?}` → enveloped info).
@@ -1667,7 +1667,7 @@ pub async fn shell_output(
     use axum::response::IntoResponse;
     // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     match st.shells.output(&id) {
-        Some(out) => Json(json!({"location": api_location(&st), "data": out})).into_response(),
+        Some(out) => Json(json!({"location": api_location_ref(&st), "data": out})).into_response(),
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({"name": "NotFoundError", "data": {"message": format!("shell not found: {id}")}})),
@@ -2411,7 +2411,7 @@ pub async fn agent_detail_api(
     drop(payloads);
     match found {
         Some(a) => Ok(Json(
-            json!({"location": api_location(&st), "data": crate::api_agent_item(&a)}),
+            json!({"location": api_location_ref(&st), "data": crate::api_agent_item(&a)}),
         )),
         None => Err(crate::HttpError::TaggedData {
             status: StatusCode::NOT_FOUND,
@@ -3930,7 +3930,7 @@ pub async fn list_mcp(State(st): State<Arc<AppState>>) -> impl IntoResponse {
                 .collect()
         })
         .unwrap_or_default();
-    Json(json!({"location": api_location(&st), "data": data}))
+    Json(json!({"location": api_location_ref(&st), "data": data}))
 }
 
 /// GET /api/mcp/resource — resource + template catalog (empty unless servers
@@ -3938,7 +3938,7 @@ pub async fn list_mcp(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 /// is honestly empty, not fabricated).
 pub async fn mcp_resource(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({
-        "location": api_location(&st),
+        "location": api_location_ref(&st),
         "data": {"resources": [], "templates": []},
     }))
 }
@@ -3959,7 +3959,7 @@ pub async fn vcs_get(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     })
     .await
     .unwrap_or_else(|_| json!({"branch": {"current": Value::Null, "default": Value::Null}}));
-    Json(json!({"location": api_location(&st), "data": info}))
+    Json(json!({"location": api_location_ref(&st), "data": info}))
 }
 
 /// GET /api/vcs/status — `{location, data: FileStatus[]}`.
@@ -3970,7 +3970,7 @@ pub async fn vcs_status(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     })
     .await
     .unwrap_or_else(|_| Value::Array(vec![]));
-    Json(json!({"location": api_location(&st), "data": status}))
+    Json(json!({"location": api_location_ref(&st), "data": status}))
 }
 
 /// GET /api/vcs/diff — `{location, data: FileDiff[]}` (same mode/context
@@ -3996,7 +3996,7 @@ pub async fn vcs_diff(
     })
     .await
     .unwrap_or_else(|_| Value::Array(vec![]));
-    Json(json!({"location": api_location(&st), "data": diff})).into_response()
+    Json(json!({"location": api_location_ref(&st), "data": diff})).into_response()
 }
 
 /// GET /api/vcs/base + /api/vcs/branch — thin git queries (branch name +
@@ -4008,7 +4008,7 @@ pub async fn vcs_base(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     })
     .await
     .unwrap_or_else(|_| Value::Null);
-    Json(json!({"location": api_location(&st), "data": base}))
+    Json(json!({"location": api_location_ref(&st), "data": base}))
 }
 
 /// GET /api/vcs/branch — `{location, data: string[]}` local branches.
@@ -4019,7 +4019,7 @@ pub async fn vcs_branch(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     })
     .await
     .unwrap_or_else(|_| Value::Array(vec![]));
-    Json(json!({"location": api_location(&st), "data": branches}))
+    Json(json!({"location": api_location_ref(&st), "data": branches}))
 }
 
 // ---------------------------------------------------------------------------
@@ -4250,7 +4250,7 @@ pub async fn form_list_global(State(st): State<Arc<AppState>>) -> Result<Json<Va
     // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     // v2 `form.list` is a Location.response — envelope required.
     Ok(Json(
-        json!({"location": api_location(&st), "data": st.form_gate.list()}),
+        json!({"location": api_location_ref(&st), "data": st.form_gate.list()}),
     ))
 }
 
@@ -5393,7 +5393,7 @@ pub async fn create_session(
 /// Live 2.2.5 with no GPU/workspace auth answers `{"data":null}`; the schema
 /// requires `workspace`+`budgets` when non-null, so null is the honest empty.
 pub async fn usage_limits(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(json!({"location": api_location(&st), "data": null}))
+    Json(json!({"location": api_location_ref(&st), "data": null}))
 }
 
 /// GET /api/experimental/voice/models — `{data:{models:[…], default?}}`.

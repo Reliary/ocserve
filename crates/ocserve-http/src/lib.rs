@@ -920,6 +920,17 @@ pub(crate) fn api_location(st: &AppState) -> Value {
     })
 }
 
+/// The v2 contract's `Location.PublicRef` envelope: `{directory}` ONLY.
+///
+/// v2-only routes have no v1 caller (they are absent from the frozen 1.18.31
+/// contract), so there is no union to serve and the extra `project` member is
+/// an `additionalProperties:false` violation — caught by the nightly
+/// `spec-validate` on `/api/experimental/usage/limits`. The union shape stays
+/// for routes BOTH surfaces bind; v2-only routes serve the contract exactly.
+pub(crate) fn api_location_ref(st: &AppState) -> Value {
+    json!({"directory": st.paths["directory"].as_str().unwrap_or("/")})
+}
+
 /// GET /api/agent — v2-shaped agent list (permission triple renamed to
 /// {action, resource, effect}; natives-first order; no plugin agents).
 async fn get_api_agent(
