@@ -624,3 +624,114 @@ async fn reviewer_sees_the_conversation_it_judges() {
          (the judge ran against a synthetic id and saw nothing)"
     );
 }
+
+/// The goal CONTEXT HOOK (upstream goal.ts:219-231): on a USER turn of an
+/// active goal whose objective is no longer in view (a compaction dropped the
+/// kickoff), a non-persisted reminder must reach the provider. This is what
+/// keeps an overnight goal on task after history is summarized.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_user_turn_on_an_active_goal_carries_the_reminder() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let saw = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw2 = saw.clone();
+    std::thread::spawn(move || {
+        for sock in listener.incoming().flatten() {
+            let saw = saw2.clone();
+            std::thread::spawn(move || {
+                let mut sock = sock;
+                let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut got = Vec::new();
+                let mut buf = [0u8; 8192];
+                let head_end = loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(k) => got.extend_from_slice(&buf[..k]),
+                    }
+                    if let Some(pos) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&got[..head_end]).to_string();
+                let clen = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while got.len() < head_end + clen {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(k) => got.extend_from_slice(&buf[..k]),
+                    }
+                }
+                let body = String::from_utf8_lossy(&got[head_end..]).to_string();
+                if body.contains("UNIQUE-GOAL-OBJECTIVE-77")
+                    && body.contains("A goal is active for this session")
+                {
+                    saw.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let sse = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                     cache-control: no-cache\r\nconnection: close\r\n\r\n\
+                     data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n\
+                     data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n\
+                     data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":5,\
+                     \"completion_tokens\":1,\"total_tokens\":6}}}}\n\n\
+                     data: [DONE]\n\n",
+                    serde_json::to_string("ok").unwrap()
+                );
+                let _ = sock.write_all(sse.as_bytes());
+            });
+        }
+    });
+    let st = setup(addr, "ses_goalreminder");
+    // Seed the goal with an objective that is NOT in the conversation (the
+    // compaction case: the kickoff is gone from the filtered history).
+    ocserve_store::set_goal(
+        &st.writer,
+        "ses_goalreminder",
+        Some(&ocserve_store::GoalRow {
+            id: "goal_rem".into(),
+            objective: "UNIQUE-GOAL-OBJECTIVE-77".into(),
+            status: "active".into(),
+            reason: None,
+            rounds: 0,
+            max_rounds: 50,
+            stalls: None,
+            boot: ocserve_http::goal_loop::boot_id().to_string(),
+            updated_at: 1,
+        }),
+    )
+    .unwrap();
+    let a = router(&st);
+    let r = req(
+        &a,
+        "POST",
+        "/session/ses_goalreminder/message",
+        Some(json!({
+            "parts": [{"type": "text", "text": "status?"}],
+            "model": {"providerID": "fake", "modelID": "m"},
+        })),
+    )
+    .await;
+    if !r.status().is_success() {
+        let b = r.into_body().collect().await.unwrap().to_bytes();
+        panic!("user turn failed: {}", String::from_utf8_lossy(&b));
+    }
+    assert!(
+        saw.load(std::sync::atomic::Ordering::SeqCst),
+        "an active goal whose objective is not in view must inject the \
+         non-persisted reminder into the provider request"
+    );
+    // Non-persisted: no reminder part in the stored history.
+    let msgs = ocserve_store::load_messages(&st.db, "ses_goalreminder", None).unwrap();
+    let stored = serde_json::to_string(&msgs).unwrap();
+    assert!(
+        !stored.contains("A goal is active for this session"),
+        "the reminder must not be persisted"
+    );
+}

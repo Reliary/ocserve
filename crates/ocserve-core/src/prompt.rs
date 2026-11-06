@@ -2158,6 +2158,46 @@ pub async fn run_prompt_with(
             // pretended.
             let history = transform_messages(ctx, session_id, &history).await;
             messages.extend(to_provider_messages(&history));
+            // Goal context hook (upstream goal.ts:219-231): when a goal is
+            // ACTIVE on this session and the objective is not already in view
+            // (e.g. after a compaction dropped the kickoff), splice the
+            // non-persisted reminder near the tail. Cache-safe by design: it
+            // is not stored, and it stops appearing once a continuation lands
+            // carrying the objective. The kickoff/continuation turns carry the
+            // objective themselves, so this only fires for USER turns.
+            if !opts.transient && opts.persist_user && !opts.skip_history {
+                let db = ctx.db.clone();
+                let sid = session_id.to_string();
+                let goal = tokio::task::spawn_blocking(move || ocserve_store::get_goal(&db, &sid))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .flatten();
+                if let Some(g) = goal.filter(|g| g.status == "active") {
+                    let block = format!(
+                        "<untrusted_objective>\n{}\n</untrusted_objective>",
+                        crate::goal::escape(&g.objective)
+                    );
+                    let in_view = messages.iter().rev().take(40).any(|m| {
+                        matches!(m.role.as_str(), "user" | "system")
+                            && m.content.as_text().contains(&block)
+                    });
+                    if !in_view {
+                        // Upstream splices BEFORE the last user message when
+                        // that is the tail (event.messages.at(-1).role).
+                        let at = messages
+                            .iter()
+                            .rposition(|m| m.role == "user")
+                            .unwrap_or(messages.len());
+                        // Index 0 is the system message; never splice before it.
+                        let at = at.max(1);
+                        messages.insert(
+                            at,
+                            ChatMessage::text("user", crate::goal::reminder(&g.objective)),
+                        );
+                    }
+                }
+            }
             // A non-persisted prompt is still the instruction FOR THIS RUN:
             // `persist_user: false` means "do not write a row", never "do not
             // send it". The goal reviewer needs the conversation as evidence

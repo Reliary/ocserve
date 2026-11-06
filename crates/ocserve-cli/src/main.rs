@@ -1394,6 +1394,35 @@ async fn doctor(
 ) -> Result<()> {
     println!("ocserve doctor");
     println!("  sqlite version:  {}", rusqlite::version());
+    // Goal loop (2026-11-05 review: an armed goal with no way to see it is
+    // how "the loop is doing nothing" becomes a support ticket). Informational:
+    // the kill switch is per-process env, so report what this install resolves.
+    {
+        let goals = std::env::var("OCSERVE_GOAL").as_deref() != Ok("0");
+        println!(
+            "  goal loop:       {}",
+            if goals {
+                "enabled (/goal <objective>; OCSERVE_GOAL=0 disables)"
+            } else {
+                "DISABLED (OCSERVE_GOAL=0)"
+            }
+        );
+        let db = ocserve_store::writer::db_path(&data_dir);
+        if db.exists()
+            && let Ok(active) = ocserve_store::active_goals(&db)
+        {
+            if active.is_empty() {
+                println!("  active goals:    none");
+            } else {
+                for (sid, g) in active {
+                    println!(
+                        "  active goal:     {sid}  rounds={}/{}  {}",
+                        g.rounds, g.max_rounds, g.objective
+                    );
+                }
+            }
+        }
+    }
     match ocserve_store::pragma::assert_version_ok() {
         Ok(()) => println!(
             "  version gate:    OK (>= {})",

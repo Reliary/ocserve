@@ -224,6 +224,11 @@ async fn settle(
     })
     .await;
     tracing::info!("goal {} session={sid}: {reason}", status.as_str());
+    ocserve_metrics::labeled_counter(
+        "ocserve_goal_total",
+        &format!("event=\"{}\"", status.as_str()),
+        1,
+    );
     announce(st, sid, &goal.to_json());
 }
 
@@ -630,7 +635,7 @@ fn spawn_driver(st: &Arc<AppState>, sid: &str, text: String, goal_id: String, sy
             }
         };
         let writer = st2.writer.clone();
-        if let Err(e) = ocserve_core::prompt::run_prompt_with(
+        let turn = ocserve_core::prompt::run_prompt_with(
             &ctx,
             &writer,
             &sid2,
@@ -640,11 +645,37 @@ fn spawn_driver(st: &Arc<AppState>, sid: &str, text: String, goal_id: String, sy
                 ..Default::default()
             },
         )
-        .await
-        {
-            tracing::error!("goal turn failed session={sid2}: {e:#}");
-        }
+        .await;
         drop(guard);
+        if let Err(e) = turn {
+            // A failing continuation must PAUSE, not retry. Without this the
+            // loop re-reviews, is told "continue", fails the same way, and
+            // burns a provider call per cycle forever (2026-11-05 review:
+            // only `run_turn_now` handled this, and only for the kickoff).
+            tracing::error!("goal turn failed session={sid2}: {e:#}");
+            ocserve_metrics::labeled_counter("ocserve_goal_total", "event=\"turn_failed\"", 1);
+            let db = st2.db.clone();
+            let sid3 = sid2.clone();
+            if let Ok(Some(mut g)) = crate::run_blocking(&db, {
+                let db = st2.db.clone();
+                let sid4 = sid3.clone();
+                move |_| ocserve_store::get_goal(&db, &sid4)
+            })
+            .await
+                && g.id == goal_id
+                && g.status == Status::Active.as_str()
+            {
+                settle(
+                    &st2,
+                    &sid3,
+                    &mut g,
+                    Status::Paused,
+                    &format!("The goal stopped after an error: {e:#}"),
+                )
+                .await;
+            }
+            return;
+        }
         // The turn finished: judge again (this is the loop). Only if the goal
         // is still active; a paused/cleared goal must not be resurrected.
         let current = crate::run_blocking(&st2.db, {
@@ -773,6 +804,7 @@ pub(crate) async fn arm(st: &Arc<AppState>, sid: &str, objective: &str) -> Resul
         })
         .await;
     }
+    ocserve_metrics::labeled_counter("ocserve_goal_total", "event=\"armed\"", 1);
     let state = row.to_json();
     announce(st, sid, &state);
     Ok(Arm::Armed {

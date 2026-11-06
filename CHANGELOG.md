@@ -56,6 +56,18 @@ Both API surfaces moved to the current upstream releases: the v1 freeze to
   so they cannot silently go stale on the next bump.
 
 ### Fixed
+- **Goal loop: context hook, failure pause, observability (2026-11-05).**
+  - The non-persisted goal reminder (upstream `goal.ts:219-231`) was compiled
+    into the binary and never used, so an overnight goal lost its objective as
+    soon as a compaction dropped the kickoff from the filtered history. It is
+    now spliced before the tail on a user turn when the objective is not in
+    view, and it is never persisted.
+  - A FAILED continuation was logged and retried: the reviewer ran again, said
+    `continue`, and the same failure repeated once per cycle with a provider
+    call each time. A failed goal turn now pauses with the reason.
+  - `ocserve_goal_total{event}` counts armed/paused/complete/turn_failed, and
+    `ocserve doctor` prints the loop switch and every ACTIVE goal (session,
+    rounds, objective) so "the loop is doing nothing" is visible without SQL.
 - **Goal-loop reliability review findings (2026-11-05).** Six defects found by
   a production-reliability review, all fixed and covered:
   - The reviewer ran against a synthetic session id, so the history loader
