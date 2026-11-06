@@ -93,6 +93,12 @@ EOF
   [ "$(read_pin "$tmp/pin" FREEZE_VERSION)" = "1.18.31" ] || { echo "selftest: read_pin extracts const"; bad=1; }
   [ -z "$(read_pin "$tmp/pin" OCCURRENCE_OF_NONE)" ] || { echo "selftest: read_pin no match empty"; bad=1; }
 
+  # the REAL tree must expose the pin through the same lookup main uses
+  local real
+  real="$(cd "$(dirname "$0")/.." && pwd)/$(grep -rl --include='*.rs' 'pub const FREEZE_VERSION' crates/ 2>/dev/null | head -n 1)"
+  [ -f "$real" ] && [ -n "$(read_pin "$real" FREEZE_VERSION)" ] \
+    || { echo "selftest: FREEZE_VERSION not found in the tree"; bad=1; }
+
   # report writer: structure + verdict row survive a pipe-escape pass
   report_write "$tmp/r.md" 1.18.31 1.19.5 "| behind (6 releases) |"
   grep -q "# upstream drift (v1)" "$tmp/r.md" || { echo "selftest: report header"; bad=1; }
@@ -135,7 +141,12 @@ LATEST="$(npm view opencode-ai version 2>/dev/null)" || { echo "harness failure:
 [ -n "$LATEST" ] || { echo "harness failure: npm returned no version"; exit 1; }
 valid_semver "$LATEST" || { echo "harness failure: npm version has unexpected format: '$LATEST'"; exit 1; }
 
-PIN_FILE="crates/ocserve-http/src/lib.rs"
+# The pin lives in ocserve-llm since the slot refactor (it was in
+# ocserve-http); search the crates rather than hardcoding one path, so the next
+# move is not a silent harness failure. `read_pin` takes the first match; the
+# constant is declared exactly once (rule: one truth).
+PIN_FILE="$(grep -rl --include='*.rs' 'pub const FREEZE_VERSION' crates/ | head -n 1)"
+[ -n "$PIN_FILE" ] || { echo "harness failure: no crate declares FREEZE_VERSION"; exit 1; }
 FROZEN="$(read_pin "$PIN_FILE" FREEZE_VERSION)" || FROZEN=""
 [ -n "$FROZEN" ] || { echo "harness failure: cannot read FREEZE_VERSION from $PIN_FILE"; exit 1; }
 
