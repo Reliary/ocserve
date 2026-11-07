@@ -14,6 +14,10 @@
 #      messages route must stream via for_each_message_json [suite]
 #   4. msg_part INSERT/UPDATE outside ocserve-store — every part write must
 #      carry its part_search projection companion (W1 FTS invariant) [suite]
+#   69. a built-in command's dispatch predicate tests `template.is_none()`
+#      (the advertised goal entry carries `template: ""`, which is Some("") —
+#      true only in an empty-list fixture, so `/goal` fell through to an empty
+#      prompt in production, 2026-11-05) [plant]
 #   68. a revert/snapshot test whose session directory defaults to the repo cwd
 #      (unrevert checkout-indexes over the working tree; UI-part drift, 2026-11-04)
 #   67. handler-level `v2_enabled` checks in v2.rs (flag authority is the gate
@@ -2179,5 +2183,29 @@ else
   echo "ok (planted query-form directory accepted)"
 fi
 rm -f "$_p68"
+
+echo "== guard: a built-in command's dispatch predicate is not template.is_none() (rule 69) =="
+# The 2026-11-05 regression: the built-in goal entry is advertised with
+# `template: ""` (the v1 Command schema requires the field), so a predicate
+# that tests `is_none()` is true only for a fixture with an EMPTY command list
+# and never in production, where `/goal` then fell through to
+# `expand_command("")` and sent the model an empty prompt.
+goal_isnone_hit() {
+  grep -rnE 'template[^;]{0,40}\.is_none\(\)' "$1" 2>/dev/null || true
+}
+_G69=crates/ocserve-http/src/lib.rs
+if [ -n "$(goal_isnone_hit "$_G69" | grep -v 'as_deref')" ]; then
+  echo "FAIL: built-in command dispatch tests template.is_none() (rule 69) — the advertised entry carries \"\", which is Some(\"\")"; fail=1
+else
+  echo "ok (dispatch predicate handles the empty-template form)"
+fi
+_p69=/var/tmp/ocserve-rule69-planted.rs
+printf 'let is_builtin_goal = name == "goal" && template.is_none();\n' > "$_p69"
+if [ -z "$(goal_isnone_hit "$_p69")" ]; then
+  echo "FAIL: rule 69 planted is_none() dispatch not detected (vacuous)"; fail=1
+else
+  echo "ok (planted is_none() dispatch detected)"
+fi
+rm -f "$_p69"
 
 exit $fail

@@ -1706,6 +1706,10 @@ pub struct RunOpts {
     /// Upstream emits nothing session-scoped for sessionless generate
     /// (verified live: zero sessions/messages rows after the call).
     pub transient: bool,
+    /// For a TRANSIENT run: the session whose budget/telemetry should own the
+    /// spend (the goal reviewer runs for a real session but writes nothing).
+    /// `None` = unattributed (`/experimental/generate`).
+    pub attribution_session: Option<String>,
 }
 
 impl Default for RunOpts {
@@ -1722,6 +1726,7 @@ impl Default for RunOpts {
             cost_ceiling: None,
             auto_title: true,
             transient: false,
+            attribution_session: None,
         }
     }
 }
@@ -2762,6 +2767,27 @@ pub async fn run_prompt_with(
             // in-memory copy in step with the queued DB op (writer.write is
             // ack-synchronous, so op + copy are always consistent).
             let step_tokens = message_tokens(&u);
+            // Transient calls (the goal REVIEWER, /experimental/generate)
+            // must not touch a session row: D-GOAL-REVIEWER-ACCOUNTING says
+            // whether upstream bills them is unsettled, and a synthetic id
+            // would UPDATE zero rows anyway. But the SPEND is real and was
+            // invisible to every counter (SRE review), so a caller that
+            // knows the owning session can attribute it without writing.
+            if opts.transient {
+                if let Some(owner) = opts.attribution_session.as_deref() {
+                    ocserve_metrics::labeled_counter(
+                        "ocserve_transient_tokens_total",
+                        &format!("owner=\"session\",session=\"{owner}\""),
+                        u.prompt_tokens.saturating_add(u.completion_tokens),
+                    );
+                } else {
+                    ocserve_metrics::labeled_counter(
+                        "ocserve_transient_tokens_total",
+                        "owner=\"none\"",
+                        u.prompt_tokens.saturating_add(u.completion_tokens),
+                    );
+                }
+            }
             // No session row for transient runs (UPDATE would be a 0-row
             // noop, but skipping keeps the writer queue clean); the
             // in-memory aggregate below still feeds the response path.

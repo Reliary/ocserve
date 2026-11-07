@@ -1728,6 +1728,10 @@ pub async fn session_remove_api(
     Path(id): Path<String>,
 ) -> Result<StatusCode, HttpError> {
     // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
+    // The goal driver is a bare task: aborting prompt_tasks does not stop it,
+    // so the loop could keep spending against a row that is being deleted
+    // (2026-11-05 review M3).
+    crate::goal_loop::cancel_driver(&st, &id);
     if let Some((_, handle)) = st.prompt_tasks.lock().remove(&id) {
         handle.abort();
     }
@@ -4475,9 +4479,16 @@ pub async fn interrupt(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    // Stop the LOOP too, and pause the goal. Upstream pauses an active goal on
+    // `session.execution.interrupted` with reason "user" (goal.ts:296-305): the
+    // interrupt itself must not be undone by the next reviewer "continue".
+    // Aborting only the current prompt let the driver finish the turn and
+    // start another (2026-11-05 review M1).
+    crate::goal_loop::cancel_driver(&st, &id);
     if let Some((_, handle)) = st.prompt_tasks.lock().remove(&id) {
         handle.abort();
     }
+    crate::goal_loop::pause_if_active(&st, &id, "Stopped by the user").await;
     Ok(StatusCode::NO_CONTENT)
 }
 

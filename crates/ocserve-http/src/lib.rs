@@ -538,6 +538,13 @@ fn wire_json(st: &AppState, key: &'static str) -> Option<axum::response::Respons
     wire_json_h(st, key, None, None)
 }
 
+/// `OCSERVE_GOAL=0` disables the whole feature. Exposed as a function so a
+/// test can assert BOTH switch states through the same seam instead of mutating
+/// process env (which races parallel tests) or trusting an untested branch.
+pub(crate) fn goals_enabled_from_env() -> bool {
+    std::env::var("OCSERVE_GOAL").as_deref() != Ok("0")
+}
+
 impl AppState {
     pub fn new() -> Arc<Self> {
         Self::with_auth(None)
@@ -678,7 +685,7 @@ impl AppState {
             ui: crate::ui::UiProxy::from_env(),
             pty,
             cors_extra: read_cors_env(),
-            goals_enabled: std::env::var("OCSERVE_GOAL").as_deref() != Ok("0"),
+            goals_enabled: goals_enabled_from_env(),
             fs_watches: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
             goal_tasks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             goal_wakes: parking_lot::Mutex::new(std::collections::HashSet::new()),
@@ -4151,6 +4158,10 @@ async fn post_abort(
         handle.abort();
         tracing::info!("abort: cancelled prompt task for {id}");
     }
+    // Upstream pauses an active goal when the USER stops the session
+    // (goal.ts:296-305). Cancelling the driver alone left the row ACTIVE, and
+    // the next idle hook would restart the loop ("/abort did nothing").
+    crate::goal_loop::pause_if_active(&st, &id, "Stopped by the user").await;
     Ok(Json(json!(true)))
 }
 

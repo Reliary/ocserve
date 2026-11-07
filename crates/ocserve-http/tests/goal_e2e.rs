@@ -82,6 +82,17 @@ fn spawn_provider(verdict: &'static str) -> std::net::SocketAddr {
 }
 
 fn setup(addr: std::net::SocketAddr, sid: &str) -> Arc<AppState> {
+    setup_with_goal_cmd(addr, sid, true)
+}
+
+/// `advertise_goal=false` mirrors what `build_commands` serves when the kill
+/// switch is OFF: the built-in entry is not in the list at all. The fixture
+/// must match production, or the switch test measures the fixture.
+fn setup_with_goal_cmd(
+    addr: std::net::SocketAddr,
+    sid: &str,
+    advertise_goal: bool,
+) -> Arc<AppState> {
     let dir = std::env::temp_dir().join(format!("ocserve-goal-{}-{sid}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -109,13 +120,17 @@ fn setup(addr: std::net::SocketAddr, sid: &str) -> Arc<AppState> {
     // advertised goal entry carries `template: ""` because the v1 Command
     // schema requires it. The fixture must match what `build_commands` serves.)
     let payloads = Payloads {
-        command: vec![json!({
-            "name": "goal",
-            "description": "keep working until an objective is met [pause|resume|clear]",
-            "source": "command",
-            "template": "",
-            "hints": [],
-        })],
+        command: if advertise_goal {
+            vec![json!({
+                "name": "goal",
+                "description": "keep working until an objective is met [pause|resume|clear]",
+                "source": "command",
+                "template": "",
+                "hints": [],
+            })]
+        } else {
+            Vec::new()
+        },
         ..Payloads::default()
     };
     let st = AppState::with_wiring(
@@ -733,5 +748,200 @@ async fn a_user_turn_on_an_active_goal_carries_the_reminder() {
     assert!(
         !stored.contains("A goal is active for this session"),
         "the reminder must not be persisted"
+    );
+}
+
+/// REGRESSION (2026-11-05 reviews): aborting a session did not stop the goal
+/// loop. `/abort` cancelled the current prompt task, the driver finished its
+/// turn, the reviewer said continue, and another turn started. The goal must
+/// be PAUSED (upstream pauses on a user interrupt) and no further round may
+/// run.
+///
+/// DETERMINISTIC: the provider holds the kickoff turn open on a gate, so the
+/// abort always lands mid-turn (no sleep race), and every wait is bounded so a
+/// regression fails instead of hanging the suite.
+#[tokio::test(flavor = "multi_thread")]
+async fn abort_pauses_the_goal_and_stops_the_loop() {
+    use std::sync::{Condvar, Mutex};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reviews = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let g2 = gate.clone();
+    let s2 = seen.clone();
+    let r2 = reviews.clone();
+    std::thread::spawn(move || {
+        for sock in listener.incoming().flatten() {
+            let g = g2.clone();
+            let seen = s2.clone();
+            let reviews = r2.clone();
+            std::thread::spawn(move || {
+                let mut sock = sock;
+                let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                let mut got = Vec::new();
+                let mut buf = [0u8; 8192];
+                let head_end = loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(k) => got.extend_from_slice(&buf[..k]),
+                    }
+                    if let Some(pos) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&got[..head_end]).to_string();
+                let clen = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while got.len() < head_end + clen {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(k) => got.extend_from_slice(&buf[..k]),
+                    }
+                }
+                let body = String::from_utf8_lossy(&got[head_end..]).to_string();
+                if body.contains("You are now the reviewer") {
+                    reviews.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let sse = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                         cache-control: no-cache\r\nconnection: close\r\n\r\n\
+                         data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n\
+                         data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n\
+                         data: [DONE]\n\n",
+                        serde_json::to_string(&format!(
+                            r#"{{"verdict":"continue","reason":"review {n}"}}"#,
+                            n = reviews.load(std::sync::atomic::Ordering::SeqCst)
+                        ))
+                        .unwrap()
+                    );
+                    let _ = sock.write_all(sse.as_bytes());
+                    return;
+                }
+                // Hold the KICKOFF turn open until the test has aborted.
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                let (lock, cv) = &*g;
+                let mut open = lock.lock().unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+                while !*open && std::time::Instant::now() < deadline {
+                    let (guard, _) = cv
+                        .wait_timeout(open, std::time::Duration::from_millis(50))
+                        .unwrap();
+                    open = guard;
+                }
+                drop(open);
+                let sse = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                           cache-control: no-cache\r\nconnection: close\r\n\r\n\
+                           data: {\"choices\":[{\"delta\":{\"content\":\"step done\"}}]}\n\n\
+                           data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                           data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\
+                           \"completion_tokens\":2,\"total_tokens\":12}}\n\n\
+                           data: [DONE]\n\n";
+                let _ = sock.write_all(sse.as_bytes());
+            });
+        }
+    });
+    let st = setup(addr, "ses_goalabort");
+    ocserve_store::session_grant_always(&st.writer, &st.db, "ses_goalabort", "bash", "*").unwrap();
+    let a = router(&st);
+    // The v1 command runs the kickoff IN the request, so it blocks: arm in a
+    // task and abort once the provider reports the turn is in flight.
+    let a2 = a.clone();
+    let arm = tokio::spawn(async move {
+        req(
+            &a2,
+            "POST",
+            "/session/ses_goalabort/command",
+            Some(json!({"command": "goal", "arguments": "loop forever"})),
+        )
+        .await
+    });
+    let mut waited = 0;
+    while !seen.load(std::sync::atomic::Ordering::SeqCst) && waited < 2_000 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        waited += 10;
+    }
+    assert!(
+        seen.load(std::sync::atomic::Ordering::SeqCst),
+        "the kickoff turn never reached the provider"
+    );
+    let _ = req(&a, "POST", "/session/ses_goalabort/abort", None).await;
+    // Release the provider so the interrupted turn can unwind.
+    {
+        let (lock, cv) = &*gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
+    let g = wait_goal(&st, "ses_goalabort", "paused", 10).await;
+    assert!(
+        g["reason"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("user"),
+        "abort must pause with the user reason: {g}"
+    );
+    // No further round: the loop must not restart after the abort.
+    let rounds_at_pause = g["rounds"].as_i64().unwrap_or(0);
+    let reviews_at_pause = reviews.load(std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    let after = ocserve_store::get_goal(&st.db, "ses_goalabort")
+        .unwrap()
+        .expect("row");
+    assert_eq!(
+        after.status, "paused",
+        "the loop must not restart after an abort"
+    );
+    assert_eq!(
+        after.rounds, rounds_at_pause,
+        "no continuation may run after the abort"
+    );
+    assert_eq!(
+        reviews.load(std::sync::atomic::Ordering::SeqCst),
+        reviews_at_pause,
+        "no further reviewer call may run after the abort"
+    );
+    let _ = arm.await;
+}
+
+/// The kill switch must disable the feature on the REAL HTTP path, not only in
+/// the runtime's discovery helper. The previous "switch off" test asserted an
+/// unrelated property (unknown command → 400), so this branch was untested
+/// (2026-11-05 review L4).
+#[tokio::test(flavor = "multi_thread")]
+async fn kill_switch_off_refuses_goal_and_writes_no_state() {
+    let addr = spawn_provider(r#"{"verdict":"done","reason":"never called"}"#);
+    // Production shape with the switch off: `build_commands` does not add the
+    // built-in entry at all, so the template lookup finds nothing.
+    let mut st = setup_with_goal_cmd(addr, "ses_goaloff", false);
+    Arc::get_mut(&mut st).expect("unique").goals_enabled = false;
+    let a = router(&st);
+    let r = req(
+        &a,
+        "POST",
+        "/session/ses_goaloff/command",
+        Some(json!({"command": "goal", "arguments": "do the thing"})),
+    )
+    .await;
+    // Freeze's shape for a command that is not registered.
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        json(r).await["data"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Command not found"),
+        "with the switch off goal must not be dispatchable"
+    );
+    assert!(
+        ocserve_store::get_goal(&st.db, "ses_goaloff")
+            .unwrap()
+            .is_none(),
+        "a disabled goal command must write no state"
     );
 }

@@ -172,6 +172,13 @@ pub const CONTRACT: &[Var] = &[
     ),
     op(
         "Prompts and providers",
+        "OCSERVE_GOAL_REVIEW_SECS",
+        "300",
+        "seconds (>= 30; lower values are ignored)",
+        "Wall-clock budget for one `/goal` reviewer model call. The stream watchdog bounds each read, not the whole call, so this is what stops a chatty provider from holding the goal's wake gate forever. On expiry the goal pauses with 'no usable verdict'.",
+    ),
+    op(
+        "Prompts and providers",
         "OCSERVE_PROMPT_MAX_COST_USD",
         "0 (off)",
         "0 = off, else USD",

@@ -16,7 +16,18 @@
 //! tokens to the session meter is the open question recorded as
 //! `D-GOAL-REVIEWER-ACCOUNTING`; until it is settled we do NOT add reviewer
 //! usage to the session row (a transient call never touches it), and the
-//! divergence row says so.
+//! divergence row says so. The spend is not invisible, though: the reviewer
+//! sets `RunOpts::attribution_session`, so its tokens land in
+//! `ocserve_transient_tokens_total{owner="session",session="…"}`.
+//!
+//! Every reviewer call has a wall-clock budget (`OCSERVE_GOAL_REVIEW_SECS`,
+//! default 300 s); on expiry the goal pauses rather than holding the wake gate.
+//!
+//! Concurrency is bounded twice: one driver per session (replace-on-arm) and
+//! at most `MAX_CONCURRENT_DRIVERS` across the process; a goal that cannot get
+//! a slot is PAUSED with a reason instead of sitting ACTIVE with no driver.
+//! Every driver removes its own registry entry through a Drop guard, so an
+//! early return cannot leave a finished handle behind.
 
 use crate::{ApiError, AppState, HttpError};
 use axum::http::StatusCode;
@@ -71,8 +82,14 @@ pub async fn pause_goals_from_earlier_boots(st: &Arc<AppState>) {
         let w = st.writer.clone();
         let sid2 = sid.clone();
         let r = row.clone();
-        let _ =
-            crate::run_blocking(&db, move |_| ocserve_store::set_goal(&w, &sid2, Some(&r))).await;
+        if let Err(e) =
+            crate::run_blocking(&db, move |_| ocserve_store::set_goal(&w, &sid2, Some(&r))).await
+        {
+            // A swallowed write leaves the goal ACTIVE with no driver, which
+            // is the exact state the boot scan exists to prevent.
+            tracing::error!("goal boot-pause persist failed session={sid}: {e:#}");
+            continue;
+        }
         tracing::info!("goal paused at boot session={sid}");
     }
 }
@@ -116,8 +133,15 @@ pub async fn after_turn(st: &Arc<AppState>, sid: &str) -> bool {
     }
     // A running shell on THIS session is background work the goal may be
     // waiting on; its completion re-enters this hook.
-    // Upstream asks for the Session's own running shells. ocserve's registry
-    // is per-process and records the owning session on each entry.
+    //
+    // HONEST LIMIT (D-GOAL-NO-BACKGROUND-SHELLS): the registry now carries an
+    // owning session, but no serving route populates it — `POST /api/shell`
+    // has no session, and `/api/session/{id}/shell` runs the command as a
+    // tool-less turn rather than registering a shell. So this list is empty in
+    // practice and a `wait` verdict is never legitimately produced. The filter
+    // is kept (and unit-tested against an attributed entry) so the mechanism
+    // starts working the day a route attributes its spawns; the previous
+    // comment claimed the registry already did, which was false.
     let shells: Vec<String> = st
         .shells
         .list()
@@ -149,7 +173,10 @@ pub async fn after_turn(st: &Arc<AppState>, sid: &str) -> bool {
             Ok(Some(g)) => g,
             _ => return false,
         };
-    if latest.id != goal.id || latest.status != Status::Active.as_str() {
+    if latest.id != goal.id
+        || latest.status != Status::Active.as_str()
+        || latest.objective != goal.objective
+    {
         return false;
     }
     let mut latest = latest;
@@ -194,10 +221,21 @@ pub async fn after_turn(st: &Arc<AppState>, sid: &str) -> bool {
             let w = st.writer.clone();
             let row = latest.clone();
             let sid_owned = sid.to_string();
-            let _ = crate::run_blocking(&db, move |_| {
+            if let Err(e) = crate::run_blocking(&db, move |_| {
                 ocserve_store::set_goal(&w, &sid_owned, Some(&row))
             })
-            .await;
+            .await
+            {
+                // A swallowed write here silently disables the 50-round cap
+                // (rounds never advances) — the guard's "never swallow a
+                // storage write" rule, which its `*.write(` match missed.
+                tracing::error!("goal round persist failed session={sid}: {e:#}");
+                ocserve_metrics::labeled_counter(
+                    "ocserve_goal_total",
+                    "event=\"persist_failed\"",
+                    1,
+                );
+            }
             let text = continuation(&latest.objective, &verdict);
             spawn_driver(st, sid, text, latest.id.clone(), true);
             true
@@ -219,10 +257,16 @@ async fn settle(
     let w = st.writer.clone();
     let row = goal.clone();
     let sid_owned = sid.to_string();
-    let _ = crate::run_blocking(&db, move |_| {
+    if let Err(e) = crate::run_blocking(&db, move |_| {
         ocserve_store::set_goal(&w, &sid_owned, Some(&row))
     })
-    .await;
+    .await
+    {
+        // A failed settle is how "paused" becomes a lie: the row stays ACTIVE
+        // and, with no driver, nothing will ever move it (SRE review).
+        tracing::error!("goal settle persist failed session={sid}: {e:#}");
+        ocserve_metrics::labeled_counter("ocserve_goal_total", "event=\"persist_failed\"", 1);
+    }
     tracing::info!("goal {} session={sid}: {reason}", status.as_str());
     ocserve_metrics::labeled_counter(
         "ocserve_goal_total",
@@ -267,6 +311,18 @@ async fn used_tools_since(st: &Arc<AppState>, sid: &str, goal_id: &str) -> bool 
 /// The reviewer call: a TRANSIENT generation (no session writes), exactly the
 /// machinery `/api/experimental/generate` uses. Returns None when the reviewer
 /// produced no parsable verdict.
+/// Wall-clock budget for one reviewer call. Generous (a real model call, and
+/// the goal is unattended) but finite: without it a chatty provider holds the
+/// per-session wake gate forever.
+fn review_budget() -> std::time::Duration {
+    let secs: u64 = std::env::var("OCSERVE_GOAL_REVIEW_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|s| *s >= 30)
+        .unwrap_or(300);
+    std::time::Duration::from_secs(secs)
+}
+
 async fn review(
     st: &Arc<AppState>,
     sid: &str,
@@ -298,21 +354,41 @@ async fn review(
     // Upstream's `ctx.session.generate({sessionID})` runs against the real
     // session for the same reason. `persist_user:false` + `transient` keep
     // the judge turn out of history and off every session-scoped emission.
-    let res = ocserve_core::prompt::run_prompt_with(
-        &ctx,
-        &writer,
-        sid,
-        &req,
-        ocserve_core::prompt::RunOpts {
-            persist_user: false,
-            skip_history: false,
-            tools_enabled: false,
-            auto_title: false,
-            transient: true,
-            ..Default::default()
-        },
+    let res = tokio::time::timeout(
+        review_budget(),
+        ocserve_core::prompt::run_prompt_with(
+            &ctx,
+            &writer,
+            sid,
+            &req,
+            ocserve_core::prompt::RunOpts {
+                persist_user: false,
+                skip_history: false,
+                tools_enabled: false,
+                auto_title: false,
+                transient: true,
+                // The reviewer is a real model call for THIS session: attribute
+                // its tokens to telemetry (it still writes nothing).
+                attribution_session: Some(sid.to_string()),
+                ..Default::default()
+            },
+        ),
     )
     .await;
+    let res = match res {
+        Ok(r) => r,
+        Err(_) => {
+            // The stream watchdog bounds each read, not the whole call. A
+            // provider that dribbles events kept the wake gate closed, so the
+            // goal sat ACTIVE with no pending review (2026-11-05 SRE review).
+            tracing::warn!(
+                "goal reviewer exceeded its {}s budget session={sid}",
+                review_budget().as_secs()
+            );
+            ocserve_metrics::labeled_counter("ocserve_goal_total", "event=\"review_timeout\"", 1);
+            return None;
+        }
+    };
     let (_info, parts) = match res {
         Ok(v) => v,
         Err(e) => {
@@ -338,6 +414,13 @@ async fn review(
 /// tag. `TextPart.metadata` is where the tag lives (a `UserMessage` has no
 /// metadata field), and `synthetic` is what makes a timeline render it as a
 /// notice row instead of something the user typed.
+/// The goal tag rides on the PART (`TextPart.metadata`).
+///
+/// ACCEPTED-LOW: a client can forge `metadata:{source:"goal"}` on an inbound
+/// part, which only affects its OWN session's stall accounting (whether a tool
+/// ran since the anchor). There is no cross-session effect and no privilege
+/// change, so it is documented rather than blocked (blocking would also block
+/// the legitimate continuation, which uses the same shape).
 pub(crate) fn goal_part(text: &str, goal_id: &str, synthetic: bool) -> Value {
     json!({
         "type": "text",
@@ -572,16 +655,75 @@ pub(crate) async fn goal_control_notice(
 /// `/goal pause` sent during a reviewer call still ran the queued continuation
 /// to completion (2026-11-05 review); without the registry entry, `/abort`
 /// cancelled only the current prompt task, not the loop that respawns it.
+/// Removes this driver's registry entry when the task ends for ANY reason
+/// (success, early return, panic during unwind). Identity is the token, so a
+/// replacement driver spawned meanwhile is never removed by the outgoing one.
+struct DriverSlot {
+    st: Arc<AppState>,
+    sid: String,
+    token: u64,
+}
+
+impl Drop for DriverSlot {
+    fn drop(&mut self) {
+        let mut m = self.st.goal_tasks.lock();
+        if m.get(&self.sid).is_some_and(|(t, _)| *t == self.token) {
+            m.remove(&self.sid);
+        }
+    }
+}
+
+/// Cap on goal loops driving AT ONCE across sessions. Each may run up to
+/// `max_rounds` model turns, so the per-session cap alone bounds one session
+/// and not the process (review L6).
+const MAX_CONCURRENT_DRIVERS: usize = 4;
+
 fn spawn_driver(st: &Arc<AppState>, sid: &str, text: String, goal_id: String, synthetic: bool) {
     static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // One driver per session: replace (and cancel) a stale one.
-    if let Some((_, old)) = st.goal_tasks.lock().remove(sid) {
-        old.abort();
+    {
+        let mut tasks = st.goal_tasks.lock();
+        if let Some((_, old)) = tasks.remove(sid) {
+            old.abort();
+        }
+        // Global bound: a session already running is replaced above, so this
+        // only refuses when OTHER sessions fill the slots. Refusing is honest
+        // (the goal stays ACTIVE and the next idle wake retries), and it keeps
+        // N armed sessions from multiplying model spend.
+        if tasks.len() >= MAX_CONCURRENT_DRIVERS {
+            tracing::warn!(
+                "goal: {MAX_CONCURRENT_DRIVERS} loops already driving; deferring session={sid}"
+            );
+            drop(tasks);
+            // Pause rather than leave an ACTIVE goal nothing will drive: a
+            // deferred goal the operator can see and resume beats one that
+            // quietly never runs.
+            let st2 = st.clone();
+            let sid2 = sid.to_string();
+            tokio::spawn(async move {
+                pause_goal(
+                    &st2,
+                    &sid2,
+                    &format!("Deferred: {MAX_CONCURRENT_DRIVERS} goals are already running"),
+                )
+                .await;
+            });
+            return;
+        }
     }
     let st2 = st.clone();
     let sid2 = sid.to_string();
+    let slot = DriverSlot {
+        st: st2.clone(),
+        sid: sid2.clone(),
+        token,
+    };
+    let goal_for_id = goal_id.clone();
     let handle = tokio::spawn(async move {
+        // Dropped on every exit path, including the early returns below.
+        let _slot = slot;
+        let goal_id = goal_for_id;
         // Re-check right before the turn: the goal may have been paused,
         // cleared or replaced while this task waited for the lock.
         let current = crate::run_blocking(&st2.db, {
@@ -600,7 +742,17 @@ fn spawn_driver(st: &Arc<AppState>, sid: &str, text: String, goal_id: String, sy
         }
         let release = match crate::lock_session(&st2, &sid2).await {
             Ok(r) => r,
-            Err(_) => return,
+            Err(e) => {
+                // Persisted state says ACTIVE but no turn can run: pause
+                // rather than leaving a goal that looks alive and is not.
+                pause_goal(
+                    &st2,
+                    &sid2,
+                    &format!("The goal could not start: {}", e.message),
+                )
+                .await;
+                return;
+            }
         };
         let guard = release.arc().lock().await;
         // Second check under the lock: a pause that landed between the read
@@ -631,6 +783,12 @@ fn spawn_driver(st: &Arc<AppState>, sid: &str, text: String, goal_id: String, sy
             Err(e) => {
                 tracing::warn!("goal turn context failed session={sid2}: {}", e.message);
                 drop(guard);
+                pause_goal(
+                    &st2,
+                    &sid2,
+                    &format!("The goal could not start: {}", e.message),
+                )
+                .await;
                 return;
             }
         };
@@ -654,6 +812,16 @@ fn spawn_driver(st: &Arc<AppState>, sid: &str, text: String, goal_id: String, sy
             // only `run_turn_now` handled this, and only for the kickoff).
             tracing::error!("goal turn failed session={sid2}: {e:#}");
             ocserve_metrics::labeled_counter("ocserve_goal_total", "event=\"turn_failed\"", 1);
+            // SURFACE the failure: this path calls `run_prompt_with` directly,
+            // so `run_prompt`'s wrapper (durable session.error + [turn
+            // stopped] part + finalize + idle) never ran and a client that saw
+            // `busy` would spin forever (2026-11-05 SRE review). Same shape the
+            // wrapper emits, so the client sees one kind of error.
+            crate::emit_session_error_event(
+                &st2,
+                &sid2,
+                &format!("The goal stopped after an error: {e:#}"),
+            );
             let db = st2.db.clone();
             let sid3 = sid2.clone();
             if let Ok(Some(mut g)) = crate::run_blocking(&db, {
@@ -689,14 +857,6 @@ fn spawn_driver(st: &Arc<AppState>, sid: &str, text: String, goal_id: String, sy
         let still_active = current.as_ref().is_some_and(|g| {
             g.id == goal_id && g.status == Status::Active.as_str() && g.boot == boot_id()
         });
-        // Unregister by TOKEN: a replacement driver spawned while this one
-        // was finishing must not be removed by the outgoing task.
-        {
-            let mut m = st2.goal_tasks.lock();
-            if m.get(&sid2).is_some_and(|(t, _)| *t == token) {
-                m.remove(&sid2);
-            }
-        }
         if still_active {
             crate::wake_inbox_after_turn(&st2, &sid2).await;
         }
@@ -704,6 +864,12 @@ fn spawn_driver(st: &Arc<AppState>, sid: &str, text: String, goal_id: String, sy
     st.goal_tasks
         .lock()
         .insert(sid.to_string(), (token, handle));
+}
+
+/// Public pause used by the abort/interrupt paths (upstream pauses an active
+/// goal on an interrupted execution that the USER caused).
+pub(crate) async fn pause_if_active(st: &Arc<AppState>, sid: &str, reason: &str) {
+    pause_goal(st, sid, reason).await;
 }
 
 /// Pause the goal if it is still active, with `reason`. Used on the paths
@@ -754,7 +920,9 @@ pub(crate) async fn arm(st: &Arc<AppState>, sid: &str, objective: &str) -> Resul
     }
     let now = now_ms();
     let row = ocserve_store::GoalRow {
-        id: format!("goal_{now:x}{:x}", std::process::id()),
+        // Monotonic suffix: two arms in the same millisecond must not share
+        // an id, or a stale reviewer applies to the new objective.
+        id: ocserve_core::goal::mint_id(),
         objective: objective.clone(),
         status: Status::Active.as_str().to_string(),
         reason: None,
@@ -873,10 +1041,13 @@ async fn control(st: &Arc<AppState>, sid: &str, which: &str) -> Result<serde_jso
             let w = st.writer.clone();
             let row = goal.clone();
             let sid_owned = sid.to_string();
-            let _ = crate::run_blocking(&db, move |_| {
+            if let Err(e) = crate::run_blocking(&db, move |_| {
                 ocserve_store::set_goal(&w, &sid_owned, Some(&row))
             })
-            .await;
+            .await
+            {
+                return Err(format!("could not pause the goal: {e:#}"));
+            }
             Ok(goal.to_json())
         }
         "resume" => {
@@ -892,10 +1063,13 @@ async fn control(st: &Arc<AppState>, sid: &str, which: &str) -> Result<serde_jso
             let w = st.writer.clone();
             let row = goal.clone();
             let sid_owned = sid.to_string();
-            let _ = crate::run_blocking(&db, move |_| {
+            if let Err(e) = crate::run_blocking(&db, move |_| {
                 ocserve_store::set_goal(&w, &sid_owned, Some(&row))
             })
-            .await;
+            .await
+            {
+                return Err(format!("could not resume the goal: {e:#}"));
+            }
             let text = continuation(
                 &goal.objective,
                 &ocserve_core::goal::Verdict {
@@ -911,9 +1085,9 @@ async fn control(st: &Arc<AppState>, sid: &str, which: &str) -> Result<serde_jso
             cancel_driver(st, sid);
             let w = st.writer.clone();
             let sid_owned = sid.to_string();
-            let _ =
-                crate::run_blocking(&db, move |_| ocserve_store::set_goal(&w, &sid_owned, None))
-                    .await;
+            crate::run_blocking(&db, move |_| ocserve_store::set_goal(&w, &sid_owned, None))
+                .await
+                .map_err(|e| format!("could not clear the goal: {e:#}"))?;
             Ok(serde_json::Value::Null)
         }
     }

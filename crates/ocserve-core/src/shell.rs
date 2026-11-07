@@ -21,6 +21,12 @@ pub struct ShellEntry {
     pub id: String,
     pub command: String,
     pub cwd: String,
+    /// Owning session, when the spawn came from a session-scoped route. The
+    /// goal loop needs it to answer "is there background work this session is
+    /// waiting on"; `list()` did not emit it, so the filter silently matched
+    /// nothing and a `wait` verdict could never be honoured (2026-11-05
+    /// review, and the code comment claimed the field existed).
+    pub session_id: Option<String>,
     pub status: String,
     pub output: Vec<u8>,
     pub exit_code: Option<i32>,
@@ -41,6 +47,16 @@ impl ShellRegistry {
     /// Spawn a shell (fails closed when full of RUNNING shells; exited ones
     /// evict first).
     pub fn spawn(self: &Arc<Self>, command: &str, cwd: &str) -> Result<String, String> {
+        self.spawn_for_session(command, cwd, None)
+    }
+
+    /// Spawn attributed to a session (goal background-work detection).
+    pub fn spawn_for_session(
+        self: &Arc<Self>,
+        command: &str,
+        cwd: &str,
+        session_id: Option<&str>,
+    ) -> Result<String, String> {
         let mut inner = self.inner.lock();
         if inner.len() >= SHELL_REGISTRY_CAP && !inner.values().any(|e| e.status != "running") {
             return Err("too many running shells".to_string());
@@ -70,6 +86,7 @@ impl ShellRegistry {
                 id: id.clone(),
                 command: command.to_string(),
                 cwd: cwd.to_string(),
+                session_id: session_id.map(str::to_string),
                 status: "running".to_string(),
                 output: Vec::new(),
                 exit_code: None,
@@ -166,6 +183,7 @@ impl ShellRegistry {
                 json!({
                     "id": e.id, "status": e.status,
                     "command": e.command, "cwd": e.cwd,
+                    "sessionID": e.session_id,
                 })
             })
             .collect()

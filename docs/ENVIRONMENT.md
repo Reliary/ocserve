@@ -40,6 +40,7 @@ for the normal behaviour.
 |---|---|---|---|
 | `OCSERVE_PROMPT_MAX_ROUNDS` | 0 (unlimited) | 0 = unlimited, else a count | Hard cap on model rounds per prompt. Exceeding it surfaces as a turn error. |
 | `OCSERVE_GOAL` | 1 (on) | 0 = off, any other value = on | Master switch for the built-in `/goal` autonomy loop (upstream ships it as a built-in v2 plugin). Off leaves the command undiscovered and the idle hook inert. |
+| `OCSERVE_GOAL_REVIEW_SECS` | 300 | seconds (>= 30; lower values are ignored) | Wall-clock budget for one `/goal` reviewer model call. The stream watchdog bounds each read, not the whole call, so this is what stops a chatty provider from holding the goal's wake gate forever. On expiry the goal pauses with 'no usable verdict'. |
 | `OCSERVE_PROMPT_MAX_COST_USD` | 0 (off) | 0 = off, else USD | Hard per-prompt spend ceiling. |
 | `OCSERVE_PROMPT_HISTORY_UNBOUNDED` | off (bounded) | 0 \| 1 | 1 reads the whole session every turn instead of the proven suffix. Debug only; the sent messages are identical. |
 | `OCSERVE_PROVIDER_STALL_SECS` | 120 | seconds | Stream-stall budget after the first real token. |
