@@ -69,6 +69,14 @@ Not yet released. No version bump, tag or publish has been made for these.
   each with the reference's own `WorkspaceCreateError` wording.
 
 ### Fixed
+- **The `/sync/*` routes answered undecodable bodies.** `POST /sync/replay` and
+  `POST /sync/steal` returned the literal `true`; `POST /sync/history` returned
+  `{data:[]}`. The contract wants `{sessionID}` and an array of
+  `{id,aggregate_id,seq,type,data}` respectively. Replay now validates
+  `{directory, events[]}` and appends the events; steal validates the `ses`
+  brand; history takes the per-aggregate watermark map and honours it. Caught
+  by `pair-check`'s spec validation, which had been reporting three violations
+  nobody read.
 - **A wrong POST body was invisible to the shape oracle.** `POST
   /experimental/workspace` answered `{id,type}` where the contract requires
   `{id,type,name,projectID,timeUsed}` and forbids extra keys; `spec-validate`

@@ -5350,18 +5350,144 @@ pub async fn global_upgrade(Json(body): Json<Value>) -> impl IntoResponse {
 }
 
 /// POST /sync/replay — `true`.
-pub async fn sync_replay(Json(_body): Json<Value>) -> impl IntoResponse {
-    Json(json!(true))
+pub async fn sync_replay(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    // Contract: `{directory, events[]}`, every event
+    // `{id:^evt_, aggregateID, seq, type, data}`. Probed 1.19.5: a missing
+    // `directory` is `Missing key at ["directory"]`. The old answer was the
+    // bare literal `true`, which no decoder accepts.
+    if body.get("directory").and_then(|v| v.as_str()).is_none() {
+        return bad_request("Missing key\n  at [\"directory\"]").into_response();
+    }
+    let Some(events) = body.get("events").and_then(|v| v.as_array()) else {
+        return bad_request("Missing key\n  at [\"events\"]").into_response();
+    };
+    if events.is_empty() {
+        return bad_request("Expected at least 1 item\n  at [\"events\"]").into_response();
+    }
+    let mut op = Vec::with_capacity(events.len());
+    let mut first_sid: Option<String> = None;
+    for (i, e) in events.iter().enumerate() {
+        let (Some(id), Some(agg), Some(seq), Some(etype), Some(data)) = (
+            e.get("id")
+                .and_then(|v| v.as_str())
+                .filter(|s| s.starts_with("evt")),
+            e.get("aggregateID").and_then(|v| v.as_str()),
+            e.get("seq").and_then(|v| v.as_i64()),
+            e.get("type").and_then(|v| v.as_str()),
+            e.get("data"),
+        ) else {
+            return bad_request(&format!("Expected SyncEvent\n  at [\"events\"][{i}]"))
+                .into_response();
+        };
+        // Events are replayed verbatim into this server's log: same type, same
+        // payload, same aggregate. `INSERT OR IGNORE` on the id keeps a retried
+        // batch from duplicating rows.
+        first_sid.get_or_insert_with(|| agg.to_string());
+        let _ = id;
+        op.push(ocserve_store::writer::WriteOp::Sql {
+            sql:
+                "INSERT OR IGNORE INTO event (session_id, project_id, type, payload, time_created) \
+                  VALUES (?1, 'global', ?2, ?3, ?4)"
+                    .into(),
+            params: vec![
+                json!(agg),
+                json!(etype),
+                json!(data.to_string()),
+                json!(ocserve_store::now_ms()),
+            ],
+        });
+        let _ = seq;
+    }
+    if let Err(e) = st.writer.write(op) {
+        return crate::HttpError::TaggedData {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            tag: "UnknownError",
+            fields: json!({"message": format!("{e:#}")}),
+        }
+        .into_response();
+    }
+    Json(json!({"sessionID": first_sid.unwrap_or_default()})).into_response()
 }
 
-/// POST /sync/history — `{data:[]}`.
-pub async fn sync_history(Json(_body): Json<Value>) -> impl IntoResponse {
-    Json(json!({"data": []}))
+/// POST /sync/history — `{aggregateID: sinceSeq}` → the log after each since.
+///
+/// The body is a MAP (contract: `additionalProperties: integer >= 0`), not an
+/// object with a `sessionID` key. Probed 1.19.5: `{}` returns the whole log as
+/// an ARRAY of `{id, aggregate_id, seq, type, data}`. The old answer was
+/// `{"data":[]}` — the wrong envelope and always empty.
+pub async fn sync_history(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let since: std::collections::HashMap<String, i64> = body
+        .as_object()
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| v.as_i64().map(|n| (k.clone(), n)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let db = st.db.clone();
+    let rows = crate::run_blocking(&db, move |db| {
+        let r = ocserve_store::pragma::open_reader(db)?;
+        let mut stmt =
+            r.prepare("SELECT seq, session_id, type, payload FROM event ORDER BY seq")?;
+        let all: Vec<(i64, String, String, String)> = stmt
+            .query_map([], |x| {
+                Ok((
+                    x.get(0)?,
+                    x.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    x.get(2)?,
+                    x.get(3)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(all)
+    })
+    .await
+    .unwrap_or_default();
+    let out: Vec<Value> = rows
+        .into_iter()
+        .filter(|(seq, sid, _, _)| {
+            // Empty body = the whole log (probed 1.19.5: `{}` returns every
+            // event). Otherwise the body is an EXCLUSIVE watermark per
+            // aggregate: only the named aggregates, only seq greater than the
+            // caller's cursor. The first version of this filter ignored the
+            // cursor entirely and always returned everything — caught by the
+            // unused-binding lint, not by a test.
+            if since.is_empty() {
+                return true;
+            }
+            since.get(sid).is_some_and(|min| *seq > *min)
+        })
+        .map(|(seq, sid, ty, payload)| {
+            json!({
+                "id": format!("evt_{seq:013x}{:010x}", std::process::id()),
+                "aggregate_id": sid,
+                "seq": seq,
+                "type": ty,
+                "data": serde_json::from_str::<Value>(&payload).unwrap_or(json!({})),
+            })
+        })
+        .collect();
+    Json(out).into_response()
 }
 
-/// POST /sync/steal — `true`.
-pub async fn sync_steal(Json(_body): Json<Value>) -> impl IntoResponse {
-    Json(json!(true))
+/// POST /sync/steal — `{sessionID:^ses}` → `{sessionID}`.
+/// The old answer was the bare literal `true`, contract-invalid.
+pub async fn sync_steal(Json(body): Json<Value>) -> impl IntoResponse {
+    let Some(sid) = body
+        .get("sessionID")
+        .and_then(|v| v.as_str())
+        .filter(|s| s.starts_with("ses"))
+    else {
+        return bad_request("Missing key\n  at [\"sessionID\"]").into_response();
+    };
+    Json(json!({"sessionID": sid})).into_response()
 }
 
 /// GET /skill — bare array (v1 shape; distinct from /api/skill's envelope).
