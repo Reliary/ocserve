@@ -4,6 +4,62 @@ All notable changes to ocserve. The wire contract targets the frozen
 openccode 1.18.31 release and the v2 surface the 2.0.28 client; anything that
 differs is a named `D-*` row in the ledger at `PLAN.md §18`.
 
+## Unreleased
+
+Not yet released. No version bump, tag or publish has been made for these.
+
+### Fixed
+- **Five v2 operation families were bound from the contract, not the reference**
+  (2.2.5). A live differential found each was plausible-but-wrong:
+  `experimental.schedule` create REQUIRED a `type` key that upstream's untagged
+  `{in|at|every|cron}` input does not have, so every valid client payload was
+  rejected; `artifact` ids are branded by PREFIX only and PATCH decodes its
+  body before the id lookup and feature gate; `debug.heap-dump` answered a 500
+  where the contract requires a 200 (`path`, `pid`, five `memory` counters,
+  no extra keys); the artifacts family refused every call even with
+  `experimental.artifacts` on; `voice/session` transport is the discriminated
+  `VoiceTransportInput` union and its refusal is the provider's own; and
+  `client-mcp` GET answers a BARE 400 when a name is present (only the token
+  route carries the tagged refusal). `fs/watch` now resolves inside the session
+  location, so an existing file outside it is `FileNotFoundError`.
+  The 27 vectors are committed in `pair-v2-check` (55 total) with the feature
+  flags enabled in both temp HOMEs.
+- **A model with unknown capabilities is text-only.** An image sent to such a
+  model is now replaced with the explanatory text part (upstream's
+  `unsupportedParts`) instead of forwarded for the provider to reject;
+  config-declared models derive capabilities from `modalities`. A
+  `text/plain` data-URL attachment is expanded AT INGEST into the synthetic
+  Read-call line plus its body, and a turn with multiple parts is emitted as a
+  content ARRAY in part order rather than one concatenated string — capdiff
+  showed the merged form changed the prompt the model reads.
+- **A provider's `options.apiKey` was never used as the credential** (issue
+  #28), so every config-declared provider reached the upstream with an empty
+  bearer token. Auth layering now falls back config-first; the 2.x
+  `credential` table is a third source.
+- **The embedded commit stamp was one build behind** after a commit (HEAD is a
+  symbolic ref), and the offload path reported a foreign tree dirty. Both
+  fixed; the offload passes the LOCAL sha and dirty flag.
+
+### Security
+- **RUSTSEC-2026-0459 / CVE-2026-119375** (SQLite before 3.54.0 could return
+  uninitialised page-cache memory when a database and a sibling `-wal` file
+  disagree on page size). The old `libsqlite3-sys` was pulled by `r2d2` and
+  `r2d2_sqlite`, both declared in `ocserve-store` and imported nowhere;
+  removing the two unused declarations let rusqlite 0.41 resolve
+  libsqlite3-sys 0.39.1 (SQLite 3.54.1).
+
+### Changed
+- Dependency updates: rolldown 1.3.x, boring 5.4, brotli 9.1.1, toml 1.2.1,
+  rustix 1.1.6, flate2 1.1.11, similar 3.2.1. `boring` needed its requirement
+  raised, not only the lock.
+- CI actions: `setup-rust-toolchain` v2.0.1 (13 uses) and `upload-artifact`
+  v7.0.2 (5 uses), each pin verified against its upstream tag.
+
+### Added
+- `scripts/remote-build.sh` offloads cargo to a builder host, because the
+  development box's `target/` reached 912 GB on a snapshot-pinned filesystem
+  and failed with ENOSPC more often than with compiler errors.
+
 ## 0.7.0
 
 Both API surfaces moved to the current upstream releases: the v1 freeze to
