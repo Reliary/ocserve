@@ -625,7 +625,10 @@ pub fn reference_markdown() -> String {
          | `OPENCODE_ENABLE_EXPERIMENTAL_MODELS` | Serve `alpha` models. `deprecated` models are never served. |\n\
          | `OPENCODE_API_KEY` | Key for the `opencode` provider (takes precedence over the keyless free tier). |\n\
          | `OPENCODE_MODELS_URL` / `OPENCODE_MODELS_PATH` | Catalog source and cache path (same as upstream). |\n\
-         | `OPENCODE_DISABLE_MODELS_FETCH` | Disable catalog refresh. |\n",
+         | `OPENCODE_DISABLE_MODELS_FETCH` | Disable catalog refresh. |\n\
+         | `OPENCODE_CONFIG` | Load an additional explicit config file over the global one (missing file warns; malformed is fatal). |\n\
+         | `OPENCODE_CONFIG_CONTENT` | Inline JSON merged as the final local config layer (launchers inject plugins this way). |\n\
+         | `OPENCODE_CONFIG_DIR` | Config directory (`opencode.json` + auto-discovered `plugin/`/`plugins/`); defaults to `$XDG_CONFIG_HOME/opencode` or `~/.config/opencode`. |\n",
     );
     out
 }

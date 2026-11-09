@@ -587,7 +587,7 @@ current anywhere.
 | `D-V2-SESSION-LIFECYCLE` | Transport-level v2 hooks (`model.request`, `http.*`, `retry`, `title`, `generate`) are not bridged. | accepted |
 | `D-V2-STORAGE-MEM` | `ctx.storage` is in-memory for the life of the sidecar; it is not disk-backed. | accepted |
 | `D-V2-SESSION-GENERATE` | The transient generate path runs, but the v2 `session.generate` hook is not dispatched. | accepted |
-| `D-V2-TOOL-EDITOR` | `tool.transform` registers and records, but the tool registry is static, so it is not applied; `tool.list` returns `[]`. | accepted |
+| `D-V2-TOOL-EDITOR` | `tool.transform` registers and records, but the tool registry is static, so it is not applied; `tool.list` returns `[]`. | closed (the callback runs against a live editor; added tools are advertised with their JSON Schema and dispatched; a disposed registration removes its names) |
 | `D-V2-UNION` | One port serves both wire shapes; no client sends a version discriminator. | accepted |
 | `D-V2-WS` | Experimental WebSocket hooks register but are not dispatched. | accepted |
 | `D-VIEW-NOWATERMARK` | View records and their 204s are served without tracking a read watermark. | accepted |

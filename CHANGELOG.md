@@ -112,6 +112,31 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   removing the two unused declarations let rusqlite 0.41 resolve
   libsqlite3-sys 0.39.1 (SQLite 3.54.1).
 
+## Unreleased
+
+### Added
+- **opencode v2 launcher compatibility (Paseo).** The config directory now
+  follows upstream (`OPENCODE_CONFIG_DIR` → `XDG_CONFIG_HOME/opencode` →
+  `~/.config/opencode`), plugin packages under `plugin/`/`plugins/` are
+  auto-discovered at boot and on inventory polls (so a launcher that
+  provisions a bridge after boot is picked up without a restart), and
+  `GET /api/plugin` serves the contract's `Plugin.Info` (`source`, `features`,
+  `state.status`) instead of a private `state:"loaded"` string. v2
+  `ctx.tool.transform` is now real: the editor runs, tools are advertised
+  with their JSON Schema and execute through the sidecar (`D-V2-TOOL-EDITOR`
+  closed).
+
+### Fixed
+- **Launcher-injected plugin config is read.** `OPENCODE_CONFIG` and
+  `OPENCODE_CONFIG_CONTENT` were documented upstream flags but never read, so
+  Paseo's bridge — a `plugin` tuple inside `OPENCODE_CONFIG_CONTENT` —
+  silently produced zero plugins and its `tool`/`shell.env` hooks were
+  missing. Both channels now layer last (content wins for scalars, plugin
+  declarations accumulate), `file://` plugin URLs
+  and plugin directories resolve, and the v2 `plugins: [{package, options}]`
+  form loads with `options ?? {}`. Malformed injected JSON fails boot loudly;
+  the value is never logged (it carries launcher tokens).
+
 ## 0.7.0
 
 Both API surfaces moved to the current upstream releases: the v1 freeze to
