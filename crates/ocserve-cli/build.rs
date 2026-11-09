@@ -6,6 +6,13 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=../../.git/HEAD");
+    // HEAD is a symbolic ref ("ref: refs/heads/main"), so its CONTENT does not
+    // change on commit — watching it alone left the embedded commit stamp one
+    // build behind (observed after a remote rsync: a clean tree reported
+    // `ec2e78a-dirty` while HEAD was 784fcff). Watch the refs cargo otherwise
+    // never sees.
+    println!("cargo:rerun-if-changed=../../.git/refs/heads");
+    println!("cargo:rerun-if-changed=../../.git/packed-refs");
     // CI and release builds pass the exact revision, so a packaged artifact
     // never depends on the state of the build machine's worktree.
     if let Ok(v) = std::env::var("OCSERVE_BUILD_COMMIT")
