@@ -121,6 +121,16 @@ q() { printf '%q' "$1"; }
 CMD=""
 for arg in "$@"; do CMD="$CMD $(q "$arg")"; done
 
+# The embedded commit must describe THIS checkout, not the rsync copy: git's
+# symbolic HEAD plus an rsync'd index can report "dirty" on the remote even
+# when the local tree is clean. CI passes OCSERVE_BUILD_COMMIT for the same
+# reason, so the offload path uses it too.
+BUILD_COMMIT="$(git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)"
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  BUILD_COMMIT="$BUILD_COMMIT-dirty"
+fi
+export BUILD_COMMIT
+
 case "$VERB" in
   gates)
     if [ "$REMOTE_TOOLS_OK" != 1 ]; then
@@ -137,12 +147,12 @@ case "$VERB" in
     # `test` and `clippy` use the workspace-wide test scope; keep TMPDIR off
     # the remote /tmp only if it is small (it is 32 GB there, so use it, but
     # the harnesses assume /var/tmp exists — both do on this host).
-    RUN="TMPDIR=/var/tmp cargo $VERB --offline -j$JOBS$CMD"
+    RUN="OCSERVE_BUILD_COMMIT=$BUILD_COMMIT TMPDIR=/var/tmp cargo $VERB --offline -j$JOBS$CMD"
     # --offline fails on a cold cache; fall back to online once.
-    RUN="$RUN || { echo '>> offline build failed; retrying with network'; TMPDIR=/var/tmp cargo $VERB -j$JOBS$CMD; }"
+    RUN="$RUN || { echo '>> offline build failed; retrying with network'; OCSERVE_BUILD_COMMIT=$BUILD_COMMIT TMPDIR=/var/tmp cargo $VERB -j$JOBS$CMD; }"
     ;;
   *)
-    RUN="TMPDIR=/var/tmp cargo $VERB -j$JOBS$CMD"
+    RUN="OCSERVE_BUILD_COMMIT=$BUILD_COMMIT TMPDIR=/var/tmp cargo $VERB -j$JOBS$CMD"
     ;;
 esac
 
