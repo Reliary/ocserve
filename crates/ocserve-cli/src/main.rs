@@ -1439,7 +1439,14 @@ async fn doctor(
             if rows.is_empty() {
                 println!("  schedules:       none");
             } else {
-                for (id, sid, status, due, runs) in rows {
+                for row in rows {
+                    let (id, sid, status, due, runs) = (
+                        row.id,
+                        row.session_id,
+                        row.status,
+                        row.next_due_ms,
+                        row.run_count,
+                    );
                     let when = due
                         .map(|d| {
                             let rel = d.saturating_sub(ocserve_store::now_ms());

@@ -5300,13 +5300,19 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Every schedule row worth showing an operator: id, session, status, next due
-/// instant, run count. `doctor` prints these because a wake-up that will never
+/// One row of `schedule_summary`.
+pub struct ScheduleSummary {
+    pub id: String,
+    pub session_id: String,
+    pub status: String,
+    pub next_due_ms: Option<i64>,
+    pub run_count: i64,
+}
+
+/// Every schedule row worth showing an operator. `doctor` prints these because a wake-up that will never
 /// fire is otherwise invisible — the runner is silent by design, and that
 /// silence was exactly the shape-without-mutation bug.
-pub fn schedule_summary(
-    db: &Path,
-) -> anyhow::Result<Vec<(String, String, String, Option<i64>, i64)>> {
+pub fn schedule_summary(db: &Path) -> anyhow::Result<Vec<ScheduleSummary>> {
     let r = pragma::open_reader(db)?;
     let mut stmt = r.prepare(
         "SELECT id, session_id, status, next_due_ms, run_count \
@@ -5314,7 +5320,13 @@ pub fn schedule_summary(
     )?;
     let rows = stmt
         .query_map([], |x| {
-            Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?))
+            Ok(ScheduleSummary {
+                id: x.get(0)?,
+                session_id: x.get(1)?,
+                status: x.get(2)?,
+                next_due_ms: x.get(3)?,
+                run_count: x.get(4)?,
+            })
         })?
         .filter_map(|r| r.ok())
         .collect();
