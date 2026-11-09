@@ -106,6 +106,7 @@ where
         .map_err(|e| anyhow::anyhow!("blocking task join: {e}"))?
 }
 
+mod artifact_store;
 pub mod compress;
 pub mod doc;
 pub mod embedded_ui;
@@ -382,6 +383,12 @@ pub struct LlmRegistry {
     pub pricing: std::collections::HashMap<(String, String), (f64, f64, f64)>,
     /// (providerID, modelID) → `limit` block (context/input) — M6 trigger
     pub limits: std::collections::HashMap<(String, String), serde_json::Value>,
+    /// (providerID, modelID) → the model's INPUT modalities (`["text",
+    /// "image", …]`). Used to apply upstream's `unsupportedParts` rule: a
+    /// model that cannot read images must receive an explanatory TEXT part
+    /// instead of the image, not the raw image (the provider then rejects the
+    /// whole turn). Empty map = unknown, treated as text-only.
+    pub modalities: std::collections::HashMap<(String, String), Vec<String>>,
     /// default (providerID, modelID) from opencode state
     pub default_model: (String, String),
     /// agent name → system prompt (only agents with explicit prompts)
@@ -3608,6 +3615,13 @@ pub(crate) fn build_prompt_context(
             api_key,
             pricing,
         },
+        modalities: st
+            .llm
+            .read()
+            .modalities
+            .get(&(pid.clone(), mid.clone()))
+            .cloned()
+            .unwrap_or_default(),
         model_id: mid,
         provider_id: pid,
         variant,
@@ -5973,13 +5987,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/experimental/artifacts/{artifactID}",
-            get(v2::artifacts_one)
-                .patch(v2::artifacts_one)
-                .delete(v2::artifacts_one),
+            get(v2::artifacts_get)
+                .patch(v2::artifacts_update)
+                .delete(v2::artifacts_delete),
         )
         .route(
             "/api/experimental/artifacts/{artifactID}/view/{*path}",
-            get(v2::artifacts_view),
+            get(v2::artifacts_view_route),
+        )
+        // The view URL upstream hands out ends in `/view/` with NOTHING after
+        // it; `{*path}` needs at least one character, so that exact URL fell
+        // through to the SPA. Two bindings, one handler (`sub` empty = entry).
+        .route(
+            "/api/experimental/artifacts/{artifactID}/view/",
+            get(v2::artifacts_view_entry),
         )
         .route(
             "/api/experimental/fs/write",

@@ -38,6 +38,12 @@ pub struct PromptContext {
     pub endpoint: LlmEndpoint,
     pub model_id: String,
     pub provider_id: String,
+    /// The model's INPUT modalities (`["text"]`, `["text","image"]`, …).
+    /// Upstream `unsupportedParts` (provider/transform.ts:409) replaces a
+    /// media part with an explanatory TEXT part when the model cannot read that
+    /// modality, so the turn degrades instead of failing at the provider.
+    /// Empty = unknown, treated as text-only.
+    pub modalities: Vec<String>,
     /// Selected variant (upstream Session.model.variant), resolved at request
     /// time. `None` and `"default"` are equivalent (upstream's `?? "default"`
     /// comparison and its `!== "default"` gate for the provider options).
@@ -82,6 +88,68 @@ pub struct PromptContext {
     /// K-TASK: configured agents (v1 `Agent.Info` shape) — the `task` tool
     /// resolves `subagent_type` against `mode == "subagent"` entries here.
     pub agent_catalog: Vec<serde_json::Value>,
+}
+
+/// Upstream's ingest-time expansion of a `text/plain` data-URL attachment
+/// (prompt.ts:795-810): a synthetic "Called the Read tool …" line and the
+/// decoded body, both persisted as synthetic text parts BEFORE the file part.
+/// Without it the text was dropped entirely — the provider converter ignores
+/// text/plain file parts, so a pasted `.txt` reached the model as nothing.
+fn expand_text_attachment(part: &Value) -> Option<(String, String)> {
+    if part["mime"].as_str()? != "text/plain" {
+        return None;
+    }
+    let url = part["url"].as_str()?;
+    let b64 = url.strip_prefix("data:")?;
+    let (_, payload) = b64.split_once(',')?;
+    let bytes = base64_decode(payload)?;
+    let text = String::from_utf8(bytes).ok()?;
+    let file_path = part["filename"].as_str().unwrap_or("");
+    Some((
+        format!(
+            "Called the Read tool with the following input: {}",
+            json!({"filePath": file_path})
+        ),
+        text,
+    ))
+}
+
+/// Minimal standard base64 decode (the attachment path only; no padding
+/// edge cases beyond what a data URL carries).
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits = 0u32;
+    for c in s.bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        let v = T.iter().position(|x| *x == c)? as u32;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// `mimeToModality` (upstream util/media): the provider content modality a
+/// MIME type maps to, or None for types that are not media at all.
+fn mime_to_modality(mime: &str) -> Option<&'static str> {
+    if mime.starts_with("image/") {
+        Some("image")
+    } else if mime.starts_with("audio/") {
+        Some("audio")
+    } else if mime.starts_with("video/") {
+        Some("video")
+    } else if mime == "application/pdf" {
+        Some("pdf")
+    } else {
+        None
+    }
 }
 
 /// `track()` off the tokio workers (git shells out — the F1 convoy rule).
@@ -886,7 +954,17 @@ async fn transform_messages(
 }
 
 pub fn to_provider_messages(history: &[(Value, Vec<Value>)]) -> Vec<ChatMessage> {
-    to_provider_messages_budget(history, PROMPT_HISTORY_MAX_BYTES)
+    to_provider_messages_with(history, &[])
+}
+
+/// As `to_provider_messages`, but applying upstream's `unsupportedParts` rule
+/// for the given model INPUT modalities. An empty slice means "unknown", which
+/// stays permissive (send the media as-is).
+pub fn to_provider_messages_with(
+    history: &[(Value, Vec<Value>)],
+    modalities: &[String],
+) -> Vec<ChatMessage> {
+    to_provider_messages_budget(history, PROMPT_HISTORY_MAX_BYTES, modalities)
 }
 
 /// Index of the oldest message the byte budget keeps.
@@ -923,6 +1001,7 @@ fn trim_start_idx(history: &[(Value, Vec<Value>)], idx: &[usize], budget: usize)
 pub(crate) fn to_provider_messages_budget(
     history: &[(Value, Vec<Value>)],
     budget: usize,
+    modalities: &[String],
 ) -> Vec<ChatMessage> {
     let start = trim_start(history, budget);
     if start > 0 {
@@ -940,66 +1019,87 @@ pub(crate) fn to_provider_messages_budget(
     let mut out = Vec::new();
     for (info, parts) in &history[start..] {
         let role = info["role"].as_str().unwrap_or("user");
-        let mut text: String = parts
-            .iter()
-            .filter(|p| p["type"] == "text")
-            .filter_map(|p| p["text"].as_str())
-            .collect();
-        // Media attachments (v1 parity: message-v2.ts:222-239). Upstream keeps
-        // a user `file` part as an AI-SDK `file` content part, EXCEPT
-        // text/plain and directory files (converted to text upstream and
-        // dropped here) — so a turn with an image becomes
-        // `content: [{type:"text",…},{type:"file",url,mediaType,filename}]`
-        // and a turn with no media stays a plain string. Emitting the string
-        // form for an image turn is the silent-drop bug: the model never sees
-        // the picture and nothing errors.
-        let media: Vec<Value> = if role == "user" {
-            parts
-                .iter()
-                .filter(|p| p["type"] == "file")
-                .filter(|p| {
-                    let mime = p["mime"].as_str().unwrap_or("");
-                    !mime.is_empty() && mime != "text/plain" && mime != "application/x-directory"
-                })
-                .map(|p| {
-                    json!({
-                        "type": "file",
-                        "url": p["url"],
-                        "mediaType": p["mime"],
-                        "filename": p["filename"],
-                    })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        // v1 parity (message-v2.ts:231-235): a user compaction part renders as
-        // the literal question "What did we do so far?" — ocserve emitted an
-        // EMPTY user message for the anchor, so the model got the summary with
-        // no cue what it summarised.
-        if role == "user" && parts.iter().any(|p| p["type"] == "compaction") {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str("What did we do so far?");
-        }
         let tool_parts: Vec<&Value> = parts.iter().filter(|p| p["type"] == "tool").collect();
         if tool_parts.is_empty() {
-            if !media.is_empty() {
-                // Text part first, then the files (AI SDK part order).
-                let mut content = Vec::with_capacity(media.len() + 1);
-                if !text.is_empty() {
-                    content.push(json!({"type": "text", "text": text}));
+            // AI-SDK part order (message-v2.ts:209-250 + convertToModelMessages):
+            // every stored part maps to content IN ITS OWN POSITION — a text
+            // part to itself, a readable file part to a file entry, an
+            // unreadable one to the explanatory text upstream substitutes, a
+            // compaction part to "What did we do so far?". text/plain and
+            // directory file parts are dropped here (already expanded at
+            // ingest, prompt.ts:795). A message with NO file/compaction part
+            // becomes a plain string, exactly as before.
+            let mut entries: Vec<Value> = Vec::new();
+            for p in parts {
+                match p["type"].as_str().unwrap_or("") {
+                    "text" => {
+                        if p["ignored"].as_bool() == Some(true) {
+                            continue;
+                        }
+                        if let Some(t) = p["text"].as_str()
+                            && !t.is_empty()
+                        {
+                            entries.push(json!({"type": "text", "text": t}));
+                        }
+                    }
+                    "compaction" if role == "user" => {
+                        entries.push(json!({"type": "text", "text": "What did we do so far?"}));
+                    }
+                    "file" if role == "user" => {
+                        let mime = p["mime"].as_str().unwrap_or("");
+                        if mime.is_empty()
+                            || mime == "text/plain"
+                            || mime == "application/x-directory"
+                        {
+                            continue;
+                        }
+                        // Upstream capability default: text true, everything
+                        // else false, so an UNKNOWN model is text-only.
+                        if let Some(kind) = mime_to_modality(mime)
+                            && !modalities.iter().any(|m| m == kind)
+                        {
+                            let name = p["filename"]
+                                .as_str()
+                                .map(|f| format!("\"{f}\""))
+                                .unwrap_or_else(|| kind.to_string());
+                            entries.push(json!({
+                                "type": "text",
+                                "text": format!(
+                                    "ERROR: Cannot read {name} (this model does not support {kind} input). Inform the user."
+                                ),
+                            }));
+                            continue;
+                        }
+                        entries.push(json!({
+                            "type": "file",
+                            "url": p["url"],
+                            "mediaType": p["mime"],
+                            "filename": p["filename"],
+                        }));
+                    }
+                    _ => {}
                 }
-                content.extend(media.iter().cloned());
+            }
+            // convertToModelMessages: a single text part becomes a STRING, two
+            // or more parts become a content ARRAY (even when every part is
+            // text, e.g. an unsupported image replaced by its explanatory
+            // text). The earlier `has_media` test collapsed that case to one
+            // merged string, which changed the prompt shape.
+            // A media entry is ALWAYS an array (even alone); otherwise only two
+            // or more parts are (a lone text part stays a string).
+            let has_media = entries.iter().any(|e| e["type"] == "file");
+            if has_media || entries.len() > 1 {
                 out.push(ChatMessage {
                     role: role.to_string(),
-                    content: ocserve_llm::Content::Parts(content),
+                    content: ocserve_llm::Content::Parts(entries),
                     tool_call_id: None,
                     tool_calls: None,
                 });
-            } else if !text.is_empty() || role == "user" {
-                out.push(ChatMessage::text(role, text));
+            } else {
+                let text: String = entries.iter().filter_map(|e| e["text"].as_str()).collect();
+                if !text.is_empty() || role == "user" {
+                    out.push(ChatMessage::text(role, text));
+                }
             }
             continue;
         }
@@ -1021,6 +1121,13 @@ pub(crate) fn to_provider_messages_budget(
                     }
                 })
             })
+            .collect();
+        // Assistant turns carry only their text parts; media is user-side.
+        let text: String = parts
+            .iter()
+            .filter(|p| p["type"] == "text")
+            .filter(|p| p["ignored"].as_bool() != Some(true))
+            .filter_map(|p| p["text"].as_str())
             .collect();
         out.push(ChatMessage::assistant_with_tools(text, calls));
         for p in &tool_parts {
@@ -1866,14 +1973,48 @@ pub async fn run_prompt_with(
             }
             user_parts.push(part);
         } else if p["type"] == "file" || p["type"] == "agent" {
+            // The wire part is FLAT (`FilePartInput {type,mime,url,filename}`,
+            // `AgentPartInput {type,name}`), and so is the stored part. An
+            // earlier version nested them under `part["file"]`, which the
+            // decoder never fills, so every attachment persisted as
+            // `{"type":"file","file":{}}` — the image was silently dropped
+            // from history and from every later provider request.
             let ptype = p["type"].as_str().unwrap_or("file").to_string();
-            user_parts.push(json!({
+            let mut part = json!({
                 "id": prt_id(),
                 "sessionID": session_id,
                 "messageID": user_msg_id,
                 "type": ptype,
-                ptype.clone(): p.get(&ptype).cloned().unwrap_or(json!({})),
-            }));
+            });
+            let allowed: &[&str] = if ptype == "file" {
+                &["mime", "filename", "url", "source"]
+            } else {
+                &["name", "source"]
+            };
+            for k in allowed {
+                if let Some(v) = p.get(*k) {
+                    part[*k] = v.clone();
+                }
+            }
+            // Upstream expands a `text/plain` data-URL attachment AT INGEST
+            // into two synthetic text parts — a "Called the Read tool" line and
+            // the decoded content — followed by the file part itself
+            // (prompt.ts:795-810). Without this the text was dropped (the
+            // provider converter ignores text/plain file parts), so a pasted
+            // .txt file reached the model as nothing at all.
+            if let Some((call_text, content)) = expand_text_attachment(&part) {
+                for text in [call_text, content] {
+                    user_parts.push(json!({
+                        "id": prt_id(),
+                        "sessionID": session_id,
+                        "messageID": user_msg_id,
+                        "type": "text",
+                        "text": text,
+                        "synthetic": true,
+                    }));
+                }
+            }
+            user_parts.push(part);
         }
     }
     let t_created = now_ms();
@@ -2162,7 +2303,7 @@ pub async fn run_prompt_with(
             // message-rebuild refactor, tracked as a named gap rather than
             // pretended.
             let history = transform_messages(ctx, session_id, &history).await;
-            messages.extend(to_provider_messages(&history));
+            messages.extend(to_provider_messages_with(&history, &ctx.modalities));
             // Goal context hook (upstream goal.ts:219-231): when a goal is
             // ACTIVE on this session and the objective is not already in view
             // (e.g. after a compaction dropped the kickoff), splice the
@@ -4491,8 +4632,8 @@ mod bounded_prompt_load_tests {
         let full = load_prompt_history_budget(&fx.db, &fx.sid, budget, true, false).unwrap();
         let bounded =
             load_prompt_history_budget(&fx.db, &fx.sid, budget, false, transform).unwrap();
-        let full_msgs = to_provider_messages_budget(&full, budget);
-        let bounded_msgs = to_provider_messages_budget(&bounded, budget);
+        let full_msgs = to_provider_messages_budget(&full, budget, &[]);
+        let bounded_msgs = to_provider_messages_budget(&bounded, budget, &[]);
         assert_eq!(
             serde_json::to_string(&full_msgs).unwrap(),
             serde_json::to_string(&bounded_msgs).unwrap(),
@@ -4665,6 +4806,7 @@ mod bounded_prompt_load_tests {
         let full = to_provider_messages_budget(
             &load_prompt_history_budget(&fx.db, &fx.sid, budget, true, false).unwrap(),
             budget,
+            &[],
         );
         // A window that starts AFTER the tail is exactly the bug this design
         // must refuse to trust; simulate it directly.
@@ -4672,7 +4814,7 @@ mod bounded_prompt_load_tests {
             .unwrap()
             .expect("tail message");
         let bad = ocserve_store::load_messages_since(&fx.db, &fx.sid, tail_seq + 1).unwrap();
-        let bad_msgs = to_provider_messages_budget(&bad, budget);
+        let bad_msgs = to_provider_messages_budget(&bad, budget, &[]);
         assert_ne!(
             serde_json::to_string(&full).unwrap(),
             serde_json::to_string(&bad_msgs).unwrap(),
@@ -4761,12 +4903,12 @@ mod bounded_prompt_load_corpus {
         let tx_ms = t2.elapsed();
         let (full_ms, bounded_ms) = (full_best, bounded_best);
 
-        let full_out = to_provider_messages_budget(&full, PROMPT_HISTORY_MAX_BYTES);
+        let full_out = to_provider_messages_budget(&full, PROMPT_HISTORY_MAX_BYTES, &[]);
         for (label, other) in [
             ("bounded", &bounded),
             ("bounded+transform", &bounded_with_tx),
         ] {
-            let out = to_provider_messages_budget(other, PROMPT_HISTORY_MAX_BYTES);
+            let out = to_provider_messages_budget(other, PROMPT_HISTORY_MAX_BYTES, &[]);
             assert_eq!(
                 serde_json::to_string(&full_out).unwrap(),
                 serde_json::to_string(&out).unwrap(),
@@ -4861,8 +5003,8 @@ mod compaction_row_safety_tests {
             let full = load_prompt_history_budget(&db, sid, budget, true, false).unwrap();
             let bounded = load_prompt_history_budget(&db, sid, budget, false, false).unwrap();
             assert_eq!(
-                serde_json::to_string(&to_provider_messages_budget(&full, budget)).unwrap(),
-                serde_json::to_string(&to_provider_messages_budget(&bounded, budget)).unwrap(),
+                serde_json::to_string(&to_provider_messages_budget(&full, budget, &[])).unwrap(),
+                serde_json::to_string(&to_provider_messages_budget(&bounded, budget, &[])).unwrap(),
                 "a summary without finish made the bounded window diverge at budget {budget}"
             );
             let (min_seq, _) = ocserve_store::prompt_window(&db, sid, budget).unwrap();
@@ -4946,13 +5088,16 @@ mod media_encoding_tests {
     /// image with no error anywhere (upstream: message-v2.ts:222-239).
     #[test]
     fn image_attachment_becomes_a_file_content_part() {
-        let msgs = to_provider_messages(&hist(vec![
-            json!({"type": "text", "text": "what is this?"}),
-            json!({
-                "type": "file", "mime": "image/webp", "filename": "shot.webp",
-                "url": "data:image/webp;base64,AAAA"
-            }),
-        ]));
+        let msgs = to_provider_messages_with(
+            &hist(vec![
+                json!({"type": "text", "text": "what is this?"}),
+                json!({
+                    "type": "file", "mime": "image/webp", "filename": "shot.webp",
+                    "url": "data:image/webp;base64,AAAA"
+                }),
+            ]),
+            &["text".to_string(), "image".to_string()],
+        );
         assert_eq!(msgs.len(), 1);
         let parts = match &msgs[0].content {
             ocserve_llm::Content::Parts(p) => p.clone(),
@@ -4963,6 +5108,78 @@ mod media_encoding_tests {
         assert_eq!(parts[1]["mediaType"], "image/webp");
         assert_eq!(parts[1]["url"], "data:image/webp;base64,AAAA");
         assert_eq!(parts[1]["filename"], "shot.webp");
+    }
+
+    /// Upstream replaces an unreadable media part with an explanatory TEXT
+    /// part (provider/transform.ts:409 `unsupportedParts`) and, because the
+    /// message now has two parts, sends a content ARRAY. Sending the raw image
+    /// to a text-only model makes the provider reject the whole turn.
+    #[test]
+    fn unreadable_media_becomes_an_explanatory_text_part() {
+        let history = hist(vec![
+            json!({"type": "text", "text": "look"}),
+            json!({"type": "file", "mime": "image/png", "filename": "dot.png",
+                   "url": "data:image/png;base64,AAAA"}),
+        ]);
+        let msgs = to_provider_messages_with(&history, &["text".to_string()]);
+        let parts = match &msgs[0].content {
+            ocserve_llm::Content::Parts(p) => p.clone(),
+            other => panic!("two parts must be an array, got {other:?}"),
+        };
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[1],
+            json!({"type": "text", "text": "ERROR: Cannot read \"dot.png\" (this model does not support image input). Inform the user."})
+        );
+        // ...and a model that CAN read images keeps the file part.
+        let ok = to_provider_messages_with(&history, &["text".to_string(), "image".to_string()]);
+        let parts = match &ok[0].content {
+            ocserve_llm::Content::Parts(p) => p.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(parts[1]["type"], "file");
+    }
+
+    /// Two TEXT parts stay two content entries. The pre-fix code merged them
+    /// into one string, so the ingest-time synthetic "Called the Read tool"
+    /// line was concatenated onto the file body (capdiff `attachments` found
+    /// this against the reference).
+    #[test]
+    fn multiple_text_parts_stay_separate_entries() {
+        let msgs = to_provider_messages(&hist(vec![
+            json!({"type": "text", "text": "two files"}),
+            json!({"type": "text", "text": "Called the Read tool with the following input: {}"}),
+            json!({"type": "text", "text": "hello attachment"}),
+        ]));
+        let parts = match &msgs[0].content {
+            ocserve_llm::Content::Parts(p) => p.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(parts.len(), 3);
+        assert_eq!(
+            parts[1]["text"],
+            "Called the Read tool with the following input: {}"
+        );
+        assert_eq!(parts[2]["text"], "hello attachment");
+    }
+
+    /// Upstream expands a text/plain data-URL attachment at INGEST into a
+    /// synthetic "Called the Read tool" line plus the decoded body, then keeps
+    /// the file part (prompt.ts:795-810). Dropping the text lost the file.
+    #[test]
+    fn text_attachment_is_expanded_at_ingest() {
+        let b64 = "aGVsbG8gYXR0YWNobWVudA=="; // "hello attachment"
+        let part = json!({"type": "file", "mime": "text/plain", "filename": "note.txt",
+                          "url": format!("data:text/plain;base64,{b64}")});
+        let (call, body) = expand_text_attachment(&part).expect("text/plain must expand");
+        assert_eq!(
+            call,
+            "Called the Read tool with the following input: {\"filePath\":\"note.txt\"}"
+        );
+        assert_eq!(body, "hello attachment");
+        // A non-text attachment must NOT expand.
+        let png = json!({"type": "file", "mime": "image/png", "url": "data:image/png;base64,AA"});
+        assert!(expand_text_attachment(&png).is_none());
     }
 
     /// A text-only turn must stay a plain string: the byte form the provider
@@ -4994,9 +5211,12 @@ mod media_encoding_tests {
     /// string and lost the attachment.
     #[test]
     fn media_only_turn_is_sent() {
-        let msgs = to_provider_messages(&hist(vec![json!({
-            "type": "file", "mime": "application/pdf", "url": "data:application/pdf;base64,AA"
-        })]));
+        let msgs = to_provider_messages_with(
+            &hist(vec![json!({
+                "type": "file", "mime": "application/pdf", "url": "data:application/pdf;base64,AA"
+            })]),
+            &["text".to_string(), "pdf".to_string()],
+        );
         match &msgs[0].content {
             ocserve_llm::Content::Parts(p) => {
                 assert_eq!(p.len(), 1);

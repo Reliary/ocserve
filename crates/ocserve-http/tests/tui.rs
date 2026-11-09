@@ -19,6 +19,7 @@ fn state() -> (Arc<AppState>, axum::Router) {
     let blobs = Arc::new(ocserve_store::BlobStore::new(dir.path().join("blobs")).unwrap());
     let writer = Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
     let llm = LlmRegistry {
+        modalities: Default::default(),
         endpoints: Default::default(),
         pricing: Default::default(),
         limits: Default::default(),

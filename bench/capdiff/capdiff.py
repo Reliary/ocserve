@@ -527,8 +527,20 @@ def run_arm(which, port, sink_port, scenarios, tmp, watcher):
             seq_before = sink.seq
             for step in sc["steps"]:
                 if step["type"] == "prompt":
+                    parts = [{"type": "text", "text": step["text"]}]
+                    # Optional file attachments (the media-encoding axis). A
+                    # step lists `files: [{mime, filename, url}]` and both arms
+                    # receive the identical part, so any difference in the
+                    # provider request is the encoding under test.
+                    for f in step.get("files", []):
+                        parts.append({
+                            "type": "file",
+                            "mime": f["mime"],
+                            "filename": f.get("filename", "f.bin"),
+                            "url": f["url"],
+                        })
                     payload = {"model": {"providerID": "stub", "modelID": model},
-                               "parts": [{"type": "text", "text": step["text"]}]}
+                               "parts": parts}
                     if agent:
                         payload["agent"] = agent
                     post(port, f"/session/{sid}/message", payload)
@@ -729,6 +741,16 @@ def main():
                   file=sys.stderr)
             return 2
         d, al, ed, cd, cost, fm, om = compare_scenario(sc, fr[name], oc[name], allow)
+        if os.environ.get("CAPDIFF_DUMP"):
+            # One file per arm, full fidelity (truncating the JSON produced a
+            # half-written string every time).
+            dump = os.environ["CAPDIFF_DUMP"]
+            with open(f"{dump}.freeze.jsonl", "w") as fh:
+                for r in fm:
+                    fh.write(json.dumps(r) + "\n")
+            with open(f"{dump}.ocserve.jsonl", "w") as fh:
+                for r in om:
+                    fh.write(json.dumps(r) + "\n")
         oc_m = oc[name]["metrics"]
         entry = {"name": name,
                  "provider_requests": {"freeze": len(fm), "ocserve": len(om)},

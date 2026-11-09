@@ -26,6 +26,7 @@ fn state_with(endpoints: [(&str, &str); 1]) -> (std::sync::Arc<AppState>, axum::
     let writer = std::sync::Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
     let blobs = std::sync::Arc::new(ocserve_store::BlobStore::new(dir.join("blobs")).unwrap());
     let llm = LlmRegistry {
+        modalities: Default::default(),
         limits: std::collections::HashMap::new(),
         endpoints: endpoints
             .into_iter()
@@ -131,6 +132,7 @@ async fn page_headers_cursor_follow_and_streamed_body() {
     let writer = std::sync::Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
     let blobs = std::sync::Arc::new(ocserve_store::BlobStore::new(dir.join("blobs")).unwrap());
     let llm = LlmRegistry {
+        modalities: Default::default(),
         limits: std::collections::HashMap::new(),
         endpoints: [("fake".into(), ("http://127.0.0.1:9".into(), String::new()))]
             .into_iter()
@@ -298,6 +300,7 @@ async fn limit_query_error_matrix_matches_probes() {
     let writer = std::sync::Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
     let blobs = std::sync::Arc::new(ocserve_store::BlobStore::new(dir.join("blobs")).unwrap());
     let llm = LlmRegistry {
+        modalities: Default::default(),
         limits: std::collections::HashMap::new(),
         endpoints: [("fake".into(), ("http://127.0.0.1:9".into(), String::new()))]
             .into_iter()
@@ -426,6 +429,7 @@ async fn abort_releases_prompt_locks_and_tasks() {
     let writer = std::sync::Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
     let blobs = std::sync::Arc::new(ocserve_store::BlobStore::new(dir.join("blobs")).unwrap());
     let llm = LlmRegistry {
+        modalities: Default::default(),
         limits: std::collections::HashMap::new(),
         endpoints: [("fake".into(), (hang, String::new()))]
             .into_iter()

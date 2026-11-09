@@ -400,7 +400,18 @@ fn transform_config_model(pid: &str, mid: &str, m: &Value) -> Value {
             "reasoning": m.get("reasoning").and_then(|v| v.as_bool()).unwrap_or(false),
             "attachment": m.get("attachment").and_then(|v| v.as_bool()).unwrap_or(false),
             "toolcall": m.get("tool_call").and_then(|v| v.as_bool()).unwrap_or(false),
-            "input": {"text": true, "audio": false, "image": false, "video": false, "pdf": false},
+            "input": {
+                "text": m.pointer("/modalities/input").and_then(|v| v.as_array())
+                    .map(|a| a.iter().any(|x| x.as_str()==Some("text"))).unwrap_or(true),
+                "audio": m.pointer("/modalities/input").and_then(|v| v.as_array())
+                    .map(|a| a.iter().any(|x| x.as_str()==Some("audio"))).unwrap_or(false),
+                "image": m.pointer("/modalities/input").and_then(|v| v.as_array())
+                    .map(|a| a.iter().any(|x| x.as_str()==Some("image"))).unwrap_or(false),
+                "video": m.pointer("/modalities/input").and_then(|v| v.as_array())
+                    .map(|a| a.iter().any(|x| x.as_str()==Some("video"))).unwrap_or(false),
+                "pdf": m.pointer("/modalities/input").and_then(|v| v.as_array())
+                    .map(|a| a.iter().any(|x| x.as_str()==Some("pdf"))).unwrap_or(false),
+            },
             "output": {"text": true, "audio": false, "image": false, "video": false, "pdf": false},
             "interleaved": m.get("interleaved").cloned().unwrap_or(json!(false)),
         },
@@ -1438,6 +1449,10 @@ impl Runtime {
         // pricing from models cache: (in, out, cache_read) USD per MTok
         let mut pricing = std::collections::HashMap::new();
         let mut limits = std::collections::HashMap::new();
+        // Input modalities decide whether an attachment may be sent as media
+        // or must become an explanatory text part (upstream `unsupportedParts`).
+        let mut modalities: std::collections::HashMap<(String, String), Vec<String>> =
+            std::collections::HashMap::new();
         if let Some(provs) = cache.as_object() {
             for (pid, p) in provs {
                 if let Some(models) = p.get("models").and_then(|v| v.as_object()) {
@@ -1445,6 +1460,15 @@ impl Runtime {
                         limits.entry((pid.clone(), mid.clone())).or_insert_with(|| {
                             m.get("limit").cloned().unwrap_or(serde_json::Value::Null)
                         });
+                        if let Some(arr) = m.pointer("/modalities/input").and_then(|v| v.as_array())
+                        {
+                            modalities.insert(
+                                (pid.clone(), mid.clone()),
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(String::from))
+                                    .collect(),
+                            );
+                        }
                         let c = m.get("cost");
                         if let (Some(i), Some(o)) = (
                             c.and_then(|c| c.get("input")).and_then(|v| v.as_f64()),
@@ -1468,6 +1492,21 @@ impl Runtime {
                         limits.entry((pid.clone(), mid.clone())).or_insert_with(|| {
                             m.get("limit").cloned().unwrap_or(serde_json::Value::Null)
                         });
+                        // Upstream derives capabilities from `modalities` with
+                        // `text` defaulting TRUE and the rest FALSE
+                        // (provider.ts:1577-1581); a config model that omits
+                        // `modalities` is text-only, so an attachment must be
+                        // stripped rather than sent.
+                        let input_mods: Vec<String> = m
+                            .pointer("/modalities/input")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|x| x.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_else(|| vec!["text".to_string()]);
+                        modalities.insert((pid.clone(), mid.clone()), input_mods);
                         if let (Some(i), Some(o)) = (
                             m.pointer("/cost/input").and_then(|v| v.as_f64()),
                             m.pointer("/cost/output").and_then(|v| v.as_f64()),
@@ -1523,6 +1562,7 @@ impl Runtime {
             endpoints,
             pricing,
             limits,
+            modalities,
             default_model,
             systems,
             default_agent,

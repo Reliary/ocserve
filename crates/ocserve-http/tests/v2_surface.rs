@@ -258,6 +258,7 @@ async fn permission_create_evaluates_ruleset() {
         std::sync::Arc::new(ocserve_store::BlobStore::new(dir.path().join("blobs")).unwrap());
     let writer = std::sync::Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
     let llm = LlmRegistry {
+        modalities: Default::default(),
         endpoints: Default::default(),
         pricing: Default::default(),
         limits: Default::default(),

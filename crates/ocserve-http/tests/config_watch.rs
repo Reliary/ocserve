@@ -17,6 +17,7 @@ fn state(dir: &std::path::Path, payloads: Payloads) -> Arc<AppState> {
     let writer = Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
     let blobs = Arc::new(ocserve_store::BlobStore::new(dir.join("blobs")).unwrap());
     let llm = LlmRegistry {
+        modalities: Default::default(),
         limits: std::collections::HashMap::new(),
         endpoints: [("fake".into(), ("http://127.0.0.1:9".into(), String::new()))]
             .into_iter()
@@ -65,6 +66,7 @@ fn file_reloader(path: std::path::PathBuf) -> ocserve_http::ConfigReloader {
         Ok((
             p,
             LlmRegistry {
+                modalities: Default::default(),
                 default_model: ("swapped".into(), "marker".into()),
                 ..Default::default()
             },

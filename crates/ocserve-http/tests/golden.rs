@@ -506,6 +506,7 @@ async fn prompt_async_returns_204_persists_user_message_and_404s_unknown() {
     let writer = std::sync::Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
     let blobs = std::sync::Arc::new(ocserve_store::BlobStore::new(dir.join("blobs")).unwrap());
     let llm = LlmRegistry {
+        modalities: Default::default(),
         limits: std::collections::HashMap::new(),
         endpoints: [(
             "fake".to_string(),
@@ -1446,6 +1447,7 @@ async fn command_expands_and_persists_user_message_before_llm_fails() {
     let writer = std::sync::Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
     let blobs = std::sync::Arc::new(ocserve_store::BlobStore::new(dir.join("blobs")).unwrap());
     let llm = LlmRegistry {
+        modalities: Default::default(),
         limits: std::collections::HashMap::new(),
         endpoints: [(
             "fake".to_string(),

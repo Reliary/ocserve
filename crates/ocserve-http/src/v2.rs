@@ -645,7 +645,10 @@ pub async fn fs_list(
 /// canonicalize (missing) is still allowed only if its lexical form stays
 /// inside `base` (so `fs/list?path=missing` reports "No such file" rather than
 /// silently passing). `..` that resolves outside `base` is rejected.
-fn resolve_within(base: &std::path::Path, rel: &str) -> std::io::Result<std::path::PathBuf> {
+pub(crate) fn resolve_within(
+    base: &std::path::Path,
+    rel: &str,
+) -> std::io::Result<std::path::PathBuf> {
     // One containment rule for both wire families (containment.rs). The v2
     // writer previously had its own deepest-existing-ancestor check while the
     // v1 reader had a weaker lexical fallback; two implementations of a
@@ -5444,21 +5447,46 @@ pub async fn fs_watch(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// DELETE /api/experimental/fs/watch — deregister (204, always).
-pub async fn fs_unwatch(State(st): State<Arc<AppState>>, body: Option<Json<Value>>) -> StatusCode {
-    if let Some(Json(v)) = body
-        && let Some(p) = v.get("path").and_then(|v| v.as_str())
-    {
-        st.fs_watches.lock().remove(p);
-    }
-    StatusCode::NO_CONTENT
+/// DELETE /api/experimental/fs/watch — deregister (204).
+///
+/// The reference REQUIRES the `{path}` body: a missing body is a 400
+/// `InvalidRequestError "Expected object"` and a body without `path` is
+/// `Missing key at ["path"]` (probed 2.2.5). An earlier version answered 204
+/// unconditionally, so a client with a bug never learned it deregistered
+/// nothing.
+pub async fn fs_unwatch(
+    State(st): State<Arc<AppState>>,
+    body: Option<Json<Value>>,
+) -> Result<StatusCode, crate::HttpError> {
+    let Some(Json(v)) = body else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Expected object", "kind": "Payload"}),
+        });
+    };
+    let Some(path) = v.get("path").and_then(|v| v.as_str()) else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"path\"]", "kind": "Payload"}),
+        });
+    };
+    st.fs_watches.lock().remove(path);
+    Ok(StatusCode::NO_CONTENT)
 }
 
-/// GET /api/experimental/artifacts* — upstream gates the whole family on
-/// `experimental.artifacts` in config and answers `ForbiddenError` when it is
-/// off (probed live). ocserve has no artifacts store, so the same envelope is
-/// the honest answer regardless of config: shape-without-mutation is worse
-/// than a named refusal. `D-ARTIFACTS` in the ledger.
+/// Artifacts family gate: `experimental.artifacts === true` in the resolved
+/// config (upstream `requireEnabled`, probed 2.2.5). Decoded BEFORE the gate.
+fn artifacts_enabled(st: &AppState) -> bool {
+    st.payloads
+        .read()
+        .config
+        .pointer("/experimental/artifacts")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 fn artifacts_disabled() -> crate::HttpError {
     crate::HttpError::TaggedData {
         status: StatusCode::FORBIDDEN,
@@ -5467,29 +5495,418 @@ fn artifacts_disabled() -> crate::HttpError {
     }
 }
 
-/// GET /api/experimental/artifacts
-pub async fn artifacts_list() -> Result<Json<Value>, crate::HttpError> {
-    Err(artifacts_disabled())
+fn artifact_bad_id(_id: &str) -> crate::HttpError {
+    crate::HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidRequestError",
+        fields: json!({
+            "message": "Expected a string starting with \"art_\"\n  at [\"artifactID\"]",
+            "kind": "Params",
+        }),
+    }
 }
 
-/// POST /api/experimental/artifacts
-pub async fn artifacts_create() -> Result<Json<Value>, crate::HttpError> {
-    Err(artifacts_disabled())
+fn artifact_id_ok(id: &str) -> bool {
+    // Prefix only (probed: `art_x` decodes to a 403/404, `nope` 400s).
+    id.starts_with("art_")
 }
 
-/// GET /api/experimental/artifacts/providers
-pub async fn artifacts_providers() -> Result<Json<Value>, crate::HttpError> {
-    Err(artifacts_disabled())
+pub(crate) fn artifact_invalid(reason: &str, field: &str) -> crate::HttpError {
+    crate::HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidRequestError",
+        fields: json!({"message": reason, "kind": "artifact_invalid", "field": field}),
+    }
 }
 
-/// GET|PATCH|DELETE /api/experimental/artifacts/{artifactID}
-pub async fn artifacts_one() -> Result<Json<Value>, crate::HttpError> {
-    Err(artifacts_disabled())
+fn artifact_not_found(id: &str) -> crate::HttpError {
+    crate::HttpError::TaggedData {
+        status: StatusCode::NOT_FOUND,
+        tag: "ArtifactNotFoundError",
+        fields: json!({"artifactID": id, "message": format!("Artifact not found: {id}")}),
+    }
 }
 
-/// GET /api/experimental/artifacts/{artifactID}/view/*
-pub async fn artifacts_view() -> Result<Json<Value>, crate::HttpError> {
-    Err(artifacts_disabled())
+/// Validate the optional `sessionID` on create/update: brand + existence.
+fn artifact_check_session(st: &AppState, v: Option<&Value>) -> Result<(), crate::HttpError> {
+    let Some(sid) = v.and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    if !sid.starts_with("ses") {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Expected a string starting with \"ses\"\n  at [\"sessionID\"]", "kind": "Payload"}),
+        });
+    }
+    if !ocserve_store::session_exists(&st.db, sid).unwrap_or(false) {
+        return Err(session_not_found(sid));
+    }
+    Ok(())
+}
+
+/// GET /api/experimental/artifacts/providers → `{location, data:[…]}`.
+pub async fn artifacts_providers(
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<Value>, crate::HttpError> {
+    if !artifacts_enabled(&st) {
+        return Err(artifacts_disabled());
+    }
+    Ok(Json(json!({
+        "location": api_location_ref(&st),
+        "data": [{"id": "local", "name": "Local", "capabilities": ["static"], "default": true}],
+    })))
+}
+
+/// GET /api/experimental/artifacts?sessionID=&provider= → `{location, data}`.
+pub async fn artifacts_list(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, crate::HttpError> {
+    let session = q.get("sessionID").cloned();
+    if let Some(sid) = &session {
+        if !sid.starts_with("ses") {
+            return Err(crate::HttpError::TaggedData {
+                status: StatusCode::BAD_REQUEST,
+                tag: "InvalidRequestError",
+                fields: json!({"message": "Expected a string starting with \"ses\"\n  at [\"sessionID\"]", "kind": "Query"}),
+            });
+        }
+        if !ocserve_store::session_exists(&st.db, sid).unwrap_or(false) {
+            return Err(session_not_found(sid));
+        }
+    }
+    if !artifacts_enabled(&st) {
+        return Err(artifacts_disabled());
+    }
+    let provider = q.get("provider").cloned();
+    let rows: Vec<Value> = crate::artifact_store::list_records(&crate::artifact_store::root(&st))
+        .into_iter()
+        .filter(|r| {
+            session
+                .as_ref()
+                .is_none_or(|s| r["sessionID"].as_str() == Some(s.as_str()))
+                && provider
+                    .as_ref()
+                    .is_none_or(|p| r["provider"].as_str() == Some(p.as_str()))
+        })
+        .collect();
+    Ok(Json(
+        json!({"location": api_location_ref(&st), "data": rows}),
+    ))
+}
+
+/// POST /api/experimental/artifacts → `{location, data: Artifact.Info}`.
+pub async fn artifacts_create(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, crate::HttpError> {
+    // Ordering probed 2.2.5: decode the body, check the session, then the gate.
+    let title =
+        body.get("title")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| crate::HttpError::TaggedData {
+                status: StatusCode::BAD_REQUEST,
+                tag: "InvalidRequestError",
+                fields: json!({"message": "Missing key\n  at [\"title\"]", "kind": "Payload"}),
+            })?;
+    let files = crate::artifact_store::files(body.get("files"))?;
+    let entry =
+        crate::artifact_store::resolve_entry(&files, body.get("entry").and_then(|v| v.as_str()))?;
+    if let Some(p) = body.get("provider").and_then(|v| v.as_str())
+        && p != "local"
+    {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "ProviderNotFoundError",
+            fields: json!({"providerID": p, "message": format!("Artifact provider not found: {p}")}),
+        });
+    }
+    artifact_check_session(&st, body.get("sessionID"))?;
+    if !artifacts_enabled(&st) {
+        return Err(artifacts_disabled());
+    }
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(artifact_invalid(
+            "Artifact title must not be empty",
+            "title",
+        ));
+    }
+    let now = now_ms_http();
+    let id = format!("art_{:013x}{:010x}", now, std::process::id());
+    let root = crate::artifact_store::root(&st);
+    // Root creation belongs to the store module (one containment/placement
+    // implementation; guard rule 43 keeps `create_dir_all` out of the router).
+    crate::artifact_store::ensure_root(&root).map_err(|e| crate::HttpError::TaggedData {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        tag: "ServiceUnavailableError",
+        fields: json!({"message": e.to_string(), "service": "local"}),
+    })?;
+    let mut files_out = serde_json::Map::new();
+    for (k, v) in &files {
+        let clean = crate::artifact_store::normalize_path(k)?;
+        files_out.insert(clean, v.clone());
+    }
+    crate::artifact_store::write_files(&root, &id, &files_out).map_err(|e| {
+        crate::HttpError::TaggedData {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            tag: "ServiceUnavailableError",
+            fields: json!({"message": e.to_string(), "service": "local"}),
+        }
+    })?;
+    let mut info = json!({
+        "id": id,
+        "provider": "local",
+        "title": title,
+        "entry": entry,
+        "url": format!("/api/experimental/artifacts/{id}/view/"),
+        "time": {"created": now, "updated": now},
+        "files": files_out,
+    });
+    if let Some(sid) = body.get("sessionID").and_then(|v| v.as_str()) {
+        info["sessionID"] = json!(sid);
+    }
+    std::fs::write(
+        crate::artifact_store::record_path(&root, &id),
+        serde_json::to_vec_pretty(&info).unwrap_or_default(),
+    )
+    .map_err(|e| crate::HttpError::TaggedData {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        tag: "ServiceUnavailableError",
+        fields: json!({"message": e.to_string(), "service": "local"}),
+    })?;
+    let mut out = info.clone();
+    if let Some(o) = out.as_object_mut() {
+        o.remove("files");
+    }
+    Ok(Json(json!({
+        "location": artifact_location(&st, out.get("sessionID")),
+        "data": out,
+    })))
+}
+
+/// `{directory}` for an artifact response: the SESSION's directory when the
+/// record names one (upstream resolves location through `sessions.get`),
+/// else the server directory.
+fn artifact_location(st: &AppState, session: Option<&Value>) -> Value {
+    if let Some(sid) = session.and_then(|v| v.as_str())
+        && let Ok(Some(dir)) = ocserve_store::session_directory(&st.db, sid)
+    {
+        return json!({"directory": dir});
+    }
+    api_location_ref(st)
+}
+
+fn artifact_load(st: &AppState, id: &str) -> Result<Value, crate::HttpError> {
+    crate::artifact_store::read_record(&crate::artifact_store::root(st), id)
+        .ok_or_else(|| artifact_not_found(id))
+}
+
+/// GET /api/experimental/artifacts/{artifactID} → `{location, data: Artifact.Info}`.
+pub async fn artifacts_get(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, crate::HttpError> {
+    if !artifact_id_ok(&id) {
+        return Err(artifact_bad_id(&id));
+    }
+    if !artifacts_enabled(&st) {
+        return Err(artifacts_disabled());
+    }
+    let mut rec = artifact_load(&st, &id)?;
+    let files = rec
+        .as_object_mut()
+        .and_then(|o| o.remove("files"))
+        .unwrap_or_else(|| json!({}));
+    Ok(Json(json!({
+        "location": artifact_location(&st, rec.get("sessionID")),
+        "data": {"info": rec, "files": files},
+    })))
+}
+
+/// PATCH /api/experimental/artifacts/{artifactID} → `{location, data}`.
+pub async fn artifacts_update(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, crate::HttpError> {
+    if !artifact_id_ok(&id) {
+        return Err(artifact_bad_id(&id));
+    }
+    // Probed ordering for PATCH: the BODY decodes before the id lookup and the
+    // gate (`PATCH art_x` with no body answers "Expected Artifact.UpdateInput").
+    let Some(body) = body.as_object() else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Expected Artifact.UpdateInput", "kind": "Payload"}),
+        });
+    };
+    let Some(files_v) = body.get("files") else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"files\"]", "kind": "Payload"}),
+        });
+    };
+    let files = crate::artifact_store::files(Some(files_v))?;
+    artifact_check_session(&st, body.get("sessionID"))?;
+    if !artifacts_enabled(&st) {
+        return Err(artifacts_disabled());
+    }
+    let mut rec = artifact_load(&st, &id)?;
+    let entry = crate::artifact_store::resolve_entry(
+        &files,
+        body.get("entry")
+            .and_then(|v| v.as_str())
+            .or_else(|| rec["entry"].as_str().filter(|e| files.contains_key(*e))),
+    )?;
+    let title = match body.get("title").and_then(|v| v.as_str()) {
+        Some(t) => t.trim().to_string(),
+        None => rec["title"].as_str().unwrap_or("").to_string(),
+    };
+    if title.is_empty() {
+        return Err(artifact_invalid(
+            "Artifact title must not be empty",
+            "title",
+        ));
+    }
+    let mut files_out = serde_json::Map::new();
+    for (k, v) in &files {
+        files_out.insert(crate::artifact_store::normalize_path(k)?, v.clone());
+    }
+    let root = crate::artifact_store::root(&st);
+    crate::artifact_store::write_files(&root, &id, &files_out).map_err(|e| {
+        crate::HttpError::TaggedData {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            tag: "ServiceUnavailableError",
+            fields: json!({"message": e.to_string(), "service": "local"}),
+        }
+    })?;
+    rec["title"] = json!(title);
+    rec["entry"] = json!(entry);
+    rec["files"] = json!(files_out);
+    rec["time"]["updated"] = json!(now_ms_http());
+    if let Some(sid) = body.get("sessionID").and_then(|v| v.as_str()) {
+        rec["sessionID"] = json!(sid);
+    } else if body.get("sessionID").map(|v| v.is_null()) == Some(true) {
+        rec.as_object_mut().map(|o| o.remove("sessionID"));
+    }
+    std::fs::write(
+        crate::artifact_store::record_path(&root, &id),
+        serde_json::to_vec_pretty(&rec).unwrap_or_default(),
+    )
+    .ok();
+    let mut out = rec.clone();
+    if let Some(o) = out.as_object_mut() {
+        o.remove("files");
+    }
+    Ok(Json(json!({
+        "location": artifact_location(&st, out.get("sessionID")),
+        "data": out,
+    })))
+}
+
+/// DELETE /api/experimental/artifacts/{artifactID} → 204.
+pub async fn artifacts_delete(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, crate::HttpError> {
+    if !artifact_id_ok(&id) {
+        return Err(artifact_bad_id(&id));
+    }
+    if !artifacts_enabled(&st) {
+        return Err(artifacts_disabled());
+    }
+    let root = crate::artifact_store::root(&st);
+    let _ = artifact_load(&st, &id)?;
+    let _ = std::fs::remove_dir_all(root.join(&id));
+    let _ = std::fs::remove_file(crate::artifact_store::record_path(&root, &id));
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /api/experimental/artifacts/{artifactID}/view/{*path} → bytes.
+pub async fn artifacts_view_route(
+    State(st): State<Arc<AppState>>,
+    Path((id, sub)): Path<(String, String)>,
+) -> axum::response::Response {
+    artifacts_view_impl(st, id, sub).await
+}
+
+/// `/view/` with an empty path (the URL upstream actually hands out).
+pub async fn artifacts_view_entry(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    artifacts_view_impl(st, id, String::new()).await
+}
+
+async fn artifacts_view_impl(
+    st: Arc<AppState>,
+    id: String,
+    sub: String,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    fn fail(e: crate::HttpError) -> axum::response::Response {
+        e.into_response()
+    }
+    if !artifact_id_ok(&id) {
+        return fail(artifact_bad_id(&id));
+    }
+    if !artifacts_enabled(&st) {
+        return fail(artifacts_disabled());
+    }
+    let rec = match artifact_load(&st, &id) {
+        Ok(r) => r,
+        Err(e) => return fail(e),
+    };
+    let sub = sub.trim_start_matches('/');
+    let requested = if sub.is_empty() {
+        rec["entry"].as_str().unwrap_or("index.html").to_string()
+    } else {
+        match crate::artifact_store::normalize_path(sub) {
+            Ok(c) => c,
+            Err(e) => return fail(e),
+        }
+    };
+    let root = crate::artifact_store::root(&st);
+    let target = root.join(&id).join(&requested);
+    let mime = match target.extension().and_then(|x| x.to_str()) {
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
+        Some("json") => "application/json",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("md") => "text/markdown; charset=utf-8",
+        _ => "application/octet-stream",
+    };
+    match std::fs::read(&target) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (axum::http::header::CONTENT_TYPE, mime),
+                (axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                (axum::http::header::CACHE_CONTROL, "private, no-cache"),
+                (
+                    axum::http::header::CONTENT_SECURITY_POLICY,
+                    "sandbox allow-scripts",
+                ),
+                (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => fail(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "FileNotFoundError",
+            fields: json!({"path": requested, "message": format!("File not found: {requested}")}),
+        }),
+    }
 }
 
 /// GET /api/experimental/media/{hash} — content-addressed blob read.
@@ -5547,19 +5964,30 @@ pub async fn media_get(
 }
 
 /// POST /api/debug/heap-dump — upstream writes a V8 `.heapsnapshot` and
-/// returns `{path, pid, memory}` (probed live). Rust has no JS heap; writing
-/// a zero-byte file with a plausible name and reporting real process memory
-/// would be a lie about the file's contents, so the route answers with the
-/// process numbers and an explicit marker. `D-HEAP-DUMP` in the ledger.
-pub async fn heap_dump(State(_st): State<Arc<AppState>>) -> impl IntoResponse {
+/// returns `{path, pid, memory{rss,heapTotal,heapUsed,external,arrayBuffers}}`
+/// (probed 2.2.5). The CONTRACT requires `path` to be a string and all five
+/// memory fields, so a 200 carrying `path:null` plus an extra `unsupported`
+/// key is not a valid response — a generated client fails to decode it.
+///
+/// A Rust process has no V8 heap, and writing an empty file named
+/// `.heapsnapshot` would be a lie about its contents. The honest answer is the
+/// reference's own failure envelope for a snapshot it cannot write: 500
+/// `UnknownError` with a message the operator can act on. `D-HEAP-DUMP`.
+pub async fn heap_dump(State(_st): State<Arc<AppState>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let pid = std::process::id();
     let rss = ocserve_store::platform::rss_of_pid(pid).unwrap_or(0);
-    Json(json!({
-        "path": Value::Null,
-        "pid": pid,
-        "memory": {"rss": rss},
-        "unsupported": "rust process: no V8 heap snapshot",
-    }))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "_tag": "UnknownError",
+            "message": format!(
+                "Failed to write heap snapshot: this server is a Rust process (pid {pid}, rss {rss} bytes) and has no V8 heap to snapshot"
+            ),
+            "ref": format!("err_ocserve_{pid:08x}"),
+        })),
+    )
+        .into_response()
 }
 
 /// GET /api/plugin/gui?id= — `{location, data: Plugin.GuiBundle}`.
@@ -5676,16 +6104,6 @@ pub async fn generate_text_api(
 // schedules (2.2.5 `experimental.schedule.*`, probed live)
 // ---------------------------------------------------------------------------
 
-/// Upstream gates the whole family on `experimental.schedules` in config and
-/// answers this exact envelope when it is off (probed live).
-fn schedules_disabled() -> crate::HttpError {
-    crate::HttpError::TaggedData {
-        status: StatusCode::FORBIDDEN,
-        tag: "ForbiddenError",
-        fields: json!({"message": "Scheduled tasks are disabled; set experimental.schedules in config"}),
-    }
-}
-
 /// The schedule statuses upstream reports.
 fn schedule_info(row: &serde_json::Value) -> Value {
     let mut out = json!({
@@ -5707,60 +6125,12 @@ fn schedule_info(row: &serde_json::Value) -> Value {
         ("remaining_runs", "remainingRuns"),
     ] {
         let v = &row[src];
-        if !v.is_null() {
+        // `name` is optional upstream: an empty string is omitted, not `""`.
+        if !v.is_null() && !(dst == "name" && v.as_str() == Some("")) {
             m.insert(dst.to_string(), v.clone());
         }
     }
     out
-}
-
-/// Parsed `when` spec plus the first due time. Upstream accepts `in`, `at`,
-/// `every` and `cron`; we cannot compute a full cron calendar without a cron
-/// library, so a cron schedule is accepted and stored with NO due time and a
-/// named divergence (D-SCHEDULE-CRON) rather than guessed at.
-fn schedule_when(when: &Value, now_ms: i64) -> Result<(Value, Option<i64>), crate::HttpError> {
-    let kind = when.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    let num = |k: &str| when.get(k).and_then(|v| v.as_i64());
-    let due = match kind {
-        "in" => num_duration_ms(when.get("in")),
-        "at" => when
-            .get("at")
-            .and_then(|v| v.as_str())
-            .and_then(parse_rfc3339_ms),
-        "every" => num_duration_ms(when.get("every")),
-        "cron" => None,
-        _ => {
-            return Err(crate::HttpError::TaggedData {
-                status: StatusCode::BAD_REQUEST,
-                tag: "InvalidRequestError",
-                fields: json!({
-                    "message": "Missing key\n  at [\"when\"][\"in\"]\nMissing key\n  at [\"when\"][\"at\"]\nMissing key\n  at [\"when\"][\"every\"]\nMissing key\n  at [\"when\"][\"cron\"]",
-                    "kind": "Payload"
-                }),
-            });
-        }
-    };
-    let _ = num;
-    Ok((
-        when.clone(),
-        due.map(|d| if kind == "at" { d } else { now_ms + d }),
-    ))
-}
-
-/// `"90 seconds"` / `"5 minutes"` / `"2 hours"` → milliseconds.
-fn num_duration_ms(v: Option<&Value>) -> Option<i64> {
-    let s = v?.as_str()?;
-    let mut it = s.split_whitespace();
-    let n: i64 = it.next()?.parse().ok()?;
-    let unit = it.next()?.trim_end_matches('s').to_ascii_lowercase();
-    let per = match unit.as_str() {
-        "second" | "sec" | "" => 1_000,
-        "minute" | "min" => 60_000,
-        "hour" | "hr" => 3_600_000,
-        "day" => 86_400_000,
-        _ => return None,
-    };
-    Some(n.saturating_mul(per))
 }
 
 /// Minimal RFC3339 → epoch ms (`2026-11-05T03:00:00Z`), UTC only.
@@ -5801,21 +6171,312 @@ fn schedules_enabled(st: &AppState) -> bool {
         .unwrap_or(false)
 }
 
-/// POST /api/experimental/schedule — `{sessionID, prompt, when, …}` → `{data}`.
+/// Upstream's default timezone when neither the `when.tz` nor the config sets
+/// one: the server's local zone. Freeze reports an IANA name (probed:
+/// "Europe/Dublin" on this box); we take `TZ` or fall back to a fixed label
+/// rather than invent a zone we cannot name.
+fn default_tz() -> String {
+    if let Ok(t) = std::env::var("TZ")
+        && !t.is_empty()
+    {
+        return t;
+    }
+    // /etc/localtime is a symlink into the zoneinfo database on every Linux
+    // distro; the basename of its target is the IANA name the reference
+    // reports (probed 2.2.5: "Europe/Dublin" on this box).
+    if let Ok(link) = std::fs::read_link("/etc/localtime")
+        && let Some(name) = link
+            .to_str()
+            .and_then(|p| p.split("zoneinfo/").nth(1))
+            .filter(|n| !n.is_empty())
+    {
+        return name.to_string();
+    }
+    if let Ok(s) = std::fs::read_to_string("/etc/timezone") {
+        let t = s.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    "UTC".to_string()
+}
+
+fn schedules_disabled() -> crate::HttpError {
+    crate::HttpError::TaggedData {
+        status: StatusCode::FORBIDDEN,
+        tag: "ForbiddenError",
+        fields: json!({"message": "Scheduled tasks are disabled; set experimental.schedules in config"}),
+    }
+}
+
+/// `Expected a string starting with "ses"` — the shape the reference emits
+/// when a session id fails its brand (probed 2.2.5, `kind:"Query"` under a
+/// query parameter and `"Payload"` in a body).
+fn schedule_bad_session(_id: &str, kind: &str) -> crate::HttpError {
+    // Upstream's message names the FIELD, never the value.
+    crate::HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidRequestError",
+        fields: json!({
+            "message": "Expected a string starting with \"ses\"\n  at [\"sessionID\"]",
+            "kind": kind,
+        }),
+    }
+}
+
+/// `Expected a string starting with "sch_"` for a malformed path id. Upstream
+/// decodes the PATH before looking anything up, so a bad id is a 400 even when
+/// the feature flag is off (probed).
+fn schedule_bad_id(_id: &str) -> crate::HttpError {
+    // Upstream's message names the FIELD, never the value.
+    crate::HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidRequestError",
+        fields: json!({
+            "message": "Expected a string starting with \"sch_\"\n  at [\"scheduleID\"]",
+            "kind": "Params",
+        }),
+    }
+}
+
+fn schedule_id_ok(id: &str) -> bool {
+    // Probed 2.2.5: the brand is the PREFIX only — `sch_nope` decodes and 404s
+    // as not-found; only an id without `sch_` is the 400 decode error.
+    id.starts_with("sch_")
+}
+
+/// `InvalidRequestError` with upstream's `kind:"schedule"` for semantic
+/// errors of the schedule service itself (a bad duration, a missing `when`).
+fn schedule_invalid(msg: &str) -> crate::HttpError {
+    crate::HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidRequestError",
+        fields: json!({"message": msg.to_string(), "kind": "schedule"}),
+    }
+}
+
+/// Parse a duration the way upstream's `Duration` decoder does: a number and
+/// a unit, in either order and either plural form ("2 hours", "90 seconds",
+/// "1h30m" is NOT accepted). Returns milliseconds.
+fn parse_duration_ms(s: &str) -> Option<i64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    // Bare number => seconds ("in": 10 is written "10 seconds" by the SDK, but
+    // upstream also accepts a plain count of seconds in some call sites).
+    let mut total: i64 = 0;
+    let mut rest = t;
+    let mut any = false;
+    while !rest.trim().is_empty() {
+        rest = rest.trim_start();
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        rest = &rest[digits.len()..];
+        rest = rest.trim_start();
+        let unit: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect();
+        if unit.is_empty() {
+            // A bare number means seconds.
+            total = total.saturating_add(digits.parse::<i64>().ok()?.saturating_mul(1_000));
+            any = true;
+            rest = rest.trim_start();
+            continue;
+        }
+        rest = &rest[unit.len()..];
+        let per: i64 = match unit.to_ascii_lowercase().trim_end_matches('s') {
+            "ms" | "millisecond" => 1,
+            "second" | "sec" => 1_000,
+            "minute" | "min" => 60_000,
+            "hour" | "hr" => 3_600_000,
+            "day" => 86_400_000,
+            "week" => 604_800_000,
+            _ => return None,
+        };
+        total = total.saturating_add(digits.parse::<i64>().ok()?.saturating_mul(per));
+        any = true;
+    }
+    any.then_some(total)
+}
+
+/// The five-field cron subset upstream accepts: `minute hour day-of-month
+/// month day-of-week`, each `*`, `*/n`, or a literal. Returns the next due
+/// time in UTC ms. Upstream uses a full cron library; anything outside this
+/// subset returns `None` and the schedule stores no due time, which is the
+/// named divergence `D-SCHEDULE-CRON` (a wrong due time is worse than none).
+fn next_cron_ms(expr: &str, now_ms: i64) -> Option<i64> {
+    let f: Vec<&str> = expr.split_whitespace().collect();
+    if f.len() != 5 {
+        return None;
+    }
+    // (lo, hi) per field.
+    let bounds = [(0i64, 59i64), (0, 23), (1, 31), (1, 12), (0, 7)];
+    let mut fixed = [None::<i64>; 5];
+    let mut step = [1i64; 5];
+    for i in 0..5 {
+        let (lo, hi) = bounds[i];
+        if let Some(n) = f[i].strip_prefix("*/") {
+            step[i] = n
+                .parse()
+                .ok()
+                .filter(|n: &i64| *n > 0 && *n <= hi - lo + 1)?;
+        } else if f[i] == "*" {
+            // any value
+        } else {
+            fixed[i] = Some(f[i].parse().ok().filter(|n: &i64| *n >= lo && *n <= hi)?);
+        }
+    }
+    // 0 and 7 both mean Sunday.
+    if fixed[4] == Some(7) {
+        fixed[4] = Some(0);
+    }
+    // Start at the next whole minute (strictly after now).
+    let start = now_ms / 60_000 + 1;
+    // Two years of minutes is a generous cap for a valid cron expression.
+    for m in start..start + 60 * 24 * 366 * 2 {
+        let minute = m % 60;
+        let hour = (m / 60) % 24;
+        let days = m.div_euclid(1440);
+        let (day, month, _year) = civil_from_days(days);
+        // 1970-01-01 was a Thursday; `rem_euclid` keeps pre-epoch days sane.
+        let dow = (days + 4).rem_euclid(7);
+        let hit =
+            |i: usize, v: i64| fixed[i].is_none_or(|x| x == v) && (v - bounds[i].0) % step[i] == 0;
+        if hit(0, minute) && hit(1, hour) && hit(2, day) && hit(3, month) && hit(4, dow) {
+            return Some(m * 60_000);
+        }
+    }
+    None
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (d, m, if m <= 2 { y + 1 } else { y })
+}
+
+/// Normalise the UNTAGGED `when` input into the tagged `Schedule.When` the
+/// reference stores. Upstream's `toWhen` picks by key presence, not by a
+/// `type` field (probed 2.2.5: a payload with `{"in": "10 minutes"}` and no
+/// `type` is accepted; requiring `type` rejected every valid client).
+fn schedule_when(
+    when: Option<&Value>,
+    tz_default: &str,
+) -> Result<(Value, Option<i64>), crate::HttpError> {
+    let Some(when) = when else {
+        // Upstream: "when is required unless until is set".
+        return Err(schedule_invalid("when is required unless until is set"));
+    };
+    if !when.is_object() {
+        return Err(schedule_invalid("Expected Schedule.WhenInput"));
+    }
+    // Upstream echoes `when.tz` ONLY when the caller set it; the resolved
+    // timezone lives in the top-level `tz` (probed 2.2.5).
+    // Only a CALLER-supplied `when.tz` is echoed back (probed 2.2.5: a
+    // payload without it comes back without it, while the resolved zone lives
+    // in the top-level `tz`). `tz_default` is used by the caller for that.
+    let _ = tz_default;
+    let caller_tz = when.get("tz").and_then(|v| v.as_str()).map(str::to_string);
+    let tagged_tz = |base: &Value| -> Value {
+        let mut o = base.clone();
+        if let (Some(t), Some(m)) = (&caller_tz, o.as_object_mut()) {
+            m.insert("tz".to_string(), json!(t));
+        }
+        o
+    };
+    let (tagged, due) = if let Some(v) = when.get("in").and_then(|v| v.as_str()) {
+        let ms = parse_duration_ms(v)
+            .ok_or_else(|| schedule_invalid(&format!("Invalid duration: {v}")))?;
+        (
+            tagged_tz(&json!({"type": "in", "in": v})),
+            Some(now_ms_http() + ms),
+        )
+    } else if let Some(v) = when.get("at").and_then(|v| v.as_str()) {
+        let ms = parse_rfc3339_ms(v)
+            .ok_or_else(|| schedule_invalid(&format!("Invalid instant: {v}")))?;
+        (tagged_tz(&json!({"type": "at", "at": v})), Some(ms))
+    } else if let Some(v) = when.get("every").and_then(|v| v.as_str()) {
+        let ms = parse_duration_ms(v)
+            .ok_or_else(|| schedule_invalid(&format!("Invalid duration: {v}")))?;
+        (
+            tagged_tz(&json!({"type": "every", "every": v})),
+            Some(now_ms_http() + ms),
+        )
+    } else if let Some(v) = when.get("cron").and_then(|v| v.as_str()) {
+        let due = next_cron_ms(v, now_ms_http());
+        (tagged_tz(&json!({"type": "cron", "cron": v})), due)
+    } else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Expected Schedule.WhenInput", "kind": "Payload"}),
+        });
+    };
+    Ok((tagged, due))
+}
+
+/// Validate a `ConditionInput` the way upstream's `toCondition` does, and
+/// return the stored tagged form.
+fn schedule_condition(v: &Value) -> Result<Value, crate::HttpError> {
+    if let Some(code) = v.get("code").and_then(|v| v.as_str()) {
+        if code.is_empty() {
+            return Err(crate::HttpError::TaggedData {
+                status: StatusCode::BAD_REQUEST,
+                tag: "InvalidRequestError",
+                fields: json!({"message": "Expected a non-empty string\n  at [\"code\"]", "kind": "Payload"}),
+            });
+        }
+        return Ok(json!({"type": "code", "code": code}));
+    }
+    let Some(run) = v.get("run").and_then(|v| v.as_str()) else {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Missing key\n  at [\"run\"]", "kind": "Payload"}),
+        });
+    };
+    let mut out = json!({"type": "shell", "run": run});
+    for k in ["is", "matches"] {
+        if let Some(x) = v.get(k).and_then(|x| x.as_str()) {
+            out[k] = json!(x);
+        }
+    }
+    if let Some(x) = v.get("changes").and_then(|x| x.as_bool()) {
+        out["changes"] = json!(x);
+    }
+    Ok(out)
+}
+
+/// POST /api/experimental/schedule — `{sessionID, prompt, when?, …}` → `{data}`.
 pub async fn schedule_create(
     State(st): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, crate::HttpError> {
-    if !schedules_enabled(&st) {
-        return Err(schedules_disabled());
-    }
-    let Some(session_id) = body.get("sessionID").and_then(|v| v.as_str()) else {
+    // Ordering probed 2.2.5: decode the body (400 Payload), decode+lookup the
+    // session (400 / 404), THEN the feature gate (403). The previous handler
+    // gated first, so every malformed payload answered 403 instead of the
+    // decode error the client uses to fix its request.
+    let Some(sid) = body.get("sessionID").and_then(|v| v.as_str()) else {
         return Err(crate::HttpError::TaggedData {
             status: StatusCode::BAD_REQUEST,
             tag: "InvalidRequestError",
             fields: json!({"message": "Missing key\n  at [\"sessionID\"]", "kind": "Payload"}),
         });
     };
+    if !sid.starts_with("ses") {
+        return Err(schedule_bad_session(sid, "Payload"));
+    }
     let Some(prompt) = body.get("prompt").and_then(|v| v.as_str()) else {
         return Err(crate::HttpError::TaggedData {
             status: StatusCode::BAD_REQUEST,
@@ -5823,18 +6484,85 @@ pub async fn schedule_create(
             fields: json!({"message": "Missing key\n  at [\"prompt\"]", "kind": "Payload"}),
         });
     };
-    let when = body.get("when").cloned().unwrap_or(Value::Null);
+    if prompt.is_empty() {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Expected a non-empty string\n  at [\"prompt\"]", "kind": "Payload"}),
+        });
+    }
+    if !ocserve_store::session_exists(&st.db, sid).unwrap_or(false) {
+        return Err(session_not_found(sid));
+    }
+    if !schedules_enabled(&st) {
+        return Err(schedules_disabled());
+    }
+    if body.get("if").is_some() && body.get("until").is_some() {
+        return Err(schedule_invalid("Choose either if or until, not both"));
+    }
+    // Payload decode happens BEFORE service validation upstream, so a bad
+    // `ends.after` wins over a bad `when.in` when both are wrong (probed).
+    let tz_default = default_tz();
+    let (ends_at_ms, remaining_runs, ends_json) = match body.get("ends") {
+        Some(e) if e.is_object() => {
+            let mut ends_at = None;
+            let mut remaining = None;
+            // A PRESENT but non-string `after` is a decode error upstream
+            // (`Expected Schedule.Duration`), not "absent": skipping it
+            // silently accepted `{"after": 3}` (probed 2.2.5).
+            if let Some(a) = e.get("after") {
+                let s = a.as_str().ok_or_else(|| crate::HttpError::TaggedData {
+                    status: StatusCode::BAD_REQUEST,
+                    tag: "InvalidRequestError",
+                    fields: json!({"message": "Expected Schedule.Duration\n  at [\"ends\"][\"after\"]", "kind": "Payload"}),
+                })?;
+                let ms = parse_duration_ms(s)
+                    .ok_or_else(|| crate::HttpError::TaggedData {
+                        status: StatusCode::BAD_REQUEST,
+                        tag: "InvalidRequestError",
+                        fields: json!({"message": "Expected Schedule.Duration\n  at [\"ends\"][\"after\"]", "kind": "Payload"}),
+                    })?;
+                ends_at = Some(now_ms_http() + ms);
+            }
+            if let Some(t) = e.get("times").and_then(|v| v.as_i64()) {
+                if t <= 0 {
+                    return Err(crate::HttpError::TaggedData {
+                        status: StatusCode::BAD_REQUEST,
+                        tag: "InvalidRequestError",
+                        fields: json!({"message": "Expected a positive integer\n  at [\"ends\"][\"times\"]", "kind": "Payload"}),
+                    });
+                }
+                remaining = Some(t);
+            }
+            (ends_at, remaining, Some(e.clone()))
+        }
+        _ => (None, None, None),
+    };
+    let (when_json, next_due) = schedule_when(body.get("when"), &tz_default)?;
+    let condition_json = match body.get("if") {
+        Some(v) => Some(schedule_condition(v)?),
+        None => match body.get("until") {
+            Some(v) => Some(schedule_condition(v)?),
+            None => None,
+        },
+    };
     let now = now_ms_http();
-    let (when_json, next_due) = schedule_when(&when, now)?;
     let id = format!("sch_{:013x}{:010x}", now, std::process::id());
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    let tz = when.get("tz").and_then(|v| v.as_str()).unwrap_or("");
+    let tz = when_json
+        .get("tz")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&tz_default)
+        .to_string();
     let row = json!({
-        "id": id, "session_id": session_id, "name": name, "prompt": prompt,
+        "id": id, "session_id": sid, "name": name, "prompt": prompt,
         "when_json": when_json, "tz": tz,
-        "condition_json": body.get("if").cloned().unwrap_or(Value::Null),
-        "next_due_ms": next_due, "run_count": 0,
-        "status": "active", "time_created": now, "time_updated": now,
+        "condition_json": condition_json,
+        "ends_json": ends_json,
+        "next_due_ms": next_due, "ends_at_ms": ends_at_ms,
+        "remaining_runs": remaining_runs,
+        "run_count": 0, "status": "active",
+        "time_created": now, "time_updated": now,
     });
     store_schedule(&st, &row).await?;
     Ok(Json(json!({"data": schedule_info(&row)})))
@@ -5845,9 +6573,6 @@ pub async fn schedule_list(
     State(st): State<Arc<AppState>>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, crate::HttpError> {
-    if !schedules_enabled(&st) {
-        return Err(schedules_disabled());
-    }
     let Some(sid) = q.get("sessionID") else {
         return Err(crate::HttpError::TaggedData {
             status: StatusCode::BAD_REQUEST,
@@ -5855,10 +6580,33 @@ pub async fn schedule_list(
             fields: json!({"message": "Missing key\n  at [\"sessionID\"]", "kind": "Query"}),
         });
     };
+    if !sid.starts_with("ses") {
+        return Err(schedule_bad_session(sid, "Query"));
+    }
+    if !ocserve_store::session_exists(&st.db, sid).unwrap_or(false) {
+        return Err(session_not_found(sid));
+    }
+    if !schedules_enabled(&st) {
+        return Err(schedules_disabled());
+    }
     let rows = read_schedules(&st, Some(sid)).unwrap_or_default();
     Ok(Json(
         json!({"data": rows.iter().map(schedule_info).collect::<Vec<_>>()}),
     ))
+}
+
+fn find_schedule(st: &AppState, id: &str) -> Result<Option<Value>, crate::HttpError> {
+    // A schedule whose session vanished reads as missing, like upstream's
+    // `find` (which maps SessionNotFound to ScheduleNotFound).
+    Ok(read_schedules(st, None)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|r| {
+            r["id"].as_str() == Some(id)
+                && r["session_id"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("ses"))
+        }))
 }
 
 /// GET /api/experimental/schedule/{scheduleID} → `{data}`.
@@ -5866,17 +6614,20 @@ pub async fn schedule_get(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, crate::HttpError> {
+    if !schedule_id_ok(&id) {
+        return Err(schedule_bad_id(&id));
+    }
+    let Some(row) = find_schedule(&st, &id)? else {
+        return Err(schedule_not_found(&id));
+    };
+    let sid = row["session_id"].as_str().unwrap_or("");
+    if !ocserve_store::session_exists(&st.db, sid).unwrap_or(false) {
+        return Err(schedule_not_found(&id));
+    }
     if !schedules_enabled(&st) {
         return Err(schedules_disabled());
     }
-    let row = read_schedules(&st, None)
-        .unwrap_or_default()
-        .into_iter()
-        .find(|r| r["id"].as_str() == Some(id.as_str()));
-    match row {
-        Some(r) => Ok(Json(json!({"data": schedule_info(&r)}))),
-        None => Err(schedule_not_found(&id)),
-    }
+    Ok(Json(json!({"data": schedule_info(&row)})))
 }
 
 fn schedule_not_found(id: &str) -> crate::HttpError {
@@ -5892,7 +6643,7 @@ pub async fn schedule_pause(
     st: State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<axum::response::Response, crate::HttpError> {
-    schedule_transition(st, Path(id), ScheduleAction::Pause).await
+    schedule_transition(st, id, ScheduleAction::Pause).await
 }
 
 /// POST /api/experimental/schedule/{scheduleID}/resume
@@ -5900,7 +6651,7 @@ pub async fn schedule_resume(
     st: State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<axum::response::Response, crate::HttpError> {
-    schedule_transition(st, Path(id), ScheduleAction::Resume).await
+    schedule_transition(st, id, ScheduleAction::Resume).await
 }
 
 /// DELETE /api/experimental/schedule/{scheduleID}
@@ -5908,25 +6659,29 @@ pub async fn schedule_delete(
     st: State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<axum::response::Response, crate::HttpError> {
-    schedule_transition(st, Path(id), ScheduleAction::Delete).await
+    schedule_transition(st, id, ScheduleAction::Delete).await
 }
 
 /// POST pause | resume | DELETE — the three transitions upstream exposes.
+/// Ordering probed: path decode (400) → existence (404) → feature gate (403).
 async fn schedule_transition(
     State(st): State<Arc<AppState>>,
-    Path(id): Path<String>,
+    id: String,
     action: ScheduleAction,
 ) -> Result<axum::response::Response, crate::HttpError> {
+    if !schedule_id_ok(&id) {
+        return Err(schedule_bad_id(&id));
+    }
+    let Some(mut row) = find_schedule(&st, &id)? else {
+        return Err(schedule_not_found(&id));
+    };
+    let sid = row["session_id"].as_str().unwrap_or("");
+    if !ocserve_store::session_exists(&st.db, sid).unwrap_or(false) {
+        return Err(schedule_not_found(&id));
+    }
     if !schedules_enabled(&st) {
         return Err(schedules_disabled());
     }
-    let exists = read_schedules(&st, None)
-        .unwrap_or_default()
-        .into_iter()
-        .find(|r| r["id"].as_str() == Some(id.as_str()));
-    let Some(mut row) = exists else {
-        return Err(schedule_not_found(&id));
-    };
     match action {
         ScheduleAction::Pause => {
             row["status"] = json!("paused");

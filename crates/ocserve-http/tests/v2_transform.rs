@@ -37,6 +37,7 @@ fn payloads() -> Payloads {
 
 fn registry() -> LlmRegistry {
     LlmRegistry {
+        modalities: Default::default(),
         limits: std::collections::HashMap::new(),
         endpoints: [("fake".into(), ("http://127.0.0.1:9".into(), String::new()))]
             .into_iter()

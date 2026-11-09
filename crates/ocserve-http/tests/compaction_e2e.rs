@@ -83,6 +83,7 @@ fn setup(addr: std::net::SocketAddr) -> Arc<AppState> {
         json!({"context": 1000}),
     );
     let llm = LlmRegistry {
+        modalities: Default::default(),
         limits,
         endpoints: [("fake".into(), (format!("http://{addr}"), String::new()))]
             .into_iter()

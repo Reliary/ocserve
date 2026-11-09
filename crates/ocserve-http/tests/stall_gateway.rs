@@ -26,6 +26,7 @@ fn app_with(addr: std::net::SocketAddr) -> std::sync::Arc<AppState> {
     let writer = std::sync::Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
     let blobs = std::sync::Arc::new(ocserve_store::BlobStore::new(dir.join("blobs")).unwrap());
     let llm = LlmRegistry {
+        modalities: Default::default(),
         limits: std::collections::HashMap::new(),
         endpoints: [(
             "fake".into(),

@@ -122,6 +122,7 @@ fn setup(
         json!({"context": 1_000_000}),
     );
     let llm = LlmRegistry {
+        modalities: Default::default(),
         limits,
         endpoints: [("fake".into(), (format!("http://{addr}"), String::new()))]
             .into_iter()

@@ -90,6 +90,7 @@ fn setup(addr: std::net::SocketAddr, sid: &str) -> Arc<AppState> {
     let writer = Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
     let blobs = Arc::new(ocserve_store::BlobStore::new(dir.join("blobs")).unwrap());
     let llm = LlmRegistry {
+        modalities: Default::default(),
         limits: Default::default(),
         endpoints: [("fake".into(), (format!("http://{addr}"), String::new()))]
             .into_iter()

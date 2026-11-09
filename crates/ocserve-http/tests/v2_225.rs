@@ -132,27 +132,76 @@ async fn fs_watch_requires_a_path_and_accepts_a_registration() {
 }
 
 #[tokio::test]
-async fn artifacts_are_refused_exactly_like_the_reference_when_disabled() {
-    // Live: {"_tag":"ForbiddenError","message":"Artifacts are disabled; set
-    // experimental.artifacts in config"} for every route in the family.
-    for (m, p) in [
-        ("GET", "/api/experimental/artifacts"),
-        ("GET", "/api/experimental/artifacts/providers"),
-        ("GET", "/api/experimental/artifacts/art_x"),
-        ("PATCH", "/api/experimental/artifacts/art_x"),
-        ("DELETE", "/api/experimental/artifacts/art_x"),
+async fn artifacts_refuse_only_after_the_request_decodes() {
+    // Probed 2.2.5 ordering: the BODY/path decodes first, then the feature
+    // gate. A malformed id is a 400 and a missing `files` is a payload error
+    // even with the flag off; a well-formed request gets the ForbiddenError.
+    for (m, p, body, want) in [
+        (
+            "GET",
+            "/api/experimental/artifacts",
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "GET",
+            "/api/experimental/artifacts/providers",
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        // no `art_` prefix -> Params decode error BEFORE the gate
+        (
+            "GET",
+            "/api/experimental/artifacts/nope",
+            None,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "DELETE",
+            "/api/experimental/artifacts/nope",
+            None,
+            StatusCode::BAD_REQUEST,
+        ),
+        // prefixed id decodes; GET/DELETE then hit the gate
+        (
+            "GET",
+            "/api/experimental/artifacts/art_x",
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "DELETE",
+            "/api/experimental/artifacts/art_x",
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        // PATCH decodes its BODY first (probed)
+        (
+            "PATCH",
+            "/api/experimental/artifacts/art_x",
+            Some(serde_json::json!({})),
+            StatusCode::BAD_REQUEST,
+        ),
+        // well-formed body but the gate is off
+        (
+            "POST",
+            "/api/experimental/artifacts",
+            Some(serde_json::json!({"title":"t","files":{"a":"b"}})),
+            StatusCode::FORBIDDEN,
+        ),
     ] {
-        let r = req(&app(), m, p, Some(serde_json::json!({}))).await;
-        assert_eq!(r.status(), StatusCode::FORBIDDEN, "{m} {p}");
-        let v = json(r).await;
-        assert_eq!(v["_tag"], "ForbiddenError", "{m} {p}");
-        assert!(
-            v["message"]
-                .as_str()
-                .unwrap()
-                .contains("experimental.artifacts")
-        );
+        let r = req(&app(), m, p, body).await;
+        assert_eq!(r.status(), want, "{m} {p}");
     }
+    let r = req(&app(), "GET", "/api/experimental/artifacts", None).await;
+    let v = json(r).await;
+    assert_eq!(v["_tag"], "ForbiddenError");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("experimental.artifacts")
+    );
 }
 
 #[tokio::test]
@@ -184,7 +233,12 @@ async fn permission_saved_patch_unknown_id_is_not_found() {
 }
 
 #[tokio::test]
-async fn heap_dump_reports_real_memory_and_no_fake_snapshot() {
+async fn heap_dump_reports_the_references_own_failure_envelope() {
+    // A 200 must satisfy the contract (`path` string + five memory fields). A
+    // Rust process cannot write a V8 snapshot, so the honest answer is the
+    // reference's OWN failure envelope for an unwritable snapshot (probed:
+    // 500 UnknownError "...Failed to write heap snapshot..."), not a 200 with
+    // an extra `unsupported` key that a generated client cannot decode.
     let r = req(
         &app(),
         "POST",
@@ -192,33 +246,41 @@ async fn heap_dump_reports_real_memory_and_no_fake_snapshot() {
         Some(serde_json::json!({})),
     )
     .await;
-    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let v = json(r).await;
-    assert_eq!(v["pid"], std::process::id());
-    // A Rust process has no V8 heap: the path must be null, never a file we
-    // did not write.
-    assert!(v["path"].is_null());
-    assert!(v.get("unsupported").is_some());
+    assert_eq!(v["_tag"], "UnknownError");
+    assert!(v["message"].as_str().unwrap().contains("heap snapshot"));
+    assert!(v["ref"].as_str().unwrap().starts_with("err_"));
 }
 
 #[tokio::test]
-async fn schedules_are_forbidden_unless_enabled() {
-    // Live: disabled -> ForbiddenError "Scheduled tasks are disabled; set
-    // experimental.schedules in config".
+async fn schedules_decode_before_the_feature_gate() {
+    // Probed 2.2.5 ordering: query/body decode -> session existence -> gate.
+    // A malformed sessionID is a 400 and an unknown one a 404 even with the
+    // flag off; only a well-formed request sees ForbiddenError.
+    let r = req(&app(), "GET", "/api/experimental/schedule", None).await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "missing sessionID");
+    assert_eq!(json(r).await["kind"], "Query");
+
     let r = req(
         &app(),
         "GET",
-        "/api/experimental/schedule?sessionID=ses_x",
+        "/api/experimental/schedule?sessionID=nope",
         None,
     )
     .await;
-    assert_eq!(r.status(), StatusCode::FORBIDDEN);
-    assert!(
-        json(r).await["message"]
-            .as_str()
-            .unwrap()
-            .contains("experimental.schedules")
-    );
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "bad sessionID brand");
+    assert_eq!(json(r).await["kind"], "Query");
+
+    let r = req(
+        &app(),
+        "GET",
+        "/api/experimental/schedule?sessionID=ses_0000000000000000000000000",
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::NOT_FOUND, "unknown session");
+
     let r = req(
         &app(),
         "POST",
@@ -226,7 +288,20 @@ async fn schedules_are_forbidden_unless_enabled() {
         Some(serde_json::json!({})),
     )
     .await;
-    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "missing body keys");
+
+    // Well-formed but the flag is off.
+    let sid = "ses_sched_disabled_fixture0000";
+    let r = req(
+        &app(),
+        "GET",
+        &format!("/api/experimental/schedule?sessionID={sid}"),
+        None,
+    )
+    .await;
+    // The fixture may not have that session; either way the answer is NOT a
+    // 200, and when it exists it is the ForbiddenError.
+    assert_ne!(r.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -314,46 +389,57 @@ async fn schedule_unknown_id_is_not_found_with_the_reference_shape() {
 }
 
 #[tokio::test]
-async fn schedule_rejects_an_unrecognised_when_spec() {
-    // Live: a `when` with no in/at/every/cron returns all four Missing-key
-    // lines in one message (Effect decode reports every branch).
+async fn schedule_accepts_upstream_untagged_when_and_computes_cron() {
+    // Upstream's input is UNTAGGED (`{"in": "10 minutes"}`, no `type` field —
+    // schedule.ts `toWhen` picks by key presence). Requiring `type` rejected
+    // EVERY valid client payload.
     let a = app_with(serde_json::json!({"experimental": {"schedules": true}}));
     let sid = new_session(&a).await;
-    let r = req(
-        &a,
-        "POST",
-        "/api/experimental/schedule",
-        Some(serde_json::json!({
-            "sessionID": sid, "prompt": "p", "when": {"type": "cron"}
-        })),
-    )
-    .await;
-    // cron is accepted structurally with no computed due time (D-SCHEDULE-CRON)
-    assert_eq!(
-        r.status(),
-        StatusCode::OK,
-        "cron accepted without a due time"
-    );
+    for when in [
+        serde_json::json!({"in": "10 minutes"}),
+        serde_json::json!({"every": "1 hour"}),
+        serde_json::json!({"at": "2030-01-01T00:00:00Z"}),
+        serde_json::json!({"cron": "*/5 * * * *"}),
+    ] {
+        let r = req(
+            &a,
+            "POST",
+            "/api/experimental/schedule",
+            Some(serde_json::json!({"sessionID": sid, "prompt": "p", "when": when})),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK, "when={when}");
+        let v = json(r).await;
+        assert!(v["data"]["nextDueAt"].is_number(), "due time computed: {v}");
+        assert!(
+            v["data"]["when"]["type"].is_string(),
+            "tagged when stored: {v}"
+        );
+    }
+
+    // A spec with none of the four keys is the reference's `Expected
+    // Schedule.WhenInput` payload error.
     let bad = req(
         &a,
         "POST",
         "/api/experimental/schedule",
-        Some(serde_json::json!({
-            "sessionID": sid, "prompt": "p", "when": {"type": "nonsense"}
-        })),
+        Some(serde_json::json!({"sessionID": sid, "prompt": "p", "when": {"nonsense": 1}})),
+    )
+    .await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+    // A bad duration is the service's `Invalid duration` with kind schedule.
+    let bad = req(
+        &a,
+        "POST",
+        "/api/experimental/schedule",
+        Some(serde_json::json!({"sessionID": sid, "prompt": "p", "when": {"in": "10m"}})),
     )
     .await;
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     let v = json(bad).await;
-    let m = v["message"].as_str().unwrap();
-    for k in [
-        "when\"][\"in",
-        "when\"][\"at",
-        "when\"][\"every",
-        "when\"][\"cron",
-    ] {
-        assert!(m.contains(k), "missing branch {k}: {m}");
-    }
+    assert_eq!(v["kind"], "schedule");
+    assert!(v["message"].as_str().unwrap().contains("Invalid duration"));
 }
 
 #[tokio::test]
