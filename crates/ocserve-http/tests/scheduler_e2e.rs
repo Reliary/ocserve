@@ -127,6 +127,16 @@ async fn a_due_schedule_admits_a_prompt_and_marks_the_run() {
     assert_eq!(row["runCount"], 1);
     assert_eq!(row["status"], "done", "an `in` schedule is a one-shot");
     assert!(row["nextDueAt"].is_null(), "no next slot after a one-shot");
+    // Caught by the live smoke: `Schedule.Info.time` is REQUIRED by the
+    // contract, and a listing without it shows 1970 in a generated client.
+    assert!(
+        row["time"]["created"].as_i64().unwrap_or(0) > 0,
+        "time.created must be a real millis value: {row}"
+    );
+    assert!(row["time"]["updated"].as_i64().unwrap_or(0) > 0);
+    // The firing state the contract declares is emitted, not just stored.
+    assert!(row["lastFiredAt"].as_i64().unwrap_or(0) > 0, "lastFiredAt");
+    assert_eq!(row["lastOutcome"], "fired");
 
     // A second pass must not re-admit: the row is done.
     pass(&app).await;

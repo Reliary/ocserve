@@ -6679,15 +6679,13 @@ pub async fn schedule_list(
 /// Rows that are due now and past their retry back-off, oldest due first.
 pub(crate) fn schedules_due(st: &AppState, now: i64) -> anyhow::Result<Vec<Value>> {
     let r = ocserve_store::pragma::open_reader(&st.db)?;
-    let mut stmt = r.prepare_cached(
-        "SELECT id, session_id, name, prompt, when_json, tz, condition_json, ends_json, status, \
-                next_due_ms, ends_at_ms, remaining_runs, run_count, last_message_id, \
-                last_fired_at, last_outcome \
-           FROM schedule \
+    let sql = format!(
+        "SELECT {SCHEDULE_COLS} FROM schedule \
           WHERE status = 'active' AND next_due_ms IS NOT NULL AND next_due_ms <= ?1 \
             AND (retry_at IS NULL OR retry_at <= ?1) \
-          ORDER BY next_due_ms",
-    )?;
+          ORDER BY next_due_ms"
+    );
+    let mut stmt = r.prepare_cached(&sql)?;
     let rows = stmt
         .query_map([now], schedule_row)?
         .filter_map(|r| r.ok())
@@ -6853,6 +6851,10 @@ pub enum ScheduleAction {
     Delete,
 }
 
+const SCHEDULE_COLS: &str = "id, session_id, name, prompt, when_json, tz, condition_json, ends_json, status, \
+         next_due_ms, ends_at_ms, remaining_runs, run_count, last_message_id, \
+         last_fired_at, last_outcome, time_created, time_updated";
+
 /// Shared column → stored-row mapper (read path and runner). Column order is
 /// fixed by the two SELECTs below; `last_message_id` is appended last.
 fn schedule_row(x: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
@@ -6873,21 +6875,21 @@ fn schedule_row(x: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "remaining_runs": x.get::<_, Option<i64>>(11)?,
         "run_count": x.get::<_, i64>(12)?,
         "last_message_id": x.get::<_, Option<String>>(13)?,
+        "last_fired_at": x.get::<_, Option<i64>>(14)?,
+        "last_outcome": x.get::<_, Option<String>>(15)?,
+        "time_created": x.get::<_, i64>(16)?,
+        "time_updated": x.get::<_, i64>(17)?,
     }))
 }
 
 fn read_schedules(st: &AppState, session: Option<&String>) -> anyhow::Result<Vec<Value>> {
     let r = ocserve_store::pragma::open_reader(&st.db)?;
     let sql = if session.is_some() {
-        "SELECT id, session_id, name, prompt, when_json, tz, condition_json, ends_json, status, \
-                next_due_ms, ends_at_ms, remaining_runs, run_count, last_message_id \
-           FROM schedule WHERE session_id = ?1 ORDER BY time_created"
+        format!("SELECT {SCHEDULE_COLS} FROM schedule WHERE session_id = ?1 ORDER BY time_created")
     } else {
-        "SELECT id, session_id, name, prompt, when_json, tz, condition_json, ends_json, status, \
-                next_due_ms, ends_at_ms, remaining_runs, run_count, last_message_id \
-           FROM schedule ORDER BY time_created"
+        format!("SELECT {SCHEDULE_COLS} FROM schedule ORDER BY time_created")
     };
-    let mut stmt = r.prepare(sql)?;
+    let mut stmt = r.prepare(&sql)?;
     let rows: Vec<Value> = match session {
         Some(sid) => stmt
             .query_map([sid], schedule_row)?
