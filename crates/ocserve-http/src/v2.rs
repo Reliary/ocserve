@@ -6202,6 +6202,8 @@ fn schedule_info(row: &serde_json::Value) -> Value {
         ("next_due_ms", "nextDueAt"),
         ("ends_at_ms", "endsAt"),
         ("remaining_runs", "remainingRuns"),
+        ("last_fired_at", "lastFiredAt"),
+        ("last_outcome", "lastOutcome"),
     ] {
         let v = &row[src];
         // `name` is optional upstream: an empty string is omitted, not `""`.
@@ -6241,7 +6243,7 @@ fn parse_rfc3339_ms(s: &str) -> Option<i64> {
 
 /// Map upstream's config knob: `experimental.schedules` truthy enables the
 /// family. Off (the default) → `ForbiddenError`, matching the live 2.2.5.
-fn schedules_enabled(st: &AppState) -> bool {
+pub(crate) fn schedules_enabled(st: &AppState) -> bool {
     st.payloads
         .read()
         .config
@@ -6337,7 +6339,7 @@ fn schedule_invalid(msg: &str) -> crate::HttpError {
 /// Parse a duration the way upstream's `Duration` decoder does: a number and
 /// a unit, in either order and either plural form ("2 hours", "90 seconds",
 /// "1h30m" is NOT accepted). Returns milliseconds.
-fn parse_duration_ms(s: &str) -> Option<i64> {
+pub(crate) fn parse_duration_ms(s: &str) -> Option<i64> {
     let t = s.trim();
     if t.is_empty() {
         return None;
@@ -6387,7 +6389,7 @@ fn parse_duration_ms(s: &str) -> Option<i64> {
 /// time in UTC ms. Upstream uses a full cron library; anything outside this
 /// subset returns `None` and the schedule stores no due time, which is the
 /// named divergence `D-SCHEDULE-CRON` (a wrong due time is worse than none).
-fn next_cron_ms(expr: &str, now_ms: i64) -> Option<i64> {
+pub(crate) fn next_cron_ms(expr: &str, now_ms: i64) -> Option<i64> {
     let f: Vec<&str> = expr.split_whitespace().collect();
     if f.len() != 5 {
         return None;
@@ -6674,6 +6676,68 @@ pub async fn schedule_list(
     ))
 }
 
+/// Rows that are due now and past their retry back-off, oldest due first.
+pub(crate) fn schedules_due(st: &AppState, now: i64) -> anyhow::Result<Vec<Value>> {
+    let r = ocserve_store::pragma::open_reader(&st.db)?;
+    let mut stmt = r.prepare_cached(
+        "SELECT id, session_id, name, prompt, when_json, tz, condition_json, ends_json, status, \
+                next_due_ms, ends_at_ms, remaining_runs, run_count, last_message_id, \
+                last_fired_at, last_outcome \
+           FROM schedule \
+          WHERE status = 'active' AND next_due_ms IS NOT NULL AND next_due_ms <= ?1 \
+            AND (retry_at IS NULL OR retry_at <= ?1) \
+          ORDER BY next_due_ms",
+    )?;
+    let rows = stmt
+        .query_map([now], schedule_row)?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+/// Milliseconds until the next future slot, or `None` when none is scheduled.
+pub(crate) fn schedules_next_wake(st: &AppState, now: i64) -> anyhow::Result<Option<i64>> {
+    let r = ocserve_store::pragma::open_reader(&st.db)?;
+    let at: Option<i64> = r.query_row(
+        "SELECT min(next_due_ms) FROM schedule \
+          WHERE status = 'active' AND next_due_ms IS NOT NULL AND next_due_ms > ?1",
+        [now],
+        |row| row.get(0),
+    )?;
+    Ok(at)
+}
+
+/// Apply one state transition. Only a still-ACTIVE row is updated, so a pause
+/// that lands during a firing wins (upstream's `update` has the same guard).
+pub(crate) fn schedule_mark(st: &AppState, id: &str, fields: Value) -> anyhow::Result<()> {
+    let obj = fields.as_object().cloned().unwrap_or_default();
+    let mut sets: Vec<String> = Vec::new();
+    let mut params: Vec<Value> = Vec::new();
+    for (col, val) in obj {
+        // Column names come from our own call sites, never from a request.
+        match col.as_str() {
+            "status" | "last_outcome" | "last_message_id" | "next_due_ms" | "remaining_runs"
+            | "run_count" | "last_fired_at" | "retry_at" | "checks" | "failures"
+            | "time_updated" => {}
+            other => anyhow::bail!("schedule_mark: unknown column {other}"),
+        }
+        params.push(val);
+        sets.push(format!("{col} = ?{}", params.len()));
+    }
+    if sets.is_empty() {
+        return Ok(());
+    }
+    let sql = format!(
+        "UPDATE schedule SET {} WHERE id = ?{} AND status = 'active'",
+        sets.join(", "),
+        params.len() + 1
+    );
+    params.push(json!(id));
+    st.writer
+        .write(vec![ocserve_store::writer::WriteOp::Sql { sql, params }])?;
+    Ok(())
+}
+
 fn find_schedule(st: &AppState, id: &str) -> Result<Option<Value>, crate::HttpError> {
     // A schedule whose session vanished reads as missing, like upstream's
     // `find` (which maps SessionNotFound to ScheduleNotFound).
@@ -6789,40 +6853,50 @@ pub enum ScheduleAction {
     Delete,
 }
 
+/// Shared column → stored-row mapper (read path and runner). Column order is
+/// fixed by the two SELECTs below; `last_message_id` is appended last.
+fn schedule_row(x: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    Ok(json!({
+        "id": x.get::<_, String>(0)?,
+        "session_id": x.get::<_, String>(1)?,
+        "name": x.get::<_, String>(2)?,
+        "prompt": x.get::<_, String>(3)?,
+        "when_json": serde_json::from_str::<Value>(&x.get::<_, String>(4)?).unwrap_or(Value::Null),
+        "tz": x.get::<_, String>(5)?,
+        "condition_json": x.get::<_, Option<String>>(6)?
+            .map(|s| serde_json::from_str::<Value>(&s).unwrap_or(Value::Null)),
+        "ends_json": x.get::<_, Option<String>>(7)?
+            .map(|s| serde_json::from_str::<Value>(&s).unwrap_or(Value::Null)),
+        "status": x.get::<_, String>(8)?,
+        "next_due_ms": x.get::<_, Option<i64>>(9)?,
+        "ends_at_ms": x.get::<_, Option<i64>>(10)?,
+        "remaining_runs": x.get::<_, Option<i64>>(11)?,
+        "run_count": x.get::<_, i64>(12)?,
+        "last_message_id": x.get::<_, Option<String>>(13)?,
+    }))
+}
+
 fn read_schedules(st: &AppState, session: Option<&String>) -> anyhow::Result<Vec<Value>> {
     let r = ocserve_store::pragma::open_reader(&st.db)?;
     let sql = if session.is_some() {
         "SELECT id, session_id, name, prompt, when_json, tz, condition_json, ends_json, status, \
-                next_due_ms, ends_at_ms, remaining_runs, run_count, time_created, time_updated \
+                next_due_ms, ends_at_ms, remaining_runs, run_count, last_message_id \
            FROM schedule WHERE session_id = ?1 ORDER BY time_created"
     } else {
         "SELECT id, session_id, name, prompt, when_json, tz, condition_json, ends_json, status, \
-                next_due_ms, ends_at_ms, remaining_runs, run_count, time_created, time_updated \
+                next_due_ms, ends_at_ms, remaining_runs, run_count, last_message_id \
            FROM schedule ORDER BY time_created"
     };
     let mut stmt = r.prepare(sql)?;
-    let map = |x: &rusqlite::Row<'_>| -> rusqlite::Result<Value> {
-        Ok(json!({
-            "id": x.get::<_, String>(0)?,
-            "session_id": x.get::<_, String>(1)?,
-            "name": x.get::<_, String>(2)?,
-            "prompt": x.get::<_, String>(3)?,
-            "when_json": serde_json::from_str::<Value>(&x.get::<_, String>(4)?).unwrap_or(Value::Null),
-            "tz": x.get::<_, String>(5)?,
-            "condition_json": x.get::<_, Option<String>>(6)?.map(|s| serde_json::from_str::<Value>(&s).unwrap_or(Value::Null)),
-            "ends_json": x.get::<_, Option<String>>(7)?.map(|s| serde_json::from_str::<Value>(&s).unwrap_or(Value::Null)),
-            "status": x.get::<_, String>(8)?,
-            "next_due_ms": x.get::<_, Option<i64>>(9)?,
-            "ends_at_ms": x.get::<_, Option<i64>>(10)?,
-            "remaining_runs": x.get::<_, Option<i64>>(11)?,
-            "run_count": x.get::<_, i64>(12)?,
-            "time_created": x.get::<_, i64>(13)?,
-            "time_updated": x.get::<_, i64>(14)?,
-        }))
-    };
     let rows: Vec<Value> = match session {
-        Some(sid) => stmt.query_map([sid], map)?.filter_map(|r| r.ok()).collect(),
-        None => stmt.query_map([], map)?.filter_map(|r| r.ok()).collect(),
+        Some(sid) => stmt
+            .query_map([sid], schedule_row)?
+            .filter_map(|r| r.ok())
+            .collect(),
+        None => stmt
+            .query_map([], schedule_row)?
+            .filter_map(|r| r.ok())
+            .collect(),
     };
     Ok(rows)
 }

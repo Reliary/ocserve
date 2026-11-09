@@ -9,6 +9,19 @@ differs is a named `D-*` row in the ledger at `PLAN.md §18`.
 Not yet released. No version bump, tag or publish has been made for these.
 
 ### Fixed
+- **Scheduled wake-ups never fired.** The v2 `experimental.schedule.*` routes
+  shipped as storage only: create/list/get/pause/resume/delete worked, and no
+  runner existed, so a wake-up set in the web UI silently did nothing. A
+  runner now polls the due index every second (bounded by the nearest slot),
+  admits a deterministic `msg_<id>_<run>` steer prompt carrying
+  `metadata.schedule`, and records the reference's own state
+  (`lastFiredAt`, `lastOutcome`, `runCount`, `nextDueAt`). `every` keeps its
+  phase and skips missed slots, `cron` evaluates through an in-tree minute
+  walker, `in`/`at` are one-shots, `ends.times|after|at` bound the run, a
+  firing over 60 s late is marked `late`, a still-pending previous wake is
+  skipped and re-woken, and a failed turn backs off five minutes instead of
+  retrying every tick. Schema v18 adds the bookkeeping columns. Conditions
+  (`if`/`until`) are stored but not evaluated (`D-SCHEDULE-CHECK`).
 - **Five v2 operation families were bound from the contract, not the reference**
   (2.2.5). A live differential found each was plausible-but-wrong:
   `experimental.schedule` create REQUIRED a `type` key that upstream's untagged

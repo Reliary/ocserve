@@ -112,6 +112,7 @@ pub mod doc;
 pub mod embedded_ui;
 pub mod goal_loop;
 pub mod pty;
+pub mod scheduler;
 pub mod tui;
 pub mod ui;
 pub mod v2;

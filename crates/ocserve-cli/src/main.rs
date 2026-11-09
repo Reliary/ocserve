@@ -1074,6 +1074,12 @@ async fn serve(
     }
     let app = ocserve_http::router(state.clone());
 
+    // Scheduled session wake-ups: the runner re-reads the config flag each
+    // pass, so enabling `experimental.schedules` needs no restart. It admits
+    // into the session inbox and wakes the coordinator, so it can never run
+    // concurrently with a user turn.
+    ocserve_http::scheduler::spawn(state.clone());
+
     // W3 opt-in prewarm (default off): fetch the entry HTML's referenced
     // /assets/* through the proxy once so the first browser load hits the
     // lazy cache. Bounded (a handful of assets); failures are logged, never

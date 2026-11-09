@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 17;
+pub const SCHEMA_VERSION: i64 = 18;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -228,6 +228,12 @@ CREATE TABLE schedule (
     ends_at_ms     INTEGER,
     remaining_runs INTEGER,
     run_count      INTEGER NOT NULL DEFAULT 0,
+    last_fired_at  INTEGER,
+    last_outcome   TEXT,
+    checks         INTEGER NOT NULL DEFAULT 0,
+    failures       INTEGER NOT NULL DEFAULT 0,
+    retry_at       INTEGER,
+    last_message_id TEXT,
     time_created   INTEGER NOT NULL,
     time_updated   INTEGER NOT NULL
 ) STRICT;
@@ -929,6 +935,51 @@ CREATE TABLE IF NOT EXISTS session_environment (
                     CREATE INDEX IF NOT EXISTS idx_goal_status
                         ON session_goal(status);",
                     )?;
+                }
+                17 => {
+                    // v17->v18: schedule FIRING bookkeeping. v16 stored a
+                    // schedule and never ran it (shape without mutation), so a
+                    // user-created wake-up silently never happened. The runner
+                    // needs the reference's own state: when it last fired and
+                    // with what outcome, how many checks, consecutive failures,
+                    // a back-off instant, and the admitted message id (used to
+                    // reconcile a crash between admission and delivery).
+                    // Idempotent: migration-order tests rewind user_version.
+                    let cols: Vec<String> = conn
+                        .prepare("PRAGMA table_info(schedule)")?
+                        .query_map([], |r| r.get::<_, String>(1))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    for (name, ddl) in [
+                        (
+                            "last_fired_at",
+                            "ALTER TABLE schedule ADD COLUMN last_fired_at INTEGER;",
+                        ),
+                        (
+                            "last_outcome",
+                            "ALTER TABLE schedule ADD COLUMN last_outcome TEXT;",
+                        ),
+                        (
+                            "checks",
+                            "ALTER TABLE schedule ADD COLUMN checks INTEGER NOT NULL DEFAULT 0;",
+                        ),
+                        (
+                            "failures",
+                            "ALTER TABLE schedule ADD COLUMN failures INTEGER NOT NULL DEFAULT 0;",
+                        ),
+                        (
+                            "retry_at",
+                            "ALTER TABLE schedule ADD COLUMN retry_at INTEGER;",
+                        ),
+                        (
+                            "last_message_id",
+                            "ALTER TABLE schedule ADD COLUMN last_message_id TEXT;",
+                        ),
+                    ] {
+                        if !cols.iter().any(|c| c == name) {
+                            conn.execute_batch(ddl)?;
+                        }
+                    }
                 }
                 other => {
                     bail!(
