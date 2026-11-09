@@ -1513,9 +1513,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.2"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -1773,7 +1773,7 @@ dependencies = [
  "ocserve-plugin",
  "ocserve-store",
  "ocserve-tools",
- "parking_lot 0.13.0",
+ "parking_lot",
  "serde",
  "serde_json",
  "sha2",
@@ -1813,7 +1813,7 @@ dependencies = [
  "ocserve-ui-v2-b",
  "ocserve-ui-v2-c",
  "ocserve-ui-v2-d",
- "parking_lot 0.13.0",
+ "parking_lot",
  "regex",
  "reqwest",
  "rusqlite",
@@ -1873,7 +1873,7 @@ dependencies = [
  "anyhow",
  "ocserve-metrics",
  "ocserve-store",
- "parking_lot 0.13.0",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
@@ -1894,7 +1894,7 @@ dependencies = [
  "hex",
  "ocserve-metrics",
  "ocserve-store",
- "parking_lot 0.13.0",
+ "parking_lot",
  "rolldown",
  "rolldown_common",
  "serde",
@@ -1927,9 +1927,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "hex",
- "parking_lot 0.13.0",
- "r2d2",
- "r2d2_sqlite",
+ "parking_lot",
  "rusqlite",
  "rustc-hash",
  "serde",
@@ -2505,16 +2503,6 @@ dependencies = [
 
 [[package]]
 name = "parking_lot"
-version = "0.12.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
-dependencies = [
- "lock_api 0.4.14",
- "parking_lot_core 0.9.12",
-]
-
-[[package]]
-name = "parking_lot"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a9cf937ca4e1d0b7578784559063422fc39ae7c5a00f02471f2614d5486fd226"
@@ -2790,28 +2778,6 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
-
-[[package]]
-name = "r2d2"
-version = "0.8.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51de85fb3fb6524929c8a2eb85e6b6d363de4e8c48f9e2c2eac4944abc181c93"
-dependencies = [
- "log",
- "parking_lot 0.12.5",
- "scheduled-thread-pool",
-]
-
-[[package]]
-name = "r2d2_sqlite"
-version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d362d41ad1f9a278dd971842c63c0fc7ae2e01bccbfbbc8c9a4689a46fa7051f"
-dependencies = [
- "r2d2",
- "rusqlite",
- "uuid",
-]
 
 [[package]]
 name = "radix_trie"
@@ -3491,9 +3457,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.40.2"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags",
  "fallible-iterator",
@@ -3578,15 +3544,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "scheduled-thread-pool"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3cbc66816425a074528352f5789333ecff06ca41b36b0b0efdfbb29edc391a19"
-dependencies = [
- "parking_lot 0.12.5",
-]
 
 [[package]]
 name = "scopeguard"
@@ -4367,7 +4324,6 @@ checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
- "rand 0.10.3",
  "wasm-bindgen",
 ]
 

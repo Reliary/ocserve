@@ -6001,7 +6001,7 @@ pub async fn media_get(
 /// `.heapsnapshot` would be a lie about its contents. The honest answer is the
 /// reference's own failure envelope for a snapshot it cannot write: 500
 /// `UnknownError` with a message the operator can act on. `D-HEAP-DUMP`.
-pub async fn heap_dump(State(st): State<Arc<AppState>>) -> axum::response::Response {
+pub async fn heap_dump(State(_st): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::IntoResponse;
     // The reference writes a V8 `.heapsnapshot` and answers
     // `{path, pid, memory:{rss,heapTotal,heapUsed,external,arrayBuffers}}`,

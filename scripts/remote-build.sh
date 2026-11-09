@@ -147,9 +147,12 @@ case "$VERB" in
     # `test` and `clippy` use the workspace-wide test scope; keep TMPDIR off
     # the remote /tmp only if it is small (it is 32 GB there, so use it, but
     # the harnesses assume /var/tmp exists — both do on this host).
-    RUN="OCSERVE_BUILD_COMMIT=$BUILD_COMMIT TMPDIR=/var/tmp cargo $VERB --offline -j$JOBS$CMD"
-    # --offline fails on a cold cache; fall back to online once.
-    RUN="$RUN || { echo '>> offline build failed; retrying with network'; OCSERVE_BUILD_COMMIT=$BUILD_COMMIT TMPDIR=/var/tmp cargo $VERB -j$JOBS$CMD; }"
+    # A caller's own --offline is honoured as-is (no duplicated flag); the
+    # fallback drops it exactly once so a cold cache can fetch.
+    OFFLINE_ARGS="--offline"
+    case " $CMD " in *" --offline "*) OFFLINE_ARGS="" ;; esac
+    RUN="OCSERVE_BUILD_COMMIT=$BUILD_COMMIT TMPDIR=/var/tmp cargo $VERB $OFFLINE_ARGS -j$JOBS$CMD"
+    RUN="$RUN || { echo '>> offline build failed; retrying with network'; OCSERVE_BUILD_COMMIT=$BUILD_COMMIT TMPDIR=/var/tmp cargo $VERB -j$JOBS$(printf '%s' "$CMD" | sed 's/ --offline//g'); }"
     ;;
   *)
     RUN="OCSERVE_BUILD_COMMIT=$BUILD_COMMIT TMPDIR=/var/tmp cargo $VERB -j$JOBS$CMD"

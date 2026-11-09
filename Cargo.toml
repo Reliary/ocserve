@@ -60,9 +60,7 @@ hyper = "1"
 bytes = "1"
 
 # storage
-rusqlite = { version = "0.40", features = ["bundled", "blob", "column_decltype"] }
-r2d2 = "0.8"
-r2d2_sqlite = "0.35"
+rusqlite = { version = "0.41", features = ["bundled", "blob", "column_decltype"] }
 zstd = "0.14"
 
 # serialization
