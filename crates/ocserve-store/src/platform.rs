@@ -50,6 +50,36 @@ pub fn data_dir() -> anyhow::Result<PathBuf> {
     Ok(home_required()?.join(".local/share/ocserve"))
 }
 
+/// opencode's configuration directory, in upstream precedence:
+/// `OPENCODE_CONFIG_DIR` → `XDG_CONFIG_HOME/opencode` → `~/.config/opencode`.
+///
+/// This is where `opencode.json` lives and where `plugin/` + `plugins/` are
+/// auto-discovered. A launcher (Paseo) provisions its managed plugin under
+/// this directory and expects the server to report the SAME path from
+/// `GET /api/config`; a hardcoded `$HOME/.config/opencode` breaks that check
+/// whenever `XDG_CONFIG_HOME` or `OPENCODE_CONFIG_DIR` is set.
+pub fn opencode_config_dir() -> Option<PathBuf> {
+    config_dir_from(
+        std::env::var_os("OPENCODE_CONFIG_DIR"),
+        std::env::var_os("XDG_CONFIG_HOME"),
+        home(),
+    )
+}
+
+fn config_dir_from(
+    opencode_config_dir: Option<std::ffi::OsString>,
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(v) = opencode_config_dir.filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(v));
+    }
+    if let Some(v) = xdg_config_home.filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(v).join("opencode"));
+    }
+    home.map(|h| h.join(".config/opencode"))
+}
+
 /// Append the platform executable suffix to a bare program name.
 ///
 /// `Command::new("bun")` does not find `bun.exe` on Windows, and neither does
@@ -600,5 +630,37 @@ mod tests {
         } else {
             assert_eq!(got, None, "documented: not implemented off Linux yet");
         }
+    }
+
+    /// Config-dir precedence is upstream's: OPENCODE_CONFIG_DIR, then
+    /// XDG_CONFIG_HOME, then ~/.config/opencode. Paseo compares the path served
+    /// by /api/config with its own computation, so a hardcoded HOME path fails
+    /// whenever either variable is set.
+    #[test]
+    fn opencode_config_dir_precedence() {
+        use std::ffi::OsString;
+        let home = Some(PathBuf::from("/home/u"));
+        assert_eq!(
+            config_dir_from(
+                Some(OsString::from("/explicit")),
+                Some(OsString::from("/xdg")),
+                home.clone()
+            ),
+            Some(PathBuf::from("/explicit")),
+            "OPENCODE_CONFIG_DIR wins"
+        );
+        assert_eq!(
+            config_dir_from(None, Some(OsString::from("/xdg")), home.clone()),
+            Some(PathBuf::from("/xdg/opencode"))
+        );
+        assert_eq!(
+            config_dir_from(None, None, home),
+            Some(PathBuf::from("/home/u/.config/opencode"))
+        );
+        // Empty values are unset (an empty env var must not mean the CWD).
+        assert_eq!(
+            config_dir_from(Some(OsString::new()), Some(OsString::new()), None),
+            None
+        );
     }
 }
