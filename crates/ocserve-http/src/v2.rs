@@ -888,10 +888,18 @@ fn bad_request(msg: &str) -> HttpError {
 pub async fn config_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let home = std::env::var("HOME").unwrap_or_default();
     let worktree = st.paths["directory"].as_str().unwrap_or("/").to_string();
-    let mut out = vec![json!({"type": "directory", "path": format!("{home}/.config/opencode")})];
+    // Same precedence as the loader: OPENCODE_CONFIG_DIR > XDG_CONFIG_HOME >
+    // ~/.config/opencode. A launcher compares this path with the directory it
+    // provisions plugins into; a hardcoded HOME path fails that check.
+    let config_dir = ocserve_store::platform::opencode_config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("{home}/.config/opencode")));
+    let mut out = vec![json!({
+        "type": "directory",
+        "path": config_dir.display().to_string(),
+    })];
     for path in [
-        format!("{home}/.config/opencode/opencode.json"),
-        format!("{worktree}/opencode.json"),
+        config_dir.join("opencode.json"),
+        std::path::PathBuf::from(&worktree).join("opencode.json"),
     ] {
         if let Ok(text) = std::fs::read_to_string(&path)
             && let Ok(info) = serde_json::from_str::<Value>(&text)
@@ -960,11 +968,134 @@ pub async fn migration_v1_status() -> impl IntoResponse {
     Json(json!({"status": "completed"}))
 }
 
+/// `Plugin.Info.source`: a path-like spec is `local`, a bare npm spec is
+/// `package` (the two shapes the contract defines for configured plugins).
+fn plugin_source(spec: &str) -> Value {
+    let local = spec.starts_with("file://")
+        || spec.starts_with('/')
+        || spec.starts_with("./")
+        || spec.starts_with("../")
+        || std::path::Path::new(spec).is_absolute();
+    if local {
+        json!({"type": "local", "path": spec.strip_prefix("file://").unwrap_or(spec)})
+    } else {
+        json!({"type": "package", "target": spec})
+    }
+}
+
+fn plugin_info(id: Value, spec: &str, ok: bool, error: Option<&str>) -> Value {
+    let state = if ok {
+        json!({"status": "active"})
+    } else {
+        json!({"status": "failed", "error": error.unwrap_or("load failed")})
+    };
+    json!({
+        "id": id,
+        "source": plugin_source(spec),
+        "features": {"server": true},
+        "state": state,
+    })
+}
+
+/// Hot plugin pickup for launchers that provision `<config_dir>/plugins/…`
+/// AFTER the server booted (Paseo writes its managed bridge, then polls
+/// `/api/plugin` for `state.status == "active"`). Bounded by
+/// `discover_plugin_specs` (64) and idempotent: an attempted spec — loaded or
+/// failed — is never retried by the 50 ms poll.
+async fn load_discovered_plugins(st: &Arc<AppState>) {
+    if let Some(config_dir) = ocserve_store::platform::opencode_config_dir() {
+        load_discovered_from(st, &config_dir).await;
+    }
+}
+
+/// Env-free core of the hot pickup, so a test can prove the wiring against an
+/// explicit directory instead of mutating process env.
+pub async fn load_discovered_from(st: &Arc<AppState>, config_dir: &std::path::Path) {
+    let discovered = ocserve_plugin::discover_plugin_specs(config_dir);
+    if discovered.is_empty() {
+        return;
+    }
+    let Some(home) = ocserve_store::platform::home() else {
+        return;
+    };
+    // A launcher can provision its first plugin after boot; then no sidecar was
+    // spawned at boot. Materialize one here (one host per process — the
+    // OnceLock is the authority if two polls race).
+    let plug = match st.plugins.get() {
+        Some(p) => p.clone(),
+        None => {
+            let host = match ocserve_plugin::materialize_host(&st.data_dir.join("plugin-host")) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!("plugin host materialize failed: {e:#}");
+                    return;
+                }
+            };
+            let url = st
+                .server_url
+                .get()
+                .cloned()
+                .unwrap_or_else(|| "http://127.0.0.1:4096".into());
+            let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+            match ocserve_plugin::Sidecar::spawn(&host, &url, &dir).await {
+                Ok(mut sc) => {
+                    // Same normalization root the boot path uses (D1).
+                    sc.set_normalize_root(st.data_dir.join("normalized"));
+                    let arc = Arc::new(tokio::sync::Mutex::new(sc));
+                    if st.plugins.set(arc).is_ok() {
+                        st.plugins.get().cloned().expect("just set")
+                    } else {
+                        // Another poll won the race; ours is dropped (kill_on_drop).
+                        match st.plugins.get() {
+                            Some(p) => p.clone(),
+                            None => return,
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("plugin sidecar spawn (on demand) failed: {e:#}");
+                    return;
+                }
+            }
+        }
+    };
+    let mut sc = plug.lock().await;
+    if sc.ensure_alive().await.is_err() {
+        return;
+    }
+    for spec in discovered {
+        if sc.attempted(&spec) {
+            continue;
+        }
+        match sc.load_discovered(&spec, &home).await {
+            Ok(hooks) if !hooks.is_empty() => {
+                tracing::info!("plugin {spec} auto-discovered and loaded: {hooks:?}")
+            }
+            Ok(_) => {}
+            Err(e) => {
+                ocserve_metrics::labeled_counter(
+                    "ocserve_plugin_load_total",
+                    "result=\"discovered_error\"",
+                    1,
+                );
+                tracing::error!("auto-discovered plugin {spec} failed to load: {e:#}");
+            }
+        }
+    }
+}
+
 /// GET /api/plugin — `{location, data: Plugin.Info[]}`. Real inventory from
 /// the sidecar: every loaded v1 (spec + hooks) and v2 (id + dialect) plugin,
 /// plus the registered RPC ids. D-PLUGIN-INVENTORY is closed: the list is
 /// never fabricated and never empty-with-a-live-sidecar.
+///
+/// The shape is the CONTRACT's `Plugin.Info` (`source`, `features`,
+/// `state.status`), not a private dialect: launchers read `state.status` to
+/// decide a plugin is active (`paseo` waits for exactly that before binding).
 pub async fn plugin_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    if st.plugin_discovery {
+        load_discovered_plugins(&st).await;
+    }
     let mut data: Vec<Value> = Vec::new();
     if let Some(plug) = st.plugins.get() {
         // statuses needs the owner (it is a load-time map); the inventory RPC
@@ -975,30 +1106,40 @@ pub async fn plugin_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             Some(h) => h.v2_inventory().await.ok(),
             None => None,
         };
-        if let Some(map) = statuses.as_object() {
-            for (spec, v) in map {
-                data.push(json!({
-                    "id": spec,
-                    "source": spec,
-                    "dialect": "v1",
-                    "hooks": v.get("hooks").cloned().unwrap_or(json!([])),
-                    "state": if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) { "loaded" } else { "failed" },
-                }));
-            }
-        }
-        if let Some(pl) = inv
+        let v2: Vec<Value> = inv
             .as_ref()
             .and_then(|v| v.get("plugins"))
             .and_then(|v| v.as_array())
-        {
-            for p in pl {
-                data.push(json!({
-                    "id": p.get("id").cloned().unwrap_or(json!(null)),
-                    "source": p.get("spec").cloned().unwrap_or(json!(null)),
-                    "dialect": p.get("dialect").cloned().unwrap_or(json!("v2")),
-                    "state": "loaded",
-                }));
+            .cloned()
+            .unwrap_or_default();
+        // A loaded v2 plugin also has a status entry (hooks). Listing it twice
+        // would report one plugin as two; the inventory carries its real id.
+        let v2_specs: std::collections::HashSet<&str> = v2
+            .iter()
+            .filter_map(|p| p.get("spec").and_then(|s| s.as_str()))
+            .collect();
+        if let Some(map) = statuses.as_object() {
+            for (spec, v) in map {
+                if v2_specs.contains(spec.as_str()) {
+                    continue;
+                }
+                let ok = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
+                data.push(plugin_info(
+                    json!(spec),
+                    spec,
+                    ok,
+                    v.get("error").and_then(|e| e.as_str()),
+                ));
             }
+        }
+        for p in &v2 {
+            let spec = p.get("spec").and_then(|s| s.as_str()).unwrap_or("");
+            data.push(plugin_info(
+                p.get("id").cloned().unwrap_or(json!(spec)),
+                spec,
+                true,
+                None,
+            ));
         }
     }
     Json(json!({"location": api_location_ref(&st), "data": data}))
