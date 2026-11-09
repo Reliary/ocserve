@@ -5291,6 +5291,36 @@ pub fn set_goal(writer: &Writer, session_id: &str, row: Option<&GoalRow>) -> any
     Ok(())
 }
 
+/// Wall-clock milliseconds since the epoch (the unit every stored timestamp
+/// uses). Shared so `doctor` and the schedule runner cannot disagree.
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Every schedule row worth showing an operator: id, session, status, next due
+/// instant, run count. `doctor` prints these because a wake-up that will never
+/// fire is otherwise invisible — the runner is silent by design, and that
+/// silence was exactly the shape-without-mutation bug.
+pub fn schedule_summary(
+    db: &Path,
+) -> anyhow::Result<Vec<(String, String, String, Option<i64>, i64)>> {
+    let r = pragma::open_reader(db)?;
+    let mut stmt = r.prepare(
+        "SELECT id, session_id, status, next_due_ms, run_count \
+           FROM schedule ORDER BY (status = 'active') DESC, next_due_ms",
+    )?;
+    let rows = stmt
+        .query_map([], |x| {
+            Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
 /// Every ACTIVE goal, for the boot scan that pauses goals left by an earlier
 /// process (upstream: "a goal armed by an earlier process comes back paused").
 pub fn active_goals(db: &Path) -> anyhow::Result<Vec<(String, GoalRow)>> {

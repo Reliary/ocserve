@@ -1429,6 +1429,34 @@ async fn doctor(
             }
         }
     }
+    // Scheduled wake-ups: a row that will never fire is invisible otherwise
+    // (the runner is silent by design, and that silence used to be the bug).
+    {
+        let db = ocserve_store::writer::db_path(&data_dir);
+        if db.exists()
+            && let Ok(rows) = ocserve_store::schedule_summary(&db)
+        {
+            if rows.is_empty() {
+                println!("  schedules:       none");
+            } else {
+                for (id, sid, status, due, runs) in rows {
+                    let when = due
+                        .map(|d| {
+                            let rel = d.saturating_sub(ocserve_store::now_ms());
+                            if rel >= 0 {
+                                format!("in {}s", rel / 1000)
+                            } else {
+                                format!("{}s ago", -rel / 1000)
+                            }
+                        })
+                        .unwrap_or_else(|| "no next slot".to_string());
+                    println!(
+                        "  schedule:        {id}  {status}  due {when}  runs={runs}  session={sid}"
+                    );
+                }
+            }
+        }
+    }
     match ocserve_store::pragma::assert_version_ok() {
         Ok(()) => println!(
             "  version gate:    OK (>= {})",
