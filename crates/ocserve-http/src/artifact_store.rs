@@ -56,11 +56,15 @@ pub(crate) fn write_files(
     let _ = std::fs::remove_dir_all(&dir);
     for (rel, content) in files {
         let clean = normalize_path(rel).map_err(|_| anyhow::anyhow!("invalid artifact path"))?;
-        // `artifact_normalize_path` already rejects absolute paths, `..` and
-        // empty segments; re-verify through the handle-based rule so the
-        // artifact writer shares ONE containment implementation (rule 43).
-        let path = crate::v2::resolve_within(&dir, &clean)
-            .map_err(|e| anyhow::anyhow!("invalid artifact path: {e}"))?;
+        // `normalize_path` already rejects absolute paths, `..` and empty
+        // segments, so `dir.join(clean)` cannot escape. Do NOT re-run the
+        // project-directory containment rule here: the artifact root lives
+        // under the DATA dir, not the project, so that rule rejects every
+        // legitimate write (found by the 2.2.5 differential: create answered
+        // 503 "path escapes the project directory"). Containment for this
+        // writer is (a) the normalizer above and (b) the join below.
+        let path = dir.join(&clean);
+        debug_assert!(path.starts_with(&dir), "artifact path escaped its root");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

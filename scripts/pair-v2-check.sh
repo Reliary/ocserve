@@ -71,8 +71,18 @@ HR=$(mktemp -d "${TMPDIR:-/tmp}/ocserve-pairv2-ocserve.XXXXXX")
 for h in "$HF" "$HR"; do
   mkdir -p "$h/.config/opencode" "$h/.local/share/opencode" "$h/.local/state/opencode"
 done
-cp "$CFG/opencode.json" "$HF/.config/opencode/opencode.json"
-cp "$CFG/opencode.json" "$HR/.config/opencode/opencode.json"
+# The new 2.2.5 families are flag-gated. Enable them in BOTH temp HOMEs so the
+# vectors exercise real shapes, not just the refusal path — and never touch the
+# committed fixture, which other oracles (capdiff, replay) share.
+python3 - "$CFG/opencode.json" "$HF/.config/opencode/opencode.json" \
+         "$HR/.config/opencode/opencode.json" <<'PYCFG'
+import json, sys
+src, *dsts = sys.argv[1:]
+cfg = json.load(open(src))
+cfg.setdefault("experimental", {}).update({"schedules": True, "artifacts": True})
+for d in dsts:
+    json.dump(cfg, open(d, "w"), indent=2)
+PYCFG
 
 say "== spawn (2.0.28 binary :$PORT_F, ocserve OCSERVE_V2=1 :$PORT_R) =="
 setsid env HOME="$HF" \
@@ -261,6 +271,70 @@ for name, path in [
         check(f"fanout-{name}", (st_f in (200, 404)) and st_r == 200, f"f={st_f} r={st_r}")
     else:
         check(f"fanout-{name}", st_f == 200 and st_r == 200, f"f={st_f} r={st_r}")
+
+# Phase 5 (2.2.5): the new operation families. Every vector below was probed
+# against the real 2.2.5 binary because these handlers were first written from
+# the contract, and five of them were plausible-but-wrong. The families need
+# their feature flags ON in the fixture config, so schedules/artifacts are
+# exercised in their real shape rather than only their refusal path.
+for name, method, path, body in [
+    ("schedule-create-in", "POST", "/api/experimental/schedule",
+     {"sessionID": "@SID", "prompt": "p", "when": {"in": "10 minutes"}}),
+    ("schedule-create-cron", "POST", "/api/experimental/schedule",
+     {"sessionID": "@SID", "prompt": "p", "when": {"cron": "*/5 * * * *"}}),
+    ("schedule-create-badwhen", "POST", "/api/experimental/schedule",
+     {"sessionID": "@SID", "prompt": "p", "when": {"nonsense": 1}}),
+    ("schedule-create-empty", "POST", "/api/experimental/schedule", {}),
+    ("schedule-list", "GET", "/api/experimental/schedule?sessionID=@SID", None),
+    ("schedule-missing", "GET", "/api/experimental/schedule/sch_nope", None),
+    ("schedule-pause-missing", "POST", "/api/experimental/schedule/sch_nope/pause", None),
+    ("artifact-create", "POST", "/api/experimental/artifacts",
+     {"title": "t", "files": {"a.txt": "hi"}}),
+    ("artifact-badid", "GET", "/api/experimental/artifacts/nope", None),
+    ("voice-models", "GET", "/api/experimental/voice/models", None),
+    ("voice-empty", "POST", "/api/experimental/voice/session", {}),
+    ("voice-object-model", "POST", "/api/experimental/voice/session",
+     {"model": {"providerID": "x", "modelID": "y"}}),
+    ("voice-string-transport", "POST", "/api/experimental/voice/session",
+     {"model": "gpt-live-1", "transport": "webrtc"}),
+    ("voice-unknown-model", "POST", "/api/experimental/voice/session",
+     {"model": "not-a-voice-model", "transport": {"type": "websocket"}}),
+    ("client-mcp-no-name", "GET", "/api/experimental/client-mcp", None),
+    ("client-mcp-name", "GET", "/api/experimental/client-mcp?name=demo", None),
+    ("client-mcp-token", "POST", "/api/experimental/client-mcp/token?name=demo", None),
+    ("usage-limits", "GET", "/api/experimental/usage/limits", None),
+    ("plugin-gui-no-id", "GET", "/api/plugin/gui", None),
+    ("plugin-gui-unknown", "GET", "/api/plugin/gui?id=nope", None),
+    ("fs-watch-no-path", "POST", "/api/experimental/fs/watch", {}),
+    ("fs-watch-outside", "POST", "/api/experimental/fs/watch", {"path": "/etc/hostname"}),
+    ("fs-watch-unwatch", "DELETE", "/api/experimental/fs/watch", {"path": "/tmp"}),
+    ("heap-dump", "POST", "/api/debug/heap-dump", {}),
+    ("generate-image-empty", "POST", "/api/experimental/generate/image", {}),
+    ("generate-decisions-empty", "POST", "/api/experimental/generate/decisions", {}),
+    ("permission-saved-missing", "PATCH", "/api/permission/saved/per_nope",
+     {"action": "allow"}),
+]:
+    bf = body
+    br = body
+    if isinstance(body, dict) and body.get("sessionID") == "@SID":
+        bf = {**body, "sessionID": sid_f}
+        br = {**body, "sessionID": sid_r}
+    pth_f = path.replace("@SID", sid_f)
+    pth_r = path.replace("@SID", sid_r)
+    rf = call(F, method, pth_f, bf, AUTH)
+    rr = call(R, method, pth_r, br)
+    st_f, bf_ = rf if isinstance(rf, tuple) else (0, {})
+    st_r, br_ = rr if isinstance(rr, tuple) else (0, {})
+
+    def _tag(b):
+        return b.get("_tag") if isinstance(b, dict) else None
+
+    # Parity = same success class, same error tag, and no contract key the
+    # reference emits that we omit. Ids/timestamps are generated per arm.
+    same_class = st_f == st_r or (st_f in (200, 201, 204) and st_r in (200, 201, 204))
+    missing = (set(bf_) - set(br_)) if isinstance(bf_, dict) and isinstance(br_, dict) else set()
+    check(f"v225-{name}", same_class and _tag(bf_) == _tag(br_) and not missing,
+          f"f={st_f}/{_tag(bf_)} r={st_r}/{_tag(br_)} missing={sorted(missing)}")
 
 # Phase 3: plugin inventory shape + RPC unregistered parity.
 # Both arms return `{location, data:[...]}`; with no plugins loaded on either

@@ -177,6 +177,13 @@ pub enum HttpError {
         tag: &'static str,
         fields: serde_json::Value,
     },
+    /// A status with an EMPTY response body. The reference does this where the
+    /// route only makes sense as a protocol upgrade (probed 2.2.5:
+    /// `GET /api/experimental/client-mcp?name=x` → 400, zero bytes), and a
+    /// synthesized `{"_tag":…}` body would be a shape the client never sees.
+    EmptyBody {
+        status: StatusCode,
+    },
 }
 
 impl From<ApiError> for HttpError {
@@ -215,6 +222,7 @@ impl IntoResponse for HttpError {
                 )
                     .into_response()
             }
+            HttpError::EmptyBody { status } => status.into_response(),
             HttpError::Query { message } => {
                 let body = serde_json::json!({
                     "name": "BadRequest",

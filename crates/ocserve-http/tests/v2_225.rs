@@ -113,11 +113,26 @@ async fn fs_watch_requires_a_path_and_accepts_a_registration() {
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     assert_eq!(json(r).await["_tag"], "InvalidRequestError");
 
+    // Probed 2.2.5: the reference resolves the path inside the session location
+    // and 404s anything else — including an existing file outside it. The test
+    // app's location is the repo root, so a nonexistent path must 404.
     let r = req(
         &app(),
         "POST",
         "/api/experimental/fs/watch",
-        Some(serde_json::json!({"path": "src/lib.rs"})),
+        Some(serde_json::json!({"path": "definitely/absent.txt"})),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    let v = json(r).await;
+    assert_eq!(v["_tag"], "FileNotFoundError");
+    assert_eq!(v["path"], "definitely/absent.txt");
+
+    let r = req(
+        &app(),
+        "POST",
+        "/api/experimental/fs/watch",
+        Some(serde_json::json!({"path": "Cargo.toml"})),
     )
     .await;
     assert_eq!(r.status(), StatusCode::NO_CONTENT);
@@ -233,12 +248,13 @@ async fn permission_saved_patch_unknown_id_is_not_found() {
 }
 
 #[tokio::test]
-async fn heap_dump_reports_the_references_own_failure_envelope() {
-    // A 200 must satisfy the contract (`path` string + five memory fields). A
-    // Rust process cannot write a V8 snapshot, so the honest answer is the
-    // reference's OWN failure envelope for an unwritable snapshot (probed:
-    // 500 UnknownError "...Failed to write heap snapshot..."), not a 200 with
-    // an extra `unsupported` key that a generated client cannot decode.
+async fn heap_dump_answers_a_contract_valid_200_with_a_real_file() {
+    // The contract requires `path`, `pid` and all five `memory` counters and
+    // forbids additional keys (`additionalProperties:false`). A Rust process
+    // has no V8 heap, so the honest mapping is a real file containing our own
+    // numbers, a truthful `rss`, and zeros for the V8-only counters
+    // (D-HEAP-DUMP). The earlier 500 was a shape no client could decode as a
+    // success, and the file it claimed to write did not exist.
     let r = req(
         &app(),
         "POST",
@@ -246,11 +262,25 @@ async fn heap_dump_reports_the_references_own_failure_envelope() {
         Some(serde_json::json!({})),
     )
     .await;
-    assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(r.status(), StatusCode::OK);
     let v = json(r).await;
-    assert_eq!(v["_tag"], "UnknownError");
-    assert!(v["message"].as_str().unwrap().contains("heap snapshot"));
-    assert!(v["ref"].as_str().unwrap().starts_with("err_"));
+    assert_eq!(v["pid"], std::process::id());
+    assert!(v["memory"]["rss"].as_u64().unwrap() > 0, "rss must be real");
+    for k in ["heapTotal", "heapUsed", "external", "arrayBuffers"] {
+        assert!(v["memory"][k].is_u64(), "{k} must be a number");
+    }
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["memory", "path", "pid"],
+        "no keys outside the contract"
+    );
+    let path = v["path"].as_str().unwrap();
+    assert!(
+        std::path::Path::new(path).is_file(),
+        "the reported path must exist"
+    );
 }
 
 #[tokio::test]
@@ -530,6 +560,45 @@ async fn voice_session_validates_shape_then_reports_unavailable() {
             .unwrap()
             .contains("transport")
     );
+    // Probed: `transport` is the discriminated union, so a bare string is the
+    // same `Expected VoiceTransportInput` decode error.
+    let r = req(
+        &app(),
+        "POST",
+        "/api/experimental/voice/session",
+        Some(serde_json::json!({"model": "gpt-live-1", "transport": "webrtc"})),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        json(r).await["message"]
+            .as_str()
+            .unwrap()
+            .contains("Expected VoiceTransportInput")
+    );
+
+    // Probed: the reference rejects a model it does not know with a plain 400
+    // before ever reaching the provider.
+    let r = req(
+        &app(),
+        "POST",
+        "/api/experimental/voice/session",
+        Some(serde_json::json!({
+            "model": "not-a-voice-model",
+            "transport": {"type": "websocket"}
+        })),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        json(r).await["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unsupported voice model")
+    );
+
+    // A supported model + transport reaches the provider and fails on the
+    // missing OpenAI credential: the reference's own message and service tag.
     let r = req(
         &app(),
         "POST",
@@ -538,7 +607,10 @@ async fn voice_session_validates_shape_then_reports_unavailable() {
     )
     .await;
     assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(json(r).await["_tag"], "ServiceUnavailableError");
+    let v = json(r).await;
+    assert_eq!(v["_tag"], "ServiceUnavailableError");
+    assert_eq!(v["service"], "openai");
+    assert!(v["message"].as_str().unwrap().contains("OpenAI API key"));
 }
 
 #[tokio::test]
@@ -548,6 +620,9 @@ async fn client_mcp_requires_name_and_refuses_with_the_reference_envelope() {
     let r = req(&app(), "GET", "/api/experimental/client-mcp", None).await;
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     assert_eq!(json(r).await["kind"], "Query");
+    // Probed: with a name present the reference tries a WebSocket upgrade and
+    // answers a BARE 400 (empty body) to a plain GET. The tagged refusal
+    // belongs to the token route only.
     let r = req(
         &app(),
         "GET",
@@ -555,8 +630,8 @@ async fn client_mcp_requires_name_and_refuses_with_the_reference_envelope() {
         None,
     )
     .await;
-    assert_eq!(r.status(), StatusCode::FORBIDDEN);
-    assert_eq!(json(r).await["_tag"], "ForbiddenError");
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(r.into_body().collect().await.unwrap().to_bytes().is_empty());
     let r = req(
         &app(),
         "POST",

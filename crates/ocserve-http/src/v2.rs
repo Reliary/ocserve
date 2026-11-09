@@ -5443,6 +5443,34 @@ pub async fn fs_watch(
             tag: "InvalidRequestError",
             fields: json!({"message": "Missing key\n  at [\"path\"]", "kind": "Payload"}),
         })?;
+    // The reference resolves the path and answers `FileNotFoundError` when it
+    // does not exist (probed: an existing file 204s even outside the project
+    // cwd; a directory and a missing file both 404, with the path echoed
+    // unchanged). Registration is in-memory only, so a nonexistent path would
+    // otherwise look watched forever.
+    // Containment (probed): an existing file INSIDE the location 204s whether
+    // the path is relative or absolute; anything outside it — or a directory —
+    // is `FileNotFoundError`, even when the path exists on the host. The
+    // reference resolves the path against the session location and never
+    // watches outside it, so `/etc/hostname` is "not found" from a project.
+    let base = std::path::PathBuf::from(st.paths["directory"].as_str().unwrap_or("/"));
+    let resolved = match resolve_within(&base, path) {
+        Ok(p) => p,
+        Err(_) => {
+            return Err(crate::HttpError::TaggedData {
+                status: StatusCode::NOT_FOUND,
+                tag: "FileNotFoundError",
+                fields: json!({"path": path, "message": format!("File not found: {path}")}),
+            });
+        }
+    };
+    if !resolved.is_file() {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "FileNotFoundError",
+            fields: json!({"path": path, "message": format!("File not found: {path}")}),
+        });
+    }
     st.fs_watches.lock().insert(path.to_string());
     Ok(StatusCode::NO_CONTENT)
 }
@@ -5973,21 +6001,72 @@ pub async fn media_get(
 /// `.heapsnapshot` would be a lie about its contents. The honest answer is the
 /// reference's own failure envelope for a snapshot it cannot write: 500
 /// `UnknownError` with a message the operator can act on. `D-HEAP-DUMP`.
-pub async fn heap_dump(State(_st): State<Arc<AppState>>) -> axum::response::Response {
+pub async fn heap_dump(State(st): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::IntoResponse;
+    // The reference writes a V8 `.heapsnapshot` and answers
+    // `{path, pid, memory:{rss,heapTotal,heapUsed,external,arrayBuffers}}`,
+    // all required, `additionalProperties:false`. A Rust process has no V8
+    // heap, so the honest mapping is: write a real file containing OUR memory
+    // numbers (so `path` is not a lie), report the true RSS, and zero the four
+    // V8-only counters — the contract has no null variant for them, and
+    // inventing values would be worse than saying "not applicable".
+    // D-HEAP-DUMP records that the file is not a V8 snapshot.
     let pid = std::process::id();
-    let rss = ocserve_store::platform::rss_of_pid(pid).unwrap_or(0);
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({
-            "_tag": "UnknownError",
-            "message": format!(
-                "Failed to write heap snapshot: this server is a Rust process (pid {pid}, rss {rss} bytes) and has no V8 heap to snapshot"
-            ),
-            "ref": format!("err_ocserve_{pid:08x}"),
-        })),
-    )
-        .into_response()
+    let rss = ocserve_store::platform::rss_of_pid(pid).unwrap_or(0).max(0) as u64;
+    // The snapshot goes under the server's DATA dir, not the project: the
+    // reference defaults to its own log directory, and writing into a user's
+    // worktree is both surprising and outside the containment rule. Placement
+    // belongs to the store (rule 43 keeps file creation out of the router).
+    let Ok(dir) = ocserve_store::platform::data_dir() else {
+        return crate::HttpError::TaggedData {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            tag: "UnknownError",
+            fields: json!({"message": "Failed to write heap snapshot: no data directory"}),
+        }
+        .into_response();
+    };
+    let dir = dir.join("log");
+    let path = dir.join(format!("heap-{pid}-{}.json", now_ms_http()));
+    if let Err(e) = crate::artifact_store::ensure_root(&dir) {
+        return crate::HttpError::TaggedData {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            tag: "UnknownError",
+            fields: json!({"message": format!("Failed to write heap snapshot: {e}")}),
+        }
+        .into_response();
+    }
+    let doc = json!({
+        "format": "ocserve-memory-report",
+        "note": "This server is a Rust process and has no V8 heap; rss is real, heap* are N/A.",
+        "pid": pid,
+        "memory": {
+            "rss": rss,
+            "heapTotal": 0,
+            "heapUsed": 0,
+            "external": 0,
+            "arrayBuffers": 0,
+        }
+    });
+    if let Err(e) = std::fs::write(&path, doc.to_string()) {
+        return crate::HttpError::TaggedData {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            tag: "UnknownError",
+            fields: json!({"message": format!("Failed to write heap snapshot: {e}")}),
+        }
+        .into_response();
+    }
+    Json(json!({
+        "path": path.to_string_lossy(),
+        "pid": pid,
+        "memory": {
+            "rss": rss,
+            "heapTotal": 0,
+            "heapUsed": 0,
+            "external": 0,
+            "arrayBuffers": 0,
+        }
+    }))
+    .into_response()
 }
 
 /// GET /api/plugin/gui?id= — `{location, data: Plugin.GuiBundle}`.
@@ -7006,19 +7085,48 @@ pub async fn voice_session_api(Json(body): Json<Value>) -> Result<Json<Value>, H
             fields: json!({"message": "Expected string\n  at [\"model\"]", "kind": "Payload"}),
         });
     }
-    if body.get("transport").is_none() {
+    // `transport` is the discriminated `VoiceTransportInput` union
+    // (`{type:"webrtc",sdp}` | `{type:"websocket"}`), not a bare string:
+    // probed, `{"transport":"webrtc"}` is `Expected VoiceTransportInput`.
+    let Some(t) = body.get("transport") else {
         return Err(crate::HttpError::TaggedData {
             status: StatusCode::BAD_REQUEST,
             tag: "InvalidRequestError",
             fields: json!({"message": "Missing key\n  at [\"transport\"]", "kind": "Payload"}),
         });
+    };
+    let kind = t.get("type").and_then(|v| v.as_str());
+    let valid = match kind {
+        Some("webrtc") => t.get("sdp").and_then(|v| v.as_str()).is_some(),
+        Some("websocket") => true,
+        _ => false,
+    };
+    if !valid {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": "Expected VoiceTransportInput\n  at [\"transport\"]", "kind": "Payload"}),
+        });
     }
+    // The reference only knows these two models and rejects anything else with
+    // a plain 400 before reaching the provider.
+    let model = body["model"].as_str().unwrap_or_default();
+    if !model.starts_with("gpt-live-") && !model.starts_with("gpt-realtime-") {
+        return Err(crate::HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": format!("Unsupported voice model: {model}")}),
+        });
+    }
+    // With a supported model the reference asks the provider for a session and
+    // fails when no OpenAI credential exists. We have no audio transport at
+    // all, so our refusal is the same class and wording (D-VOICE-TRANSPORT).
     Err(crate::HttpError::TaggedData {
         status: StatusCode::SERVICE_UNAVAILABLE,
         tag: "ServiceUnavailableError",
         fields: json!({
-            "message": "voice sessions are not available on this server",
-            "service": "experimental.voice"
+            "message": "GPT-Live needs an OpenAI API key (a stored key or OPENAI_API_KEY) or an OpenCode Console connection on the server. ChatGPT sign-in can't start voice sessions.",
+            "service": "openai"
         }),
     })
 }
@@ -7042,7 +7150,12 @@ pub async fn client_mcp_get(
             fields: json!({"message": "Missing key\n  at [\"name\"]", "kind": "Query"}),
         });
     }
-    Err(client_mcp_refused())
+    // Probed: with a name present the reference upgrades the request to a
+    // WebSocket and a plain HTTP GET gets a bare 400 with an EMPTY body, not
+    // the tagged envelope (the token route is where the tagged refusal lives).
+    Err(crate::HttpError::EmptyBody {
+        status: StatusCode::BAD_REQUEST,
+    })
 }
 
 /// POST /api/experimental/client-mcp/token?name= — same story: minting a
