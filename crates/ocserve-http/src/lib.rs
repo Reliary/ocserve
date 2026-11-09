@@ -320,6 +320,16 @@ pub struct AppState {
     pub mcp: std::sync::OnceLock<std::sync::Arc<ocserve_mcp::McpHub>>,
     /// Plugin sidecar (M4b): async mutex — trigger() takes &mut across await.
     pub plugins: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<ocserve_plugin::Sidecar>>>,
+    /// Data dir, for lazily materializing the plugin host when a launcher
+    /// provisions its first plugin AFTER boot (no sidecar existed at boot).
+    pub data_dir: std::path::PathBuf,
+    /// The URL this server is reachable at; set by `serve` before the router
+    /// runs. A lazily spawned sidecar needs it for `ctx.client`/`serverUrl`.
+    pub server_url: std::sync::OnceLock<String>,
+    /// Scan `<config_dir>/{plugin,plugins}` on `/api/plugin` (production). The
+    /// hermetic test constructor disables it so a dev's real plugins never leak
+    /// into a test run; tests drive `v2::load_discovered_from` explicitly.
+    pub plugin_discovery: bool,
     /// Per-session prompt serialization (queue semantics). Bounded: entries
     /// exist only for in-flight prompts + transient races, removed post-run
     /// when uncontended (AGENTS §2.3 — active-set bound, no eviction).
@@ -603,7 +613,7 @@ impl AppState {
         let blobs = std::sync::Arc::new(
             ocserve_store::BlobStore::new(dir.join("blobs")).expect("temp blobs"),
         );
-        Self::with_wiring_and_v2(
+        Self::build(
             auth,
             p,
             Wires {
@@ -613,12 +623,16 @@ impl AppState {
                 llm: LlmRegistry::default(),
             },
             v2,
+            // Hermetic test constructor: /api/plugin must never scan the
+            // developer's real config directory. Explicit `load_discovered_from`
+            // is how discovery tests exercise the path.
+            false,
         )
     }
 
     /// One-shot construction with real runtime wiring (CLI path).
     pub fn with_wiring(auth: Option<(String, String)>, p: Payloads, w: Wires) -> Arc<Self> {
-        Self::with_wiring_and_v2(auth, p, w, v2_flag())
+        Self::build(auth, p, w, v2_flag(), true)
     }
 
     /// Construction with an explicit v2 flag (tests: hermetic per-state gate,
@@ -629,6 +643,16 @@ impl AppState {
         p: Payloads,
         w: Wires,
         v2: bool,
+    ) -> Arc<Self> {
+        Self::build(auth, p, w, v2, true)
+    }
+
+    fn build(
+        auth: Option<(String, String)>,
+        p: Payloads,
+        w: Wires,
+        v2: bool,
+        plugin_discovery: bool,
     ) -> Arc<Self> {
         let home = std::env::var("HOME").unwrap_or_default();
         let worktree = std::env::current_dir()
@@ -647,6 +671,8 @@ impl AppState {
             "project": {"id": "global", "directory": "/", "canonical": "/"},
         });
         let wire_map = rebuild_wire(&p, wire_off, &location);
+        // The data dir owns `ocserve.db`; the plugin host lives beside it.
+        let data_dir = w.db.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let bus = ocserve_core::EventBus::new();
         let pty = {
             let mgr = ocserve_pty::PtyManager::new(worktree.clone());
@@ -681,6 +707,9 @@ impl AppState {
             gate: ocserve_core::PermissionGate::new(),
             mcp: std::sync::OnceLock::new(),
             plugins: std::sync::OnceLock::new(),
+            data_dir,
+            server_url: std::sync::OnceLock::new(),
+            plugin_discovery,
             prompt_locks: std::sync::Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),

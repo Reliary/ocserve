@@ -86,8 +86,9 @@ pub fn trim_heap() -> bool {
     }
 }
 
-/// Watched-file state. `paths` set once at boot (≤6 files — bounded by the
-/// set `Runtime::load_for` reads); `observed` tracks last-seen
+/// Watched-file state. `paths` set once at boot (the bounded set
+/// `Runtime::load_for` reads — the fixed files plus `OPENCODE_CONFIG` when
+/// set); `observed` tracks last-seen
 /// (mtime,len)+content-hash so the watcher fires only on real CONTENT
 /// changes. The hash matters: their opencode rewrites `models.json`
 /// ~hourly with IDENTICAL bytes (fresh-TTL fetch) — mtime churn without a

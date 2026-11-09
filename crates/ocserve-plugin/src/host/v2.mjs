@@ -188,17 +188,55 @@ export function makeV2Context({
     session: mergeDomain(registrar("session"), "session", fetchJson),
     tool: {
       ...registrar("tool"),
-      // transform/list/reload operate on the tool registry — not bridged
-      // (named divergence D-V2-TOOL-EDITOR); present so detection does not
-      // crash, but a call throws the named error rather than lying.
-      // Registered, never run: failing `setup` here would lose the plugin's
-      // execute.before/after hooks, which ARE bridged. D-V2-TOOL-EDITOR.
+      // v2 tool registry (upstream `ToolEditor`). BROADER than the old stub:
+      // `transform` now RUNS the callback against a live editor so a plugin
+      // (Paseo's bridge) can actually install tools; `add`/`update`/`remove`
+      // mutate the registry that `collectTools()` advertises and
+      // `executeTool()` dispatches. Disposing a registration removes the names
+      // that registration added (Paseo disposes when a binding goes away).
       transform: async (callback) => {
-        state.toolTransforms.push(callback);
-        state.unbridgedTransforms.push("tool");
-        return registration(state.toolTransforms, callback);
+        const before = new Set(state.v2Tools.map((t) => t.name));
+        const editor = {
+          list: () => state.v2Tools.map((t) => ({ ...t, id: t.name })),
+          get: (id) => state.v2Tools.find((t) => t.name === id),
+          namespace: () => {},
+          add: (tool) => {
+            if (!tool || typeof tool.name !== "string" || !tool.name)
+              throw new Error("tool.add requires a name");
+            const rec = {
+              name: tool.name,
+              description: String(tool.description ?? ""),
+              input: tool.input,
+              execute: tool.execute,
+              options: tool.options,
+            };
+            const i = state.v2Tools.findIndex((t) => t.name === rec.name);
+            if (i >= 0) state.v2Tools[i] = rec;
+            else state.v2Tools.push(rec);
+          },
+          update: (id, fn) => {
+            const t = state.v2Tools.find((x) => x.name === id);
+            if (t) fn(t);
+          },
+          remove: (id) => {
+            state.v2Tools = state.v2Tools.filter((t) => t.name !== id);
+          },
+        };
+        callback(editor);
+        const entry = { callback };
+        state.toolTransforms.push(entry);
+        return {
+          dispose: async () => {
+            const i = state.toolTransforms.indexOf(entry);
+            if (i >= 0) state.toolTransforms.splice(i, 1);
+            const added = new Set(
+              state.v2Tools.map((t) => t.name).filter((n) => !before.has(n)),
+            );
+            state.v2Tools = state.v2Tools.filter((t) => !added.has(t.name));
+          },
+        };
       },
-      list: async () => [],
+      list: async () => state.v2Tools.map((t) => ({ ...t, id: t.name })),
       reload: async () => {},
     },
     permission: mergeDomain(registrar("permission"), "permission", fetchJson),
@@ -528,10 +566,13 @@ export function newV2State() {
     // that did not ask for it.
     commandTransforms: [],
     skillTransforms: [],
-    // Transforms for domains we do not bridge: recorded so the plugin's setup
-    // succeeds, never invoked. `unbridgedTransforms` is the report.
+    // Transforms we accepted but cannot apply. `tool` is no longer in this
+    // set: its callbacks run against a live editor (see makeV2Context).
     toolTransforms: [],
     unbridgedTransforms: [],
+    // v2 tool definitions installed through `ctx.tool.transform` (Paseo's
+    // `paseo_*` tools). Advertised by collectTools(), dispatched by executeTool().
+    v2Tools: [],
     // what the last pull produced; backs ctx.command.list()/skill.list().
     lastCommands: [],
     reloadRequested: false,
