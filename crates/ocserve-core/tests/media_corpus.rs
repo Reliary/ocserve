@@ -8,7 +8,7 @@
 //! Run: OCSERVE_MEDIA_DB=~/.local/share/ocserve/ocserve.db \
 //!        cargo test -p ocserve-core --test media_corpus -- --nocapture
 
-use ocserve_core::prompt::to_provider_messages;
+use ocserve_core::prompt::to_provider_messages_with;
 use serde_json::{Value, json};
 
 type FileRow = (String, String, String, Option<String>, Option<String>, i64);
@@ -18,10 +18,13 @@ type FileRow = (String, String, String, Option<String>, Option<String>, i64);
 #[test]
 fn every_file_part_in_a_real_db_encodes_to_a_provider_part() {
     if std::env::var("OCSERVE_MEDIA_PLANT").as_deref() == Ok("drop") {
-        let msgs = to_provider_messages(&[(
-            json!({"role": "user"}),
-            vec![json!({"type": "text", "text": "x"})],
-        )]);
+        let msgs = to_provider_messages_with(
+            &[(
+                json!({"role": "user"}),
+                vec![json!({"type": "text", "text": "x"})],
+            )],
+            &[],
+        );
         if let ocserve_llm::Content::Text(_) = &msgs[0].content {
             panic!("PLANT: file part encoded as text (the silent-drop bug)");
         }
@@ -62,6 +65,38 @@ fn every_file_part_in_a_real_db_encodes_to_a_provider_part() {
         "corpus must contain file parts to prove this"
     );
 
+    // Every modality present in the corpus, so a new mime type is still
+    // exercised rather than silently classified as unsupported.
+    let allowed: Vec<String> = rows
+        .iter()
+        .filter_map(|(id, _, _, inline, sha, len)| {
+            let src = match (inline, sha) {
+                (Some(t), _) => t.clone(),
+                (None, Some(sha)) => {
+                    String::from_utf8_lossy(&blobs.get(sha, (*len).max(0) as u64).ok()?).to_string()
+                }
+                (None, None) => return None,
+            };
+            let _ = id;
+            let part: Value = serde_json::from_str(&src).ok()?;
+            Some(part["mime"].as_str().unwrap_or("").to_string())
+        })
+        .map(|mime| {
+            if mime.starts_with("image/") {
+                "image"
+            } else if mime.starts_with("audio/") {
+                "audio"
+            } else if mime.starts_with("video/") {
+                "video"
+            } else {
+                "pdf"
+            }
+        })
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
     let mut checked = 0usize;
     let mut media = 0usize;
     for (id, sid, mid, inline, sha, len) in rows {
@@ -78,7 +113,11 @@ fn every_file_part_in_a_real_db_encodes_to_a_provider_part() {
         let info: Value = json!({"id": mid, "sessionID": sid, "role": "user"});
         let mut part: Value = serde_json::from_str(&src).expect("stored file part is JSON");
         part["messageID"] = json!(mid);
-        let msgs = to_provider_messages(&[(info, vec![part])]);
+        // This gate proves the ENCODER, not the capability gate: pass the
+        // modalities the corpus actually contains, so every part must come out
+        // as media. (The capability gate is proven separately by
+        // `unreadable_media_becomes_an_explanatory_text_part`.)
+        let msgs = to_provider_messages_with(&[(info, vec![part])], &allowed);
         assert_eq!(msgs.len(), 1, "file part {id} produced no message");
         match &msgs[0].content {
             ocserve_llm::Content::Parts(parts) => {

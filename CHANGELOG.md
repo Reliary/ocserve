@@ -62,6 +62,11 @@ Not yet released. No version bump, tag or publish has been made for these.
   libsqlite3-sys 0.39.1 (SQLite 3.54.1).
 
 ### Changed
+- The nightly media corpus gate now tests what it claims to (attachment
+  ENCODING, with the corpus's own modalities) and the zen free-tier gate
+  reports a spent anonymous pool as a CONDITION rather than a wire
+  regression, while a plain 429, an auth failure and a stream stall remain
+  hard failures.
 - Dependency updates: rolldown 1.3.x, boring 5.4, brotli 9.1.1, toml 1.2.1,
   rustix 1.1.6, flate2 1.1.11, similar 3.2.1. `boring` needed its requirement
   raised, not only the lock.

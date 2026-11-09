@@ -958,8 +958,14 @@ pub fn to_provider_messages(history: &[(Value, Vec<Value>)]) -> Vec<ChatMessage>
 }
 
 /// As `to_provider_messages`, but applying upstream's `unsupportedParts` rule
-/// for the given model INPUT modalities. An empty slice means "unknown", which
-/// stays permissive (send the media as-is).
+/// for the given model INPUT modalities.
+///
+/// An empty slice means the model is UNKNOWN, and upstream's capability block
+/// for an unknown model is `{text: true, image/audio/video/pdf: false}`
+/// (provider/capabilities), so media is replaced with the explanatory text —
+/// NOT forwarded for the provider to reject. This comment used to claim the
+/// opposite, which is exactly how the corpus gate and the shipped behaviour
+/// drifted apart (nightly red for days, K-MEDIA-ENCODE).
 pub fn to_provider_messages_with(
     history: &[(Value, Vec<Value>)],
     modalities: &[String],
