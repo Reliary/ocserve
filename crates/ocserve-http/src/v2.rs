@@ -5498,11 +5498,16 @@ pub async fn workspace_create(
     // `Workspace` requires id, type, name, projectID and timeUsed and forbids
     // extra keys. The earlier body was `{id,type}` — contract-invalid, which no
     // gate caught because spec-validate only walked GETs (fixed: it walks POST
-    // too now). `name`/`directory` are the generated worktree identity, so the
-    // answer describes a specific workspace instead of a bare id.
+    // too now).
+    //
+    // `directory` is NULL on purpose: this route does not create a worktree
+    // (D-WORKSPACE-ADAPTER), and returning a path we never made is a
+    // fabricated answer a client would trust and then fail on. The field is
+    // nullable; `POST /api/worktree` is the route that runs `git worktree add`
+    // and returns a real path.
     let id = format!("wrk_{}", ocserve_core::ids::ascending_tail());
     let name = format!("{}-{}", worktree_word(0), worktree_word(1));
-    let directory = format!("{}/.ocserve-worktrees/{id}", dir.trim_end_matches('/'));
+    let directory = Value::Null;
     let branch = body.get("branch").cloned().unwrap_or(Value::Null);
     let extra = body.get("extra").cloned().unwrap_or(Value::Null);
     let dir_for_proj = dir.clone();

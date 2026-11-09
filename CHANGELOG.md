@@ -76,7 +76,9 @@ Not yet released. No version bump, tag or publish has been made for these.
   parameterless POSTs, with a `--selftest` that fails on a body missing
   required keys, wired into the guard suite. `DELETE /experimental/workspace/{id}`
   also decodes the `wrk_` brand first (`nope` is a 400 `Params` error, as the
-  reference does) and answers 200 instead of a blanket 204.
+  reference does) and answers 200 instead of a blanket 204. Create reports
+  `directory: null`, because the route creates nothing and a path it never made
+  is an answer a client would trust and then fail on.
 
 ### Changed
 - Dev builds default to a target dir OUTSIDE the snapshotted subvolume

@@ -90,6 +90,15 @@ async fn a_created_workspace_satisfies_the_contract() {
     );
     assert!(v["id"].as_str().unwrap().starts_with("wrk"));
     assert!(!v["name"].as_str().unwrap().is_empty(), "name is required");
+    // Nothing was created, so no directory is claimed: a path that does not
+    // exist is the fabricated-answer class this route was fixed for.
+    assert!(v["directory"].is_null(), "must not invent a path: {v}");
+    // No directory key may point at something that exists on disk, because
+    // this route creates nothing.
+    assert!(
+        v["directory"].is_null(),
+        "create must not claim a directory it did not make"
+    );
     assert!(!v["projectID"].as_str().unwrap().is_empty());
     assert!(v["timeUsed"].as_i64().unwrap() > 0);
 }
