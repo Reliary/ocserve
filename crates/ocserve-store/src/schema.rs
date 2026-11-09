@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 18;
+pub const SCHEMA_VERSION: i64 = 19;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -172,6 +172,21 @@ CREATE TABLE form (
 ) STRICT;
 
 CREATE INDEX idx_form_session ON form(session_id, time_created);
+
+-- Project-level saved permissions ('always' with a scope that outlives the
+-- session). Upstream `PermissionTable` (permission/saved.ts); the unique index
+-- is what turns an edit into ConflictError rather than a duplicate row.
+CREATE TABLE permission_saved (
+    id             TEXT PRIMARY KEY,
+    project_id     TEXT NOT NULL,
+    action         TEXT NOT NULL,
+    resource       TEXT NOT NULL,
+    time_created   INTEGER NOT NULL,
+    time_updated   INTEGER NOT NULL
+) STRICT;
+CREATE UNIQUE INDEX idx_permission_saved_unique
+    ON permission_saved(project_id, action, resource);
+CREATE INDEX idx_permission_saved_project ON permission_saved(project_id);
 
 -- v2 credentials (gap closure): upstream `credential` table shape
 -- (verified live against 2.0.28: id/integration_id/label/value/active +
@@ -980,6 +995,30 @@ CREATE TABLE IF NOT EXISTS session_environment (
                             conn.execute_batch(ddl)?;
                         }
                     }
+                }
+                18 => {
+                    // v18->v19: project-level saved permissions. `GET
+                    // /api/permission/saved` answered `[]` and the PATCH/DELETE
+                    // routes were 204 no-ops, yet the shipped web UI lists,
+                    // edits and removes saved permissions — so a user's "always
+                    // (this project)" vanished on the next screen. Upstream
+                    // keeps these in `PermissionTable`, keyed by project, with a
+                    // unique (project, action, resource) that makes a duplicate
+                    // edit a ConflictError. Pure CREATE.
+                    conn.execute_batch(
+                        "CREATE TABLE IF NOT EXISTS permission_saved (
+                        id             TEXT PRIMARY KEY,
+                        project_id     TEXT NOT NULL,
+                        action         TEXT NOT NULL,
+                        resource       TEXT NOT NULL,
+                        time_created   INTEGER NOT NULL,
+                        time_updated   INTEGER NOT NULL
+                    ) STRICT;
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_permission_saved_unique
+                        ON permission_saved(project_id, action, resource);
+                    CREATE INDEX IF NOT EXISTS idx_permission_saved_project
+                        ON permission_saved(project_id);",
+                    )?;
                 }
                 other => {
                     bail!(

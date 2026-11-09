@@ -74,6 +74,13 @@ Not yet released. No version bump, tag or publish has been made for these.
   v7.0.2 (5 uses), each pin verified against its upstream tag.
 
 ### Added
+- **Saved permissions are real state.** `GET /api/permission/saved` returned an
+  empty array and the PATCH/DELETE routes were 204 no-ops, while the shipped web
+  UI lists, edits and removes them. Backed now by schema v19 `permission_saved`
+  (project-scoped, unique on action + resource) with the reference's semantics:
+  idempotent save, partial update, 404 for a missing id, conflict on a
+  duplicate, and a bare delete that does not 404. An "always" reply writes the
+  project row as well as the session grant.
 - `scripts/remote-build.sh` offloads cargo to a builder host, because the
   development box's `target/` reached 912 GB on a snapshot-pinned filesystem
   and failed with ENOSPC more often than with compiler errors.

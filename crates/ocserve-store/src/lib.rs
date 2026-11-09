@@ -5291,6 +5291,152 @@ pub fn set_goal(writer: &Writer, session_id: &str, row: Option<&GoalRow>) -> any
     Ok(())
 }
 
+/// The project a session belongs to (the v2 saved-permission scope).
+pub fn session_project_id(db: &Path, session_id: &str) -> anyhow::Result<Option<String>> {
+    let r = pragma::open_reader(db)?;
+    let pid: Option<String> = r
+        .query_row(
+            "SELECT project_id FROM session WHERE id = ?1",
+            [session_id],
+            |x| x.get(0),
+        )
+        .ok();
+    Ok(pid)
+}
+
+/// A project-level saved permission (upstream `PermissionTable`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SavedPermission {
+    pub id: String,
+    pub project_id: String,
+    pub action: String,
+    pub resource: String,
+    pub time_created: i64,
+    pub time_updated: i64,
+}
+
+/// Rows in the saved-permission set, newest last.
+pub fn saved_permissions(
+    db: &Path,
+    project_id: Option<&str>,
+) -> anyhow::Result<Vec<SavedPermission>> {
+    let r = pragma::open_reader(db)?;
+    let sql = "SELECT id, project_id, action, resource, time_created, time_updated \
+                 FROM permission_saved";
+    let map = |x: &rusqlite::Row<'_>| {
+        Ok(SavedPermission {
+            id: x.get(0)?,
+            project_id: x.get(1)?,
+            action: x.get(2)?,
+            resource: x.get(3)?,
+            time_created: x.get(4)?,
+            time_updated: x.get(5)?,
+        })
+    };
+    let rows = match project_id {
+        Some(p) => r
+            .prepare(&format!(
+                "{sql} WHERE project_id = ?1 ORDER BY time_created"
+            ))?
+            .query_map([p], map)?
+            .filter_map(|r| r.ok())
+            .collect(),
+        None => r
+            .prepare(&format!("{sql} ORDER BY time_created"))?
+            .query_map([], map)?
+            .filter_map(|r| r.ok())
+            .collect(),
+    };
+    Ok(rows)
+}
+
+/// Record a project-level "always". Idempotent like upstream's
+/// `onConflictDoNothing`: saving the same (project, action, resource) twice
+/// leaves one row.
+pub fn save_permission(
+    writer: &Writer,
+    project_id: &str,
+    action: &str,
+    resource: &str,
+) -> anyhow::Result<()> {
+    let now = now_ms();
+    // The id is a BRAND, not a timestamp: two saves in the same millisecond
+    // (a prompt granting several patterns, or two "always" replies) produced
+    // the same `per_` id and the second died on the primary key. A process
+    // counter makes it unique while staying readable and lexically ordered.
+    static SAVED_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SAVED_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let id = format!(
+        "per_{:013x}{:010x}{:06x}",
+        now,
+        std::process::id(),
+        seq & 0xff_ffff
+    );
+    writer.write(vec![writer::WriteOp::Sql {
+        sql: "INSERT INTO permission_saved \
+              (id, project_id, action, resource, time_created, time_updated) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
+              ON CONFLICT(project_id, action, resource) DO NOTHING"
+            .into(),
+        params: vec![
+            serde_json::json!(id),
+            serde_json::json!(project_id),
+            serde_json::json!(action),
+            serde_json::json!(resource),
+            serde_json::json!(now),
+        ],
+    }])?;
+    Ok(())
+}
+
+/// Edit a saved permission. `None` fields keep their stored value (upstream
+/// `input.action ?? current.action`). A duplicate edit is `Conflict`, a missing
+/// row is `None`.
+pub fn update_permission(
+    writer: &Writer,
+    db: &Path,
+    id: &str,
+    action: Option<&str>,
+    resource: Option<&str>,
+) -> anyhow::Result<std::result::Result<(), bool>> {
+    let current = saved_permissions(db, None)?
+        .into_iter()
+        .find(|p| p.id == id);
+    let Some(current) = current else {
+        return Ok(Err(false));
+    };
+    let action = action.unwrap_or(&current.action);
+    let resource = resource.unwrap_or(&current.resource);
+    let clash = saved_permissions(db, Some(&current.project_id))?
+        .into_iter()
+        .any(|p| p.id != id && p.action == action && p.resource == resource);
+    if clash {
+        return Ok(Err(true));
+    }
+    writer.write(vec![writer::WriteOp::Sql {
+        sql: "UPDATE permission_saved SET action = ?1, resource = ?2, time_updated = ?3 \
+              WHERE id = ?4"
+            .into(),
+        params: vec![
+            serde_json::json!(action),
+            serde_json::json!(resource),
+            serde_json::json!(now_ms()),
+            serde_json::json!(id),
+        ],
+    }])?;
+    Ok(Ok(()))
+}
+
+/// Remove a saved permission. Upstream's `remove` is a bare DELETE and does
+/// NOT 404 an unknown id (probed); the route therefore answers 204 either way.
+pub fn remove_permission(writer: &Writer, id: &str) -> anyhow::Result<()> {
+    writer.write(vec![writer::WriteOp::Sql {
+        sql: "DELETE FROM permission_saved WHERE id = ?1".into(),
+        params: vec![serde_json::json!(id)],
+    }])?;
+    Ok(())
+}
+
 /// Wall-clock milliseconds since the epoch (the unit every stored timestamp
 /// uses). Shared so `doctor` and the schedule runner cannot disagree.
 pub fn now_ms() -> i64 {

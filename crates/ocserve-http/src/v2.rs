@@ -3276,11 +3276,33 @@ pub async fn session_history(
 // ---------------------------------------------------------------------------
 
 /// GET /api/permission/saved — `{data:[PermissionSavedInfo]}`.
-pub async fn permission_saved(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    // ocserve stores per-session always-grants as string keys, not the v2
-    // PermissionSavedInfo rows; there is no project-level saved set => [].
-    let _ = &st;
-    Json(json!({"data": []}))
+///
+/// These are PROJECT-level always-grants (upstream `permission/saved.ts`), a
+/// different scope from the per-session string keys in the permission gate.
+/// The shipped web UI lists, edits and removes them, so an empty array was a
+/// lie the moment a user saved one.
+pub async fn permission_saved(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let rows = crate::run_blocking(&st.db, move |db| ocserve_store::saved_permissions(db, None))
+        .await
+        .unwrap_or_default();
+    let project = q.get("projectID");
+    let data: Vec<Value> = rows
+        .into_iter()
+        .filter(|r| project.is_none_or(|p| &r.project_id == p))
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "projectID": r.project_id,
+                "action": r.action,
+                "resource": r.resource,
+                "time": {"created": r.time_created, "updated": r.time_updated},
+            })
+        })
+        .collect();
+    Json(json!({"data": data}))
 }
 
 /// GET /api/permission/request — `{location, data:[...]}` pending asks.
@@ -4758,11 +4780,22 @@ pub async fn session_permission_one(
 }
 
 /// DELETE /api/permission/saved/{id} — NoContent (best-effort grant removal).
+/// DELETE /api/permission/saved/{id} — remove a saved permission.
+///
+/// Upstream's `remove` is a bare DELETE with no existence check (probed), so
+/// an unknown id is still 204. It used to be a 204 that deleted nothing.
 pub async fn permission_saved_delete(
-    State(_): State<Arc<AppState>>,
-    Path(_id): Path<String>,
-) -> StatusCode {
-    StatusCode::NO_CONTENT
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, crate::HttpError> {
+    ocserve_store::remove_permission(&st.writer, &id).map_err(|e| {
+        crate::HttpError::TaggedData {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            tag: "UnknownError",
+            fields: json!({"message": format!("{e:#}")}),
+        }
+    })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------------
@@ -6098,6 +6131,7 @@ pub async fn plugin_gui(
 /// that is not in that set is `PermissionSavedNotFoundError` (probed live),
 /// which is the truthful answer here: there is nothing to edit.
 pub async fn permission_saved_update(
+    State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
     body: Option<Json<Value>>,
 ) -> Result<Json<Value>, crate::HttpError> {
@@ -6109,11 +6143,59 @@ pub async fn permission_saved_update(
             fields: json!({"message": "Expected an object\n  at [\"body\"]", "kind": "Payload"}),
         });
     }
-    Err(crate::HttpError::TaggedData {
-        status: StatusCode::NOT_FOUND,
-        tag: "PermissionSavedNotFoundError",
-        fields: json!({"id": id, "message": format!("Saved permission not found: {id}")}),
-    })
+    let action = body.get("action").and_then(|v| v.as_str());
+    let resource = body.get("resource").and_then(|v| v.as_str());
+    let res = ocserve_store::update_permission(&st.writer, &st.db, &id, action, resource).map_err(
+        |e| crate::HttpError::TaggedData {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            tag: "UnknownError",
+            fields: json!({"message": format!("{e:#}")}),
+        },
+    )?;
+    match res {
+        Ok(()) => {
+            let id_read = id.clone();
+            let rows =
+                crate::run_blocking(&st.db, move |db| ocserve_store::saved_permissions(db, None))
+                    .await
+                    .unwrap_or_default();
+            let row = rows.into_iter().find(|r| r.id == id_read);
+            match row {
+                Some(r) => Ok(Json(json!({
+                    "data": {
+                        "id": r.id,
+                        "projectID": r.project_id,
+                        "action": r.action,
+                        "resource": r.resource,
+                        "time": {"created": r.time_created, "updated": r.time_updated},
+                    }
+                }))),
+                None => Err(crate::HttpError::TaggedData {
+                    status: StatusCode::NOT_FOUND,
+                    tag: "PermissionSavedNotFoundError",
+                    fields: json!({"id": id, "message": format!("Saved permission not found: {id}")}),
+                }),
+            }
+        }
+        Err(false) => Err(crate::HttpError::TaggedData {
+            status: StatusCode::NOT_FOUND,
+            tag: "PermissionSavedNotFoundError",
+            fields: json!({"id": id, "message": format!("Saved permission not found: {id}")}),
+        }),
+        Err(true) => {
+            // The unique index rejects an edit that duplicates another saved
+            // permission in the same project (upstream ConflictError).
+            let (a, r) = (action.unwrap_or(""), resource.unwrap_or(""));
+            Err(crate::HttpError::TaggedData {
+                status: StatusCode::CONFLICT,
+                tag: "PermissionSavedConflictError",
+                fields: json!({
+                    "id": id, "action": a, "resource": r,
+                    "message": format!("A saved permission for {a} {r} already exists"),
+                }),
+            })
+        }
+    }
 }
 
 /// POST /api/experimental/generate/text — `{prompt, model?}` → `{data:{text}}`.

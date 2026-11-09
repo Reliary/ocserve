@@ -3214,9 +3214,10 @@ pub async fn run_prompt_with(
                                 break;
                             }
                             if reply == "always" {
+                                // Session scope: the grant that answers this
+                                // turn and survives a restart (K-ALWAYS).
                                 for pat in &ask.always {
                                     ctx.gate.grant_always(session_id, &ask.permission, pat);
-                                    // K-ALWAYS: persist past restart
                                     if let Err(e) = ocserve_store::session_grant_always(
                                         writer,
                                         &ctx.db,
@@ -3228,6 +3229,29 @@ pub async fn run_prompt_with(
                                             "persist always grant {}:{pat}: {e:#}",
                                             ask.permission
                                         );
+                                    }
+                                }
+                                // PROJECT scope: upstream `permission.ts:333`
+                                // saves the ask's `save` patterns into the
+                                // project-level set on an "always" reply, which
+                                // is what the web UI's Saved Permissions screen
+                                // lists and edits. Without this the screen was
+                                // empty and its edits were 204 no-ops.
+                                if let Ok(Some(pid)) =
+                                    ocserve_store::session_project_id(&ctx.db, session_id)
+                                {
+                                    for pat in &ask.always {
+                                        if let Err(e) = ocserve_store::save_permission(
+                                            writer,
+                                            &pid,
+                                            &ask.permission,
+                                            pat,
+                                        ) {
+                                            tracing::error!(
+                                                "save project permission {}:{pat}: {e:#}",
+                                                ask.permission
+                                            );
+                                        }
                                     }
                                 }
                             }
