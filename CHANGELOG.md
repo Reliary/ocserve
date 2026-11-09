@@ -61,7 +61,18 @@ Not yet released. No version bump, tag or publish has been made for these.
   removing the two unused declarations let rusqlite 0.41 resolve
   libsqlite3-sys 0.39.1 (SQLite 3.54.1).
 
+### Fixed
+- **The workspace picker accepted adapters the reference does not have.** `local`
+  and `directory` were treated as aliases of `worktree`, so a client could get a
+  `wrk_` id for a workspace that would never exist. The route now enforces the
+  probed rules: `worktree` is the only adapter, and it requires a git project,
+  each with the reference's own `WorkspaceCreateError` wording.
+
 ### Changed
+- Dev builds default to a target dir OUTSIDE the snapshotted subvolume
+  (`scripts/remote-build.sh` now uses `/var/tmp/ocserve-build`): on btrfs with
+  snapper, deleting a 100 GB `target/` frees nothing while an hourly snapshot
+  still references the extents.
 - The nightly media corpus gate now tests what it claims to (attachment
   ENCODING, with the corpus's own modalities) and the zen free-tier gate
   reports a spent anonymous pool as a CONDITION rather than a wire

@@ -40,7 +40,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 HOST="${OCSERVE_BUILD_HOST:-john@100.74.133.54}"
-REMOTE_DIR="${OCSERVE_BUILD_DIR:-ocserve-build}"
+# Absolute by default: /var/tmp is a SEPARATE btrfs subvolume that snapper does
+# not snapshot, so a 100 GB target/ can actually be reclaimed by deleting it.
+# Under $HOME every build artefact gets pinned by the hourly timeline snapshot
+# and a `rm -rf target` frees nothing (measured 2026-11-09: 160 GB deleted,
+# free space unchanged, because five snapshots still referenced the extents).
+REMOTE_DIR="${OCSERVE_BUILD_DIR:-/var/tmp/ocserve-build}"
 JOBS="${OCSERVE_BUILD_JOBS:-16}"
 SYNC=1
 PULL=()
@@ -161,7 +166,7 @@ esac
 
 echo ">> $HOST: $VERB"
 # shellcheck disable=SC2029  # intentional: the command is expanded locally
-if ! timeout 7200 "${SSH[@]}" "bash -lc $(q "cd ~/$REMOTE_DIR && $RUN")"; then
+if ! timeout 7200 "${SSH[@]}" "bash -lc $(q "mkdir -p '$REMOTE_DIR' && cd '$REMOTE_DIR' && $RUN")"; then
   rc=$?
   echo ">> remote-build.sh: remote command exited $rc" >&2
   exit "$rc"
@@ -174,6 +179,6 @@ for path in "${PULL[@]+"${PULL[@]}"}"; do
 done
 
 if [ "$KEEP" = 0 ]; then
-  size=$(timeout 30 "${SSH[@]}" "du -sh ~/$REMOTE_DIR/target 2>/dev/null | cut -f1" 2>/dev/null || true)
+  size=$(timeout 30 "${SSH[@]}" "du -sh '$REMOTE_DIR/target' 2>/dev/null | cut -f1" 2>/dev/null || true)
   [ -n "$size" ] && echo ">> remote target/ is $size (left in place for incremental reuse)"
 fi

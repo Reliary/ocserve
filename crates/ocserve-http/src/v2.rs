@@ -5402,7 +5402,24 @@ pub async fn vcs_apply(
 /// POST /experimental/workspace — create a workspace. Freeze requires `type`
 /// and rejects unknown adapters. ocserve registers the built-in adapters and
 /// mirrors the error envelope for others.
-pub async fn workspace_create(Json(body): Json<Value>) -> impl IntoResponse {
+/// The reference's adapter rules (probed 1.19.5), as a pure predicate so the
+/// non-git arm is unit-testable: only `worktree` is known, and it needs a git
+/// project. Returns the exact `WorkspaceCreateError` message, or None.
+pub(crate) fn workspace_adapter_refusal(wtype: &str, is_git: bool) -> Option<String> {
+    if wtype != "worktree" {
+        return Some(format!("Unknown workspace adapter: {wtype}"));
+    }
+    if !is_git {
+        return Some("Worktrees are only supported for git projects".to_string());
+    }
+    None
+}
+
+pub async fn workspace_create(
+    State(st): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
     let Some(wtype) = body.get("type").and_then(|v| v.as_str()) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -5410,11 +5427,29 @@ pub async fn workspace_create(Json(body): Json<Value>) -> impl IntoResponse {
         )
             .into_response();
     };
-    let known = matches!(wtype, "worktree" | "local" | "directory");
-    if !known {
+    // Probed against 1.19.5: `worktree` is the ONLY adapter the reference
+    // accepts (`/experimental/workspace/adapter` advertises exactly it), so
+    // `local`/`directory` are "Unknown workspace adapter", not aliases. A
+    // worktree also requires a git project and fails with its own message on a
+    // plain directory.
+    if wtype != "worktree" {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"name": "WorkspaceCreateError", "data": {"message": format!("Unknown workspace adapter: {wtype}")}})),
+        )
+            .into_response();
+    }
+    // A worktree needs a git project; the reference refuses a plain directory
+    // with this exact message (probed 1.19.5). Detecting git here rather than
+    // handing back a `wrk_` id for something that will never exist is the
+    // difference between a stub and an answer.
+    if let Some(err) = workspace_adapter_refusal(
+        "worktree",
+        crate::vcs::toplevel(std::path::Path::new(&dir)).is_some(),
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"name": "WorkspaceCreateError", "data": {"message": err}})),
         )
             .into_response();
     }
@@ -7338,5 +7373,34 @@ fn client_mcp_refused() -> crate::HttpError {
         status: StatusCode::FORBIDDEN,
         tag: "ForbiddenError",
         fields: json!({"message": "Invalid client MCP connect token request"}),
+    }
+}
+
+#[cfg(test)]
+mod workspace_adapter_tests {
+    use super::workspace_adapter_refusal;
+
+    /// Probed 1.19.5: `local` and `directory` are NOT aliases for `worktree`.
+    /// This handler used to accept them and mint a `wrk_` id for anything.
+    #[test]
+    fn only_worktree_is_known() {
+        for bad in ["local", "directory", "bogus", ""] {
+            assert_eq!(
+                workspace_adapter_refusal(bad, true).as_deref(),
+                Some(format!("Unknown workspace adapter: {bad}").as_str()),
+                "{bad} must be refused"
+            );
+        }
+        assert_eq!(workspace_adapter_refusal("worktree", true), None);
+    }
+
+    /// A worktree on a non-git project is refused with the reference's own
+    /// wording, not a bare 400 and not a fabricated id.
+    #[test]
+    fn worktree_requires_a_git_project() {
+        assert_eq!(
+            workspace_adapter_refusal("worktree", false).as_deref(),
+            Some("Worktrees are only supported for git projects")
+        );
     }
 }
