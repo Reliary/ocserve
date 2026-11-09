@@ -5000,8 +5000,35 @@ pub async fn session_background(Path(_id): Path<String>) -> impl IntoResponse {
 }
 
 /// DELETE /experimental/workspace/{id} — 204.
-pub async fn workspace_delete(Path(_id): Path<String>) -> StatusCode {
-    StatusCode::NO_CONTENT
+/// DELETE /experimental/workspace/{id} — the contract answers 200 with the
+/// deleted `Workspace` and decodes the id as a `wrk_` branded string first
+/// (probed 1.19.5: `nope` → 400 Params "Expected a string starting with
+/// \"wrk\""). A blanket 204 was wrong twice: bad ids looked successful and the
+/// client got no body to reconcile.
+pub async fn workspace_delete(Path(id): Path<String>) -> impl IntoResponse {
+    if !id.starts_with("wrk") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"name": "BadRequest", "data": {
+                "message": format!("Expected a string starting with \"wrk\", got \"{id}\"\n  at [\"id\"]"),
+                "kind": "Params"}})),
+        )
+            .into_response();
+    }
+    // Workspaces are not persisted by this server (D-WORKSPACE-ADAPTER), so a
+    // well-formed id is answered with the shape a client can reconcile and no
+    // state is invented.
+    Json(json!({
+        "id": id,
+        "type": "worktree",
+        "name": "",
+        "branch": Value::Null,
+        "directory": Value::Null,
+        "extra": Value::Null,
+        "projectID": "global",
+        "timeUsed": ocserve_store::now_ms(),
+    }))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -5420,6 +5447,21 @@ pub async fn workspace_create(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    // The contract allows only these four keys and requires `type`.
+    if let Some(bad) = body
+        .as_object()
+        .map(|o| o.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .find(|k| !["id", "type", "branch", "extra"].contains(&k.as_str()))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"name": "BadRequest", "data": {
+                "message": format!("Unknown key\n  at [\"{bad}\"]"), "kind": "Payload"}})),
+        )
+            .into_response();
+    }
     let Some(wtype) = body.get("type").and_then(|v| v.as_str()) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -5453,8 +5495,60 @@ pub async fn workspace_create(
         )
             .into_response();
     }
-    Json(json!({"id": format!("wrk_{}", ocserve_core::ids::ascending_tail()), "type": wtype}))
-        .into_response()
+    // `Workspace` requires id, type, name, projectID and timeUsed and forbids
+    // extra keys. The earlier body was `{id,type}` — contract-invalid, which no
+    // gate caught because spec-validate only walked GETs (fixed: it walks POST
+    // too now). `name`/`directory` are the generated worktree identity, so the
+    // answer describes a specific workspace instead of a bare id.
+    let id = format!("wrk_{}", ocserve_core::ids::ascending_tail());
+    let name = format!("{}-{}", worktree_word(0), worktree_word(1));
+    let directory = format!("{}/.ocserve-worktrees/{id}", dir.trim_end_matches('/'));
+    let branch = body.get("branch").cloned().unwrap_or(Value::Null);
+    let extra = body.get("extra").cloned().unwrap_or(Value::Null);
+    let dir_for_proj = dir.clone();
+    let project_id = crate::run_blocking(&st.db, move |db| {
+        let r = ocserve_store::pragma::open_reader(db)?;
+        let pid: Option<String> = r
+            .query_row(
+                "SELECT project_id FROM session WHERE directory = ?1 LIMIT 1",
+                [dir_for_proj],
+                |x| x.get(0),
+            )
+            .ok();
+        Ok(pid.unwrap_or_else(|| "global".to_string()))
+    })
+    .await
+    .unwrap_or_else(|_| "global".to_string());
+    Json(json!({
+        "id": id,
+        "type": wtype,
+        "name": name,
+        "branch": branch,
+        "directory": directory,
+        "extra": extra,
+        "projectID": project_id,
+        "timeUsed": ocserve_store::now_ms(),
+    }))
+    .into_response()
+}
+
+/// One word of a generated worktree name (upstream `Slug.create()` shape:
+/// `adjective-noun`). Pure so the name is testable; `which` picks the list.
+fn worktree_word(which: usize) -> &'static str {
+    const A: [&str; 10] = [
+        "amber", "brave", "lunar", "quiet", "rapid", "silent", "vivid", "glowing", "nimble",
+        "bright",
+    ];
+    const B: [&str; 10] = [
+        "river", "pixel", "comet", "forest", "harbor", "ember", "meadow", "falcon", "stone",
+        "sparrow",
+    ];
+    let list = if which == 0 { &A } else { &B };
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize + which * 7)
+        .unwrap_or(0);
+    list[n % list.len()]
 }
 
 /// POST /api/session — create a session (v2). Shares the v1 creation path.

@@ -68,6 +68,16 @@ Not yet released. No version bump, tag or publish has been made for these.
   probed rules: `worktree` is the only adapter, and it requires a git project,
   each with the reference's own `WorkspaceCreateError` wording.
 
+### Fixed
+- **A wrong POST body was invisible to the shape oracle.** `POST
+  /experimental/workspace` answered `{id,type}` where the contract requires
+  `{id,type,name,projectID,timeUsed}` and forbids extra keys; `spec-validate`
+  only walked GETs, so every gate stayed green. The validator now walks
+  parameterless POSTs, with a `--selftest` that fails on a body missing
+  required keys, wired into the guard suite. `DELETE /experimental/workspace/{id}`
+  also decodes the `wrk_` brand first (`nope` is a 400 `Params` error, as the
+  reference does) and answers 200 instead of a blanket 204.
+
 ### Changed
 - Dev builds default to a target dir OUTSIDE the snapshotted subvolume
   (`scripts/remote-build.sh` now uses `/var/tmp/ocserve-build`): on btrfs with

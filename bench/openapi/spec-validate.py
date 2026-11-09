@@ -157,9 +157,22 @@ def main():
         except Exception:
             session_id = None
     for path, ops in spec["paths"].items():
-        op = ops.get("get")
+      # GET plus the parameterless POSTs. Restricting to GET meant a WRONG
+      # response body on a POST was invisible: `POST /experimental/workspace`
+      # answered `{id,type}` where the contract requires
+      # `{id,type,name,projectID,timeUsed}` and forbids extras, and every gate
+      # stayed green (found 2026-11-09 while antagonising the workspace fix).
+      # Only no-path-parameter, no-body operations are exercised: a POST with a
+      # required body would need a per-op fixture, and a fabricated one teaches
+      # nothing.
+      for method in ("get", "post"):
+        op = ops.get(method)
         if not op:
             continue
+        if method == "post":
+            body = op.get("requestBody") or {}
+            if body.get("required") and body.get("content"):
+                continue
         if "{" in path:
             # v2 session-scoped GETs validate against the seeded session.
             if not (is_v2 and session_id and "{sessionID}" in path
@@ -178,7 +191,12 @@ def main():
         if not schema:
             continue
         try:
-            data = json.loads(urllib.request.urlopen(url, timeout=8).read())
+            if method == "post":
+                req = urllib.request.Request(url, data=b"{}", method="POST",
+                                             headers={"Content-Type": "application/json"})
+                data = json.loads(urllib.request.urlopen(req, timeout=8).read())
+            else:
+                data = json.loads(urllib.request.urlopen(url, timeout=8).read())
         except Exception:
             skipped += 1
             continue
@@ -215,5 +233,28 @@ def main():
     return 1 if viol else 0
 
 
+def _selftest() -> int:
+    """Prove the POST arm is not vacuous: a body missing required keys must be
+    reported. Uses the real Workspace schema from the vendored contract."""
+    import pathlib as _p
+    spec = json.loads(_p.Path("crates/ocserve-core/assets/openapi/v1.json").read_text())
+    schema = spec["paths"]["/experimental/workspace"]["post"]["responses"]["200"][
+        "content"]["application/json"]["schema"]
+    resolved = relax_null(inline(schema, spec))
+    v = jsonschema.Draft202012Validator(resolved)
+    bad = {"id": "wrk_1", "type": "worktree"}          # the shape we shipped
+    good = {"id": "wrk_1", "type": "worktree", "name": "a-b",
+            "branch": None, "directory": "/x", "extra": None,
+            "projectID": "global", "timeUsed": 1}
+    bad_errs = list(v.iter_errors(bad))
+    good_errs = list(v.iter_errors(good))
+    ok = bool(bad_errs) and not good_errs
+    print(f"spec-validate selftest: bad-shape errors={len(bad_errs)} "
+          f"good-shape errors={len(good_errs)} -> {'ok' if ok else 'FAIL'}")
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(_selftest())
     sys.exit(main())

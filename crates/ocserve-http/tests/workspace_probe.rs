@@ -53,3 +53,76 @@ async fn only_worktree_is_a_known_adapter() {
         );
     }
 }
+
+/// The contract's `Workspace` requires id, type, name, projectID, timeUsed and
+/// forbids extra keys. The first fix answered `{id,type}` — contract-invalid,
+/// and invisible because spec-validate only walked GETs (it walks POSTs now).
+#[tokio::test]
+async fn a_created_workspace_satisfies_the_contract() {
+    let app = ocserve_http::router(AppState::with_payloads_and_v2(
+        None,
+        ocserve_http::Payloads::default(),
+        true,
+    ));
+    let (st, v) = post(
+        &app,
+        "/experimental/workspace",
+        serde_json::json!({"type": "worktree"}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "repo checkout is a git project: {v}");
+    let obj = v.as_object().expect("object");
+    let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "branch",
+            "directory",
+            "extra",
+            "id",
+            "name",
+            "projectID",
+            "timeUsed",
+            "type"
+        ],
+        "exactly the contract's Workspace members"
+    );
+    assert!(v["id"].as_str().unwrap().starts_with("wrk"));
+    assert!(!v["name"].as_str().unwrap().is_empty(), "name is required");
+    assert!(!v["projectID"].as_str().unwrap().is_empty());
+    assert!(v["timeUsed"].as_i64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn deleting_a_workspace_decodes_the_id_brand_first() {
+    let app = ocserve_http::router(AppState::with_payloads_and_v2(
+        None,
+        ocserve_http::Payloads::default(),
+        true,
+    ));
+    // Probed 1.19.5: an unbranded id is a 400 Params error, not a 204.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/experimental/workspace/nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let b = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(v["data"]["kind"], "Params");
+    assert!(
+        v["data"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("starting with \"wrk\"")
+    );
+}

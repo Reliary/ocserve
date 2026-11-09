@@ -1539,6 +1539,15 @@ else
   echo "FAIL: fetch-release --selftest (checksum gate vacuous)"; fail=1
 fi
 
+# The shape validator gained a POST arm (a wrong POST body was invisible while
+# it walked GETs only). A widened validator that silently matches nothing is
+# worse than the blind spot, so its own selftest runs here.
+if python3 bench/openapi/spec-validate.py --selftest >/dev/null 2>&1; then
+  echo "ok (spec-validate POST arm rejects a body missing required keys)"
+else
+  echo "FAIL: spec-validate --selftest (POST arm vacuous)"; fail=1
+fi
+
 echo "== guard: shebang entry points are executable (rule 40) =="
 # A script beginning with a shebang that has a __main__ entry point is meant to
 # be run directly. Losing the exec bit is invisible to `python3 x.py` callers
