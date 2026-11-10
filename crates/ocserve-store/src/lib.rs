@@ -51,12 +51,14 @@ pub fn load_sessions_wire(db: &std::path::Path) -> anyhow::Result<Vec<serde_json
         "SELECT id, project_id, directory, path, slug, title, version, agent, model, cost,
                 summary_additions, summary_deletions, summary_files,
                 tokens_input, tokens_output, tokens_reasoning,
-                tokens_cache_read, tokens_cache_write, time_created, time_updated
+                tokens_cache_read, tokens_cache_write, time_created, time_updated,
+                parent_id
          FROM session ORDER BY time_updated DESC",
     )?;
     let rows = stmt.query_map([], |r| {
         let model_txt: Option<String> = r.get(8)?;
-        Ok(serde_json::json!({
+        let parent_id: Option<String> = r.get(20)?;
+        let mut row = serde_json::json!({
             "id": r.get::<_, String>(0)?,
             "projectID": r.get::<_, String>(1)?,
             "directory": r.get::<_, String>(2)?,
@@ -76,7 +78,11 @@ pub fn load_sessions_wire(db: &std::path::Path) -> anyhow::Result<Vec<serde_json
                 "cache": {"read": r.get::<_, i64>(16)?, "write": r.get::<_, i64>(17)?},
             },
             "time": {"created": r.get::<_, i64>(18)?, "updated": r.get::<_, i64>(19)?},
-        }))
+        });
+        if let Some(parent) = parent_id {
+            row["parentID"] = serde_json::json!(parent);
+        }
+        Ok(row)
     })?;
     let mut out = Vec::new();
     for row in rows {
@@ -3168,7 +3174,8 @@ pub fn insert_session(writer: &Writer, info: &serde_json::Value) -> anyhow::Resu
     let id = info["id"].as_str().unwrap_or_default().to_string();
     writer.write(vec![WriteOp::Sql {
         sql: "INSERT OR REPLACE INTO session (id, project_id, slug, directory, path, title, version, \
-              time_created, time_updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+              time_created, time_updated, parent_id, agent, model) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
             .into(),
         params: vec![
             id.into(),
@@ -3180,6 +3187,15 @@ pub fn insert_session(writer: &Writer, info: &serde_json::Value) -> anyhow::Resu
             info["version"].as_str().unwrap_or("").into(),
             info["time"]["created"].as_i64().unwrap_or(0).into(),
             info["time"]["updated"].as_i64().unwrap_or(0).into(),
+            info["parentID"]
+                .as_str()
+                .map(|s| s.to_string())
+                .into(),
+            info["agent"].as_str().map(|s| s.to_string()).into(),
+            info["model"]
+                .is_object()
+                .then(|| info["model"].to_string())
+                .into(),
         ],
     }])?;
     Ok(())

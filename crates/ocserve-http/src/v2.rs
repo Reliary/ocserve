@@ -3238,12 +3238,26 @@ pub async fn list_sessions(
     let roots = q.get("roots").map(|v| v == "true").unwrap_or(false);
     let search = q.get("search").cloned().unwrap_or_default().to_lowercase();
     let sid = q.get("sessionID").cloned();
+    let parent = q.get("parentID").cloned();
+    let directory = q.get("directory").cloned();
     let db = st.db.clone();
     let mut sessions = run_blocking(&db, ocserve_store::load_sessions_wire)
         .await
         .map_err(|e| crate::HttpError::Api(internal(e)))?;
     if roots {
         sessions.retain(|s| s.get("parentID").map(|p| p.is_null()).unwrap_or(true));
+    }
+    // The filters are load-bearing, not cosmetic: Paseo reconciles subagents
+    // with `session.list({parentID})` and would otherwise receive the parent
+    // itself, bind it as its own child, and fail with "already bound".
+    if let Some(parent) = parent {
+        sessions.retain(|s| s.get("parentID").and_then(|v| v.as_str()) == Some(parent.as_str()));
+    }
+    if let Some(dir) = directory {
+        sessions.retain(|s| s.get("directory").and_then(|v| v.as_str()) == Some(dir.as_str()));
+    }
+    if let Some(sid) = sid {
+        sessions.retain(|s| s.get("id").and_then(|v| v.as_str()) == Some(sid.as_str()));
     }
     if !search.is_empty() {
         sessions.retain(|s| {
@@ -3253,7 +3267,6 @@ pub async fn list_sessions(
                 .unwrap_or(false)
         });
     }
-    let _ = sid;
     let total = sessions.len();
     let more = total > limit;
     let window: Vec<Value> = sessions

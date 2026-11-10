@@ -2112,6 +2112,12 @@ pub(crate) fn create_session_record(
     if model.is_object() {
         info["model"] = model;
     }
+    // Subagent sessions carry their parent; the v2 children reconciler
+    // queries `session.list({parentID})`, so dropping it here would hide the
+    // whole child tree (and the parent would look like its own child).
+    if let Some(parent) = body.get("parentID").and_then(|v| v.as_str()) {
+        info["parentID"] = json!(parent);
+    }
     ocserve_store::insert_session(&st.writer, &info).map_err(|e| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         name: "InternalError",
