@@ -5414,15 +5414,28 @@ pub async fn sync_replay(
 
 /// POST /sync/history — `{aggregateID: sinceSeq}` → the log after each since.
 ///
-/// The body is a MAP (contract: `additionalProperties: integer >= 0`), not an
-/// object with a `sessionID` key. Probed 1.19.5: `{}` returns the whole log as
-/// an ARRAY of `{id, aggregate_id, seq, type, data}`. The old answer was
-/// `{"data":[]}` — the wrong envelope and always empty.
+/// BOUNDED BY CONSTRUCTION. The first version of this handler loaded the whole
+/// event table and serialised it: 73,295 events / 542 MB on the live database,
+/// which OOM-killed the service (kernel OOM at the 768 MB main cap, five
+/// restarts on 2026-11-09). That is the unbounded-materialisation class AGENTS
+/// §2.3 bans, and it was the only route in the tree that did it.
+///
+/// It now filters in SQL by the aggregates the CALLER named (upstream's own
+/// caller always sends the session ids it wants), caps rows and bytes, and
+/// reports truncation by simply returning fewer events — the contract response
+/// is a bare array, so there is nowhere to put a flag.
+///
+/// D-SYNC-HISTORY-BOUND: an empty body returns `[]` instead of the whole log.
+/// The reference materialises everything for `{}`, which is exactly the
+/// behaviour that killed this server; the real caller never sends `{}`.
 pub async fn sync_history(
     State(st): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let since: std::collections::HashMap<String, i64> = body
+    const MAX_EVENTS: usize = 2_000;
+    const MAX_BYTES: usize = 4 << 20;
+
+    let since: Vec<(String, i64)> = body
         .as_object()
         .map(|o| {
             o.iter()
@@ -5430,51 +5443,67 @@ pub async fn sync_history(
                 .collect()
         })
         .unwrap_or_default();
+    if since.is_empty() {
+        return Json(json!([])).into_response();
+    }
     let db = st.db.clone();
     let rows = crate::run_blocking(&db, move |db| {
         let r = ocserve_store::pragma::open_reader(db)?;
-        let mut stmt =
-            r.prepare("SELECT seq, session_id, type, payload FROM event ORDER BY seq")?;
-        let all: Vec<(i64, String, String, String)> = stmt
-            .query_map([], |x| {
-                Ok((
-                    x.get(0)?,
-                    x.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    x.get(2)?,
-                    x.get(3)?,
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(all)
+        // One query per aggregate: the counts are small (a session's events),
+        // and a single UNION-style statement over a dynamic IN list would need
+        // string-built SQL for no gain.
+        let mut out: Vec<(i64, String, String, String)> = Vec::new();
+        let mut stmt = r.prepare_cached(
+            "SELECT seq, session_id, type, payload FROM event \
+              WHERE session_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+        )?;
+        for (sid, cursor) in &since {
+            let remaining = MAX_EVENTS.saturating_sub(out.len());
+            if remaining == 0 {
+                break;
+            }
+            let more = stmt
+                .query_map(rusqlite::params![sid, cursor, remaining as i64], |x| {
+                    Ok((
+                        x.get(0)?,
+                        x.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        x.get(2)?,
+                        x.get(3)?,
+                    ))
+                })?
+                .filter_map(|r| r.ok());
+            out.extend(more);
+        }
+        Ok(out)
     })
     .await
     .unwrap_or_default();
-    let out: Vec<Value> = rows
-        .into_iter()
-        .filter(|(seq, sid, _, _)| {
-            // Empty body = the whole log (probed 1.19.5: `{}` returns every
-            // event). Otherwise the body is an EXCLUSIVE watermark per
-            // aggregate: only the named aggregates, only seq greater than the
-            // caller's cursor. The first version of this filter ignored the
-            // cursor entirely and always returned everything — caught by the
-            // unused-binding lint, not by a test.
-            if since.is_empty() {
-                return true;
-            }
-            since.get(sid).is_some_and(|min| *seq > *min)
-        })
-        .map(|(seq, sid, ty, payload)| {
-            json!({
-                "id": format!("evt_{seq:013x}{:010x}", std::process::id()),
-                "aggregate_id": sid,
-                "seq": seq,
-                "type": ty,
-                "data": serde_json::from_str::<Value>(&payload).unwrap_or(json!({})),
-            })
-        })
-        .collect();
-    Json(out).into_response()
+
+    let mut bytes = 0usize;
+    let mut events = Vec::new();
+    for (seq, sid, ty, payload) in rows {
+        let data = serde_json::from_str::<Value>(&payload).unwrap_or(json!({}));
+        // The byte budget is checked against the SERIALISED event, so a log of
+        // huge payloads cannot blow past it.
+        let ev = json!({
+            "id": format!("evt_{seq:013x}{:010x}", std::process::id()),
+            "aggregate_id": sid,
+            "seq": seq,
+            "type": ty,
+            "data": data,
+        });
+        bytes += ev.to_string().len();
+        if bytes > MAX_BYTES {
+            ocserve_metrics::labeled_counter(
+                "ocserve_sync_history_truncated_total",
+                "reason=\"bytes\"",
+                1,
+            );
+            break;
+        }
+        events.push(ev);
+    }
+    Json(Value::Array(events)).into_response()
 }
 
 /// POST /sync/steal — `{sessionID:^ses}` → `{sessionID}`.

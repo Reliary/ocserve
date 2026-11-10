@@ -99,10 +99,18 @@ async fn history_is_an_array_and_honours_the_per_aggregate_watermark() {
         .unwrap();
     ocserve_store::emit_event(&app.writer, Some(&sid), "session.updated", &json!({"n": 2}))
         .unwrap();
-    let (st, all) = post(&app, "/sync/history", json!({})).await;
+    // An EMPTY body is deliberately `[]`: the reference materialises the whole
+    // log for `{}`, which OOM-killed this server on 2026-11-09 (73k events,
+    // 542 MB) — D-SYNC-HISTORY-BOUND. The real caller always names the
+    // aggregates it wants.
+    let (st, empty) = post(&app, "/sync/history", json!({})).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(empty, json!([]), "empty body must not dump the log");
+
+    let (st, all) = post(&app, "/sync/history", json!({sid.clone(): 0})).await;
     assert_eq!(st, StatusCode::OK);
     let arr = all.as_array().expect("an ARRAY, not {data:...}");
-    assert!(!arr.is_empty(), "the log has the create events");
+    assert!(!arr.is_empty(), "the session's events");
     let first = &arr[0];
     assert!(first["id"].as_str().unwrap().starts_with("evt_"));
     assert!(first["seq"].is_i64());
@@ -131,4 +139,25 @@ async fn history_is_an_array_and_honours_the_per_aggregate_watermark() {
         !some.as_array().unwrap().is_empty(),
         "seq > 0 returns the session's events"
     );
+}
+
+/// The bound that matters: a request for ONE aggregate must not return another
+/// aggregate's events, and must not walk the whole table. The pre-fix handler
+/// loaded everything and died at the 768 MB cap.
+#[tokio::test]
+async fn history_returns_only_the_aggregates_the_caller_names() {
+    let app = app();
+    let a = session(&app).await;
+    let b = session(&app).await;
+    for i in 0..3 {
+        ocserve_store::emit_event(&app.writer, Some(&a), "session.updated", &json!({"a": i}))
+            .unwrap();
+        ocserve_store::emit_event(&app.writer, Some(&b), "session.updated", &json!({"b": i}))
+            .unwrap();
+    }
+    let (st, v) = post(&app, "/sync/history", json!({a.clone(): 0})).await;
+    assert_eq!(st, StatusCode::OK);
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 3, "only session A's three events: {v}");
+    assert!(arr.iter().all(|e| e["aggregate_id"] == a.as_str()));
 }
