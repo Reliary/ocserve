@@ -102,6 +102,13 @@ const REST_METHODS = {
  */
 function restDomain(name, fetchJson) {
   const table = REST_METHODS[name] ?? {};
+  // Plugin code calls the v2 client with PARAM OBJECTS
+  // (`ctx.session.context({ sessionID })`), not positional ids. Encoding the
+  // object itself produced `/api/session/%5Bobject%20Object%5D/context`, a 404
+  // body without `.findLast`/`.parentID` — Paseo's bridge then failed its
+  // context hook. Accept both forms.
+  const idArg = (v) =>
+    v && typeof v === "object" ? (v.sessionID ?? v.id ?? v.directory ?? "") : v;
   const out = {};
   for (const verb of Object.keys(table)) {
     Object.defineProperty(out, verb, {
@@ -113,7 +120,7 @@ function restDomain(name, fetchJson) {
       // object and lose every parent/tool lookup. Paginated shapes that carry
       // a cursor keep their envelope.
       value: async (...args) => {
-        const r = await fetchJson("GET", table[verb].path(args[0]), args[1]);
+        const r = await fetchJson("GET", table[verb].path(idArg(args[0])), args[1]);
         if (r && typeof r === "object" && !Array.isArray(r) && "data" in r) {
           const keys = Object.keys(r);
           if (keys.length === 1 || (keys.length === 2 && "location" in r)) return r.data;

@@ -65,6 +65,11 @@ pub fn resolve_entry(spec: &str, home: &Path) -> Result<PathBuf> {
     if let Some(p) = file_url_path(spec) {
         return entry_from_path(&p);
     }
+    // Upstream config paths are allowed to start with `~/`; a literal tilde
+    // otherwise falls through to the npm cache and reports "not found".
+    if let Some(rest) = spec.strip_prefix("~/") {
+        return entry_from_path(&home.join(rest));
+    }
     if is_path_spec(spec) {
         return entry_from_path(Path::new(spec));
     }
