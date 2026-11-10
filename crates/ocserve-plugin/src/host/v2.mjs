@@ -106,7 +106,20 @@ function restDomain(name, fetchJson) {
   for (const verb of Object.keys(table)) {
     Object.defineProperty(out, verb, {
       enumerable: true,
-      value: (...args) => fetchJson("GET", table[verb].path(args[0]), args[1]),
+      // The v2 plugin `ctx` exposes CLIENT results, not raw HTTP envelopes:
+      // upstream's `client.session.get()` returns the Session object and
+      // `client.session.context()` returns the message ARRAY. Returning our
+      // `{data: …}` envelope here made Paseo's bridge call `.findLast()` on an
+      // object and lose every parent/tool lookup. Paginated shapes that carry
+      // a cursor keep their envelope.
+      value: async (...args) => {
+        const r = await fetchJson("GET", table[verb].path(args[0]), args[1]);
+        if (r && typeof r === "object" && !Array.isArray(r) && "data" in r) {
+          const keys = Object.keys(r);
+          if (keys.length === 1 || (keys.length === 2 && "location" in r)) return r.data;
+        }
+        return r;
+      },
     });
   }
   // Unknown verbs keep the honest named divergence.
