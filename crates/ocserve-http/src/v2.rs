@@ -3314,6 +3314,23 @@ pub async fn list_messages(
         .and_then(|l| l.parse().ok())
         .unwrap_or(50)
         .clamp(1, 200);
+    // The cursor is load-bearing, not decorative. Paseo walks this list page by
+    // page; ignoring `?cursor=` returned the SAME first page forever, and the
+    // client kept appending it to its timeline until the JS heap died (the
+    // 2026-11-11 3.4 GB "Paseo leak"). Decode it and pass it to the page walk,
+    // exactly like the v1 `before` cursor.
+    let before: Option<(String, i64)> = match q.get("cursor") {
+        Some(c) => {
+            Some(
+                ocserve_store::decode_cursor(c).map_err(|_| crate::HttpError::TaggedData {
+                    status: StatusCode::BAD_REQUEST,
+                    tag: "InvalidCursorError",
+                    fields: json!({"message": "Invalid cursor"}),
+                })?,
+            )
+        }
+        None => None,
+    };
     let s = {
         let sid = id.clone();
         run_blocking(&st.db, move |db| ocserve_store::load_session_wire(db, &sid))
@@ -3325,7 +3342,12 @@ pub async fn list_messages(
     }
     let sid = id.clone();
     let (msgs, _more, next) = run_blocking(&st.db, move |db| {
-        ocserve_store::page_messages(db, &sid, limit as u64, None)
+        ocserve_store::page_messages(
+            db,
+            &sid,
+            limit as u64,
+            before.as_ref().map(|(b, t)| (b.as_str(), *t)),
+        )
     })
     .await
     .map_err(|e| crate::HttpError::Api(internal(e)))?;
