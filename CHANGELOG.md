@@ -1,12 +1,38 @@
 # Changelog
 
-All notable changes to ocserve. The wire contract targets the frozen
-openccode 1.18.31 release and the v2 surface the 2.0.28 client; anything that
-differs is a named `D-*` row in the ledger at `PLAN.md §18`.
+All notable changes to ocserve. The wire contract targets the frozen opencode
+1.19.5 release and the v2 surface the 2.2.5 client; anything that differs is a
+named `D-*` row in the ledger at `PLAN.md` section 18.
 
-## Unreleased
+## 0.7.1 - 2026-11-10
 
-Not yet released. No version bump, tag or publish has been made for these.
+### Added
+- **Saved permissions are real state.** `GET /api/permission/saved` returned an
+  empty array and the PATCH/DELETE routes were 204 no-ops, while the shipped web
+  UI lists, edits and removes them. Backed now by schema v19 `permission_saved`
+  (project-scoped, unique on action + resource) with the reference's semantics:
+  idempotent save, partial update, 404 for a missing id, conflict on a
+  duplicate, and a bare delete that does not 404. An "always" reply writes the
+  project row as well as the session grant.
+- `scripts/remote-build.sh` offloads cargo to a builder host, because the
+  development box's `target/` reached 912 GB on a snapshot-pinned filesystem
+  and failed with ENOSPC more often than with compiler errors.
+
+### Changed
+- Dev builds default to a target dir OUTSIDE the snapshotted subvolume
+  (`scripts/remote-build.sh` now uses `/var/tmp/ocserve-build`): on btrfs with
+  snapper, deleting a 100 GB `target/` frees nothing while an hourly snapshot
+  still references the extents.
+- The nightly media corpus gate now tests what it claims to (attachment
+  ENCODING, with the corpus's own modalities) and the zen free-tier gate
+  reports a spent anonymous pool as a CONDITION rather than a wire
+  regression, while a plain 429, an auth failure and a stream stall remain
+  hard failures.
+- Dependency updates: rolldown 1.3.x, boring 5.4, brotli 9.1.1, toml 1.2.1,
+  rustix 1.1.6, flate2 1.1.11, similar 3.2.1. `boring` needed its requirement
+  raised, not only the lock.
+- CI actions: `setup-rust-toolchain` v2.0.1 (13 uses) and `upload-artifact`
+  v7.0.2 (5 uses), each pin verified against its upstream tag.
 
 ### Fixed
 - **Scheduled wake-ups never fired.** The v2 `experimental.schedule.*` routes
@@ -53,22 +79,12 @@ Not yet released. No version bump, tag or publish has been made for these.
   symbolic ref), and the offload path reported a foreign tree dirty. Both
   fixed; the offload passes the LOCAL sha and dirty flag.
 
-### Security
-- **RUSTSEC-2026-0459 / CVE-2026-119375** (SQLite before 3.54.0 could return
-  uninitialised page-cache memory when a database and a sibling `-wal` file
-  disagree on page size). The old `libsqlite3-sys` was pulled by `r2d2` and
-  `r2d2_sqlite`, both declared in `ocserve-store` and imported nowhere;
-  removing the two unused declarations let rusqlite 0.41 resolve
-  libsqlite3-sys 0.39.1 (SQLite 3.54.1).
-
-### Fixed
 - **The workspace picker accepted adapters the reference does not have.** `local`
   and `directory` were treated as aliases of `worktree`, so a client could get a
   `wrk_` id for a workspace that would never exist. The route now enforces the
   probed rules: `worktree` is the only adapter, and it requires a git project,
   each with the reference's own `WorkspaceCreateError` wording.
 
-### Fixed
 - **The `/sync/*` routes answered undecodable bodies.** `POST /sync/replay` and
   `POST /sync/steal` returned the literal `true`; `POST /sync/history` returned
   `{data:[]}`. The contract wants `{sessionID}` and an array of
@@ -88,33 +104,13 @@ Not yet released. No version bump, tag or publish has been made for these.
   `directory: null`, because the route creates nothing and a path it never made
   is an answer a client would trust and then fail on.
 
-### Changed
-- Dev builds default to a target dir OUTSIDE the snapshotted subvolume
-  (`scripts/remote-build.sh` now uses `/var/tmp/ocserve-build`): on btrfs with
-  snapper, deleting a 100 GB `target/` frees nothing while an hourly snapshot
-  still references the extents.
-- The nightly media corpus gate now tests what it claims to (attachment
-  ENCODING, with the corpus's own modalities) and the zen free-tier gate
-  reports a spent anonymous pool as a CONDITION rather than a wire
-  regression, while a plain 429, an auth failure and a stream stall remain
-  hard failures.
-- Dependency updates: rolldown 1.3.x, boring 5.4, brotli 9.1.1, toml 1.2.1,
-  rustix 1.1.6, flate2 1.1.11, similar 3.2.1. `boring` needed its requirement
-  raised, not only the lock.
-- CI actions: `setup-rust-toolchain` v2.0.1 (13 uses) and `upload-artifact`
-  v7.0.2 (5 uses), each pin verified against its upstream tag.
-
-### Added
-- **Saved permissions are real state.** `GET /api/permission/saved` returned an
-  empty array and the PATCH/DELETE routes were 204 no-ops, while the shipped web
-  UI lists, edits and removes them. Backed now by schema v19 `permission_saved`
-  (project-scoped, unique on action + resource) with the reference's semantics:
-  idempotent save, partial update, 404 for a missing id, conflict on a
-  duplicate, and a bare delete that does not 404. An "always" reply writes the
-  project row as well as the session grant.
-- `scripts/remote-build.sh` offloads cargo to a builder host, because the
-  development box's `target/` reached 912 GB on a snapshot-pinned filesystem
-  and failed with ENOSPC more often than with compiler errors.
+### Security
+- **RUSTSEC-2026-0459 / CVE-2026-119375** (SQLite before 3.54.0 could return
+  uninitialised page-cache memory when a database and a sibling `-wal` file
+  disagree on page size). The old `libsqlite3-sys` was pulled by `r2d2` and
+  `r2d2_sqlite`, both declared in `ocserve-store` and imported nowhere;
+  removing the two unused declarations let rusqlite 0.41 resolve
+  libsqlite3-sys 0.39.1 (SQLite 3.54.1).
 
 ## 0.7.0
 

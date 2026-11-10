@@ -89,8 +89,8 @@ aarch64. Each tarball has its own `.sha256`, and the release carries a combined
 `SHA256SUMS`.
 
 ```sh
-tar xzf ocserve-v0.7.0-linux-x86_64.tar.gz
-./ocserve-v0.7.0-linux-x86_64/ocserve --version
+tar xzf ocserve-v0.7.1-linux-x86_64.tar.gz
+./ocserve-v0.7.1-linux-x86_64/ocserve --version
 ```
 
 ### From source
@@ -111,7 +111,7 @@ implicitly):
 ```
 
 `scripts/fetch-release.sh --platform linux-x86_64-musl` selects the static
-build, and a positional tag (`scripts/fetch-release.sh v0.7.0`) pins a version.
+build, and a positional tag (`scripts/fetch-release.sh v0.7.1`) pins a version.
 `install.sh --bin <path>` installs a binary you already have (for example one
 you built) and renders the unit to point at it. `install.sh --bin-only` is the
 different, common case: place the binary and leave systemd untouched.
