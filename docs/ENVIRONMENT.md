@@ -89,7 +89,7 @@ for the normal behaviour.
 | Variable | Default | Accepted | Meaning |
 |---|---|---|---|
 | `OCSERVE_UI` | on | 0 disables | HTTP UI routes. Disabled returns a JSON 404 instead of the app. |
-| `OCSERVE_UI_PACK` | 1.18.31 | 1.18.31 \| 2.0.28 | Which embedded web-UI build is served. |
+| `OCSERVE_UI_PACK` | v1 | v1 \| v2 \| any 2.x tag | Which embedded web-UI build is served. `v2` (or a 2.x tag) also turns the v2 runtime on unless OCSERVE_V2=0. |
 | `OCSERVE_DISABLE_EMBEDDED_WEB_UI` | off (embedded build served) | 1 disables | Serve through OCSERVE_UI_UPSTREAM instead of the embedded build. |
 | `OCSERVE_UI_UPSTREAM` | https://app.opencode.ai | a URL | Proxy target used only when the embedded UI is disabled. |
 | `OCSERVE_UI_PREWARM` | off | 1 enables | Fetch the entry HTML's assets at boot. |

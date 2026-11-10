@@ -1,7 +1,7 @@
 # testdata — provenance and privacy rules
 
 All fixtures here are **contract artifacts** captured from a real upstream
-opencode 1.18.31 server (the frozen wire contract), or synthetic values shaped
+opencode 1.19.5 server (the frozen wire contract), or synthetic values shaped
 like upstream's. None of them contain user session content: session ids are
 placeholders, titles are probe labels, and the recorded streams are trivial
 hello-world exchanges. The privacy rules below are enforced by the pre-commit
@@ -11,7 +11,7 @@ hook (`.githooks/pre-commit`).
 
 | Path | Content | Recreatable? |
 |---|---|---|
-| `golden/manifest.json` | 31 GET routes: key-path projections + byte/status expectations, captured from upstream 1.18.31 | Yes — `ocserve replay --record` against any 1.18.31 server (see below) |
+| `golden/manifest.json` | 31 GET routes: key-path projections + byte/status expectations, captured from upstream 1.19.5 | Yes — `ocserve replay --record` against any 1.19.5 server (see below) |
 | `golden/*.body` | Byte-exact response bodies for `bytes`-mode routes (health, 404 envelope, busy status, vcs) | Same recording flow; bodies are environment-normalized at record time |
 | `golden/message_page_contract.json`, `summarize_contract.json` | Structural notes for paging/compaction wire shapes | Same |
 | `m2/llm_stream_*.bin` | Recorded OpenAI-compatible SSE streams — now living in `crates/ocserve-llm/testdata/` so the crate packages independently | Not bit-identical (provider output varies); the *shape* is what tests assert |
@@ -22,7 +22,7 @@ hook (`.githooks/pre-commit`).
 `/tui/*` (external-controller ingress) is event-shaped: every endpoint
 answers `true` and publishes onto the global SSE stream. Its contract is
 asserted in `crates/ocserve-http/tests/tui.rs` against semantics probed live
-from freeze 1.18.31 (2026-10-08), including the upstream quirks (open-themes
+from freeze 1.19.5, including the upstream quirks (open-themes
 publishes `session.list`; unknown execute-command publishes empty
 properties; toast duration defaults 5000).
 

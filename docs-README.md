@@ -1,9 +1,9 @@
 # Documentation
 
-Docs are the specification (see `AGENTS.md` §1). Two rules make that true
-rather than aspirational: a doc that is not in this index is not authoritative,
-and `scripts/check-docs.py` mechanically rejects dead paths, dangling guard-rule
-references and stale divergences on every commit.
+These documents are the specification (see `AGENTS.md` §1). Two rules enforce
+that: a document missing from this index is not authoritative, and
+`scripts/check-docs.py` rejects dead paths, dangling guard-rule references and
+stale divergences on every commit.
 
 ## Start here
 

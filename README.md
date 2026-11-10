@@ -1,23 +1,20 @@
 # ocserve
 
-A compatible reimplementation of the [opencode](https://github.com/anomalyco/opencode)
-server, written in Rust. It speaks the same HTTP and SSE wire as upstream, so
-the official clients work against it unmodified: the TUI (`opencode attach`),
-the web UI, and anything else that talks to the API.
+An independent Rust implementation of the
+[opencode](https://github.com/anomalyco/opencode) server. It serves the same
+HTTP and SSE API, so the official clients work against it unchanged: the TUI
+(`opencode attach`), the web app, or any other client written for that API.
 
-Both contracts are covered, and both are verified against real upstream
-binaries rather than described:
+Two contracts are covered, each checked against the real upstream binary:
 
-- the **1.x server API** (frozen at 1.19.5), used by today's clients:
-  **188 of 188** operations implemented
-- the **opencode 2 API** (`/api/*`, pinned at 2.0.28), used by the current 2.x
-  TUI and web UI: **142 of 142** operations implemented, including every route
-  a 2.x TUI calls at boot
+- **v1**, frozen at 1.19.5: 188 of 188 operations, used by current clients.
+- **v2** (`/api/*`), pinned at 2.2.5: 169 of 169 operations, including every
+  route the 2.x TUI calls while booting.
 
-The v2-only operations are opt-in, because `/api/*` also carries 58 operations
-that 1.x clients use. Run with `OCSERVE_V2=1` to serve the full 2.x surface;
-without it those 96 v2-only operations answer a clean JSON 404. Details and the
-exact gate are in [v2](#v2-opencode-2) below.
+The 123 operations that exist only in v2 are opt-in. `/api/*` also carries 46
+operations that v1 clients use, so the flag gates the v2-only set rather than
+the path prefix. Run `OCSERVE_V2=1` to serve it. See
+[v2](#v2-opencode-2) for the details.
 
 ## When to use this
 
@@ -27,21 +24,21 @@ well on your machine, use it.
 ocserve exists for the cases where a long-lived server is the problem: a small
 VPS, an old laptop, many concurrent sessions, months of accumulated history.
 
-It also reclaims space. Upstream never runs an incremental vacuum, so on this
-machine its 32 GB database contains about 19 GB of free pages it will not
+It also reclaims disk space. Upstream never runs an incremental vacuum, so on
+this machine its 32 GB database holds about 19 GB of free pages it will not
 return to the filesystem. ocserve vacuums incrementally and keeps a retention
-ring, so its file tracks its data.
+ring, so the file size tracks the data.
 
 ## At a glance
 
-This laptop, both servers up with the same config and no traffic (measured
-against 1.18.31; the 1.19.5 contract is byte-identical apart from two schema
-descriptions, so the numbers carry over, but they are not a 1.19.5 re-run):
+One client, no traffic, both servers on the same machine with the same config.
+Measured against 1.18.31; the 1.19.5 wire is identical apart from two schema
+descriptions, so these numbers carry over, but they were not re-run on 1.19.5.
 
 | | ocserve | upstream 1.18.31 |
 |---|---:|---:|
-| binary | 61 MB | 177 MB |
-| server RSS, steady | 196 MB | 2,007 MB |
+| binary | 68 MB | 177 MB |
+| server RSS, steady | 227 MB | 3,712 MB |
 | boot to healthy | 0.6 s | 4.7 s |
 | read p95 | 0 to 2 ms | 8 to 15 ms |
 
@@ -54,14 +51,17 @@ pinned to the same two cores, no model calls, closed model:
 | p95 | 34.6 ms | 561.9 ms |
 | peak cgroup memory | 724 MB | 3,089 MB |
 
-Read the two tables differently. The first is one client making requests, so it
-measures latency and footprint. The second saturates the route mix, so it
-measures capacity and queueing. Both are single-machine results. Sources:
-`bench/load/G2-BASELINE.md`, `bench/parity/`, `DIFFERENTIATION.md`. Re-run the
-harness on your own box rather than trusting these.
+The two tables measure different things. The first is one client making
+requests, so it shows latency and memory. The second saturates the route mix,
+so it shows capacity and queueing. Both are single-machine results, and the
+second depends on how the servers were pinned to cores. Sources:
+`bench/load/G2-BASELINE.md`, `bench/parity/`, `DIFFERENTIATION.md`. Run the
+harness on your own machine instead of trusting these.
 
-Server RSS depends on the size of the model catalog your config loads; 196 MB
-is this machine's config with a 5.3 MB catalog.
+Server RSS scales with the model catalog your config loads. These figures were
+re-measured on 2026-11-10 with this machine's config and a 5.3 MB catalog; the
+upstream figure is that process's resident set at the time, which had been up
+for days with its own history loaded.
 
 ## Install
 
@@ -71,14 +71,14 @@ is this machine's config with a 5.3 MB catalog.
 cargo install ocserve
 ```
 
-That compiles the crate family from crates.io, including the embedded web UI
-packs, so `cargo install ocserve --version 0.6.10` gives you the same feature
-set the GitHub release tarballs carry (compiled on your machine, so the bytes
-differ). `0.6.9` is the first version with all of it; earlier ones predate the
-sharded UI. Building needs a C toolchain because BoringSSL is compiled from
-source: `cmake`, `perl`, a C compiler and `pkg-config` (Debian and Ubuntu:
-`build-essential cmake perl pkg-config`; macOS: `xcode-select --install` plus
-`cmake`). Rust 1.98 or newer.
+This compiles the whole crate family from crates.io, including the embedded web
+UI packs, so you get the same feature set as the release tarballs. The bytes
+differ because it is built on your machine.
+
+It needs a C toolchain, because BoringSSL is compiled from source: `cmake`,
+`perl`, a C compiler and `pkg-config`. On Debian and Ubuntu install
+`build-essential cmake perl pkg-config`; on macOS run
+`xcode-select --install` and install `cmake`. Rust 1.98 or newer.
 
 ### Prebuilt binary
 
@@ -89,8 +89,8 @@ aarch64. Each tarball has its own `.sha256`, and the release carries a combined
 `SHA256SUMS`.
 
 ```sh
-tar xzf ocserve-v0.6.10-linux-x86_64.tar.gz
-./ocserve-v0.6.10-linux-x86_64/ocserve --version
+tar xzf ocserve-v0.7.0-linux-x86_64.tar.gz
+./ocserve-v0.7.0-linux-x86_64/ocserve --version
 ```
 
 ### From source
@@ -111,7 +111,7 @@ implicitly):
 ```
 
 `scripts/fetch-release.sh --platform linux-x86_64-musl` selects the static
-build, and a positional tag (`scripts/fetch-release.sh v0.6.10`) pins a version.
+build, and a positional tag (`scripts/fetch-release.sh v0.7.0`) pins a version.
 `install.sh --bin <path>` installs a binary you already have (for example one
 you built) and renders the unit to point at it. `install.sh --bin-only` is the
 different, common case: place the binary and leave systemd untouched.
@@ -203,15 +203,12 @@ generated guard requires every operation to be bound or explicitly cited:
 
 ### v2 (opencode 2)
 
-Every v2 `/api/*` operation is bound (142 of 142), including the routes the
-current TUI calls at boot, so a 2.x TUI attaches and lists sessions against
-ocserve. Verified live against the real `@opencode/cli` 2.0.28 binary:
+Every v2 `/api/*` operation is bound (169 of 169), including the routes the
+current TUI calls while booting, so a 2.x TUI attaches and lists sessions.
+Checked live against the real `@opencode/cli` 2.2.5 binary:
 
-- `scripts/pair-v2-check.sh`: 28 of 28 vectors, 0 divergences
-- `scripts/spec-validate-v2.sh`: 44 checked, 0 violations
-
-The same suite also passes against 2.0.32, the newest 2.x release at the time
-of writing.
+- `scripts/pair-v2-check.sh`: 55 vectors, 0 divergences
+- `scripts/spec-validate-v2.sh`: 38 checked, 0 violations
 
 Everything that exists only in the 2.x contract is behind `OCSERVE_V2=1` and
 answers a clean JSON 404 without it, so pointing this at an existing 1.x install
@@ -224,9 +221,9 @@ OCSERVE_V2=1 ocserve serve --port 4096
 The gate is derived mechanically from the two contracts, not by path prefix:
 `/api/*` is part of the frozen 1.x contract too (58 operations, and the
 1.x TUI calls them), so those keep working. What the flag actually gates is
-the 96 operations present in 2.0.28 and absent from the 1.x contract: the run engine
-(inbox admission, write-ahead claims, `content[]` projection, dual-grammar
-events, `log?after&follow` replay, form service) plus the v2-only
+the 123 operations present in 2.2.5 and absent from the 1.x contract: the run
+engine (inbox admission, write-ahead claims, `content[]` projection,
+dual-grammar events, `log?after&follow` replay, form service) plus the v2-only
 administration surface.
 
 v2 plugins work, in both authoring shapes (promise and Effect). `session.context`,
@@ -251,7 +248,7 @@ decisions, not gaps. The ones a client author will notice first:
 
 ### Not implemented
 
-Named rather than hidden:
+Not implemented:
 
 - hosted share links (the record is returned, but there is no remote backend)
 - provider OAuth login
@@ -267,33 +264,34 @@ hosted bundle instead.
 
 ### Contract
 
-Wire-compatible with upstream 1.19.5 and opencode 2.x. Upstream changes are
-tracked by a nightly drift watch and adopted deliberately, not automatically. A
-future release may change the API; when it does, `ocserve` pins the new version
-and re-runs every oracle before claiming compatibility.
+Wire-compatible with upstream 1.19.5 and opencode 2.2.5. A nightly drift watch
+reports when upstream publishes something newer; adopting it is a manual step
+that re-runs every oracle before any compatibility claim is made.
 
 ## Platform support
 
-Linux x86_64 and aarch64 (glibc) are the published artifacts and remain the
-reference platform.
+Linux x86_64 and aarch64 (glibc) are the published artifacts and the reference
+platform.
 
-**macOS** builds and runs, and its PTY layer is verified on a real macOS runner:
-`forkpty` spawn, write, resize (the Darwin `TIOCSWINSZ` constant is checked by a
-`TIOCGWINSZ` round-trip), exit code and kill. The client-facing contract is the
-same one Linux serves.
+**macOS** builds and runs. Its PTY layer is verified on a real macOS runner:
+`forkpty` spawn, write, resize (the Darwin `TIOCSWINSZ` constant is checked with
+a `TIOCGWINSZ` round-trip), exit code and kill. It serves the same
+client-facing contract as Linux.
 
 **Windows** runs the server, the shell tool, the terminal routes and the frozen
-wire contract. The wire is verified in a Windows 11 LTSC VM (`pair-check` 18
-compared / 0 divergent against `opencode-windows-x64@1.19.5`); the terminal
-routes use ConPTY and are verified on the Windows CI runner by a test that
-spawns a real shell and requires its output back through the PTY. Building that
-found four bugs no compile check could, all fixed (child environment, std
-handles, Darwin errno values, env duplicate spelling). What is **not** there
-yet: Windows-specific path normalization beyond the handle-based containment
-check, long-path handling, and plugin/MCP spawning is still compile-checked only.
+wire contract. The wire was verified in a Windows 11 LTSC VM: `pair-check` 18
+compared, 0 divergent against `opencode-windows-x64@1.18.31`. That run predates
+the move to 1.19.5 and has not been repeated, because the VM was torn down. The terminal
+routes use ConPTY and are covered on the Windows CI runner by a test that
+spawns a real shell and reads its output back through the PTY. That work found
+four bugs a compile check cannot catch, all fixed: the child environment, the
+standard handles, Darwin errno values, and duplicate environment names.
 
-No performance number is claimed for macOS or Windows: every measurement in this
-README comes from Linux, on the same machine, against the same freeze binary.
+Not yet done on Windows: path normalization beyond the handle-based containment
+check, long-path handling, and plugin/MCP spawning (compile-checked only).
+
+No performance numbers are claimed for macOS or Windows. Every measurement in
+this README comes from Linux, on one machine, against the same frozen binary.
 `PLATFORM.md` records the per-platform evidence and the open items.
 
 ## License
@@ -325,13 +323,13 @@ vendored binary for the version under test. Each has its own README under
 
 ## Documentation map
 
-The full, categorised index is in `docs-README.md`. The short version:
+The full index is in `docs-README.md`. The short version:
 
 | You want to | Read |
 |---|---|
 | install, or decide whether this fits | `README.md`, `CHANGELOG.md` |
 | expose it beyond loopback | `SECURITY.md` |
-| understand the wire contract and what differs | `PLAN.md` (divergence ledger in section 17) |
+| understand the wire contract and what differs | `PLAN.md` (divergence ledger in section 18) |
 | work on storage, memory, or the service | `STORAGE.md`, `MEMORY.md`, `SRE.md` |
 | change behaviour without breaking something | `TESTING.md`, `TRACEABILITY.md`, `AGENTS.md` |
 | work on a subsystem | `COMPACTION.md`, `SNAPSHOT.md`, `PLATFORM.md`, `V2-PLAN.md` |
@@ -339,8 +337,8 @@ The full, categorised index is in `docs-README.md`. The short version:
 
 ## Heavy builds
 
-A build inside the agent is an external workload: the service contains it but
-does not schedule it. Run heavy Rust work in a scope the machine governs:
+A build started inside a tool call is an external workload. The service keeps it
+contained but does not schedule it. Run heavy Rust work in its own scope:
 
 ```sh
 systemd-run --user --scope --collect \
@@ -349,7 +347,7 @@ systemd-run --user --scope --collect \
   cargo build --release
 ```
 
-That scope is outside `ocserve.service`, so it does not count against the
+That scope sits outside `ocserve.service`, so it does not count against the
 service's memory and the service cannot kill it. For a standing policy, put
 those properties in `~/.config/systemd/user/ocserve-build.slice` and pass
 `--slice=ocserve-build.slice`. Do not background a build inside a tool call
@@ -374,4 +372,3 @@ git config core.hooksPath .githooks    # enables the commit gate
 Host services other than ocserve's own are read-only to scripts in this repo
 (`AGENTS.md` section 2.11).
 
-CANARY2

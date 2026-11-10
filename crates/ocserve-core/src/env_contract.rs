@@ -380,9 +380,9 @@ pub const CONTRACT: &[Var] = &[
     op(
         "Web UI",
         "OCSERVE_UI_PACK",
-        "1.18.31",
-        "1.18.31 | 2.0.28",
-        "Which embedded web-UI build is served.",
+        "v1",
+        "v1 | v2 | any 2.x tag",
+        "Which embedded web-UI build is served. `v2` (or a 2.x tag) also turns the v2 runtime on unless OCSERVE_V2=0.",
     ),
     op(
         "Web UI",

@@ -1,8 +1,8 @@
 # ocserve
 
-A compatible reimplementation of the [opencode](https://github.com/anomalyco/opencode)
-server in Rust: the same HTTP and SSE wire, so the official TUI, the web UI and
-the SDK clients work unmodified against it.
+An independent Rust implementation of the [opencode](https://github.com/anomalyco/opencode)
+server. It serves the same HTTP and SSE API, so the official TUI, the web app
+and SDK clients work against it unmodified.
 
 ```sh
 cargo install ocserve
@@ -24,7 +24,7 @@ happens at runtime.
 
 ## Commands
 
-`serve` (the drop-in server), `import`, `backup`, `doctor`, `models`, `env-reference`,
+`serve` (the server), `import`, `backup`, `doctor`, `models`, `env-reference`,
 `replay` (differential wire harness), and the self-check commands.
 
 Full documentation, the compatibility ledger and the divergence list live in the

@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Embedded web-UI pack part (2.0.28, part d) for ocserve"
+description = "Embedded web-UI pack part (2.2.5, part d) for ocserve"
 include = ["src/**", "assets/**", "README.md"]
 
 [dependencies]

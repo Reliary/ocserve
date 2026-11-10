@@ -1,4 +1,4 @@
-# ocserve — Rust drop-in server for opencode v1
+# ocserve: an independent Rust server for the opencode API
 
 Status (2026-10-26): **v0.6.10** is a tag-triggered CI release (binaries +
 SHA256SUMS from `release.yml`) **and** a crates.io release: the web UI is split
