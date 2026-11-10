@@ -32,7 +32,7 @@ fn payloads() -> ocserve_http::Payloads {
                           "custom1": {"name": "Custom One"}},
         }),
         provider: serde_json::json!({
-            "connected": ["acme"],
+            "connected": ["acme", "authonly"],
             "all": [
                 {"id": "acme", "name": "Acme", "env": ["ACME_KEY"],
                  "models": {
@@ -48,11 +48,13 @@ fn payloads() -> ocserve_http::Payloads {
                  }},
                 {"id": "unavail", "name": "Unavailable", "models": {
                     "x": {"id": "x", "providerID": "unavail", "name": "X",
-                          "status": "active", "api": {"npm": "@u/sdk", "url": "https://x"}}}}
+                          "status": "active", "api": {"npm": "@u/sdk", "url": "https://x"}}}},
+                {"id": "authonly", "name": "Auth Only", "env": ["AUTHONLY_KEY"], "models": {}}
             ]
         }),
         catalog: std::sync::Arc::new(serde_json::json!({
             "acme": {"name": "Acme", "env": ["ACME_KEY"]},
+            "authonly": {"name": "Auth Only", "env": ["AUTHONLY_KEY"]},
             "other": {"name": "Other", "env": ["OTHER_KEY"]}
         })),
         config_providers: serde_json::json!({
@@ -153,6 +155,13 @@ async fn v2_metadata_wire_bytes_equal_projection_builders() {
         .filter_map(|p| p.get("id").and_then(|x| x.as_str()))
         .collect();
     assert!(ids.contains(&"acme"), "available provider served: {v}");
+    // `opencode auth login` stores credentials in auth.json, not as
+    // `provider.<id>.options.apiKey`. A connected provider that exists in the
+    // models catalog must still be served (the old filter hid opencode-go).
+    assert!(
+        ids.contains(&"authonly"),
+        "auth-only catalog provider must stay visible: {v}"
+    );
     assert!(
         !ids.contains(&"unavail"),
         "unavailable provider must be filtered: {v}"

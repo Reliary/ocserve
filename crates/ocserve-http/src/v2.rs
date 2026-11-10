@@ -52,7 +52,13 @@ pub async fn location(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 /// catalog (hence with no integration record). This reproduces the observed
 /// freeze set `{opencode, entrim, nube}` from this box's config.
 fn available_provider_ids(payloads: &crate::Payloads) -> Vec<String> {
-    let connected: Vec<String> = payloads
+    // `connected` is ALREADY the auth/config-derived set (auth.json order,
+    // built-in opencode, then config-only providers). The old extra filter
+    // dropped every provider that exists in the models catalog but carries
+    // its key in auth.json instead of `provider.<id>.options.apiKey` — which
+    // is exactly how `opencode auth login` stores `opencode-go`. The v2
+    // provider/model lists therefore hid a provider the v1 surface showed.
+    let mut ids: Vec<String> = payloads
         .provider
         .get("connected")
         .and_then(|v| v.as_array())
@@ -62,26 +68,9 @@ fn available_provider_ids(payloads: &crate::Payloads) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default();
-    let cfg_providers = payloads.config.get("provider").and_then(|v| v.as_object());
-    let cat_obj = payloads.catalog.as_object();
-    connected
-        .into_iter()
-        .filter(|pid| {
-            if pid == "opencode" {
-                return true;
-            }
-            let has_cfg_key = cfg_providers
-                .and_then(|c| c.get(pid))
-                .and_then(|v| v.pointer("/options/apiKey"))
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| !s.is_empty());
-            if has_cfg_key {
-                return true;
-            }
-            // not in the models catalog => no integration record => available
-            cat_obj.map(|c| !c.contains_key(pid)).unwrap_or(true)
-        })
-        .collect()
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
+    ids
 }
 
 /// Project a v1 model entry to the v2 `ModelV2Info` shape (freeze-probed).

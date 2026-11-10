@@ -1540,6 +1540,17 @@ impl Runtime {
                     .pointer(&format!("/provider/{pid}/options/baseURL"))
                     .and_then(|v| v.as_str())
                     .map(String::from)
+                    // The models.dev catalog carries the provider's API base
+                    // (`api`); opencode-go is auth-only, so the hardcoded
+                    // defaults list alone left `opencode auth login` users
+                    // with no endpoint and no provider on the v2 wire.
+                    .or_else(|| {
+                        cache
+                            .get(pid)
+                            .and_then(|p| p.get("api"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                    })
                     .or_else(|| {
                         defaults
                             .iter()
