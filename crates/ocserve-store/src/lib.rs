@@ -51,12 +51,15 @@ pub fn load_sessions_wire(db: &std::path::Path) -> anyhow::Result<Vec<serde_json
         "SELECT id, project_id, directory, path, slug, title, version, agent, model, cost,
                 summary_additions, summary_deletions, summary_files,
                 tokens_input, tokens_output, tokens_reasoning,
-                tokens_cache_read, tokens_cache_write, time_created, time_updated
+                tokens_cache_read, tokens_cache_write, time_created, time_updated,
+                parent_id, time_archived
          FROM session ORDER BY time_updated DESC",
     )?;
     let rows = stmt.query_map([], |r| {
         let model_txt: Option<String> = r.get(8)?;
-        Ok(serde_json::json!({
+        let parent_id: Option<String> = r.get(20)?;
+        let time_archived: Option<i64> = r.get(21)?;
+        let mut row = serde_json::json!({
             "id": r.get::<_, String>(0)?,
             "projectID": r.get::<_, String>(1)?,
             "directory": r.get::<_, String>(2)?,
@@ -76,7 +79,17 @@ pub fn load_sessions_wire(db: &std::path::Path) -> anyhow::Result<Vec<serde_json
                 "cache": {"read": r.get::<_, i64>(16)?, "write": r.get::<_, i64>(17)?},
             },
             "time": {"created": r.get::<_, i64>(18)?, "updated": r.get::<_, i64>(19)?},
-        }))
+        });
+        if let Some(parent) = parent_id {
+            row["parentID"] = serde_json::json!(parent);
+        }
+        if let Some(t) = time_archived {
+            // Internal field for the `archived=` filter; `session_v2` never
+            // serves it (upstream's Session.Info has no archive field on the v2
+            // wire — the client filters by request, not by reading a stamp).
+            row["timeArchived"] = serde_json::json!(t);
+        }
+        Ok(row)
     })?;
     let mut out = Vec::new();
     for row in rows {
@@ -1030,6 +1043,10 @@ pub fn part_row_ops(row: &PartRow<'_>) -> Vec<WriteOp> {
 /// contract §1084); None = full history.
 /// Cursor format — byte-compatible with upstream MessageV2.cursor
 /// (message-v2.ts:71-84): base64url(JSON {"id","time"}), no padding.
+///
+/// NOTE: this is the **v1 `before` cursor**. The v2 `/api/session/{id}/message`
+/// route uses a different payload (`{id,order,direction}`) — see
+/// [`V2MessageCursor`]. Two formats exist because upstream has two.
 pub fn encode_cursor(id: &str, time_created: i64) -> String {
     use base64::Engine as _;
     let json = format!("{{\"id\":\"{id}\",\"time\":{time_created}}}");
@@ -1051,6 +1068,289 @@ pub fn decode_cursor(s: &str) -> anyhow::Result<(String, i64)> {
     match (id.starts_with("msg_"), time) {
         (true, Some(t)) if t >= 0 => Ok((id.to_string(), t)),
         _ => anyhow::bail!("cursor fields"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v2 message cursor: base64url(JSON {"id","order","direction"})
+// ---------------------------------------------------------------------------
+
+/// Ordering of a v2 message page. Upstream `SessionMessagesQuery.order`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageOrder {
+    Asc,
+    Desc,
+}
+
+impl MessageOrder {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MessageOrder::Asc => "asc",
+            MessageOrder::Desc => "desc",
+        }
+    }
+    /// Parse the wire value. `None` for anything that is not exactly
+    /// `asc`/`desc` (the caller turns that into a Query error).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "asc" => Some(MessageOrder::Asc),
+            "desc" => Some(MessageOrder::Desc),
+            _ => None,
+        }
+    }
+    fn flipped(self) -> Self {
+        match self {
+            MessageOrder::Asc => MessageOrder::Desc,
+            MessageOrder::Desc => MessageOrder::Asc,
+        }
+    }
+}
+
+/// Which way a v2 message cursor walks from its anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorDirection {
+    Previous,
+    Next,
+}
+
+impl CursorDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            CursorDirection::Previous => "previous",
+            CursorDirection::Next => "next",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "previous" => Some(CursorDirection::Previous),
+            "next" => Some(CursorDirection::Next),
+            _ => None,
+        }
+    }
+}
+
+/// The v2 message-list cursor.
+///
+/// Upstream (`packages/server/src/handlers/message.ts:22-29`) encodes
+/// `{id, order, direction}` — deliberately NOT the v1 `{id, time}` shape.
+/// The order travels inside the cursor so a client that pages without
+/// repeating `order` keeps the ordering it started with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2MessageCursor {
+    pub id: String,
+    pub order: MessageOrder,
+    pub direction: CursorDirection,
+}
+
+impl V2MessageCursor {
+    pub fn encode(&self) -> String {
+        use base64::Engine as _;
+        let json = serde_json::json!({
+            "id": self.id,
+            "order": self.order.as_str(),
+            "direction": self.direction.as_str(),
+        });
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.to_string())
+    }
+
+    /// Decode; `Err` for malformed base64, bad JSON, a non-`msg_` id, an
+    /// unknown order, or an unknown direction. Every failure maps to the
+    /// caller's `InvalidCursorError` (upstream: `Invalid cursor`).
+    pub fn decode(s: &str) -> anyhow::Result<Self> {
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(s)
+            .map_err(|e| anyhow::anyhow!("cursor base64: {e}"))?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&raw).map_err(|e| anyhow::anyhow!("cursor json: {e}"))?;
+        let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("");
+        if !id.starts_with("msg_") {
+            anyhow::bail!("cursor id");
+        }
+        let order = v
+            .get("order")
+            .and_then(|x| x.as_str())
+            .and_then(MessageOrder::parse)
+            .ok_or_else(|| anyhow::anyhow!("cursor order"))?;
+        let direction = v
+            .get("direction")
+            .and_then(|x| x.as_str())
+            .and_then(CursorDirection::parse)
+            .ok_or_else(|| anyhow::anyhow!("cursor direction"))?;
+        Ok(Self {
+            id: id.to_string(),
+            order,
+            direction,
+        })
+    }
+}
+
+/// One v2 message page: rows in the REQUESTED order.
+///
+/// No `has_next` flag on purpose. Upstream's `page()` emits BOTH cursors
+/// whenever the page is non-empty (probed against 2.2.5: a one-row page
+/// carries a `previous` AND a `next`), and an empty page carries explicit
+/// nulls. Both cursors are derived from the first/last row, so a "has more"
+/// flag would have no consumer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2MessagePage {
+    pub rows: Vec<(String, String)>,
+}
+
+/// One page of v2 messages, matching upstream `SessionStore.messageRows`
+/// (`packages/core/src/session/store.ts:101-130`):
+///
+/// - a cursor's `direction` flips the SQL order (walking backwards means
+///   reading forwards in the opposite direction), then the page is reversed
+///   so the caller always receives the REQUESTED order;
+/// - `type` filters in SQL **before** the limit, so a filtered page is a
+///   full page of that type;
+/// - an anchor id that does not exist yields an empty page (not an error).
+///
+/// The +1 probe row is how `has_next` is known without a second query.
+pub fn page_messages_v2(
+    db: &std::path::Path,
+    session_id: &str,
+    limit: u64,
+    order: MessageOrder,
+    cursor: Option<&V2MessageCursor>,
+    v2_type: Option<&str>,
+) -> anyhow::Result<V2MessagePage> {
+    let conn = pragma::open_reader(db)?;
+    // Which way to read relative to the anchor's seq.
+    let direction = cursor.map(|c| c.direction).unwrap_or(CursorDirection::Next);
+    // Upstream: `order = direction === "previous" ? requested.flipped() : requested`.
+    let read_order = if direction == CursorDirection::Previous {
+        order.flipped()
+    } else {
+        order
+    };
+    let anchor_seq: Option<i64> = match cursor {
+        None => None,
+        Some(c) => Some(
+            conn.prepare_cached("SELECT seq FROM msg WHERE session_id = ?1 AND id = ?2")
+                .and_then(|mut st| {
+                    st.query_row((session_id, &c.id), |r| r.get::<_, i64>(0))
+                        .or_else(|e| match e {
+                            rusqlite::Error::QueryReturnedNoRows => Ok(-1),
+                            other => Err(other),
+                        })
+                })?,
+        ),
+    };
+    // Unknown anchor id: upstream answers an EMPTY page, not an error (probed:
+    // a well-formed cursor naming a deleted message returns `[]` with null
+    // cursors). Short-circuit before running the page query.
+    if anchor_seq == Some(-1) {
+        return Ok(V2MessagePage { rows: Vec::new() });
+    }
+
+    // seq is the insertion order and is what upstream pages on.
+    let mut sql = String::from("SELECT id, info FROM msg WHERE session_id = ?1");
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(session_id.to_string())];
+    if let Some(anchor) = anchor_seq {
+        params.push(Box::new(anchor));
+        sql.push_str(match read_order {
+            MessageOrder::Asc => " AND seq > ?",
+            MessageOrder::Desc => " AND seq < ?",
+        });
+        sql.push('2');
+    }
+    if let Some(t) = v2_type {
+        params.push(Box::new(t.to_string()));
+        sql.push_str(" AND v2_type = ?");
+        sql.push_str(&(params.len()).to_string());
+    }
+    sql.push_str(match read_order {
+        MessageOrder::Asc => " ORDER BY seq ASC LIMIT ",
+        MessageOrder::Desc => " ORDER BY seq DESC LIMIT ",
+    });
+    sql.push_str(&limit.saturating_add(1).to_string());
+
+    let mut rows: Vec<(String, String)> = Vec::new();
+    {
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut map = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for r in map.by_ref() {
+            rows.push(r?);
+        }
+    }
+
+    if rows.len() as u64 > limit {
+        rows.pop(); // the +1 probe row
+    }
+    if direction == CursorDirection::Previous {
+        rows.reverse(); // back to the requested order
+    }
+    Ok(V2MessagePage { rows })
+}
+
+// ---------------------------------------------------------------------------
+// v2 session-list cursor: base64url(JSON {"anchor":{"id","time","direction"}})
+// ---------------------------------------------------------------------------
+
+/// The v2 session-list cursor. Upstream
+/// (`packages/schema/src/session.ts:65-70`, `:114-147`) wraps an anchor:
+///
+/// ```text
+/// {"anchor":{"id","time","direction"}}
+/// ```
+///
+/// `time` is the anchor row's `time_updated` and the page is walked on
+/// `(time_updated, id)`, NOT on the message `seq`. A session cursor and a
+/// message cursor are therefore different types with different payloads — one
+/// codec cannot serve both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2SessionCursor {
+    pub id: String,
+    pub time: i64,
+    pub direction: CursorDirection,
+}
+
+impl V2SessionCursor {
+    pub fn encode(&self) -> String {
+        use base64::Engine as _;
+        let json = serde_json::json!({
+            "anchor": {
+                "id": self.id,
+                "time": self.time,
+                "direction": self.direction.as_str(),
+            }
+        });
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.to_string())
+    }
+
+    pub fn decode(s: &str) -> anyhow::Result<Self> {
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(s)
+            .map_err(|e| anyhow::anyhow!("cursor base64: {e}"))?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&raw).map_err(|e| anyhow::anyhow!("cursor json: {e}"))?;
+        let anchor = v
+            .get("anchor")
+            .and_then(|a| a.as_object())
+            .ok_or_else(|| anyhow::anyhow!("cursor anchor"))?;
+        let id = anchor.get("id").and_then(|x| x.as_str()).unwrap_or("");
+        if !id.starts_with("ses_") {
+            anyhow::bail!("cursor id");
+        }
+        let time = anchor
+            .get("time")
+            .and_then(|x| x.as_i64())
+            .ok_or_else(|| anyhow::anyhow!("cursor time"))?;
+        let direction = anchor
+            .get("direction")
+            .and_then(|x| x.as_str())
+            .and_then(CursorDirection::parse)
+            .ok_or_else(|| anyhow::anyhow!("cursor direction"))?;
+        Ok(Self {
+            id: id.to_string(),
+            time,
+            direction,
+        })
     }
 }
 
@@ -1251,7 +1551,42 @@ pub fn project_page_v2(
                 _ => {} // step-start/finish, patch, idle, busy, compaction: envelope, not content
             }
         }
-        match role {
+        // A user row marked `synthetic` is the v2 `synthetic` type, not `user`
+        // (upstream stores it as its own message type; we derive it from the
+        // marker so the v1 wire shape is unchanged). The SQL `v2_type` column
+        // and this projection must agree — they are the same rule stated once
+        // for filtering and once for the served body.
+        let is_synthetic = info
+            .get("synthetic")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        match if role == "user" && is_synthetic {
+            "synthetic"
+        } else {
+            role
+        } {
+            "synthetic" => {
+                let text = info
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        // Fall back to the first text part (the v1 shell route
+                        // stores its prompt text there).
+                        plist
+                            .iter()
+                            .find(|(t, _, _)| t == "text")
+                            .and_then(|(_, inline, _)| inline.as_deref())
+                            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                            .and_then(|b| {
+                                b.get("text").and_then(|t| t.as_str()).map(str::to_string)
+                            })
+                            .unwrap_or_default()
+                    });
+                out.push(json!({
+                    "id": mid, "time": time, "type": "synthetic", "text": text,
+                }));
+            }
             "user" => {
                 let text = info
                     .get("text")
@@ -3168,7 +3503,8 @@ pub fn insert_session(writer: &Writer, info: &serde_json::Value) -> anyhow::Resu
     let id = info["id"].as_str().unwrap_or_default().to_string();
     writer.write(vec![WriteOp::Sql {
         sql: "INSERT OR REPLACE INTO session (id, project_id, slug, directory, path, title, version, \
-              time_created, time_updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+              time_created, time_updated, parent_id, agent, model) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
             .into(),
         params: vec![
             id.into(),
@@ -3180,6 +3516,15 @@ pub fn insert_session(writer: &Writer, info: &serde_json::Value) -> anyhow::Resu
             info["version"].as_str().unwrap_or("").into(),
             info["time"]["created"].as_i64().unwrap_or(0).into(),
             info["time"]["updated"].as_i64().unwrap_or(0).into(),
+            info["parentID"]
+                .as_str()
+                .map(|s| s.to_string())
+                .into(),
+            info["agent"].as_str().map(|s| s.to_string()).into(),
+            info["model"]
+                .is_object()
+                .then(|| info["model"].to_string())
+                .into(),
         ],
     }])?;
     Ok(())
@@ -3452,6 +3797,31 @@ pub fn backup_to(conn: &rusqlite::Connection, dest: &std::path::Path) -> anyhow:
 
 /// PATCH /session/{id} — title update (oc-remote rename sends {title} only;
 /// metadata/permission/archived fields are not stored by ocserve — ignored).
+/// Set or clear the archive stamp. `Some(now)` archives; `None` restores.
+/// Upstream: "Archive the session with true or restore it with false. Repeating
+/// the current state is a no-op." A no-op must NOT bump `time_updated` — a
+/// session jumping to the top of the list because the client re-asserted its
+/// state would be a visible lie.
+pub fn set_session_archived(
+    writer: &Writer,
+    session_id: &str,
+    archived: Option<i64>,
+) -> anyhow::Result<usize> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    // `time_updated` only moves when the stamp actually changes.
+    writer.write(vec![WriteOp::Sql {
+        sql: "UPDATE session SET time_archived = ?2, \
+              time_updated = CASE WHEN (time_archived IS NULL) = (?2 IS NULL) \
+                                  THEN time_updated ELSE ?3 END \
+              WHERE id = ?1"
+            .into(),
+        params: vec![session_id.into(), archived.into(), now.into()],
+    }])
+}
+
 pub fn update_session_title(
     writer: &Writer,
     session_id: &str,

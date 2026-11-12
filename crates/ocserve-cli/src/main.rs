@@ -175,30 +175,121 @@ fn resolve_net(flag: Option<String>, env_key: &str, default: &str) -> String {
     }
 }
 
-/// Data directory. Delegates to `platform` so the `HOME`-unset case is a named
-/// error instead of silently landing in the process CWD (PLATFORM.md §1.2).
-/// v1 `ConfigPluginV1.Spec` parsing: a string is options=Null, `[spec, options]`
-/// is the tuple form, anything else is dropped (upstream schema rejects it).
+/// Configured plugins, in load order, from both config dialects:
+///
+/// - v1 `plugin`: `string | [string, options]` (`ConfigPluginV1.Spec`)
+/// - v2 `plugins`: `string | {package, options?}` (`@opencode/schema`
+///   ConfigPlugin.Entry). The v2 form is what launchers (Paseo) inject through
+///   `OPENCODE_CONFIG_CONTENT`; upstream v1 cannot represent it, ocserve loads
+///   it instead of silently ignoring the whole plugin surface.
+///
+/// A v2 entry without `options` gets `{}` (upstream v2 `input.options ?? {}`);
+/// the v1 plain-string form keeps `Null` (its factory never had options).
+/// `-target` removes an entry declared earlier (v2 removal operation).
 fn plugin_specs(config: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
-    config
-        .get("plugin")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|e| match e {
-                    serde_json::Value::String(s) => Some((s.clone(), serde_json::Value::Null)),
-                    serde_json::Value::Array(t) if !t.is_empty() => {
-                        let spec = t.first().and_then(|v| v.as_str())?.to_string();
-                        let opts = t.get(1).cloned().unwrap_or(serde_json::Value::Null);
-                        Some((spec, opts))
+    let mut out: Vec<(String, serde_json::Value)> = Vec::new();
+
+    fn push(out: &mut Vec<(String, serde_json::Value)>, spec: String, options: serde_json::Value) {
+        // Later declaration wins (upstream dedupe keeps the last origin).
+        if let Some(i) = out.iter().position(|(s, _)| s == &spec) {
+            out.remove(i);
+        }
+        out.push((spec, options));
+    }
+    fn remove(out: &mut Vec<(String, serde_json::Value)>, spec: &str) {
+        out.retain(|(s, _)| s != spec);
+    }
+
+    match config.get("plugin") {
+        Some(serde_json::Value::Array(entries)) => {
+            for (i, entry) in entries.iter().enumerate() {
+                match entry {
+                    serde_json::Value::String(spec) => {
+                        push(&mut out, spec.clone(), serde_json::Value::Null);
                     }
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+                    serde_json::Value::Array(t) if !t.is_empty() => {
+                        match t.first().and_then(|v| v.as_str()) {
+                            Some(spec) => {
+                                let opts = t.get(1).cloned().unwrap_or(serde_json::Value::Null);
+                                push(&mut out, spec.to_string(), opts);
+                            }
+                            None => tracing::warn!(
+                                "config.plugin[{i}] ignored: tuple entry without a string spec"
+                            ),
+                        }
+                    }
+                    other => tracing::warn!(
+                        "config.plugin[{i}] ignored: expected a string or [string, options], got {}",
+                        json_kind(other)
+                    ),
+                }
+            }
+        }
+        Some(other) if !other.is_null() => {
+            tracing::warn!(
+                "config.plugin ignored: expected an array, got {}",
+                json_kind(other)
+            );
+        }
+        _ => {}
+    }
+
+    match config.get("plugins") {
+        Some(serde_json::Value::Array(entries)) => {
+            for (i, entry) in entries.iter().enumerate() {
+                match entry {
+                    serde_json::Value::String(s) if s.starts_with('-') => {
+                        remove(&mut out, &s[1..]);
+                    }
+                    serde_json::Value::String(spec) => {
+                        push(&mut out, spec.clone(), serde_json::json!({}));
+                    }
+                    serde_json::Value::Object(obj) => {
+                        match obj.get("package").and_then(|v| v.as_str()) {
+                            Some(spec) => {
+                                let opts = obj
+                                    .get("options")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!({}));
+                                push(&mut out, spec.to_string(), opts);
+                            }
+                            None => tracing::warn!(
+                                "config.plugins[{i}] ignored: object entry without a string `package`"
+                            ),
+                        }
+                    }
+                    other => tracing::warn!(
+                        "config.plugins[{i}] ignored: expected a string or {{package, options}}, got {}",
+                        json_kind(other)
+                    ),
+                }
+            }
+        }
+        Some(other) if !other.is_null() => {
+            tracing::warn!(
+                "config.plugins ignored: expected an array, got {}",
+                json_kind(other)
+            );
+        }
+        _ => {}
+    }
+
+    out
 }
 
+fn json_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Data directory. Delegates to `platform` so the `HOME`-unset case is a named
+/// error instead of silently landing in the process CWD (PLATFORM.md §1.2).
 fn default_data_dir() -> std::path::PathBuf {
     match platform::data_dir() {
         Ok(p) => p,
@@ -425,11 +516,21 @@ async fn serve(
     // M4a: probe MCP servers before serving (statuses captured, never fatal)
     let mcp_cfgs =
         ocserve_mcp::parse_config(rt.config.get("mcp").unwrap_or(&serde_json::Value::Null));
-    // v1 config.plugin is `(string | [string, options])[]` (ConfigPluginV1.Spec).
-    // The tuple form carries per-plugin options delivered to the server
-    // factory; the plain-string form is options=Null. Non-string non-tuple
-    // entries are dropped (upstream schema rejects them upstream of here).
-    let plugin_specs = plugin_specs(&rt.config);
+    // v1 config.plugin is `(string | [string, options])[]`, v2 config.plugins
+    // is `(string | {package, options?})[]`; both are accepted (a launcher
+    // injects the v2 form). Malformed entries are dropped individually with a
+    // named warning so a bad entry cannot hide the rest of the plugin surface.
+    let mut plugin_specs = plugin_specs(&rt.config);
+    // v2 auto-discovery: `<config_dir>/{plugin,plugins}` source files and
+    // package directories. A launcher (Paseo) provisions its managed bridge
+    // there; without this the plugin exists on disk and is never loaded.
+    if let Some(config_dir) = platform::opencode_config_dir() {
+        for spec in ocserve_plugin::discover_plugin_specs(&config_dir) {
+            if !plugin_specs.iter().any(|(s, _)| s == &spec) {
+                plugin_specs.push((spec, serde_json::json!({})));
+            }
+        }
+    }
     let llm = rt.llm_registry()?;
     // W6: warn only about the EFFECTIVE default (what an unset prompt
     // actually resolves to — llm_registry's state→config precedence), not
@@ -553,6 +654,9 @@ async fn serve(
             llm,
         },
     );
+    // A sidecar materialized later (launcher provisions its first plugin after
+    // boot) needs the server URL for the plugin's `ctx.client`/`serverUrl`.
+    let _ = state.server_url.set(format!("http://{hostname}:{port}"));
     let hub = ocserve_mcp::McpHub::probe_all(&mcp_cfgs).await;
     // P2b: persist TOFU pins next to the DB so an offline rug-pull (server
     // edited while ocserve is down) trips drift at next boot
@@ -982,13 +1086,16 @@ async fn serve(
                                 // A load failure used to be one boot WARN, after
                                 // which the plugin was skipped for the life of
                                 // the process with no signal (review H2). Count
-                                // it and name the spec.
+                                // it, name the spec, and record the failure so
+                                // /api/plugin reports it and the discovery poll
+                                // does not retry it.
                                 ocserve_metrics::labeled_counter(
                                     "ocserve_plugin_load_total",
                                     "result=\"error\"",
                                     1,
                                 );
-                                tracing::error!("plugin {spec} load failed: {e:#}")
+                                tracing::error!("plugin {spec} load failed: {e:#}");
+                                sc.note_failure(spec, &e);
                             }
                         },
                         Err(e) => {
@@ -997,7 +1104,8 @@ async fn serve(
                                 "result=\"unresolved\"",
                                 1,
                             );
-                            tracing::error!("plugin {spec} resolve failed: {e:#}")
+                            tracing::error!("plugin {spec} resolve failed: {e:#}");
+                            sc.note_failure(spec, &e);
                         }
                     }
                 }
@@ -1023,12 +1131,15 @@ async fn serve(
             Err(e) => tracing::error!("plugin sidecar spawn failed: {e:#}"),
         }
     }
+    // P0e: bus → plugin `event` hook pump (v1 plugin/index.ts:255-259).
+    // Started unconditionally: a launcher can materialize the sidecar AFTER
+    // boot (Paseo provisions its bridge later), and the pump resolves
+    // `st.plugins` per frame — so a late sidecar must not mean lost events.
+    ocserve_http::start_plugin_event_pump(&state);
     if let Some(sc) = plugin_sidecar {
         let _ = state
             .plugins
             .set(std::sync::Arc::new(tokio::sync::Mutex::new(sc)));
-        // P0e: bus → plugin `event` hook pump (v1 plugin/index.ts:255-259)
-        ocserve_http::start_plugin_event_pump(&state);
         // Tier 2 (2026-10-18): apply v2 command/skill transforms at BOOT too,
         // not only on the next config reload — otherwise a plugin's commands
         // and skills are missing until the operator edits a config file, and
@@ -1650,7 +1761,14 @@ async fn plugin_report(data_dir: &std::path::Path) {
             return;
         }
     };
-    let specs = crate::plugin_specs(&rt.config);
+    let mut specs = crate::plugin_specs(&rt.config);
+    if let Some(config_dir) = platform::opencode_config_dir() {
+        for spec in ocserve_plugin::discover_plugin_specs(&config_dir) {
+            if !specs.iter().any(|(s, _)| s == &spec) {
+                specs.push((spec, serde_json::json!({})));
+            }
+        }
+    }
     if specs.is_empty() {
         println!("  plugins:         none configured");
         return;
@@ -1723,4 +1841,83 @@ fn import(
         ocserve_importer::import_sessions(&source, &data_dir, &sessions, force, mode)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod plugin_config_tests {
+    use super::plugin_specs;
+    use serde_json::json;
+
+    /// v1 `plugin` forms (ConfigPluginV1.Spec) stay exactly as before:
+    /// plain string → options Null, tuple → second element.
+    #[test]
+    fn v1_plugin_string_and_tuple() {
+        let cfg = json!({
+            "plugin": ["a", ["b", {"baseUrl": "http://x", "token": "t"}], ["c"]]
+        });
+        let specs = plugin_specs(&cfg);
+        assert_eq!(specs[0], ("a".into(), serde_json::Value::Null));
+        assert_eq!(specs[1].0, "b");
+        assert_eq!(specs[1].1, json!({"baseUrl": "http://x", "token": "t"}));
+        assert_eq!(specs[2], ("c".into(), serde_json::Value::Null));
+    }
+
+    /// Regression for the 2026-11-09 Paseo report: the v2 `plugins` key
+    /// (package + options objects) was dropped wholesale — zero loads, no log
+    /// line. It must yield load specs, and a missing `options` must become `{}`
+    /// (upstream v2 `input.options ?? {}`), not `null` (the null.baseUrl crash).
+    #[test]
+    fn v2_plugins_objects_and_strings_are_loaded() {
+        let cfg = json!({
+            "plugins": [
+                {"package": "/tmp/paseo-bridge.mjs", "options": {"baseUrl": "http://127.0.0.1:6767", "token": "t"}},
+                {"package": "no-options"},
+                "plain-package"
+            ]
+        });
+        let specs = plugin_specs(&cfg);
+        assert_eq!(
+            specs[0],
+            (
+                "/tmp/paseo-bridge.mjs".into(),
+                json!({"baseUrl": "http://127.0.0.1:6767", "token": "t"})
+            )
+        );
+        assert_eq!(specs[1], ("no-options".into(), json!({})));
+        assert_eq!(specs[2], ("plain-package".into(), json!({})));
+    }
+
+    /// v2 removal (`-target`) drops an earlier declaration and a later
+    /// duplicate wins — upstream's dedupe keeps the last origin.
+    #[test]
+    fn v2_removal_and_last_declaration_wins() {
+        let cfg = json!({
+            "plugin": [["keep", {"n": 1}], ["drop", {"n": 1}]],
+            "plugins": [
+                {"package": "keep", "options": {"n": 2}},
+                "-drop"
+            ]
+        });
+        let specs = plugin_specs(&cfg);
+        assert_eq!(specs.len(), 1, "{specs:?}");
+        assert_eq!(specs[0], ("keep".into(), json!({"n": 2})));
+    }
+
+    /// Negative control: malformed entries are skipped individually; they
+    /// must never discard the valid ones (the old silent-empty failure class).
+    #[test]
+    fn malformed_entries_do_not_drop_valid_plugins() {
+        let cfg = json!({
+            "plugin": [42, [], ["ok"]],
+            "plugins": [{"options": {}}, 7, {"package": "also-ok"}]
+        });
+        let specs = plugin_specs(&cfg);
+        assert_eq!(
+            specs,
+            vec![
+                ("ok".to_string(), serde_json::Value::Null),
+                ("also-ok".to_string(), json!({}))
+            ]
+        );
+    }
 }

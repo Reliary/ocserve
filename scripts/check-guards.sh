@@ -14,6 +14,9 @@
 #      messages route must stream via for_each_message_json [suite]
 #   4. msg_part INSERT/UPDATE outside ocserve-store — every part write must
 #      carry its part_search projection companion (W1 FTS invariant) [suite]
+#   70. a declared query parameter is never read by its handler (the v2 message
+#      list replayed page 1 forever, and the shipped v2 web UI's
+#      ?parentID=null&archived=false returned zero sessions, 2026-11-11) [plant]
 #   69. a built-in command's dispatch predicate tests `template.is_none()`
 #      (the advertised goal entry carries `template: ""`, which is Some("") —
 #      true only in an empty-list fixture, so `/goal` fell through to an empty
@@ -2216,5 +2219,38 @@ else
   echo "ok (planted is_none() dispatch detected)"
 fi
 rm -f "$_p69"
+
+echo "== guard: a declared query parameter is read by its handler (rule 70) =="
+# The 2026-11-11 Paseo class and the three more this scan found: a route
+# advertises `?cursor=` / `?order=` / `?archived=` in the frozen contract and the
+# handler never reads it, so the client silently gets unfiltered or unpaginated
+# data. Coverage (route bound), shape (response body), effect (mutating methods)
+# and replay (recorded responses never varied the parameter) are ALL blind to it.
+# Measured cost of the blind spot: the v2 message list replayed its first page
+# forever (a client walked it to a 3.4 GB heap), and the shipped v2 web UI's
+# `?parentID=null&archived=false` returned ZERO sessions.
+QP_SPEC=crates/ocserve-core/assets/openapi/v2.json
+qp_out=$(python3 bench/openapi/check-query-params.py "$QP_SPEC" \
+  crates/ocserve-http/src/lib.rs crates/ocserve-http/src/v2.rs 2>&1)
+if [ $? -eq 0 ]; then
+  echo "$qp_out" | tail -1
+else
+  echo "$qp_out"; echo "FAIL: declared query parameter never read (rule 70)"; fail=1
+fi
+# Planted control: drop the `q.get("cursor")` read from a copy of the message
+# handler and the same predicate must flag it. A rule that cannot fail on a
+# sabotaged copy is theatre.
+# The route map comes from lib.rs (that is where `.route(...)` lives); the
+# handler bodies come from the SABOTAGED copy only, so the real v2.rs cannot
+# mask the planted regression.
+_qp_plant=/var/tmp/ocserve-rule70-planted.rs
+sed 's/q\.get("cursor")/q.get("__nope__")/g' crates/ocserve-http/src/v2.rs > "$_qp_plant"
+if python3 bench/openapi/check-query-params.py "$QP_SPEC" \
+     crates/ocserve-http/src/lib.rs "$_qp_plant" >/dev/null 2>&1; then
+  echo "FAIL: rule 70 planted unread cursor not detected (vacuous)"; fail=1
+else
+  echo "ok (planted unread query parameter detected)"
+fi
+rm -f "$_qp_plant"
 
 exit $fail

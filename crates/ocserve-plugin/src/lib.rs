@@ -55,17 +55,23 @@ pub fn materialize_host(dir: &Path) -> Result<PathBuf> {
 
 /// Resolve a plugin spec to an entry file (loader.ts semantics, npm-install
 /// stage assumed already done by opencode's cache — we re-use it read-only):
-/// - absolute/relative path → direct entry
+/// - `file://` URL (what upstream configs and launchers inject) → path
+/// - absolute/relative path → direct entry (a directory resolves through its
+///   package.json or conventional `index`/`server` files, v2 config semantics)
 /// - npm spec (`name`, `@scope/name`, `name@version`) →
 ///   `~/.cache/opencode/packages/{spec}[@latest]/node_modules/{pkg}/…` entry
 ///   via package.json exports["."] | main | module
 pub fn resolve_entry(spec: &str, home: &Path) -> Result<PathBuf> {
-    if spec.starts_with('/') || spec.starts_with("./") || spec.starts_with("../") {
-        let p = PathBuf::from(spec);
-        if p.exists() {
-            return Ok(p);
-        }
-        anyhow::bail!("plugin file not found: {spec}");
+    if let Some(p) = file_url_path(spec) {
+        return entry_from_path(&p);
+    }
+    // Upstream config paths are allowed to start with `~/`; a literal tilde
+    // otherwise falls through to the npm cache and reports "not found".
+    if let Some(rest) = spec.strip_prefix("~/") {
+        return entry_from_path(&home.join(rest));
+    }
+    if is_path_spec(spec) {
+        return entry_from_path(Path::new(spec));
     }
     let cache = home.join(".cache/opencode/packages");
     let pkg_name = strip_version(spec);
@@ -95,6 +101,168 @@ pub fn resolve_entry(spec: &str, home: &Path) -> Result<PathBuf> {
     anyhow::bail!("plugin target not found in opencode cache: {spec}")
 }
 
+/// Upstream `isPathPluginSpec`: `file://`, dot-relative, absolute, or a
+/// Windows drive path (`C:\…` / `C:/…`).
+fn is_path_spec(spec: &str) -> bool {
+    let b = spec.as_bytes();
+    let drive = b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b[2] == b'\\' || b[2] == b'/');
+    spec.starts_with('/')
+        || spec.starts_with("./")
+        || spec.starts_with("../")
+        || Path::new(spec).is_absolute()
+        || drive
+}
+
+/// Resolve a concrete path: a file IS the entry; a directory resolves to its
+/// package entry (v2 `plugins` entries point at package directories).
+fn entry_from_path(p: &Path) -> Result<PathBuf> {
+    // Absolutize before the containment check: a relative base containing
+    // `..` otherwise makes `entry_from_package`'s normalized entry look like
+    // an escape (`../pkg` + `dist/x.js` → `pkg/dist/x.js`).
+    let abs;
+    let p = if p.is_absolute() {
+        p
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => {
+                abs = cwd.join(p);
+                &abs
+            }
+            Err(_) => p,
+        }
+    };
+    if p.is_file() {
+        return Ok(p.to_path_buf());
+    }
+    if p.is_dir() {
+        return dir_entry(p)
+            .ok_or_else(|| anyhow!("plugin directory has no entrypoint: {}", p.display()));
+    }
+    anyhow::bail!("plugin file not found: {}", p.display())
+}
+
+/// Entry file of a plugin DIRECTORY. Upstream `resolvePathPluginTarget`
+/// (`plugin/shared.ts`): package.json first (`exports["./server"]`, then
+/// `main`/`module`), else `index.{ts,tsx,js,mjs,cjs}`.
+fn dir_entry(dir: &Path) -> Option<PathBuf> {
+    if let Some(entry) = entry_from_package(&dir.join("package.json"), dir, "") {
+        return Some(entry);
+    }
+    for name in [
+        "index.ts",
+        "index.tsx",
+        "index.js",
+        "index.mjs",
+        "index.cjs",
+    ] {
+        let p = dir.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// `file://` URL → local path (Paseo and other launchers configure plugins as
+/// `pathToFileURL(...)`). Percent-decoding is required: a temp path with a
+/// space is otherwise "not found". Returns None for non-file specs; a
+/// non-localhost authority is not supported (there is no local path).
+fn file_url_path(spec: &str) -> Option<PathBuf> {
+    let rest = spec.strip_prefix("file://")?;
+    // `file:///tmp/x` (empty authority) or `file://localhost/tmp/x`.
+    let rest = match rest.strip_prefix("localhost") {
+        Some(r) if r.starts_with('/') => r,
+        _ => rest,
+    };
+    if !rest.starts_with('/') {
+        return None;
+    }
+    let decoded = percent_decode(rest);
+    if decoded.is_empty() {
+        return None;
+    }
+    #[cfg(windows)]
+    let decoded = decoded.trim_start_matches('/').to_string();
+    Some(PathBuf::from(decoded))
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2]))
+        {
+            out.push(hi * 16 + lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Auto-discovered plugin targets under `<config_dir>/{plugin,plugins}`.
+///
+/// Upstream v2 `PluginSourceDirectory.discover`: a FILE ending `.ts`/`.js`, or
+/// ANY directory (a package with its own entrypoint). Sorted, deduped and
+/// CAPPED — a hostile/huge config dir must not make every `/api/plugin` poll
+/// pay an unbounded scan (AGENTS §2.3). `.mjs` files are deliberately not
+/// discovered (upstream does not); an explicitly configured spec may still
+/// name one.
+pub fn discover_plugin_specs(config_dir: &Path) -> Vec<String> {
+    const MAX_DISCOVERED: usize = 64;
+    let mut out = Vec::new();
+    for sub in ["plugin", "plugins"] {
+        let dir = config_dir.join(sub);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            if out.len() >= MAX_DISCOVERED {
+                break;
+            }
+            let path = entry.path();
+            // `metadata` follows symlinks: a linked plugin file/dir loads like
+            // the target, matching upstream's isFile/isDir checks.
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let is_source = meta.is_file()
+                && matches!(
+                    path.extension().and_then(|e| e.to_str()),
+                    Some("ts") | Some("js")
+                );
+            if (is_source || meta.is_dir())
+                && let Some(s) = path.to_str()
+            {
+                out.push(s.to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out.truncate(MAX_DISCOVERED);
+    out
+}
+
 fn strip_version(spec: &str) -> String {
     // "@scope/name@latest" → "@scope/name"; "name@1.2.3" → "name"
     let bytes = spec.as_bytes();
@@ -115,17 +283,24 @@ fn entry_from_package(pkg_json: &Path, base: &Path, _pkg_name: &str) -> Option<P
     let text = std::fs::read_to_string(pkg_json).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
     let mut rel: Option<&str> = None;
-    if let Some(exp) = v.get("exports")
-        && let Some(dot) = exp.get(".")
-    {
-        rel = match dot {
-            Value::String(s) => Some(s.as_str()),
-            Value::Object(_) => dot
-                .get("import")
-                .and_then(|x| x.as_str())
-                .or_else(|| dot.get("default").and_then(|x| x.as_str())),
-            _ => None,
-        };
+    if let Some(exp) = v.get("exports") {
+        // `exports["."]` is the npm entry; v2 plugin packages name their
+        // server part `exports["./server"]` (upstream `resolvePathPluginTarget`
+        // tries that first for a directory target).
+        for key in [".", "./server"] {
+            let Some(dot) = exp.get(key) else { continue };
+            rel = match dot {
+                Value::String(s) => Some(s.as_str()),
+                Value::Object(_) => dot
+                    .get("import")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| dot.get("default").and_then(|x| x.as_str())),
+                _ => None,
+            };
+            if rel.is_some() {
+                break;
+            }
+        }
     }
     rel = rel.or_else(|| v.get("main").and_then(|x| x.as_str()));
     rel = rel.or_else(|| v.get("module").and_then(|x| x.as_str()));
@@ -232,6 +407,28 @@ impl Handle {
             v.get("hooks")
                 .and_then(|h| h.as_array())
                 .is_some_and(|a| a.iter().any(|x| x.as_str() == Some(hook)))
+        })
+    }
+
+    /// Any v1 or v2 plugin loaded successfully. The tool fetch is gated on
+    /// this (not on a specific hook/tool count) because v2 tools can be added
+    /// after load.
+    pub fn any_loaded(&self) -> bool {
+        self.0
+            .statuses
+            .lock()
+            .values()
+            .any(|v| v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false))
+    }
+
+    /// Did any loaded plugin contribute tools outside the v1 `tool` hook
+    /// (v2 `tool.transform`)? Observability only; a v2 plugin may add more
+    /// tools later, so this must not gate `tools()`.
+    pub fn has_tools(&self) -> bool {
+        self.0.statuses.lock().values().any(|v| {
+            v.get("has_tools")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false)
         })
     }
 
@@ -422,7 +619,13 @@ impl Handle {
     /// (review M6): dropping tools mid-session made a later call to one fall
     /// through to "unknown tool", a worse failure than a stale schema.
     pub async fn tools(&self) -> Result<Vec<Value>> {
-        if !self.registers("tool") {
+        // Any loaded plugin may advertise tools — v1 via the `tool` hook, v2
+        // via `tool.transform`, which a launcher can call LATER (Paseo installs
+        // its `paseo_*` tools on `rpc.bind`, after load). A load-time tool
+        // count would therefore short-circuit exactly the tools that matter.
+        // The RPC only happens when a plugin host exists at all (most installs
+        // have none; `tools()` then returns before this).
+        if !self.any_loaded() {
             return Ok(Vec::new());
         }
         match self.request("tools", json!({})).await {
@@ -952,7 +1155,15 @@ impl Sidecar {
             .unwrap_or_default();
         self.inner.statuses.lock().insert(
             spec.to_string(),
-            json!({"ok": true, "hooks": hooks, "id": res["id"]}),
+            json!({
+                "ok": true,
+                "hooks": hooks,
+                "id": res["id"],
+                // v2 tools are registered through `tool.transform`, not a hook
+                // name; this flag is what lets `tools()` skip the RPC when
+                // nobody advertises one (v1 keeps the `tool` hook).
+                "has_tools": res["has_tools"].as_bool().unwrap_or(false),
+            }),
         );
         self.loads.push((
             spec.to_string(),
@@ -961,6 +1172,54 @@ impl Sidecar {
             options.clone(),
         ));
         Ok(hooks)
+    }
+
+    /// Was this spec already attempted (loaded OR failed)? Failures stay
+    /// recorded so a launcher polling `/api/plugin` every 50 ms cannot re-run a
+    /// crashing plugin thousands of times.
+    pub fn attempted(&self, spec: &str) -> bool {
+        self.inner.statuses.lock().contains_key(spec)
+    }
+
+    /// Load one auto-discovered plugin on demand (hot pickup for a launcher
+    /// that provisions `<config_dir>/plugins/…` after the server booted, as
+    /// Paseo does). Idempotent; a resolve/load failure is recorded as a failed
+    /// status instead of being retried on every poll.
+    pub async fn load_discovered(&mut self, spec: &str, home: &Path) -> Result<Vec<String>> {
+        if self.attempted(spec) {
+            return Ok(Vec::new());
+        }
+        let entry = match resolve_entry(spec, home) {
+            Ok(entry) => entry,
+            Err(e) => {
+                self.note_failure(spec, &e);
+                return Err(e);
+            }
+        };
+        self.ensure_alive().await?;
+        let input = json!({
+            "directory": self.server.1,
+            "projectID": "global",
+            "worktree": "/",
+            "serverUrl": self.server.0,
+        });
+        match self.load(spec, &entry, &input, &json!({})).await {
+            Ok(hooks) => Ok(hooks),
+            Err(e) => {
+                self.note_failure(spec, &e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Record a failed attempt so `/api/plugin` reports `failed` instead of
+    /// pretending the plugin is absent, and the discovery poll does not retry
+    /// forever.
+    pub fn note_failure(&self, spec: &str, e: &anyhow::Error) {
+        self.inner.statuses.lock().insert(
+            spec.to_string(),
+            json!({"ok": false, "hooks": [], "error": format!("{e:#}")}),
+        );
     }
 
     /// v1 trigger semantics: sequential hooks mutate `output` in place.
@@ -1087,6 +1346,213 @@ mod tests {
         let e =
             entry_from_package(&dir.path().join("package.json"), dir.path(), "x").expect("main");
         assert!(e.ends_with("lib/main.js"));
+    }
+
+    #[test]
+    fn resolve_entry_accepts_file_urls_and_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        // file:// URL (what launchers inject via OPENCODE_CONFIG_CONTENT)
+        let file = dir.path().join("bridge.mjs");
+        std::fs::write(&file, "//").unwrap();
+        let url = format!("file://{}", file.display());
+        assert_eq!(resolve_entry(&url, dir.path()).unwrap(), file);
+        // percent-encoded URL (a temp path with a space must still resolve)
+        let spaced = dir.path().join("bridge copy.mjs");
+        std::fs::write(&spaced, "//").unwrap();
+        let encoded = format!("file://{}", spaced.display()).replace(' ', "%20");
+        assert_eq!(resolve_entry(&encoded, dir.path()).unwrap(), spaced);
+        // directory with a v2-style package manifest: the `./server` export is
+        // the entry, even when no conventional index file exists (upstream
+        // resolvePathPluginTarget reads exports["./server"], then main).
+        let pkg = dir.path().join("managed-bridge");
+        std::fs::create_dir_all(pkg.join("dist")).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"paseo-managed-bridge","type":"module","exports":{"./server":"./dist/main.mjs"}}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("dist/main.mjs"), "//").unwrap();
+        assert_eq!(
+            resolve_entry(pkg.to_str().unwrap(), dir.path()).unwrap(),
+            pkg.join("dist/main.mjs")
+        );
+        // no package.json exports → conventional index.ts (upstream order)
+        let plain = dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("index.ts"), "//").unwrap();
+        assert_eq!(
+            resolve_entry(plain.to_str().unwrap(), dir.path()).unwrap(),
+            plain.join("index.ts")
+        );
+        // directory without any entrypoint is a named error, never a dir import
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let err = resolve_entry(empty.to_str().unwrap(), dir.path()).unwrap_err();
+        assert!(err.to_string().contains("no entrypoint"), "{err}");
+    }
+
+    #[test]
+    fn resolve_entry_negative_control_still_rejects_unknown_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_entry("no-such-plugin-package", dir.path()).unwrap_err();
+        assert!(err.to_string().contains("plugin target not found"), "{err}");
+    }
+
+    #[test]
+    fn discover_plugin_specs_matches_upstream_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("plugin")).unwrap();
+        std::fs::create_dir_all(dir.path().join("plugins/managed-bridge")).unwrap();
+        std::fs::write(dir.path().join("plugin/a.js"), "//").unwrap();
+        std::fs::write(dir.path().join("plugin/b.mjs"), "//").unwrap(); // upstream: not discovered
+        std::fs::write(dir.path().join("plugins/readme.txt"), "x").unwrap();
+        let got = discover_plugin_specs(dir.path());
+        assert!(
+            got.iter().any(|s| s.ends_with("/plugin/a.js")),
+            "a .js source file is discovered: {got:?}"
+        );
+        assert!(
+            got.iter().any(|s| s.ends_with("/plugins/managed-bridge")),
+            "a package DIRECTORY is discovered: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|s| s.ends_with("b.mjs")),
+            "upstream does not discover .mjs by glob: {got:?}"
+        );
+        assert!(!got.iter().any(|s| s.ends_with("readme.txt")));
+        // Another volume of entries must not panic or duplicate; the cap is
+        // enforced by construction (bounded scan).
+        assert_eq!(got.len(), 2, "{got:?}");
+    }
+
+    /// v2 tools: `ctx.tool.transform(editor => editor.add(...))` must actually
+    /// install the tool (Paseo's bridge depends on it), advertise its JSON
+    /// Schema, and dispatch `execute(input, {sessionID})`.
+    #[tokio::test]
+    async fn v2_tool_transform_registers_and_executes() -> anyhow::Result<()> {
+        if !runtime_available() {
+            panic!(
+                "plugin-runtime binary ({}) required for plugin-host tests",
+                crate::plugin_runtime().program()
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tools.mjs"),
+            r#"export default {
+  id: "toolshop",
+  setup: async (ctx) => {
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: "echo",
+        description: "echo the input",
+        input: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+        async execute(input, call) {
+          return {
+            content: [{ type: "text", text: `hi ${input.text} ${call.sessionID}` }],
+            metadata: { tag: "v2" },
+          };
+        },
+      });
+    });
+  },
+};"#,
+        )
+        .unwrap();
+        let host = materialize_host(&dir.path().join("host"))?;
+        let mut sc = Sidecar::spawn(&host, "http://127.0.0.1:9", "/work").await?;
+        sc.load(
+            "toolshop",
+            &dir.path().join("tools.mjs"),
+            &json!({"directory": "/work", "serverUrl": "http://127.0.0.1:9"}),
+            &json!({}),
+        )
+        .await?;
+        assert!(sc.handle().has_tools(), "load must report has_tools");
+        let tools = sc.handle().tools().await?;
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "echo")
+            .expect("v2 tool advertised");
+        assert_eq!(tool["parameters"]["properties"]["text"]["type"], "string");
+        let res = sc
+            .handle()
+            .execute_tool("echo", json!({"text": "x"}), json!({"sessionID": "s1"}))
+            .await?;
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(res["output"], "hi x s1", "{res}");
+        assert_eq!(res["metadata"]["tag"], "v2", "{res}");
+        // Negative control: an unregistered name still fails honestly.
+        let missing = sc
+            .handle()
+            .execute_tool("nope", json!({}), json!({}))
+            .await?;
+        assert_eq!(missing["ok"], false, "{missing}");
+        sc.shutdown().await;
+        Ok(())
+    }
+
+    /// The Paseo sequencing: tools are added AFTER load, from an RPC handler
+    /// (`rpc.bind` → `tool.transform`). A load-time tool count must not gate
+    /// `tools()` — this test goes red under that gate.
+    #[tokio::test]
+    async fn v2_tool_added_after_load_is_advertised() -> anyhow::Result<()> {
+        if !runtime_available() {
+            panic!(
+                "plugin-runtime binary ({}) required for plugin-host tests",
+                crate::plugin_runtime().program()
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("late.mjs"),
+            r#"export default {
+  id: "late",
+  setup: async (ctx) => {
+    await ctx.rpc.register(
+      { id: "late.rpc", methods: { add: { input: {}, output: {} } }, events: {} },
+      {
+        add: async () => {
+          await ctx.tool.transform((editor) => {
+            editor.add({
+              name: "late_tool",
+              description: "added by rpc",
+              input: { type: "object", properties: {} },
+              async execute() { return { content: [{ type: "text", text: "late-ok" }] }; },
+            });
+          });
+          return {};
+        },
+      },
+    );
+  },
+};"#,
+        )
+        .unwrap();
+        let host = materialize_host(&dir.path().join("host"))?;
+        let mut sc = Sidecar::spawn(&host, "http://127.0.0.1:9", "/work").await?;
+        let hooks = sc
+            .load(
+                "late",
+                &dir.path().join("late.mjs"),
+                &json!({"directory": "/work", "serverUrl": "http://127.0.0.1:9"}),
+                &json!({}),
+            )
+            .await?;
+        assert!(hooks.is_empty(), "no hooks at load: {hooks:?}");
+        assert!(
+            sc.handle().tools().await?.is_empty(),
+            "no tools before bind"
+        );
+        let out = sc.rpc_call("late.rpc", "add", json!({})).await?;
+        assert!(out.get("output").is_some(), "{out}");
+        let tools = sc.handle().tools().await?;
+        assert!(
+            tools.iter().any(|t| t["name"] == "late_tool"),
+            "tool added after load must be advertised: {tools:?}"
+        );
+        sc.shutdown().await;
+        Ok(())
     }
 
     #[tokio::test]
@@ -1488,7 +1954,9 @@ export default PluginModule.server;
         assert_eq!(out["matched"], 1);
         assert_eq!(out["output"]["survived"], true);
 
-        // And the unbridged domains are reported, not silently swallowed.
+        // And the still-unbridged domains are reported, not silently swallowed.
+        // `tool` is NOT here any more: its transform runs against a live editor
+        // (see v2_tool_transform_registers_and_executes).
         let inv = sc.v2_inventory().await?;
         let unbridged: Vec<String> = inv["unbridged_transforms"]
             .as_array()
@@ -1496,7 +1964,7 @@ export default PluginModule.server;
             .iter()
             .map(|v| v.as_str().unwrap_or_default().to_string())
             .collect();
-        assert!(unbridged.contains(&"tool".to_string()), "{inv}");
+        assert!(!unbridged.contains(&"tool".to_string()), "{inv}");
         assert!(unbridged.contains(&"integration".to_string()), "{inv}");
 
         // Genuine USE of an unbridged domain still throws its named divergence

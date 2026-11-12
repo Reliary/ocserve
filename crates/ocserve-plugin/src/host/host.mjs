@@ -291,6 +291,9 @@ async function loadPlugin({ spec, entry, origin, input, options }) {
       hooks: names,
       id: def.id,
       dialect: "v2",
+      // Tools registered through ctx.tool.transform have no hook name; this
+      // flag lets the Rust side skip the `tools` RPC when nobody has any.
+      has_tools: v2State.v2Tools.length > 0,
       unbridged_transforms: [...new Set(v2State.unbridgedTransforms)],
     };
   }
@@ -493,7 +496,52 @@ function collectTools() {
       });
     }
   }
+  // v2 tools installed via ctx.tool.transform (upstream Tool.Info: `input` is
+  // a JSON Schema, so it goes to the provider unchanged; a schema-less tool
+  // gets the empty object schema rather than an invalid `null`).
+  for (const t of v2State.v2Tools) {
+    if (!t || typeof t.name !== "string" || typeof t.execute !== "function") continue;
+    out.push({
+      name: t.name,
+      description: String(t.description ?? ""),
+      parameters:
+        t.input && typeof t.input === "object" && !Array.isArray(t.input)
+          ? t.input
+          : { type: "object", properties: {} },
+      plugin: "v2",
+    });
+  }
   return out;
+}
+
+/// Bound + shape-normalize a tool result from either dialect. v1 returns
+/// `{output, metadata, title}`; v2 `Tool.Result` returns `{content:[...],
+/// metadata}`. Output is capped HERE, before the NDJSON pipe: a 9 MiB output
+/// overran the reader's 8 MiB line cap and killed the reader for good.
+function finalizeToolResult(value, fallbackMetadata) {
+  const raw = typeof value === "string" ? { output: value } : (value ?? {});
+  const textPart = (p) =>
+    p?.type === "text" ? String(p.text ?? "") : p?.type === "file" ? `[file ${p.mime ?? p.mimeType ?? "attachment"}]` : "";
+  const contentText = Array.isArray(raw.content) ? raw.content.map(textPart).filter(Boolean).join("\n") : "";
+  const LIMIT = 1024 * 1024;
+  let output = typeof raw.output === "string" ? raw.output : contentText;
+  let truncated = false;
+  if (output.length > LIMIT) {
+    output = output.slice(0, LIMIT);
+    truncated = true;
+  }
+  const metadata =
+    raw.metadata && typeof raw.metadata === "object" && !Array.isArray(raw.metadata)
+      ? raw.metadata
+      : (fallbackMetadata && typeof fallbackMetadata === "object" ? fallbackMetadata : {});
+  return {
+    ok: true,
+    title: String(raw.title ?? ""),
+    output,
+    truncated,
+    metadata,
+    attachments: raw.attachments ?? undefined,
+  };
 }
 
 async function executeTool({ name, input, ctx }) {
@@ -522,32 +570,27 @@ async function executeTool({ name, input, ctx }) {
     };
     try {
       const r = await def.execute(input ?? {}, toolCtx);
-      const value = typeof r === "string" ? { output: r } : (r ?? { output: "" });
-      // Bound the payload HERE, before it crosses the NDJSON pipe: a 9 MiB
-      // output overruns the reader's 8 MiB line cap and killed the reader for
-      // good (review M-6). Rust truncates again for the model, but the wire
-      // bound must hold at the producer.
-      const LIMIT = 1024 * 1024;
-      let output = typeof value.output === "string" ? value.output : String(value.output ?? "");
-      let truncated = false;
-      if (output.length > LIMIT) {
-        output = output.slice(0, LIMIT);
-        truncated = true;
-      }
-      // A plugin may return anything as metadata; only an object survives to
-      // the part state (a non-object panicked the server, review H-1).
-      const metadata =
-        value.metadata && typeof value.metadata === "object" && !Array.isArray(value.metadata)
-          ? value.metadata
-          : (toolCtx._meta && typeof toolCtx._meta === "object" ? toolCtx._meta : {});
-      return {
-        ok: true,
-        title: String(value.title ?? ""),
-        output,
-        truncated,
-        metadata,
-        attachments: value.attachments ?? undefined,
-      };
+      return finalizeToolResult(r, toolCtx._meta);
+    } catch (e) {
+      return { ok: false, error: String(e?.message ?? e) };
+    }
+  }
+  // v2 tools (Paseo bridge): `execute(input, context)` with the sessionID the
+  // Rust executor passed; the bridge uses it to find the bound Paseo agent.
+  for (const t of v2State.v2Tools) {
+    if (t.name !== name) continue;
+    const controller = new AbortController();
+    try {
+      const r = await t.execute(input ?? {}, {
+        sessionID: ctx?.sessionID ?? "",
+        messageID: ctx?.messageID ?? "",
+        agent: ctx?.agent ?? "",
+        directory: ctx?.directory ?? process.cwd(),
+        worktree: ctx?.directory ?? process.cwd(),
+        signal: controller.signal,
+        progress: async () => {},
+      });
+      return finalizeToolResult(r, {});
     } catch (e) {
       return { ok: false, error: String(e?.message ?? e) };
     }

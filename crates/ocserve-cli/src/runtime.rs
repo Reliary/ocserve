@@ -15,7 +15,7 @@
 //!   (skills discovery separate, not in TUI hit-set)
 //! - /experimental/console, /experimental/capabilities: static captures
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use ocserve_http::LlmRegistry;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -182,6 +182,107 @@ fn read_global_config(path: &Path) -> Value {
     read_config_resolved(path)
 }
 
+/// Layer the two explicit config channels upstream reads on top of the
+/// file-derived config (config.ts: `OPENCODE_CONFIG` then
+/// `OPENCODE_CONFIG_CONTENT`, the latter a final local-scope merge).
+///
+/// This is how launchers inject plugins: Paseo rewrites
+/// `OPENCODE_CONFIG_CONTENT` with its bridge plugin tuple. Ignoring the
+/// variable silently dropped the whole plugin surface (observed 2026-11-09).
+/// The channels are explicit operator intent, so a malformed value is a loud
+/// boot error (upstream dies on it too) rather than a silent ignore; a MISSING
+/// `OPENCODE_CONFIG` file warns and contributes nothing (upstream's
+/// readConfigFile returns undefined there).
+///
+/// Never logs the value — it carries launcher tokens.
+fn layer_env_config(
+    mut cfg: Value,
+    config_path: Option<std::path::PathBuf>,
+    content: Option<&str>,
+    base_dir: &Path,
+) -> Result<Value> {
+    if let Some(path) = config_path {
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => {
+                let base = path.parent().unwrap_or(base_dir);
+                let text = expand_config_vars(&raw, base, &|n| std::env::var(n).ok())
+                    .map_err(|e| anyhow!("OPENCODE_CONFIG {}: {e}", path.display()))?;
+                let v: Value = serde_json::from_str(&text)
+                    .with_context(|| format!("parse OPENCODE_CONFIG {}", path.display()))?;
+                if !v.is_object() {
+                    anyhow::bail!("OPENCODE_CONFIG {}: expected a JSON object", path.display());
+                }
+                tracing::info!(
+                    "loaded explicit config from OPENCODE_CONFIG ({})",
+                    path.display()
+                );
+                merge_config_layer(&mut cfg, v);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    "OPENCODE_CONFIG points at a missing file ({}) — ignored",
+                    path.display()
+                );
+            }
+            Err(e) => {
+                return Err(anyhow!("read OPENCODE_CONFIG {}: {e}", path.display()));
+            }
+        }
+    }
+    if let Some(raw) = content.map(str::trim).filter(|s| !s.is_empty()) {
+        let text = expand_config_vars(raw, base_dir, &|n| std::env::var(n).ok())
+            .map_err(|e| anyhow!("OPENCODE_CONFIG_CONTENT: {e}"))?;
+        let v: Value = serde_json::from_str(&text)
+            .context("parse OPENCODE_CONFIG_CONTENT (invalid JSON; value is not logged)")?;
+        if !v.is_object() {
+            anyhow::bail!("OPENCODE_CONFIG_CONTENT: expected a JSON object");
+        }
+        tracing::info!(
+            "loaded explicit config from OPENCODE_CONFIG_CONTENT ({} bytes)",
+            raw.len()
+        );
+        merge_config_layer(&mut cfg, v);
+    }
+    Ok(cfg)
+}
+
+/// Merge one config layer over `base`.
+///
+/// `plugin` / `plugins` ACCUMULATE instead of replacing. Upstream rebuilds the
+/// effective list as the deduped union of every layer's declarations
+/// (`mergePluginOrigins` / v2 `external.ts`), so a launcher that injects its
+/// bridge must not erase the plugins the user declared in `opencode.json`
+/// (arrays still replace for every other key, matching `mergeDeep`).
+fn merge_config_layer(base: &mut Value, patch: Value) {
+    let mut previous: [(&str, Vec<Value>); 2] = [("plugin", Vec::new()), ("plugins", Vec::new())];
+    for (key, slot) in previous.iter_mut() {
+        if patch.get(*key).is_some_and(Value::is_array) {
+            *slot = base
+                .get(*key)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+        }
+    }
+    ocserve_http::deep_merge(base, patch);
+    for (key, prev) in previous {
+        if prev.is_empty() {
+            continue;
+        }
+        let next = base
+            .get(key)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(obj) = base.as_object_mut() {
+            obj.insert(
+                key.to_string(),
+                Value::Array(prev.into_iter().chain(next).collect()),
+            );
+        }
+    }
+}
+
 /// models catalog read with upstream self-heal semantics (models-dev.ts
 /// loadFromDisk): unreadable/corrupt → remove best-effort + treat missing
 /// so the hourly refresh refetches. NEVER fails the caller — a broken cache
@@ -211,8 +312,19 @@ fn read_catalog(path: &Path) -> Value {
 /// keys added via PUT /auth reach actual prompts, not just the display routes
 /// (was a real gap: registry read legacy-only).
 fn load_auth(data_dir: &Path) -> Result<Value> {
+    load_auth_with(data_dir, None)
+}
+
+/// `legacy_home` is a TEST SEAM: when set, the legacy `auth.json` is read from
+/// `<legacy_home>/auth.json` instead of `$HOME/.local/share/opencode/auth.json`,
+/// so a loader test cannot read the developer's real credentials. Production
+/// passes `None` and keeps the documented path.
+fn load_auth_with(data_dir: &Path, legacy_home: Option<&Path>) -> Result<Value> {
     let home = std::env::var("HOME").unwrap_or_default();
-    let auth_path = Path::new(&home).join(".local/share/opencode/auth.json");
+    let auth_path = match legacy_home {
+        Some(h) => h.join("auth.json"),
+        None => Path::new(&home).join(".local/share/opencode/auth.json"),
+    };
     let auth = if auth_path.exists() {
         read_json(&auth_path)?
     } else {
@@ -237,17 +349,39 @@ fn layer_auth(mut legacy: Value, overlay: Value) -> Value {
 /// The exact files Runtime reads (load_for + llm_registry) — the hot-reload
 /// watch set (H1). Keep in sync when load_for gains a read.
 pub fn watch_paths(data_dir: &Path) -> Vec<std::path::PathBuf> {
+    // OPENCODE_CONFIG is a real read input now; a changed file must reload.
+    // OPENCODE_CONFIG_CONTENT is process env, not a file — restart to change.
+    let explicit = std::env::var_os("OPENCODE_CONFIG")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    let home = std::env::var("HOME").unwrap_or_default();
+    let config_json = ocserve_store::platform::opencode_config_dir()
+        .map(|d| d.join("opencode.json"))
+        .unwrap_or_else(|| Path::new(&home).join(".config/opencode/opencode.json"));
+    watch_paths_with(data_dir, explicit, config_json)
+}
+
+/// Env-free variant so the watch-set test never depends on the ambient shell.
+fn watch_paths_with(
+    data_dir: &Path,
+    opencode_config: Option<std::path::PathBuf>,
+    config_json: std::path::PathBuf,
+) -> Vec<std::path::PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     let h = Path::new(&home);
-    vec![
-        h.join(".config/opencode/opencode.json"),
+    let mut paths = vec![
+        config_json,
         h.join(".config/ocserve/config.json"),
         h.join(".local/share/opencode/auth.json"),
         data_dir.join("auth-overlay.json"),
         // K-MODELS: the catalog ocserve READS (source-aware + fixture flag)
         crate::models_dev::read_path(),
         h.join(".local/state/opencode/model.json"),
-    ]
+    ];
+    if let Some(p) = opencode_config {
+        paths.push(p);
+    }
+    paths
 }
 
 use std::path::Path;
@@ -745,8 +879,59 @@ impl Runtime {
     /// and layers over the read-only legacy auth.json. (Boot + reloader both
     /// call this — there is deliberately no env-default variant.)
     pub fn load_for(data_dir: &std::path::Path) -> Result<Self> {
+        // Explicit channels (upstream order): OPENCODE_CONFIG then
+        // OPENCODE_CONFIG_CONTENT. A launcher that injects its plugin config
+        // this way must win over the on-disk file.
+        let env_config_path = std::env::var_os("OPENCODE_CONFIG")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from);
+        let env_content = match std::env::var("OPENCODE_CONFIG_CONTENT") {
+            Ok(v) => Some(v),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                tracing::warn!("OPENCODE_CONFIG_CONTENT is not valid UTF-8 — ignored");
+                None
+            }
+            Err(std::env::VarError::NotPresent) => None,
+        };
+        Self::load_for_with(
+            data_dir,
+            env_config_path,
+            env_content,
+            ocserve_store::platform::opencode_config_dir(),
+            None, // production: overlay + legacy auth use their documented paths
+        )
+    }
+
+    /// The env inputs are explicit here so a test can prove the WIRING (env →
+    /// merged config → plugin list) without racing process-wide `set_var`.
+    ///
+    /// `config_dir` is explicit for the same reason, and it is load-bearing for
+    /// test hygiene: the config directory is now a real env input
+    /// (`OPENCODE_CONFIG_DIR` / `XDG_CONFIG_HOME`), so a test that let it
+    /// default read the DEVELOPER's `~/.config/opencode` — asserting an exact
+    /// plugin list against whatever plugins happen to be installed there
+    /// (caught 2026-11-12: two tests failed only on a machine with plugins).
+    fn load_for_with(
+        data_dir: &std::path::Path,
+        env_config_path: Option<std::path::PathBuf>,
+        env_content: Option<String>,
+        config_dir: Option<std::path::PathBuf>,
+        test_root: Option<&std::path::Path>,
+    ) -> Result<Self> {
         let home = std::env::var("HOME").unwrap_or_default();
-        let config_path = Path::new(&home).join(".config/opencode/opencode.json");
+        // Upstream precedence: OPENCODE_CONFIG_DIR > XDG_CONFIG_HOME/opencode
+        // > ~/.config/opencode. A launcher provisioning a dedicated config dir
+        // must find its opencode.json/plugins read from the same place.
+        //
+        // `config_dir` is explicit in the test seam so no test can read the
+        // developer's `~/.config/opencode`. The overlay below is derived from
+        // the SAME directory, so pointing the seam at a temp dir also isolates
+        // the `~/.config/ocserve/config.json` overlay (previously ambient, which
+        // a review flagged as a masked dependency).
+        let config_path = config_dir
+            .as_ref()
+            .map(|d| d.join("opencode.json"))
+            .unwrap_or_else(|| Path::new(&home).join(".config/opencode/opencode.json"));
         // K-MODELS: OPENCODE_MODELS_URL/_PATH aware (upstream read precedence)
         let cache_path = crate::models_dev::read_path();
 
@@ -754,12 +939,30 @@ impl Runtime {
         // W4 overlay: a ocserve-owned patch file (OCSERVE_CONFIG_WRITE=overlay
         // writes it) deep-merges OVER the shared opencode.json on every load —
         // never mutates the user's other server's config unless told to.
-        let overlay_path = Path::new(&home).join(".config/ocserve/config.json");
+        let overlay_path = match test_root {
+            // Test seam: an overlay under the caller's temp root, so a test
+            // cannot pick up the developer's real `~/.config/ocserve`.
+            Some(r) => r.join("ocserve-overlay.json"),
+            None => Path::new(&home).join(".config/ocserve/config.json"),
+        };
         if overlay_path.exists() {
             let overlay = read_json(&overlay_path)?;
             ocserve_http::deep_merge(&mut raw_config, overlay);
         }
-        let auth = load_auth(data_dir)?;
+        let base_dir = std::env::current_dir().unwrap_or_else(|_| Path::new(".").into());
+        raw_config = layer_env_config(
+            raw_config,
+            env_config_path,
+            env_content.as_deref(),
+            &base_dir,
+        )?;
+        // `config_dir` is a REAL input (resolved from OPENCODE_CONFIG_DIR /
+        // XDG_CONFIG_HOME in production), so it must not double as the test
+        // seam — the legacy auth file lives under `~/.local/share/opencode`,
+        // not under the config dir. Using it for both made production read
+        // `$XDG_CONFIG_HOME/opencode/auth.json` and drop every provider key
+        // (caught by the differential replay, 2026-11-12).
+        let auth = load_auth_with(data_dir, test_root)?;
         let cache = read_catalog(&cache_path);
         Self::from_parts(data_dir, raw_config, auth, cache)
     }
@@ -1381,6 +1584,17 @@ impl Runtime {
                     .pointer(&format!("/provider/{pid}/options/baseURL"))
                     .and_then(|v| v.as_str())
                     .map(String::from)
+                    // The models.dev catalog carries the provider's API base
+                    // (`api`); opencode-go is auth-only, so the hardcoded
+                    // defaults list alone left `opencode auth login` users
+                    // with no endpoint and no provider on the v2 wire.
+                    .or_else(|| {
+                        cache
+                            .get(pid)
+                            .and_then(|p| p.get("api"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                    })
                     .or_else(|| {
                         defaults
                             .iter()
@@ -1950,15 +2164,17 @@ mod tests {
     #[test]
     fn watch_paths_cover_every_runtime_read() {
         let dp = std::path::Path::new("/tmp/ocserve-data");
-        let paths = watch_paths(dp);
+        // A neutral root, not a literal home path (the repo gate rejects those).
+        let cfg = std::path::PathBuf::from("/srv/root/.config/opencode/opencode.json");
+        let paths = watch_paths_with(dp, None, cfg.clone());
         assert_eq!(
             paths.len(),
             6,
             "opencode.json, overlay, auth, auth-overlay, models cache, state model"
         );
-        assert!(
-            paths[0].ends_with(".config/opencode/opencode.json"),
-            "shared config first: {:?}",
+        assert_eq!(
+            paths[0], cfg,
+            "shared config first (OPENCODE_CONFIG_DIR-aware): {:?}",
             paths[0]
         );
         assert_eq!(paths[3], dp.join("auth-overlay.json"), "data-dir overlay");
@@ -1967,6 +2183,11 @@ mod tests {
             "state model (default-model hot-swap): {:?}",
             paths[5]
         );
+        // An explicit OPENCODE_CONFIG is a read input and must be watched.
+        let explicit = std::path::PathBuf::from("/tmp/explicit-opencode.json");
+        let with_env = watch_paths_with(dp, Some(explicit.clone()), cfg);
+        assert_eq!(with_env.len(), 7);
+        assert_eq!(with_env[6], explicit);
     }
 
     #[test]
@@ -2498,5 +2719,157 @@ mod registry_catalog_tests {
             .expect("keyless endpoint installs");
         assert_eq!(ep.0, "https://from-stored.invalid", "stored catalog wins");
         assert_eq!(ep.1, "public", "keyless default");
+    }
+}
+
+#[cfg(test)]
+mod env_config_tests {
+    use super::*;
+
+    /// The Paseo regression (2026-11-09): a launcher injects its plugin tuple
+    /// through OPENCODE_CONFIG_CONTENT. It must reach the merged config — and
+    /// it must win over the on-disk config (upstream merges it last, local).
+    #[test]
+    fn content_is_merged_last_and_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = r#"{"plugin":[["file:///tmp/paseo-bridge.mjs",{"baseUrl":"http://127.0.0.1:6767","token":"t"}]],"model":"x/y"}"#;
+        let cfg = layer_env_config(
+            json!({"model": "stale/old", "theme": "dark"}),
+            None,
+            Some(content),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(cfg["model"], "x/y", "explicit content wins over the file");
+        assert_eq!(cfg["theme"], "dark", "unrelated file keys survive");
+        assert_eq!(
+            cfg["plugin"][0][0], "file:///tmp/paseo-bridge.mjs",
+            "the plugin tuple reaches the config the loader reads"
+        );
+    }
+
+    /// Plugin declarations accumulate across layers (upstream mergePluginOrigins):
+    /// a launcher's bridge must be ADDED, not replace the plugins the user
+    /// already declared in opencode.json. Same for the v2 `plugins` key.
+    #[test]
+    fn plugin_declarations_accumulate_across_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = layer_env_config(
+            json!({"plugin": ["from-file"], "plugins": [{"package": "v2-from-file"}]}),
+            None,
+            Some(r#"{"plugin":["from-content"],"plugins":[{"package":"v2-from-content"}]}"#),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(cfg["plugin"], json!(["from-file", "from-content"]));
+        assert_eq!(
+            cfg["plugins"],
+            json!([{"package": "v2-from-file"}, {"package": "v2-from-content"}])
+        );
+    }
+
+    /// Anti-theater wiring test: the env inputs must reach the PLUGIN LIST, not
+    /// just the merge helper. This is the exact Paseo path (file:// tuple in
+    /// OPENCODE_CONFIG_CONTENT). Deleting the `layer_env_config` call in
+    /// load_for_with makes this red.
+    #[test]
+    fn load_for_with_env_reaches_the_plugin_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty_cfg = dir.path().join("cfgdir");
+        std::fs::create_dir_all(&empty_cfg).unwrap();
+        let rt = Runtime::load_for_with(
+            dir.path(),
+            None,
+            Some(
+                r#"{"plugin":[["file:///tmp/paseo-bridge.mjs",{"baseUrl":"http://127.0.0.1:6767","token":"t"}]]}"#
+                    .into(),
+            ),
+            Some(empty_cfg),
+            Some(dir.path()),
+        )
+        .unwrap();
+        let specs = crate::plugin_specs(&rt.config);
+        assert_eq!(specs.len(), 1, "{specs:?}");
+        assert_eq!(specs[0].0, "file:///tmp/paseo-bridge.mjs");
+        assert_eq!(specs[0].1["baseUrl"], "http://127.0.0.1:6767");
+    }
+
+    /// OPENCODE_CONFIG (file) and OPENCODE_CONFIG_CONTENT (inline) layer in
+    /// upstream order: scalars from content win, plugin lists from both survive.
+    #[test]
+    fn explicit_file_and_content_layer_in_upstream_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("explicit.json");
+        std::fs::write(&file, r#"{"model":"from/file","plugin":["file-plugin"]}"#).unwrap();
+        let empty_cfg = dir.path().join("cfgdir");
+        std::fs::create_dir_all(&empty_cfg).unwrap();
+        // The developer's real overlay must NOT leak in; the seam's own
+        // overlay must be the one applied.
+        std::fs::write(
+            dir.path().join("ocserve-overlay.json"),
+            r#"{"__seam_overlay": true}"#,
+        )
+        .unwrap();
+        let rt = Runtime::load_for_with(
+            dir.path(),
+            Some(file),
+            Some(r#"{"model":"from/content","plugin":["content-plugin"]}"#.into()),
+            Some(empty_cfg),
+            Some(dir.path()),
+        )
+        .unwrap();
+        assert_eq!(rt.config["model"], "from/content");
+        assert_eq!(
+            rt.config["__seam_overlay"], true,
+            "the seam's overlay is applied, so no ambient ~/.config/ocserve leak"
+        );
+        let specs = crate::plugin_specs(&rt.config);
+        let names: Vec<&str> = specs.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(names, vec!["file-plugin", "content-plugin"]);
+    }
+
+    /// Negative control for the silent-drop class: malformed injected config
+    /// is a loud error, not an ignored variable. (Old behavior: any value of
+    /// OPENCODE_CONFIG_CONTENT was never read at all.)
+    #[test]
+    fn corrupt_content_is_a_loud_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = layer_env_config(json!({}), None, Some("{ not json"), dir.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("OPENCODE_CONFIG_CONTENT"),
+            "{err:#}"
+        );
+        let err = layer_env_config(json!({}), None, Some("[]"), dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("JSON object"), "{err:#}");
+    }
+
+    /// OPENCODE_CONFIG file: missing warns + contributes nothing (upstream
+    /// readConfigFile returns undefined); a valid file merges; corrupt is fatal.
+    #[test]
+    fn explicit_config_file_layers_and_missing_is_harmless() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("explicit.json");
+        std::fs::write(&file, r#"{"models":{"p":{"m":{}}}}"#).unwrap();
+        let cfg = layer_env_config(
+            json!({"theme": "dark"}),
+            Some(file.clone()),
+            None,
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(cfg["theme"], "dark");
+        assert!(cfg.pointer("/models/p/m").is_some());
+
+        let missing = dir.path().join("nope.json");
+        let cfg =
+            layer_env_config(json!({"theme": "dark"}), Some(missing), None, dir.path()).unwrap();
+        assert_eq!(cfg["theme"], "dark", "missing file changes nothing");
+
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, "{").unwrap();
+        assert!(
+            layer_env_config(json!({}), Some(bad), None, dir.path()).is_err(),
+            "a corrupt explicit config must fail loudly"
+        );
     }
 }

@@ -134,3 +134,6 @@ upstream does.
 | `OPENCODE_API_KEY` | Key for the `opencode` provider (takes precedence over the keyless free tier). |
 | `OPENCODE_MODELS_URL` / `OPENCODE_MODELS_PATH` | Catalog source and cache path (same as upstream). |
 | `OPENCODE_DISABLE_MODELS_FETCH` | Disable catalog refresh. |
+| `OPENCODE_CONFIG` | Load an additional explicit config file over the global one (missing file warns; malformed is fatal). |
+| `OPENCODE_CONFIG_CONTENT` | Inline JSON merged as the final local config layer (launchers inject plugins this way). |
+| `OPENCODE_CONFIG_DIR` | Config directory (`opencode.json` + auto-discovered `plugin/`/`plugins/`); defaults to `$XDG_CONFIG_HOME/opencode` or `~/.config/opencode`. |

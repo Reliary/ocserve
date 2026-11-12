@@ -112,6 +112,85 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   removing the two unused declarations let rusqlite 0.41 resolve
   libsqlite3-sys 0.39.1 (SQLite 3.54.1).
 
+## Unreleased
+
+### Security
+- **`?base=` can no longer reach `git diff` as an option.** The v2 diff route
+  passed the query value straight through as a positional ref, so
+  `base=--output=/path` made the server write an attacker-chosen file and
+  `base=--ext-diff` re-enabled a repository's external diff driver (command
+  execution where one is configured). The value must now look like a ref and is
+  resolved with `git rev-parse --verify --end-of-options`; both `git diff`
+  calls also pass `--end-of-options`.
+
+### Fixed
+- **A malformed stored message could brick boot.** The v20 `msg.v2_type`
+  generated column called `json_extract` unguarded, and SQLite raises (rather
+  than returning NULL) on invalid JSON, so one bad imported row aborted the
+  index build and made every subsequent start fail. The expression is now
+  guarded with `json_valid` and classifies a malformed row as its role.
+- **The pre-migration snapshot now actually runs.** It lived in
+  `Writer::spawn`, but `serve` migrates in `boot_checks` before the writer
+  exists, so the writer saw an already-current database and skipped the
+  backup — the safety net never fired for the migration it exists for. It is
+  now taken inside `migrate`, which covers boot checks, the writer, the
+  importer and tests.
+- **Every declared query parameter on the message and session lists is read.**
+  The v2 message list accepted `?cursor=` and passed `None` down, so each page
+  returned the same first window with the same `next` cursor; a client walking
+  that chain grew to a 3.4 GB heap. Paging now advances, and the same route's
+  other three parameters work too: `order` (asc/desc, carried inside the
+  cursor), `type` (filtered in SQL before the limit, so a filtered page is
+  still full), and `previous` (emitted alongside `next`, as the reference
+  does). `cursor` with `order` is a 400 `InvalidCursorError`, an unknown
+  anchor id is an empty page, and an invalid `limit`/`order`/`type` is the
+  reference's own `InvalidRequestError` wording.
+- **The v2 session list honours its filters.** `?parentID=null` — the exact
+  call the shipped v2 web UI and TUI make to list root sessions — was treated
+  as the literal string `"null"` and returned ZERO sessions. It now means root
+  sessions. `archived`, `project`, `subpath`, `id` and a real cursor also
+  work; `PATCH /api/session {archived}` sets and clears the archive state.
+- **The v1 `/experimental/session` list pages.** `cursor`, `start`, `roots`
+  and `archived` were accepted and ignored, so older history was unreachable
+  through the offset-style cursor the endpoint advertises. It now applies the
+  reference's `time_updated` window and emits `x-next-cursor`.
+- **A failed plugin sidecar spawn is not retried forever.** A host without a
+  working `bun`/`node` re-materialized the host files and attempted a spawn
+  every config poll (2 s). The failure is now recorded once
+  (`ocserve_plugin_spawn_total{result}`) and discovery is disabled until
+  restart; the discovery pass is also bounded to 10 s so it cannot stall
+  config hot-reload.
+- **Plugin discovery happens off the request path.** `GET /api/plugin` did
+  synchronous directory scans and could spawn the plugin sidecar while a
+  launcher polled it every ~50 ms; discovery now runs on the config poller and
+  the route is a pure read.
+- **Two loader tests were reading the developer's real config.** With the
+  config directory as an env input, they asserted an exact plugin list against
+  whatever happened to be installed on the machine.
+
+### Added
+- **opencode v2 launcher compatibility (Paseo).** The config directory now
+  follows upstream (`OPENCODE_CONFIG_DIR` → `XDG_CONFIG_HOME/opencode` →
+  `~/.config/opencode`), plugin packages under `plugin/`/`plugins/` are
+  auto-discovered at boot and on inventory polls (so a launcher that
+  provisions a bridge after boot is picked up without a restart), and
+  `GET /api/plugin` serves the contract's `Plugin.Info` (`source`, `features`,
+  `state.status`) instead of a private `state:"loaded"` string. v2
+  `ctx.tool.transform` is now real: the editor runs, tools are advertised
+  with their JSON Schema and execute through the sidecar (`D-V2-TOOL-EDITOR`
+  closed).
+
+### Fixed
+- **Launcher-injected plugin config is read.** `OPENCODE_CONFIG` and
+  `OPENCODE_CONFIG_CONTENT` were documented upstream flags but never read, so
+  Paseo's bridge — a `plugin` tuple inside `OPENCODE_CONFIG_CONTENT` —
+  silently produced zero plugins and its `tool`/`shell.env` hooks were
+  missing. Both channels now layer last (content wins for scalars, plugin
+  declarations accumulate), `file://` plugin URLs
+  and plugin directories resolve, and the v2 `plugins: [{package, options}]`
+  form loads with `options ?? {}`. Malformed injected JSON fails boot loudly;
+  the value is never logged (it carries launcher tokens).
+
 ## 0.7.0
 
 Both API surfaces moved to the current upstream releases: the v1 freeze to

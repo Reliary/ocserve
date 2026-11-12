@@ -525,6 +525,24 @@ current anywhere.
 | `D-AGENT-MODEL` | Compaction runs on the request's model; upstream honors a per-agent model pin (`agent.model`). | open |
 | `D-BACKGROUND-NOOP` | `POST /api/session/{id}/background` records the request and returns 204; turns run tools inline, so there is nothing to background. | accepted |
 | `D-BASH-SPLIT` | `bash_patterns::split_commands` approximates the shell (quote-aware only). Heredocs, `$( )`, backticks, `&>` and `2>&1` can split a sub-command, which can produce a slightly-off external-directory or arity ask. The tool still runs the whole command. | accepted |
+| `D-VCS-REF-STRICT` | `GET /api/vcs/diff?base=` rejects a value that is not a resolvable ref: no leading `-`, no control characters, no `..`, and it is resolved with `git rev-parse --verify --end-of-options`. Upstream forwards it to `git diff` as a positional argument, which lets `--output=/path` write a file and `--ext-diff` re-enable a repo's external diff driver. | accepted |
+| `D-PLUGIN-SPAWN-LATCH` | A failed plugin sidecar spawn disables on-demand plugin discovery until restart (metric `ocserve_plugin_spawn_total{result}`). Upstream loads plugins at boot only, so there is no equivalent retry to match. | accepted |
+| `D-LOCATION-PARAM` | The v2 `?location=…` parameter is ignored: every process serves one location, and the reference also echoes its own directory regardless of the value (`/api/vcs/status?location[directory]=/home` → `{"directory":"/tmp"}`, measured on 2.2.5). | accepted |
+| `D-EVENT-TYPE-FILTER` | `GET /api/event?types=` streams every type; the filter would narrow server-side. No shipped client sends it (grep over the 2.2.5 TUI, app and web bundle). | open |
+| `D-MODEL-TYPE-FILTER` | `GET /api/model?types=` is accepted and ignored; the response already carries every entry with its `type`, and the shipped clients filter locally. | open |
+| `D-PROJECT-ARCHIVE` | Projects are not archivable in our store, so `GET /api/project?archived=` is accepted and ignored. Sessions do archive (`PATCH /api/session {archived}`). | open |
+| `D-SHELL-OUTPUT-PAGING` | `GET /api/shell/{id}/output?cursor=&limit=` returns the whole bounded buffer (64 KiB cap) instead of a page. The web app re-reads on poll rather than resuming mid-stream. | open |
+| `D-STATS-WINDOW` | `GET /api/experimental/session/stats` aggregates all history; `from`/`to`/`project`/`timezone`/`tools` are accepted and ignored. The TUI passes `from`+`timezone`, so its yearly view currently shows lifetime totals. | open |
+| `D-EXPORT-SANITIZE` | `GET …/export?sanitize=` always exports unsanitized. No shipped client sends the parameter. | open |
+| `D-TERMINAL-READ-LINES` | `GET …/terminal/read?lines=` returns the whole retained scrollback; the parameter is accepted and ignored. | open |
+| `D-SESSION-DIFF-WINDOW` | `GET /api/session/{id}/diff` returns the full turn snapshot; `from`/`to`/`context` are accepted and ignored (the v2 TUI sends `context`). | open |
+| `D-PTY-RESUME-CURSOR` | WebSocket PTY cursors are ignored on connect; the client resubscribes rather than resuming mid-stream. | open |
+| `D-PTY-TICKET-QUERY` | The PTY `?ticket=` connect token is honoured from the marker header only; the query form is accepted and ignored. | open |
+| `D-PERSISTENT-PTY-PARAMS` | `role`/`attachment_id`/`takeover`/`input_protocol`/`ticket` on the persistent-PTY connect route are accepted and ignored (single local client). | open |
+| `D-CLIENT-MCP-TICKET` | `GET /api/experimental/client-mcp?ticket=` is accepted and ignored; the route serves the local client inventory. | open |
+| `D-WORKTREE-PROJECT-SCOPE` | `GET /api/worktree?projectID=` is accepted and ignored; worktrees are listed for the server's own worktree. | open |
+| `D-EXPERIMENTAL-SESSION-DIRECTORY` | `GET /experimental/session?directory=` is accepted and ignored; the listing is already scoped to the server's location. | open |
+| `D-VCS-BRANCH-PAGING` | `GET /api/vcs/branch?search=&limit=` filters and truncates the branch list in memory rather than in git; fine for local branch counts. | accepted |
 | `D-CONFIG-VAR` | A `{env:…}`/`{file:…}` that cannot be resolved degrades the load to defaults with a named warning; upstream aborts the config load with `InvalidError`. `{env:}` is honoured, literal keys pass through, `{file:}` resolves relative to the config dir and is JSON-escaped (issue #28). | accepted |
 | `D-CONFIG-1` | Upstream has no config file watcher (invalidated only on its own write), so an external edit needs a restart there. ocserve applies it within one poll interval. | accepted |
 | `D-CREDENTIAL` | The credential store is implemented (`GET`/`POST`/`PATCH`/`DELETE /api/credential`); only the OAuth code exchange is absent, so `connect/oauth` answers the probe's 401. | open (OAuth only) |
@@ -587,7 +605,7 @@ current anywhere.
 | `D-V2-SESSION-LIFECYCLE` | Transport-level v2 hooks (`model.request`, `http.*`, `retry`, `title`, `generate`) are not bridged. | accepted |
 | `D-V2-STORAGE-MEM` | `ctx.storage` is in-memory for the life of the sidecar; it is not disk-backed. | accepted |
 | `D-V2-SESSION-GENERATE` | The transient generate path runs, but the v2 `session.generate` hook is not dispatched. | accepted |
-| `D-V2-TOOL-EDITOR` | `tool.transform` registers and records, but the tool registry is static, so it is not applied; `tool.list` returns `[]`. | accepted |
+| `D-V2-TOOL-EDITOR` | `tool.transform` registers and records, but the tool registry is static, so it is not applied; `tool.list` returns `[]`. | closed (the callback runs against a live editor; added tools are advertised with their JSON Schema and dispatched; a disposed registration removes its names) |
 | `D-V2-UNION` | One port serves both wire shapes; no client sends a version discriminator. | accepted |
 | `D-V2-WS` | Experimental WebSocket hooks register but are not dispatched. | accepted |
 | `D-VIEW-NOWATERMARK` | View records and their 204s are served without tracking a read watermark. | accepted |
