@@ -475,9 +475,44 @@ pub fn diff_raw_bounded(dir: &str) -> (String, bool) {
 
 /// `mode`: git | branch. `context`: unified context lines (default full).
 pub fn diff(dir: &str, mode: &str, context: Option<u32>) -> Value {
+    // v1 defaults: the mode-derived ref, untracked files included.
+    diff_with(dir, mode, context, None, true)
+}
+
+/// `diff` plus the two v2 query parameters the shipped TUI sends.
+///
+/// * `base` — diff against this ref instead of the mode-derived one. The TUI's
+///   diff viewer passes the branch the user selected, so ignoring it rendered
+///   the HEAD diff for every selection.
+/// * `untracked` — include untracked files (default true, the v1 behaviour).
+pub fn diff_with(
+    dir: &str,
+    mode: &str,
+    context: Option<u32>,
+    base: Option<&str>,
+    untracked: bool,
+) -> Value {
     if !is_git(dir) {
         return Value::Array(vec![]);
     }
+    let mut explicit = None;
+    let ref_ = match base.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(b) => {
+            explicit = Some(b.to_string());
+            b.to_string()
+        }
+        None => match diff_ref_for(dir, mode) {
+            Some(r) => r,
+            None => return Value::Array(vec![]),
+        },
+    };
+    let _ = &explicit;
+    diff_body(dir, &ref_, context, untracked)
+}
+
+/// The mode-derived ref (`git` → HEAD, `branch` → merge-base with origin/HEAD).
+/// `None` means "no diff to show" (not a repo, no HEAD, no default branch).
+fn diff_ref_for(dir: &str, mode: &str) -> Option<String> {
     let ref_ = match mode {
         "git" => {
             if has_head(dir) {
@@ -487,11 +522,9 @@ pub fn diff(dir: &str, mode: &str, context: Option<u32>) -> Value {
             }
         }
         "branch" => {
-            let Some((def, c)) = run_git(dir, &["symbolic-ref", "refs/remotes/origin/HEAD"]) else {
-                return Value::Array(vec![]);
-            };
+            let (def, c) = run_git(dir, &["symbolic-ref", "refs/remotes/origin/HEAD"])?;
             if c != 0 || def.trim().is_empty() {
-                return Value::Array(vec![]);
+                return None;
             }
             let name = def
                 .trim()
@@ -499,28 +532,34 @@ pub fn diff(dir: &str, mode: &str, context: Option<u32>) -> Value {
                 .to_string();
             match run_git(dir, &["merge-base", "HEAD", &name]) {
                 Some((mb, 0)) if !mb.trim().is_empty() => mb.trim().to_string(),
-                _ => return Value::Array(vec![]),
+                _ => return None,
             }
         }
-        _ => return json!({"__error": "mode"}),
+        _ => return None,
     };
+    Some(ref_)
+}
 
+fn diff_body(dir: &str, ref_: &str, context: Option<u32>, untracked: bool) -> Value {
     let ctx = context
         .map(|c| c.to_string())
         .unwrap_or_else(|| FULL_CONTEXT.into());
     let stats = if ref_.is_empty() {
         std::collections::HashMap::new()
     } else {
-        numstat(dir, &ref_)
+        numstat(dir, ref_)
     };
     let (tracked, _trunc) = if ref_.is_empty() {
         (std::collections::HashMap::new(), false)
     } else {
-        tracked_patches(dir, &ref_, &ctx)
+        tracked_patches(dir, ref_, &ctx)
     };
 
     // Build the file list: status entries (covers untracked), sorted.
-    let mut items: Vec<(String, String)> = status_entries(dir);
+    let mut items: Vec<(String, String)> = status_entries(dir)
+        .into_iter()
+        .filter(|(_, code)| untracked || code != "??")
+        .collect();
     items.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut out: Vec<Value> = Vec::new();

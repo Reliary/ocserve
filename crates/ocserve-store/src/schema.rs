@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 /// Bump when the schema changes; refuse to open mismatches with an actionable error
 /// (reliary8/stria pattern: schema.rs user_version gate).
-pub const SCHEMA_VERSION: i64 = 19;
+pub const SCHEMA_VERSION: i64 = 21;
 
 const DDL: &str = "
 -- session metadata (no payloads)
@@ -18,6 +18,9 @@ CREATE TABLE session (
     parent_id     TEXT,
     title         TEXT NOT NULL DEFAULT '',
     version       TEXT NOT NULL DEFAULT '1',
+    -- NULL = not archived. Upstream filters archived=true|false on this.
+    -- Kept nullable so omitting the filter (include both) is distinguishable.
+    time_archived INTEGER,
     path          TEXT NOT NULL DEFAULT '',
     agent         TEXT,
     model         TEXT,
@@ -53,6 +56,21 @@ CREATE TABLE msg (
 
 CREATE INDEX idx_msg_session ON msg(session_id, seq);
 CREATE INDEX idx_msg_page ON msg(session_id, time_created, id);
+
+-- v20: the v2 message-list `type=` filter runs in SQL BEFORE the limit.
+-- The column is derived, so every existing writer (insert_message, the
+-- importer, fork) fills it without an extra parameter: role is the base,
+-- and a user row marked `synthetic` is the `synthetic` type.
+-- Adding a writer must not bypass this: it is computed, not bound.
+ALTER TABLE msg ADD COLUMN v2_type TEXT
+    GENERATED ALWAYS AS (
+        CASE
+            WHEN role = 'user' THEN
+                CASE WHEN json_extract(info, '$.synthetic') = 1 THEN 'synthetic' ELSE 'user' END
+            ELSE role
+        END
+    ) VIRTUAL;
+CREATE INDEX idx_msg_v2_type ON msg(session_id, v2_type, seq);
 
 -- parts: small payloads inline (≤8KB per MEMORY §6), large → blob store
 CREATE TABLE msg_part (
@@ -1019,6 +1037,60 @@ CREATE TABLE IF NOT EXISTS session_environment (
                     CREATE INDEX IF NOT EXISTS idx_permission_saved_project
                         ON permission_saved(project_id);",
                     )?;
+                }
+                19 => {
+                    // v19->v20: the v2 message list declared `type=` and
+                    // `order=` on `GET /api/session/{id}/message` while the
+                    // handler read neither, so a filtered request silently got
+                    // every type. Filtering has to happen in SQL *before* the
+                    // limit or a page comes back short. The type is derived
+                    // (role + the `synthetic` marker), never bound by callers,
+                    // so no writer can forget it.
+                    //
+                    // Idempotent: a rewound version stamp (or a partially
+                    // applied step) must not re-ADD an existing column.
+                    //
+                    // `table_xinfo`, NOT `table_info`: the latter omits
+                    // generated columns entirely, so this check would never see
+                    // v2_type and the re-ADD would fail with "duplicate column
+                    // name" (found by the v9 rewind test).
+                    let cols: Vec<String> = conn
+                        .prepare("SELECT name FROM pragma_table_xinfo('msg')")?
+                        .query_map([], |r| r.get::<_, String>(0))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    if !cols.iter().any(|c| c == "v2_type") {
+                        conn.execute_batch(
+                            "ALTER TABLE msg ADD COLUMN v2_type TEXT
+                                GENERATED ALWAYS AS (
+                                    CASE
+                                        WHEN role = 'user' THEN
+                                            CASE WHEN json_extract(info, '$.synthetic') = 1 THEN 'synthetic' ELSE 'user' END
+                                        ELSE role
+                                    END
+                                ) VIRTUAL;",
+                        )?;
+                    }
+                    conn.execute_batch(
+                        "CREATE INDEX IF NOT EXISTS idx_msg_v2_type ON msg(session_id, v2_type, seq);",
+                    )?;
+                }
+                20 => {
+                    // v20->v21: the v2 session list declares `archived=` and the
+                    // handler ignored it, so archived sessions could not be
+                    // filtered out. Upstream stores a nullable `time_archived`
+                    // (NULL = live), which keeps "omit this filter" (include
+                    // both) distinguishable from `archived=false`.
+                    let cols: Vec<String> = conn
+                        .prepare("SELECT name FROM pragma_table_xinfo('session')")?
+                        .query_map([], |r| r.get::<_, String>(0))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    if !cols.iter().any(|c| c == "time_archived") {
+                        conn.execute_batch(
+                            "ALTER TABLE session ADD COLUMN time_archived INTEGER;",
+                        )?;
+                    }
                 }
                 other => {
                     bail!(

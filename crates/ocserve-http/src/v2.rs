@@ -991,7 +991,7 @@ fn plugin_info(id: Value, spec: &str, ok: bool, error: Option<&str>) -> Value {
 /// `/api/plugin` for `state.status == "active"`). Bounded by
 /// `discover_plugin_specs` (64) and idempotent: an attempted spec — loaded or
 /// failed — is never retried by the 50 ms poll.
-async fn load_discovered_plugins(st: &Arc<AppState>) {
+pub async fn load_discovered_plugins(st: &Arc<AppState>) {
     if let Some(config_dir) = ocserve_store::platform::opencode_config_dir() {
         load_discovered_from(st, &config_dir).await;
     }
@@ -1082,9 +1082,9 @@ pub async fn load_discovered_from(st: &Arc<AppState>, config_dir: &std::path::Pa
 /// `state.status`), not a private dialect: launchers read `state.status` to
 /// decide a plugin is active (`paseo` waits for exactly that before binding).
 pub async fn plugin_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    if st.plugin_discovery {
-        load_discovered_plugins(&st).await;
-    }
+    // Pure read: discovery happens on the config poller (watch_loop), never
+    // here. This route is polled every ~50 ms by a launcher, and it must not do
+    // filesystem work or spawn a sidecar on a GET.
     let mut data: Vec<Value> = Vec::new();
     if let Some(plug) = st.plugins.get() {
         // statuses needs the owner (it is a load-time map); the inventory RPC
@@ -1894,7 +1894,7 @@ pub async fn session_update_api(
     let obj = body.as_object().cloned().unwrap_or_default();
     if let Some(bad) = obj
         .keys()
-        .find(|k| !["title", "metadata", "permissions"].contains(&k.as_str()))
+        .find(|k| !["title", "metadata", "permissions", "archived"].contains(&k.as_str()))
     {
         return Err(bad_request(&format!("unknown key {bad}")));
     }
@@ -1915,6 +1915,19 @@ pub async fn session_update_api(
                 ocserve_store::update_session_title(&st.writer, &id, t).map_err(internal)?;
             }
             _ => return Err(bad_request("title must be a string or null")),
+        }
+    }
+    if let Some(archived) = obj.get("archived") {
+        match archived {
+            Value::Null => {}
+            Value::Bool(true) => {
+                ocserve_store::set_session_archived(&st.writer, &id, Some(crate::now_ms_local()))
+                    .map_err(internal)?;
+            }
+            Value::Bool(false) => {
+                ocserve_store::set_session_archived(&st.writer, &id, None).map_err(internal)?;
+            }
+            _ => return Err(bad_request("archived must be a boolean or null")),
         }
     }
     Ok(StatusCode::NO_CONTENT)
@@ -3207,28 +3220,55 @@ pub async fn list_sessions(
             (n as usize).clamp(1, 200)
         }
     };
-    if let Some(order) = q.get("order")
-        && order != "asc"
-        && order != "desc"
-    {
-        return Err(q_err(format!(
-            "Expected \"asc\" | \"desc\", got \"{order}\"\n  at [\"order\"]"
-        )));
-    }
-    if let Some(cur) = q.get("cursor")
-        && ocserve_store::decode_cursor(cur).is_err()
-    {
-        return Err(crate::HttpError::TaggedData {
-            status: StatusCode::BAD_REQUEST,
-            tag: "InvalidCursorError",
-            fields: json!({"message": "Invalid cursor"}),
-        });
-    }
+    let requested_order = match q.get("order").map(String::as_str) {
+        None => ocserve_store::MessageOrder::Desc,
+        Some(raw) => ocserve_store::MessageOrder::parse(raw).ok_or_else(|| {
+            q_err(format!(
+                "Expected \"asc\" | \"desc\", got \"{raw}\"\n  at [\"order\"]"
+            ))
+        })?,
+    };
+    // The session cursor is a DIFFERENT payload from the message cursor
+    // (`{anchor:{id,time,direction}}` vs `{id,order,direction}`); reusing the
+    // message codec meant every real client cursor was rejected.
+    let cursor = match q.get("cursor") {
+        None => None,
+        Some(c) => Some(ocserve_store::V2SessionCursor::decode(c).map_err(|_| {
+            crate::HttpError::TaggedData {
+                status: StatusCode::BAD_REQUEST,
+                tag: "InvalidCursorError",
+                fields: json!({"message": "Invalid cursor"}),
+            }
+        })?),
+    };
+    let order = match cursor.as_ref().map(|c| c.direction) {
+        Some(ocserve_store::CursorDirection::Previous) => match requested_order {
+            ocserve_store::MessageOrder::Asc => ocserve_store::MessageOrder::Desc,
+            ocserve_store::MessageOrder::Desc => ocserve_store::MessageOrder::Asc,
+        },
+        _ => requested_order,
+    };
+
     let roots = q.get("roots").map(|v| v == "true").unwrap_or(false);
     let search = q.get("search").cloned().unwrap_or_default().to_lowercase();
     let sid = q.get("sessionID").cloned();
     let parent = q.get("parentID").cloned();
     let directory = q.get("directory").cloned();
+    // The rest of the declared filter set. Every one of these was accepted and
+    // ignored before 0.7.2; a client that scopes by project silently received
+    // the whole database.
+    let project = q.get("project").cloned();
+    let subpath = q.get("subpath").cloned();
+    let archived: Option<bool> = match q.get("archived").map(String::as_str) {
+        None => None,
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(other) => {
+            return Err(q_err(format!(
+                "Expected \"true\" | \"false\", got \"{other}\"\n  at [\"archived\"]"
+            )));
+        }
+    };
     let db = st.db.clone();
     let mut sessions = run_blocking(&db, ocserve_store::load_sessions_wire)
         .await
@@ -3240,13 +3280,38 @@ pub async fn list_sessions(
     // with `session.list({parentID})` and would otherwise receive the parent
     // itself, bind it as its own child, and fail with "already bound".
     if let Some(parent) = parent {
-        sessions.retain(|s| s.get("parentID").and_then(|v| v.as_str()) == Some(parent.as_str()));
+        // Upstream's schema encodes "no parent" as the LITERAL STRING "null"
+        // (`Schema.encodeTo(Schema.Literal("null"), …)`), and the shipped v2 web
+        // UI and TUI send exactly `?parentID=null&archived=false` to list root
+        // sessions. Treating that as an id match returned ZERO sessions, so the
+        // v2 app showed an empty session list. `null` therefore means
+        // `parent_id IS NULL`, not `parent_id = 'null'`.
+        if parent == "null" {
+            sessions.retain(|s| s.get("parentID").map(|p| p.is_null()).unwrap_or(true));
+        } else {
+            sessions
+                .retain(|s| s.get("parentID").and_then(|v| v.as_str()) == Some(parent.as_str()));
+        }
     }
     if let Some(dir) = directory {
         sessions.retain(|s| s.get("directory").and_then(|v| v.as_str()) == Some(dir.as_str()));
     }
     if let Some(sid) = sid {
         sessions.retain(|s| s.get("id").and_then(|v| v.as_str()) == Some(sid.as_str()));
+    }
+    if let Some(proj) = project {
+        sessions.retain(|s| s.get("projectID").and_then(|v| v.as_str()) == Some(proj.as_str()));
+    }
+    if let Some(sub) = subpath {
+        // Upstream matches SessionTable.path exactly (it is the path RELATIVE
+        // to the project root), not a prefix.
+        sessions.retain(|s| s.get("path").and_then(|v| v.as_str()) == Some(sub.as_str()));
+    }
+    if let Some(want) = archived {
+        sessions.retain(|s| {
+            let is_archived = s.get("timeArchived").is_some_and(|v| !v.is_null());
+            is_archived == want
+        });
     }
     if !search.is_empty() {
         sessions.retain(|s| {
@@ -3256,19 +3321,69 @@ pub async fn list_sessions(
                 .unwrap_or(false)
         });
     }
-    let total = sessions.len();
-    let more = total > limit;
+    // Stable total order on (time_updated, id) — upstream orders on exactly
+    // those two columns, and the tiebreak is what makes paging deterministic.
+    let time_of = |s: &Value| {
+        s.pointer("/time/updated")
+            .and_then(|t| t.as_i64())
+            .unwrap_or(0)
+    };
+    sessions.sort_by(|a, b| {
+        let (ta, tb) = (time_of(a), time_of(b));
+        let ia = a.get("id").and_then(|i| i.as_str()).unwrap_or("");
+        let ib = b.get("id").and_then(|i| i.as_str()).unwrap_or("");
+        match order {
+            ocserve_store::MessageOrder::Asc => ta.cmp(&tb).then_with(|| ia.cmp(ib)),
+            ocserve_store::MessageOrder::Desc => tb.cmp(&ta).then_with(|| ib.cmp(ia)),
+        }
+    });
+    // Anchor window: strictly after (asc) / before (desc) the anchor tuple.
+    if let Some(c) = &cursor {
+        sessions.retain(|s| {
+            let t = time_of(s);
+            let id = s.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            match order {
+                ocserve_store::MessageOrder::Asc => {
+                    t > c.time || (t == c.time && id > c.id.as_str())
+                }
+                ocserve_store::MessageOrder::Desc => {
+                    t < c.time || (t == c.time && id < c.id.as_str())
+                }
+            }
+        });
+    }
+    let more = sessions.len() > limit;
     let window: Vec<Value> = sessions
         .into_iter()
         .take(limit)
         .map(|s| session_v2(&s))
         .collect();
-    // freeze always emits both cursor keys (opaque base64url cursors); ocserve
-    // does not paginate v2 session list, so both are null (shape-faithful).
+    // Cursors come from the page's own first/last rows (upstream `page()` in
+    // `handlers/message.ts` does the same for messages): a non-empty page always
+    // carries both, an empty one carries nulls. `more` is only used to decide
+    // whether a `next` is meaningful; upstream emits one regardless, so the
+    // client terminates on an empty page.
     let _ = more;
-    Ok(Json(
-        json!({"data": window, "cursor": {"previous": Value::Null, "next": Value::Null}}),
-    ))
+    let mut cursor_out = json!({"previous": Value::Null, "next": Value::Null});
+    if let (Some(first), Some(last)) = (window.first(), window.last()) {
+        let anchor = |s: &Value, dir| ocserve_store::V2SessionCursor {
+            id: s
+                .get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or("")
+                .to_string(),
+            time: s
+                .pointer("/time")
+                .and_then(|t| t.get("updated"))
+                .and_then(|t| t.as_i64())
+                .unwrap_or(0),
+            direction: dir,
+        };
+        cursor_out["previous"] =
+            json!(anchor(first, ocserve_store::CursorDirection::Previous).encode());
+        cursor_out["next"] = json!(anchor(last, ocserve_store::CursorDirection::Next).encode());
+    }
+    Ok(Json(json!({"data": window, "cursor": cursor_out})))
 }
 
 /// GET /api/session/active — `{data:{}}` (no per-request foreground drains
@@ -3301,36 +3416,125 @@ pub async fn get_session(
     }
 }
 
+/// The v2 message types the contract accepts for `?type=`. Order matters:
+/// it is the order upstream's Schema union prints in its validation error.
+const MESSAGE_TYPES: [&str; 11] = [
+    "agent-switched",
+    "model-switched",
+    "location-switched",
+    "user",
+    "synthetic",
+    "system",
+    "skill",
+    "shell",
+    "assistant",
+    "compaction",
+    "idle",
+];
+
 /// GET /api/session/{sessionID}/message — paginated projected messages.
 /// Real `content[]` via `store::project_page_v2` (V2-PLAN.md P4 — the
 /// skeletal `"content": []` is gone).
+///
+/// Four query parameters, all of them load-bearing (probed against the real
+/// 2.2.5 binary, not read off the spec):
+///
+/// * `limit` — 1..=200; absent = 50. Out of range or non-integer is a
+///   `InvalidRequestError{kind:"Query"}` with upstream's exact wording.
+/// * `order` — `asc` | `desc`, default `desc`. Travels inside the cursor so a
+///   client that pages without repeating it keeps its ordering.
+/// * `cursor` — opaque `{id,order,direction}`; combined with `order` it is a
+///   400 (`Cursor cannot be combined with order`), and an unknown anchor id
+///   yields an EMPTY page rather than an error.
+/// * `type` — one of the 11 contract types, filtered in SQL **before** the
+///   limit so a filtered page is still a full page.
+///
+/// Regression this closes: `?cursor=` used to be accepted and dropped, so
+/// every page returned the same first window and the same `cursor.next`.
+/// Paseo walked that chain until its JS heap died at ~3.4 GB.
 pub async fn list_messages(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, crate::HttpError> {
-    let limit: usize = q
-        .get("limit")
-        .and_then(|l| l.parse().ok())
-        .unwrap_or(50)
-        .clamp(1, 200);
-    // The cursor is load-bearing, not decorative. Paseo walks this list page by
-    // page; ignoring `?cursor=` returned the SAME first page forever, and the
-    // client kept appending it to its timeline until the JS heap died (the
-    // 2026-11-11 3.4 GB "Paseo leak"). Decode it and pass it to the page walk,
-    // exactly like the v1 `before` cursor.
-    let before: Option<(String, i64)> = match q.get("cursor") {
-        Some(c) => {
-            Some(
-                ocserve_store::decode_cursor(c).map_err(|_| crate::HttpError::TaggedData {
-                    status: StatusCode::BAD_REQUEST,
-                    tag: "InvalidCursorError",
-                    fields: json!({"message": "Invalid cursor"}),
-                })?,
-            )
-        }
-        None => None,
+    // Query decode precedes the handler (freeze): every shape error is the
+    // tagged v2 envelope, never a bare 400.
+    let q_err = |message: String| crate::HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidRequestError",
+        fields: json!({"message": message, "kind": "Query"}),
     };
+    let invalid_cursor = |message: &str| crate::HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidCursorError",
+        fields: json!({"message": message}),
+    };
+
+    let limit: usize = match q.get("limit") {
+        None => 50,
+        Some(raw) => {
+            let n: f64 = raw
+                .parse()
+                .map_err(|_| q_err("Expected an integer\n  at [\"limit\"]".into()))?;
+            if !n.is_finite() || n.fract() != 0.0 {
+                return Err(q_err("Expected an integer\n  at [\"limit\"]".into()));
+            }
+            if n < 1.0 {
+                return Err(q_err(
+                    "Expected a value greater than or equal to 1\n  at [\"limit\"]".into(),
+                ));
+            }
+            if n > 200.0 {
+                return Err(q_err(
+                    "Expected a value less than or equal to 200\n  at [\"limit\"]".into(),
+                ));
+            }
+            n as usize
+        }
+    };
+    let query_order = match q.get("order") {
+        None => None,
+        Some(raw) => Some(
+            ocserve_store::MessageOrder::parse(raw)
+                .ok_or_else(|| q_err("Expected \"asc\" | \"desc\"\n  at [\"order\"]".into()))?,
+        ),
+    };
+    let v2_type = match q.get("type") {
+        None => None,
+        Some(raw) => {
+            if !MESSAGE_TYPES.contains(&raw.as_str()) {
+                let list = MESSAGE_TYPES
+                    .iter()
+                    .map(|t| format!("\"{t}\""))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                return Err(q_err(format!("Expected {list}\n  at [\"type\"]")));
+            }
+            Some(raw.clone())
+        }
+    };
+    // Upstream: `if (cursor && order !== undefined) throw InvalidCursorError`.
+    // Explicitly checked BEFORE the cursor is decoded, so `?cursor=bogus&order=asc`
+    // reports the combination, not the garbage (probed).
+    let cursor = match q.get("cursor") {
+        None => None,
+        Some(_) if q.contains_key("order") => {
+            return Err(invalid_cursor("Cursor cannot be combined with order"));
+        }
+        Some(c) => Some(
+            ocserve_store::V2MessageCursor::decode(c)
+                .map_err(|_| invalid_cursor("Invalid cursor"))?,
+        ),
+    };
+    // Upstream: `order = decoded?.order ?? query.order ?? "desc"`. The cursor's
+    // order WINS — that is what lets a client page without repeating `order`,
+    // and it is why `cursor`+`order` is rejected rather than merged.
+    let order = cursor
+        .as_ref()
+        .map(|c| c.order)
+        .or(query_order)
+        .unwrap_or(ocserve_store::MessageOrder::Desc);
+
     let s = {
         let sid = id.clone();
         run_blocking(&st.db, move |db| ocserve_store::load_session_wire(db, &sid))
@@ -3340,26 +3544,56 @@ pub async fn list_messages(
     if s.is_none() {
         return Err(session_not_found(&id));
     }
+
     let sid = id.clone();
-    let (msgs, _more, next) = run_blocking(&st.db, move |db| {
-        ocserve_store::page_messages(
+    let type_filter = v2_type.clone();
+    let cursor_for_page = cursor.clone();
+    let page = run_blocking(&st.db, move |db| {
+        ocserve_store::page_messages_v2(
             db,
             &sid,
             limit as u64,
-            before.as_ref().map(|(b, t)| (b.as_str(), *t)),
+            order,
+            cursor_for_page.as_ref(),
+            type_filter.as_deref(),
         )
     })
     .await
     .map_err(|e| crate::HttpError::Api(internal(e)))?;
-    let data = run_blocking(&st.db, move |db| ocserve_store::project_page_v2(db, &msgs))
-        .await
-        .map_err(|e| crate::HttpError::Api(internal(e)))?;
-    // freeze always emits BOTH cursor keys (previous/next), null when absent.
-    let mut cursor = json!({"previous": Value::Null, "next": Value::Null});
-    if let Some(n) = next {
-        cursor["next"] = json!(n);
+
+    let msgs = page.rows;
+    let page_ids: Vec<String> = msgs.iter().map(|(m, _)| m.clone()).collect();
+    let projection_input = msgs;
+    let data = run_blocking(&st.db, move |db| {
+        ocserve_store::project_page_v2(db, &projection_input)
+    })
+    .await
+    .map_err(|e| crate::HttpError::Api(internal(e)))?;
+
+    // Cursors are built from the page's own first/last ids, exactly like
+    // upstream's `page()`: a NON-EMPTY page always carries both, and an empty
+    // page carries explicit nulls. There is deliberately no "is there another
+    // page" check: probed against 2.2.5, the FINAL non-empty page (one row of
+    // twelve) still returns a `next` cursor, and the client's following request
+    // gets an empty page with `next: null`. A client therefore terminates on an
+    // empty page, never on a null cursor, and a walk can never loop because the
+    // anchor always advances (or the page is empty).
+    let mut cursor_out = json!({"previous": Value::Null, "next": Value::Null});
+    if let (Some(first), Some(last)) = (page_ids.first(), page_ids.last()) {
+        let prev = ocserve_store::V2MessageCursor {
+            id: first.clone(),
+            order,
+            direction: ocserve_store::CursorDirection::Previous,
+        };
+        let next = ocserve_store::V2MessageCursor {
+            id: last.clone(),
+            order,
+            direction: ocserve_store::CursorDirection::Next,
+        };
+        cursor_out["previous"] = json!(prev.encode());
+        cursor_out["next"] = json!(next.encode());
     }
-    Ok(Json(json!({"data": data, "cursor": cursor})))
+    Ok(Json(json!({"data": data, "cursor": cursor_out})))
 }
 
 /// GET /api/session/{sessionID}/message/{messageID} — single message.
@@ -4185,8 +4419,21 @@ pub async fn vcs_diff(
     }
     let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
     let context: Option<u32> = q.get("context").and_then(|c| c.parse().ok());
+    // `base`: diff against a named ref instead of HEAD. The v2 TUI's diff
+    // viewer sends `base: <branch>` for every non-HEAD mode, so ignoring it
+    // showed the working-tree diff no matter which base the user picked.
+    let base = q.get("base").cloned();
+    // `untracked`: whether to include untracked files. Default matches the v1
+    // behaviour (included).
+    let untracked = q.get("untracked").map(|v| v != "false").unwrap_or(true);
     let diff = run_blocking(&st.db, move |_db| {
-        Ok::<_, anyhow::Error>(crate::vcs::diff(&dir, &mode, context))
+        Ok::<_, anyhow::Error>(crate::vcs::diff_with(
+            &dir,
+            &mode,
+            context,
+            base.as_deref(),
+            untracked,
+        ))
     })
     .await
     .unwrap_or_else(|_| Value::Array(vec![]));
@@ -4206,13 +4453,35 @@ pub async fn vcs_base(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 /// GET /api/vcs/branch — `{location, data: string[]}` local branches.
-pub async fn vcs_branch(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+///
+/// `search` and `limit` are load-bearing: the v2 TUI's branch picker calls
+/// `vcs.branch.list({location, search, limit: 100})` on every keystroke
+/// (debounced 150 ms), so an ignored `search` means the picker can never
+/// narrow and an ignored `limit` sends the whole list each time.
+pub async fn vcs_branch(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
     let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
-    let branches = run_blocking(&st.db, move |_db| {
+    let mut branches = run_blocking(&st.db, move |_db| {
         Ok::<_, anyhow::Error>(crate::vcs::branches(&dir))
     })
     .await
     .unwrap_or_else(|_| Value::Array(vec![]));
+    if let Some(needle) = q.get("search").filter(|s| !s.is_empty()) {
+        let needle = needle.to_lowercase();
+        if let Some(arr) = branches.as_array_mut() {
+            arr.retain(|b| {
+                b.as_str()
+                    .is_some_and(|s| s.to_lowercase().contains(&needle))
+            });
+        }
+    }
+    if let Some(limit) = q.get("limit").and_then(|l| l.parse::<usize>().ok())
+        && let Some(arr) = branches.as_array_mut()
+    {
+        arr.truncate(limit);
+    }
     Json(json!({"location": api_location_ref(&st), "data": branches}))
 }
 

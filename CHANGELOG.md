@@ -114,6 +114,34 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 
 ## Unreleased
 
+### Fixed
+- **Every declared query parameter on the message and session lists is read.**
+  The v2 message list accepted `?cursor=` and passed `None` down, so each page
+  returned the same first window with the same `next` cursor; a client walking
+  that chain grew to a 3.4 GB heap. Paging now advances, and the same route's
+  other three parameters work too: `order` (asc/desc, carried inside the
+  cursor), `type` (filtered in SQL before the limit, so a filtered page is
+  still full), and `previous` (emitted alongside `next`, as the reference
+  does). `cursor` with `order` is a 400 `InvalidCursorError`, an unknown
+  anchor id is an empty page, and an invalid `limit`/`order`/`type` is the
+  reference's own `InvalidRequestError` wording.
+- **The v2 session list honours its filters.** `?parentID=null` — the exact
+  call the shipped v2 web UI and TUI make to list root sessions — was treated
+  as the literal string `"null"` and returned ZERO sessions. It now means root
+  sessions. `archived`, `project`, `subpath`, `id` and a real cursor also
+  work; `PATCH /api/session {archived}` sets and clears the archive state.
+- **The v1 `/experimental/session` list pages.** `cursor`, `start`, `roots`
+  and `archived` were accepted and ignored, so older history was unreachable
+  through the offset-style cursor the endpoint advertises. It now applies the
+  reference's `time_updated` window and emits `x-next-cursor`.
+- **Plugin discovery happens off the request path.** `GET /api/plugin` did
+  synchronous directory scans and could spawn the plugin sidecar while a
+  launcher polled it every ~50 ms; discovery now runs on the config poller and
+  the route is a pure read.
+- **Two loader tests were reading the developer's real config.** With the
+  config directory as an env input, they asserted an exact plugin list against
+  whatever happened to be installed on the machine.
+
 ### Added
 - **opencode v2 launcher compatibility (Paseo).** The config directory now
   follows upstream (`OPENCODE_CONFIG_DIR` → `XDG_CONFIG_HOME/opencode` →

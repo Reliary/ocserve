@@ -882,21 +882,34 @@ impl Runtime {
             }
             Err(std::env::VarError::NotPresent) => None,
         };
-        Self::load_for_with(data_dir, env_config_path, env_content)
+        Self::load_for_with(
+            data_dir,
+            env_config_path,
+            env_content,
+            ocserve_store::platform::opencode_config_dir(),
+        )
     }
 
     /// The env inputs are explicit here so a test can prove the WIRING (env →
     /// merged config → plugin list) without racing process-wide `set_var`.
+    ///
+    /// `config_dir` is explicit for the same reason, and it is load-bearing for
+    /// test hygiene: the config directory is now a real env input
+    /// (`OPENCODE_CONFIG_DIR` / `XDG_CONFIG_HOME`), so a test that let it
+    /// default read the DEVELOPER's `~/.config/opencode` — asserting an exact
+    /// plugin list against whatever plugins happen to be installed there
+    /// (caught 2026-11-12: two tests failed only on a machine with plugins).
     fn load_for_with(
         data_dir: &std::path::Path,
         env_config_path: Option<std::path::PathBuf>,
         env_content: Option<String>,
+        config_dir: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         let home = std::env::var("HOME").unwrap_or_default();
         // Upstream precedence: OPENCODE_CONFIG_DIR > XDG_CONFIG_HOME/opencode
         // > ~/.config/opencode. A launcher provisioning a dedicated config dir
         // must find its opencode.json/plugins read from the same place.
-        let config_path = ocserve_store::platform::opencode_config_dir()
+        let config_path = config_dir
             .map(|d| d.join("opencode.json"))
             .unwrap_or_else(|| Path::new(&home).join(".config/opencode/opencode.json"));
         // K-MODELS: OPENCODE_MODELS_URL/_PATH aware (upstream read precedence)
@@ -2120,7 +2133,8 @@ mod tests {
     #[test]
     fn watch_paths_cover_every_runtime_read() {
         let dp = std::path::Path::new("/tmp/ocserve-data");
-        let cfg = std::path::PathBuf::from("/home/u/.config/opencode/opencode.json");
+        // A neutral root, not a literal home path (the repo gate rejects those).
+        let cfg = std::path::PathBuf::from("/srv/root/.config/opencode/opencode.json");
         let paths = watch_paths_with(dp, None, cfg.clone());
         assert_eq!(
             paths.len(),
@@ -2730,6 +2744,8 @@ mod env_config_tests {
     #[test]
     fn load_for_with_env_reaches_the_plugin_list() {
         let dir = tempfile::tempdir().unwrap();
+        let empty_cfg = dir.path().join("cfgdir");
+        std::fs::create_dir_all(&empty_cfg).unwrap();
         let rt = Runtime::load_for_with(
             dir.path(),
             None,
@@ -2737,6 +2753,7 @@ mod env_config_tests {
                 r#"{"plugin":[["file:///tmp/paseo-bridge.mjs",{"baseUrl":"http://127.0.0.1:6767","token":"t"}]]}"#
                     .into(),
             ),
+            Some(empty_cfg),
         )
         .unwrap();
         let specs = crate::plugin_specs(&rt.config);
@@ -2752,10 +2769,13 @@ mod env_config_tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("explicit.json");
         std::fs::write(&file, r#"{"model":"from/file","plugin":["file-plugin"]}"#).unwrap();
+        let empty_cfg = dir.path().join("cfgdir");
+        std::fs::create_dir_all(&empty_cfg).unwrap();
         let rt = Runtime::load_for_with(
             dir.path(),
             Some(file),
             Some(r#"{"model":"from/content","plugin":["content-plugin"]}"#.into()),
+            Some(empty_cfg),
         )
         .unwrap();
         assert_eq!(rt.config["model"], "from/content");

@@ -60,10 +60,10 @@ for h in "$HF" "$HR"; do
   cp "$PERM_CFG" "$h/.config/opencode/opencode.json"
 done
 
-setsid env HOME="$HF" OPENCODE_DISABLE_MODELS_FETCH=1 \
+setsid env OPENCODE_CONFIG_DIR= XDG_CONFIG_HOME= HOME="$HF" OPENCODE_DISABLE_MODELS_FETCH=1 \
   "$VENDOR" serve --port "$PORT_F" --hostname 127.0.0.1 >"$HF/freeze.log" 2>&1 &
 PID_F=$!
-setsid env HOME="$HR" OPENCODE_DISABLE_MODELS_FETCH=1 OCSERVE_DATA_DIR="$HR/.local/share/ocserve" \
+setsid env OPENCODE_CONFIG_DIR= XDG_CONFIG_HOME= HOME="$HR" OPENCODE_DISABLE_MODELS_FETCH=1 OCSERVE_DATA_DIR="$HR/.local/share/ocserve" \
   OCSERVE_LEGACY_SYNC=0 "$OCSERVE_BIN" serve --port "$PORT_R" >"$HR/ocserve.log" 2>&1 &
 PID_R=$!
 cleanup() {

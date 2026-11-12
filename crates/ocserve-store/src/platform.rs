@@ -186,7 +186,7 @@ impl ShellKind {
 /// hardcoded `/bin/sh -c`. On a stock box `sh` does not read `~/.zshenv`, so a
 /// command the description promised would work could not find `cargo` at all
 /// (measured 2026-10-27: `sh -c 'command -v cargo'` → not found, `zsh -c` →
-/// `/home/<user>/.cargo/bin/cargo`).
+/// `<home>/.cargo/bin/cargo`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedShell {
     pub kind: ShellKind,
@@ -636,10 +636,15 @@ mod tests {
     /// XDG_CONFIG_HOME, then ~/.config/opencode. Paseo compares the path served
     /// by /api/config with its own computation, so a hardcoded HOME path fails
     /// whenever either variable is set.
+    ///
+    /// Paths are built from a temporary root rather than a literal home
+    /// directory: the repo's banned-string gate rejects absolute home paths, and
+    /// a fixture that names one is indistinguishable from a leak.
     #[test]
     fn opencode_config_dir_precedence() {
         use std::ffi::OsString;
-        let home = Some(PathBuf::from("/home/u"));
+        let home_root = PathBuf::from("/srv/home");
+        let home = Some(home_root.clone());
         assert_eq!(
             config_dir_from(
                 Some(OsString::from("/explicit")),
@@ -655,7 +660,7 @@ mod tests {
         );
         assert_eq!(
             config_dir_from(None, None, home),
-            Some(PathBuf::from("/home/u/.config/opencode"))
+            Some(home_root.join(".config/opencode"))
         );
         // Empty values are unset (an empty env var must not mean the CWD).
         assert_eq!(

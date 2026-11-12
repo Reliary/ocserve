@@ -90,7 +90,7 @@ cp "$HOME/.cache/opencode/models.json" "$TMP/home/.cache/opencode/models.json" 2
 
 # ---- boot ------------------------------------------------------------------
 echo "capture-hooks: $TAG from $BIN (port $PORT, stub $STUB_PORT)"
-setsid env HOME="$TMP/home" OPENCODE_DISABLE_MODELS_FETCH=1 \
+setsid env OPENCODE_CONFIG_DIR= XDG_CONFIG_HOME= HOME="$TMP/home" OPENCODE_DISABLE_MODELS_FETCH=1 \
   OCSERVE_DATA_DIR="$TMP/home/.local/share/opencode" \
   OCSERVE_LEGACY_SYNC=0 OCSERVE_CONFIG_WATCH=0 \
   "$BIN" serve --port "$PORT" --hostname 127.0.0.1 >"$TMP/server.log" 2>&1 &

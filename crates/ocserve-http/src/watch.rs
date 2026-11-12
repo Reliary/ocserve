@@ -478,5 +478,15 @@ pub async fn watch_loop(st: Arc<AppState>, opts: WatchOpts) {
         {
             tracing::warn!("config hot-reload failed (will retry next tick): {e:#}");
         }
+        // Hot plugin pickup runs HERE, not on the request path: a launcher
+        // (Paseo) provisions `<config_dir>/plugins/<name>/` after boot and then
+        // polls `GET /api/plugin`. Scanning the directory inside that GET did
+        // synchronous `read_dir` work on a tokio worker and could spawn the
+        // sidecar — a state-mutating, potentially slow GET that a 50 ms poll
+        // would hammer. The poller already exists, already runs off the request
+        // path, and is bounded by the same discovery cap.
+        if st.plugin_discovery {
+            crate::v2::load_discovered_plugins(&st).await;
+        }
     }
 }

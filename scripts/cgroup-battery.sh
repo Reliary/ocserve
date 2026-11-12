@@ -88,6 +88,7 @@ systemd-run --user --unit="$UNIT" --collect \
   -p MemoryAccounting=yes -p OOMScoreAdjust=200 \
   -p StandardOutput=file:"$TMP/server.log" \
   -p StandardError=append:"$TMP/server.log" \
+  -E OPENCODE_CONFIG_DIR= -E XDG_CONFIG_HOME= \
   -E HOME="$TMP/home" -E OCSERVE_DATA_DIR="$TMP/data" \
   -E OCSERVE_LEGACY_SYNC=0 -E OCSERVE_CONFIG_WATCH=0 \
   "$BIN" serve --port "$PORT" --hostname 127.0.0.1 >/dev/null 2>&1 \

@@ -326,9 +326,12 @@ pub struct AppState {
     /// The URL this server is reachable at; set by `serve` before the router
     /// runs. A lazily spawned sidecar needs it for `ctx.client`/`serverUrl`.
     pub server_url: std::sync::OnceLock<String>,
-    /// Scan `<config_dir>/{plugin,plugins}` on `/api/plugin` (production). The
-    /// hermetic test constructor disables it so a dev's real plugins never leak
-    /// into a test run; tests drive `v2::load_discovered_from` explicitly.
+    /// Scan `<config_dir>/{plugin,plugins}` from the config poller
+    /// (production). The hermetic test constructor disables it so a dev's real
+    /// plugins never leak into a test run; tests drive
+    /// `v2::load_discovered_from` explicitly. `/api/plugin` does NOT consult
+    /// this: it stays a pure read, because a launcher polls it every ~50 ms and
+    /// discovery does filesystem work and may spawn a sidecar.
     pub plugin_discovery: bool,
     /// Per-session prompt serialization (queue semantics). Bounded: entries
     /// exist only for in-flight prompts + transient races, removed post-run
@@ -1255,7 +1258,7 @@ pub(crate) fn decode_v2<T>(r: Result<T, ocserve_core::wire::WireError>) -> Resul
 async fn get_experimental_sessions(
     State(st): State<Arc<AppState>>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Json<Value> {
+) -> axum::response::Response {
     let mut v = run_blocking(&st.db, ocserve_store::load_sessions_wire)
         .await
         .unwrap_or_else(|e| {
@@ -1272,14 +1275,93 @@ async fn get_experimental_sessions(
                 .contains(&needle)
         });
     }
-    if let Some(limit) = q.get("limit").and_then(|l| l.parse::<usize>().ok()) {
-        v.truncate(limit);
+    // Upstream listGlobal (session.ts:555-583) applies, in this order:
+    //   start   -> time_updated >= start
+    //   cursor  -> time_updated <  cursor      (a NUMBER here, not a token)
+    //   search  -> title LIKE %..%
+    //   archived-> omitted => only LIVE sessions (isNull time_archived)
+    //   roots   -> parent_id IS NULL
+    //   order   -> time_updated DESC, id DESC
+    //   limit   -> default 100, and `x-next-cursor: <last row's time_updated>`
+    //              is set only when a further row exists.
+    //
+    // The old handler read `search` and `limit` and dropped the other five, so
+    // `?cursor=` replayed the first page forever (same class as the v2 message
+    // list, found on a v1 route this time).
+    let roots = q.get("roots").map(|v| v == "true").unwrap_or(false);
+    if roots {
+        v.retain(|s| s.get("parentID").map(|p| p.is_null()).unwrap_or(true));
     }
+    if let Some(start) = q.get("start").and_then(|s| s.parse::<i64>().ok()) {
+        v.retain(|s| {
+            s.pointer("/time/updated")
+                .and_then(|t| t.as_i64())
+                .is_some_and(|t| t >= start)
+        });
+    }
+    if let Some(cursor) = q.get("cursor").and_then(|c| c.parse::<i64>().ok()) {
+        v.retain(|s| {
+            s.pointer("/time/updated")
+                .and_then(|t| t.as_i64())
+                .is_some_and(|t| t < cursor)
+        });
+    }
+    // Archived is EXCLUDED unless the caller asks for it (upstream defaults to
+    // live sessions; `archived=true` includes archived ones).
+    let include_archived = q.get("archived").map(|v| v == "true").unwrap_or(false);
+    if !include_archived {
+        v.retain(|s| s.get("timeArchived").is_none_or(|t| t.is_null()));
+    }
+    // Stable total order: time_updated DESC, id DESC.
+    v.sort_by(|a, b| {
+        let ta = a
+            .pointer("/time/updated")
+            .and_then(|t| t.as_i64())
+            .unwrap_or(0);
+        let tb = b
+            .pointer("/time/updated")
+            .and_then(|t| t.as_i64())
+            .unwrap_or(0);
+        tb.cmp(&ta).then_with(|| {
+            let ia = a.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            let ib = b.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            ib.cmp(ia)
+        })
+    });
+    let limit = q
+        .get("limit")
+        .and_then(|l| l.parse::<usize>().ok())
+        .unwrap_or(100);
+    let has_more = v.len() > limit;
+    v.truncate(limit);
+    let next_cursor: Option<String> = if has_more {
+        v.last()
+            .and_then(|s| s.pointer("/time/updated"))
+            .and_then(|t| t.as_i64())
+            .map(|t| t.to_string())
+    } else {
+        None
+    };
     // roots=true is implicit: our store holds root sessions only (M3 scope).
     for row in &mut v {
         row["project"] = json!({"id": "global", "worktree": "/"});
+        // `timeArchived` is an internal filter input, not part of the served
+        // GlobalInfo shape.
+        if let Some(o) = row.as_object_mut() {
+            o.remove("timeArchived");
+        }
     }
-    Json(Value::Array(v))
+    match next_cursor {
+        Some(cur) => (
+            [(
+                axum::http::header::HeaderName::from_static("x-next-cursor"),
+                cur,
+            )],
+            Json(Value::Array(v)),
+        )
+            .into_response(),
+        None => Json(Value::Array(v)).into_response(),
+    }
 }
 
 /// POST /permission/{id}/reply — {reply: once|always|reject} (oc-remote contract).

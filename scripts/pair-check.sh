@@ -25,6 +25,12 @@
 # Allowlist (only with a named divergence row): OCSERVE_PAIR_ALLOW=file of
 # `name # D-ROW reason` lines — read by the replay engine, never silently.
 set -euo pipefail
+# The config dir now follows upstream precedence (OPENCODE_CONFIG_DIR >
+# XDG_CONFIG_HOME/opencode > ~/.config/opencode), so an ambient value would
+# bypass the fixture config this harness depends on and make the gate
+# machine-dependent (caught on CI 2026-11-11: the runner exports
+# XDG_CONFIG_HOME). Pin both to their fixture roots for every child.
+export OPENCODE_CONFIG_DIR="" XDG_CONFIG_HOME=""
 cd "$(dirname "$0")/.."
 
 # Position-independent corpus (same reason as replay-check.sh): the binary's

@@ -30,6 +30,12 @@
 #
 # Exit: 0 green/baseline | 1 gated-threshold breach | 2 infra | 3 selftest
 set -euo pipefail
+# The config dir now follows upstream precedence (OPENCODE_CONFIG_DIR >
+# XDG_CONFIG_HOME/opencode > ~/.config/opencode), so an ambient value would
+# bypass the fixture config this harness depends on and make the gate
+# machine-dependent (caught on CI 2026-11-11: the runner exports
+# XDG_CONFIG_HOME). Pin both to their fixture roots for every child.
+export OPENCODE_CONFIG_DIR="" XDG_CONFIG_HOME=""
 cd "$(dirname "$0")/.."
 
 PORT_R=4930 # ocserve arm
