@@ -1,0 +1,64 @@
+name: Bug report
+description: Something behaves differently from the opencode server it replaces, or crashes/lies
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two things make a report actionable here: the version, and whether the
+        same request behaves differently against upstream.
+
+  - type: input
+    id: version
+    attributes:
+      label: ocserve version
+      description: Output of `ocserve --version`
+      placeholder: ocserve 0.7.2 (abc1234)
+    validations:
+      required: true
+
+  - type: input
+    id: surface
+    attributes:
+      label: Upstream version you are comparing against
+      description: The v1 freeze or v2 tag, e.g. 1.19.5 or 2.2.5. Write "none" if you are not comparing.
+      placeholder: "2.2.5"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: client
+    attributes:
+      label: Which client
+      options:
+        - opencode TUI
+        - web UI
+        - a mobile client
+        - a plugin or MCP server
+        - raw HTTP
+        - other
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got. Paste the request and response if you have them.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        `journalctl --user -u ocserve -n 100` if you are running the service,
+        or the terminal output otherwise. Remove anything sensitive.
+
+  - type: textarea
+    id: database
+    attributes:
+      label: Storage (only if relevant)
+      description: |
+        `ocserve doctor` output. Do not attach the database itself.

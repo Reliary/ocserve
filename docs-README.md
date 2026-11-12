@@ -14,6 +14,7 @@ stale divergences on every commit.
 | `SECURITY.md` | you are exposing the server beyond loopback, or reporting a vulnerability |
 | `CONTRIBUTING.md` | you are sending a change |
 | `THIRD-PARTY.md` | you need the upstream attribution and compatibility framing |
+| `CONTRIBUTORS.md` | you want to know who has contributed, or to add yourself |
 
 ## Specification
 

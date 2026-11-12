@@ -82,6 +82,31 @@ commits (precedence: `TESTING.md` → `PLAN.md` → domain spec):
 - No personal names or absolute home paths anywhere (use `~`/`$HOME`); the
   pre-commit hook enforces this.
 
+## Recognition
+
+Contributions are credited in four places, all of them permanent:
+
+- **The commit.** A change sent as a patch or a PR keeps its author, and joint
+  work carries a `Co-authored-by:` trailer. Do not rename someone else's
+  commits when rebasing or squashing.
+- **`CONTRIBUTORS.md`.** One row per person, with the specific thing they did.
+  Add yourself in the same PR that earns the row; a maintainer will add it for
+  you if you would rather not.
+- **The changelog.** A user-visible fix or feature credits the reporter or
+  author by handle in `CHANGELOG.md`, so the release notes carry it too.
+- **The release notes.** A release whose content includes outside work names
+  the handles in the release body.
+
+What earns a row: a merged change, a report that led to a fix, a reproduction
+that made a bug actionable, or a harness that catches a class of bug. A report
+that is closed as already-fixed still earns the row when the diagnosis was
+real.
+
+Handles only, never an email address or a legal name. This repository's
+pre-commit hook rejects absolute home paths and personal names for the same
+reason: documents are published, and the people in them did not ask to be
+enumerated.
+
 ## Anti-theater
 
 A bug fix lands with a test that fails without the fix (a negative control),
