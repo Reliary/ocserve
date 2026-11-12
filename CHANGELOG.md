@@ -112,7 +112,20 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   removing the two unused declarations let rusqlite 0.41 resolve
   libsqlite3-sys 0.39.1 (SQLite 3.54.1).
 
-## Unreleased
+## 0.7.2 (2026-11-12)
+
+Paseo v2 launcher compatibility, and the query-parameter class that surfaced
+while verifying it: on four endpoints a client could send a documented
+parameter and silently get unfiltered or unpaginated data. Two of those were
+live in the shipped clients.
+
+### Added
+- `CONTRIBUTORS.md` and a documented credit policy in `CONTRIBUTING.md`:
+  commits keep their author, joint work carries `Co-authored-by`, and the
+  changelog and release notes name the reporter or author by GitHub handle.
+- Issue and pull-request templates that ask for the two things that make a
+  report actionable here: the version, and whether upstream behaves
+  differently.
 
 ### Security
 - **`?base=` can no longer reach `git diff` as an option.** The v2 diff route
@@ -122,6 +135,13 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   execution where one is configured). The value must now look like a ref and is
   resolved with `git rev-parse --verify --end-of-options`; both `git diff`
   calls also pass `--end-of-options`.
+
+### Credits
+- Paseo integration gaps reported by [@glanzel](https://github.com/glanzel)
+  (issue #33) with the fix branch in #34. The message-list cursor commit
+  includes the heap diagnosis that made the bug findable.
+- `options.apiKey` being ignored was reported by
+  [@tungmv](https://github.com/tungmv) (issue #28).
 
 ### Fixed
 - **A malformed stored message could brick boot.** The v20 `msg.v2_type`

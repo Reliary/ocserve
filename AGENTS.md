@@ -27,7 +27,8 @@ tests pass.
 | `bench/BUMP-MACHINERY-TEST.md` | upgrade-machinery shakedown vs 2.0.32/1.19.3 (report-only; pins stay frozen) |
 | `TRACEABILITY.md` | requirement ↔ test ↔ evidence matrix (every F/N/K row) |
 | `THIRD-PARTY.md` | upstream MIT attribution and the compatibility framing |
-| `SECURITY.md` / `CONTRIBUTING.md` | vulnerability reporting + threat posture; contributor workflow |
+| `SECURITY.md` / `CONTRIBUTING.md` | vulnerability reporting + threat posture; contributor workflow and credit policy |
+| `CONTRIBUTORS.md` | who contributed what, GitHub handles only (never names or emails) |
 
 Precedence when documents disagree: `TESTING.md` gates always win (nothing ships untested);
 then `PLAN.md`; then the companion spec for that domain (`STORAGE`/`MEMORY`/`SRE`). Any

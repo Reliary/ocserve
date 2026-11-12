@@ -1,0 +1,39 @@
+name: Feature or compatibility gap
+description: An endpoint, parameter, hook or behaviour that upstream has and ocserve does not
+labels: [enhancement]
+body:
+  - type: input
+    id: surface
+    attributes:
+      label: Which upstream
+      description: v1 (frozen at a tag) or v2 (`/api/*`). Include the tag.
+      placeholder: "v2 2.2.5"
+    validations:
+      required: true
+
+  - type: input
+    id: route
+    attributes:
+      label: Route, parameter or hook
+      placeholder: GET /api/session/{id}/message?type=
+
+  - type: textarea
+    id: behaviour
+    attributes:
+      label: What upstream does
+      description: A capture from the real binary is ideal. Say how you observed it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Who hits this
+      description: A client that fails, a workflow that cannot work, or "nobody yet, reported for completeness".
+
+  - type: checkboxes
+    id: kind
+    attributes:
+      label: Is this already known?
+      options:
+        - label: I checked PLAN.md section 18 (the divergence ledger) and it is not there
