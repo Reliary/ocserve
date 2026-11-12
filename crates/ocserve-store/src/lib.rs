@@ -4756,6 +4756,14 @@ pub struct SearchHit {
 // cache-on and cache-off variants (PERF-10X ethics): k6 repeats one query,
 // which overstates the hit rate vs real traffic.
 static WRITE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LOCAL_WRITE_EPOCHS: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<std::path::PathBuf, u64>>,
+> = std::sync::OnceLock::new();
+static LOCAL_WRITE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Serializes a local Writer's COMMIT+epoch publication with the sampler's
+// data_version+epoch observation. Other SQLite connections do not participate.
+static LOCAL_COMMIT_BARRIER: std::sync::OnceLock<parking_lot::RwLock<()>> =
+    std::sync::OnceLock::new();
 static SEARCH_MEMO_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SEARCH_MEMO_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LIST_MEMO_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -4764,10 +4772,6 @@ static LIST_MEMO_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 pub const SEARCH_MEMO_CAP: usize = 64;
 
 /// Live write epoch (Acquire).
-///
-/// This only moves when THIS process's writer commits. A commit by another
-/// process (the importer) is picked up by [`import_stamp`], which the serve
-/// sampler polls and turns into a `bump_write_epoch()` — see `StampWatcher`.
 pub fn write_epoch() -> u64 {
     WRITE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -4785,22 +4789,72 @@ pub fn bump_write_epoch() {
     l.db = None;
 }
 
-/// Watches for commits made by ANOTHER process into this database.
+/// Mark a commit made by this process's Writer and invalidate local memos.
+/// The per-database attribution table is capped at 64 paths; if it fills,
+/// it is cleared and subsequent observations conservatively classify an
+/// unknown writer as local/mixed instead of claiming an external source.
+pub(crate) fn bump_local_write_epoch(db: &std::path::Path) {
+    const MAX_TRACKED_LOCAL_DBS: usize = 64;
+    let epochs = LOCAL_WRITE_EPOCHS
+        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let mut epochs = epochs.lock();
+    if !epochs.contains_key(db) && epochs.len() >= MAX_TRACKED_LOCAL_DBS {
+        epochs.clear();
+        LOCAL_WRITE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+    let epoch = epochs.entry(db.to_path_buf()).or_insert(0);
+    *epoch = epoch.saturating_add(1);
+    drop(epochs);
+    bump_write_epoch();
+}
+
+pub(crate) fn local_commit_barrier() -> &'static parking_lot::RwLock<()> {
+    LOCAL_COMMIT_BARRIER.get_or_init(|| parking_lot::RwLock::new(()))
+}
+
+fn local_write_epoch(db: &std::path::Path) -> (u64, Option<u64>) {
+    let Some(epochs) = LOCAL_WRITE_EPOCHS.get() else {
+        return (
+            LOCAL_WRITE_GENERATION.load(std::sync::atomic::Ordering::Acquire),
+            None,
+        );
+    };
+    let epochs = epochs.lock();
+    let generation = LOCAL_WRITE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+    (generation, epochs.get(db).copied())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbCommitObservation {
+    /// No change since the previous poll.
+    Unchanged,
+    /// A change coincided with a local writer commit, or attribution was
+    /// ambiguous. Cache invalidation is still required, but do not label it
+    /// as an external commit.
+    LocalOrMixed,
+    /// SQLite changed without a local Writer commit in the observed interval.
+    /// This identifies another connection, not necessarily another process.
+    OtherConnectionOnly,
+}
+
+/// Watches for database commits visible from another SQLite connection.
 ///
-/// `PRAGMA data_version` is per-connection and increments when a different
-/// connection commits. A long-lived read-only connection therefore sees the
-/// importer's commits even though our writer never ran. Re-opening a
-/// connection per poll would reset the counter to its baseline and see
-/// nothing, so the connection is kept for the process lifetime.
+/// `PRAGMA data_version` changes when any other connection commits, including
+/// this process's own Writer. The local writer epoch lets the sampler avoid
+/// attributing ordinary server traffic to an external process. SQLite cannot
+/// distinguish another process from an otherwise-untracked connection, so
+/// the strongest truthful attribution is `OtherConnectionOnly`.
 ///
-/// Returns `true` when external commits were observed since the previous
-/// poll. The first poll only establishes the baseline (returns `false`).
-pub fn poll_external_commits(db: &std::path::Path) -> anyhow::Result<bool> {
+/// The first poll only establishes a baseline (`Unchanged`).
+pub fn poll_db_commits(db: &std::path::Path) -> anyhow::Result<DbCommitObservation> {
+    let _commit_barrier = local_commit_barrier().read();
+
     struct Watcher {
         /// (device, inode) of the file this connection reads.
         ident: Option<(u64, u64)>,
         conn: pragma::Reader,
         version: i64,
+        local_epoch: (u64, Option<u64>),
     }
 
     #[cfg(unix)]
@@ -4838,22 +4892,36 @@ pub fn poll_external_commits(db: &std::path::Path) -> anyhow::Result<bool> {
         Some(w) if w.ident == ident => {
             let version: i64 = w.conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
             if version == w.version {
-                return Ok(false);
+                return Ok(DbCommitObservation::Unchanged);
             }
+            let local_epoch = local_write_epoch(db);
+            let source = if local_epoch == w.local_epoch {
+                DbCommitObservation::OtherConnectionOnly
+            } else {
+                DbCommitObservation::LocalOrMixed
+            };
             w.version = version;
-            Ok(true)
+            w.local_epoch = local_epoch;
+            Ok(source)
         }
         Some(w) => {
             // Same path, different file: every cached value came from the old
             // inode, so this is a real change.
             let conn = pragma::open_reader(db)?;
             let version: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+            let local_epoch = local_write_epoch(db);
+            let source = if local_epoch == w.local_epoch {
+                DbCommitObservation::OtherConnectionOnly
+            } else {
+                DbCommitObservation::LocalOrMixed
+            };
             *w = Watcher {
                 ident,
                 conn,
                 version,
+                local_epoch,
             };
-            Ok(true)
+            Ok(source)
         }
         None => {
             if map.len() >= MAX_WATCHED {
@@ -4861,15 +4929,17 @@ pub fn poll_external_commits(db: &std::path::Path) -> anyhow::Result<bool> {
             }
             let conn = pragma::open_reader(db)?;
             let version: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+            let local_epoch = local_write_epoch(db);
             map.insert(
                 db.to_path_buf(),
                 Watcher {
                     ident,
                     conn,
                     version,
+                    local_epoch,
                 },
             );
-            Ok(false) // baseline
+            Ok(DbCommitObservation::Unchanged) // baseline
         }
     }
 }
@@ -6085,4 +6155,114 @@ pub fn active_goals(db: &Path) -> anyhow::Result<Vec<(String, GoalRow)>> {
         .filter_map(|r| r.ok())
         .collect();
     Ok(rows)
+}
+
+#[cfg(test)]
+mod commit_attribution_tests {
+    use super::*;
+
+    #[test]
+    fn local_commit_attribution_is_atomic_with_data_version_sampling() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = writer::db_path(dir.path());
+        {
+            let conn = pragma::create_new(&db).unwrap();
+            conn.execute_batch("CREATE TABLE sample (value INTEGER NOT NULL);")
+                .unwrap();
+        }
+        assert_eq!(
+            poll_db_commits(&db).unwrap(),
+            DbCommitObservation::Unchanged,
+            "the initial read establishes the sampler baseline"
+        );
+
+        let commit_guard = local_commit_barrier().write();
+        {
+            let conn = pragma::open_writer(&db).unwrap();
+            conn.execute("INSERT INTO sample (value) VALUES (1)", [])
+                .unwrap();
+        }
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let poll_db = db.clone();
+        std::thread::spawn(move || {
+            let _ = started_tx.send(());
+            let _ = tx.send(poll_db_commits(&poll_db).unwrap());
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("sampler thread should start");
+        assert!(
+            matches!(
+                rx.recv_timeout(std::time::Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "watcher must wait until commit attribution is published"
+        );
+
+        bump_local_write_epoch(&db);
+        drop(commit_guard);
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            DbCommitObservation::LocalOrMixed,
+            "watcher must observe the local epoch paired with the commit"
+        );
+    }
+
+    /// The Writer half of the pairing: a real `Writer` commits while a sampler
+    /// polls concurrently. Removing the barrier in `Writer::run_loop` lets the
+    /// sampler see the new `data_version` before the epoch bump and report a
+    /// local commit as `OtherConnectionOnly`.
+    #[test]
+    fn writer_commits_are_never_attributed_to_another_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = writer::db_path(dir.path());
+        let w = writer::Writer::spawn(db.clone()).unwrap();
+        insert_session(
+            &w,
+            &serde_json::json!({
+                "id": "ses_attr", "projectID": "global", "directory": "/w",
+                "path": "ses_attr", "slug": "ses_attr", "title": "attr", "version": "1",
+                "time": {"created": 1, "updated": 2},
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            poll_db_commits(&db).unwrap(),
+            DbCommitObservation::Unchanged,
+            "baseline"
+        );
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let misattributed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sampler = {
+            let (db, stop, mis) = (db.clone(), stop.clone(), misattributed.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if poll_db_commits(&db).unwrap() == DbCommitObservation::OtherConnectionOnly {
+                        mis.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+        for n in 0..300 {
+            insert_message(
+                &w,
+                None,
+                "ses_attr",
+                &serde_json::json!({"id": format!("msg_{n:04}"), "role": "user",
+                                    "time": {"created": n}}),
+                &[],
+            )
+            .unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        sampler.join().unwrap();
+        assert_eq!(
+            misattributed.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a Writer commit must never be logged as another connection's"
+        );
+    }
 }
