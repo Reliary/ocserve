@@ -1013,10 +1013,31 @@ pub async fn load_discovered_from(st: &Arc<AppState>, config_dir: &std::path::Pa
     let plug = match st.plugins.get() {
         Some(p) => p.clone(),
         None => {
+            // Do not retry a spawn that already failed. Without this, a host
+            // with no working `bun`/`node` re-materialized the host files and
+            // attempted a process spawn every poll (2 s) forever, logging each
+            // time — and `materialize_host` rewrites files, so it was disk
+            // churn too. The failure is recorded once with the same
+            // negative-cache the loader uses for per-spec failures.
+            if st
+                .plugin_spawn_failed
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return;
+            }
             let host = match ocserve_plugin::materialize_host(&st.data_dir.join("plugin-host")) {
                 Ok(h) => h,
                 Err(e) => {
-                    tracing::error!("plugin host materialize failed: {e:#}");
+                    st.plugin_spawn_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    ocserve_metrics::labeled_counter(
+                        "ocserve_plugin_spawn_total",
+                        "result=\"materialize_failed\"",
+                        1,
+                    );
+                    tracing::error!(
+                        "plugin host materialize failed (discovery disabled until restart): {e:#}"
+                    );
                     return;
                 }
             };
@@ -1042,7 +1063,16 @@ pub async fn load_discovered_from(st: &Arc<AppState>, config_dir: &std::path::Pa
                     }
                 }
                 Err(e) => {
-                    tracing::error!("plugin sidecar spawn (on demand) failed: {e:#}");
+                    st.plugin_spawn_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    ocserve_metrics::labeled_counter(
+                        "ocserve_plugin_spawn_total",
+                        "result=\"spawn_failed\"",
+                        1,
+                    );
+                    tracing::error!(
+                        "plugin sidecar spawn (on demand) failed (discovery disabled                          until restart): {e:#}"
+                    );
                     return;
                 }
             }

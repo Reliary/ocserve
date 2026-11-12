@@ -66,7 +66,11 @@ ALTER TABLE msg ADD COLUMN v2_type TEXT
     GENERATED ALWAYS AS (
         CASE
             WHEN role = 'user' THEN
-                CASE WHEN json_extract(info, '$.synthetic') = 1 THEN 'synthetic' ELSE 'user' END
+                CASE
+                    WHEN json_valid(info) AND json_extract(info, '$.synthetic') = 1
+                        THEN 'synthetic'
+                    ELSE 'user'
+                END
             ELSE role
         END
     ) VIRTUAL;
@@ -370,6 +374,16 @@ CREATE INDEX idx_compaction_session ON compaction(session_id, time_ms);
 /// refuses anything else.
 pub fn migrate(conn: &Connection) -> Result<()> {
     let t0 = std::time::Instant::now();
+    // Pre-migration snapshot, taken HERE rather than in the writer.
+    //
+    // The backup used to live in `Writer::spawn`, which is too late on the
+    // `serve` path: `boot_checks` migrates the database before the writer is
+    // constructed (`ocserve-cli/src/lib.rs`), so the writer then saw
+    // `user_version == SCHEMA_VERSION` and skipped the backup — the safety net
+    // never fired for exactly the migration it exists for (found by the
+    // 2026-11-12 SRE review). Doing it inside `migrate` covers every caller:
+    // boot checks, the writer, the importer, and tests.
+    crate::writer::backup_before_migration(conn)?;
     apply_migrations(conn)?;
     let t1 = std::time::Instant::now();
     post_maintenance(conn)?;
@@ -1065,7 +1079,11 @@ CREATE TABLE IF NOT EXISTS session_environment (
                                 GENERATED ALWAYS AS (
                                     CASE
                                         WHEN role = 'user' THEN
-                                            CASE WHEN json_extract(info, '$.synthetic') = 1 THEN 'synthetic' ELSE 'user' END
+                                            CASE
+                                                WHEN json_valid(info) AND json_extract(info, '$.synthetic') = 1
+                                                    THEN 'synthetic'
+                                                ELSE 'user'
+                                            END
                                         ELSE role
                                     END
                                 ) VIRTUAL;",
@@ -1633,6 +1651,82 @@ mod sa_search {
             !plan.contains("TEMP B-TREE"),
             "no sort in the scoped shape: {plan}"
         );
+    }
+
+    /// A schema-advancing migration takes a restorable snapshot, on EVERY path.
+    ///
+    /// The snapshot used to live in `Writer::spawn`, so a `serve` boot — which
+    /// migrates in `boot_checks` BEFORE constructing the writer — skipped it
+    /// entirely (the writer then saw the already-current version). Nothing ran
+    /// the backup for the one case it exists for. It now lives in `migrate`.
+    #[test]
+    fn migrate_takes_a_pre_migration_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.db");
+        let conn = pragma::create_new(&p).unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch("PRAGMA user_version = 19;").unwrap();
+        migrate(&conn).unwrap();
+
+        let safety = dir.path().join(".safety");
+        let snapshot = safety.join("ocserve-pre-v19.db");
+        assert!(
+            snapshot.exists(),
+            "the pre-migration snapshot must exist for a v19 DB"
+        );
+        let snap = rusqlite::Connection::open(&snapshot).unwrap();
+        let v: i64 = snap
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 19, "the snapshot is the pre-migration state");
+    }
+
+    /// A stored row with MALFORMED `info` JSON must not block v19→v20.
+    ///
+    /// `json_extract` RAISES on invalid JSON (verified on 3.53.0 and bundled
+    /// 3.54.1 — it does not return NULL), so an unguarded generated column made
+    /// `CREATE INDEX idx_msg_v2_type` abort and roll the step back: the server
+    /// then could not boot at all, permanently, retrying every start. The
+    /// importer copies legacy `data` verbatim and defaults `role` to "user" on a
+    /// parse failure, so exactly this row is producible from a legacy import.
+    #[test]
+    fn v20_migration_survives_malformed_info_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.db");
+        let conn = pragma::create_new(&p).unwrap();
+        migrate(&conn).unwrap();
+        // Rewind the version and drop the derived column, simulating a v19 DB.
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_msg_v2_type;
+             ALTER TABLE msg DROP COLUMN v2_type;
+             INSERT INTO session (id, project_id, directory, path, slug, title, version, time_created, time_updated)
+                 VALUES ('ses_bad','global','/w','s','s','t','1',1,1);
+             INSERT INTO msg (id, session_id, role, seq, time_created, info)
+                 VALUES ('msg_bad','ses_bad','user',1,1,'{not json');
+             INSERT INTO msg (id, session_id, role, seq, time_created, info)
+                 VALUES ('msg_ok','ses_bad','user',2,2,'{\"synthetic\":true}');
+             PRAGMA user_version = 19;",
+        )
+        .unwrap();
+        migrate(&conn).expect("v20 must migrate over a malformed row");
+        let ver: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, SCHEMA_VERSION);
+        // The malformed row classifies as `user` (guarded → NULL → ELSE), and
+        // the well-formed synthetic row keeps its class.
+        let bad: String = conn
+            .query_row("SELECT v2_type FROM msg WHERE id='msg_bad'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let ok: String = conn
+            .query_row("SELECT v2_type FROM msg WHERE id='msg_ok'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(bad, "user", "malformed JSON falls back to the role");
+        assert_eq!(ok, "synthetic", "a valid marker still classifies");
     }
 
     /// v9→v10 migration preserves the recorded contract order exactly —

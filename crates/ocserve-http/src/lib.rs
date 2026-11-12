@@ -333,6 +333,10 @@ pub struct AppState {
     /// this: it stays a pure read, because a launcher polls it every ~50 ms and
     /// discovery does filesystem work and may spawn a sidecar.
     pub plugin_discovery: bool,
+    /// Set once a sidecar spawn/materialize has failed. Plugin discovery is
+    /// then disabled for the life of the process instead of re-attempting a
+    /// doomed spawn (and rewriting the host files) on every config poll.
+    pub plugin_spawn_failed: std::sync::atomic::AtomicBool,
     /// Per-session prompt serialization (queue semantics). Bounded: entries
     /// exist only for in-flight prompts + transient races, removed post-run
     /// when uncontended (AGENTS §2.3 — active-set bound, no eviction).
@@ -713,6 +717,7 @@ impl AppState {
             data_dir,
             server_url: std::sync::OnceLock::new(),
             plugin_discovery,
+            plugin_spawn_failed: std::sync::atomic::AtomicBool::new(false),
             prompt_locks: std::sync::Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),

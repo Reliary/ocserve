@@ -114,7 +114,27 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 
 ## Unreleased
 
+### Security
+- **`?base=` can no longer reach `git diff` as an option.** The v2 diff route
+  passed the query value straight through as a positional ref, so
+  `base=--output=/path` made the server write an attacker-chosen file and
+  `base=--ext-diff` re-enabled a repository's external diff driver (command
+  execution where one is configured). The value must now look like a ref and is
+  resolved with `git rev-parse --verify --end-of-options`; both `git diff`
+  calls also pass `--end-of-options`.
+
 ### Fixed
+- **A malformed stored message could brick boot.** The v20 `msg.v2_type`
+  generated column called `json_extract` unguarded, and SQLite raises (rather
+  than returning NULL) on invalid JSON, so one bad imported row aborted the
+  index build and made every subsequent start fail. The expression is now
+  guarded with `json_valid` and classifies a malformed row as its role.
+- **The pre-migration snapshot now actually runs.** It lived in
+  `Writer::spawn`, but `serve` migrates in `boot_checks` before the writer
+  exists, so the writer saw an already-current database and skipped the
+  backup — the safety net never fired for the migration it exists for. It is
+  now taken inside `migrate`, which covers boot checks, the writer, the
+  importer and tests.
 - **Every declared query parameter on the message and session lists is read.**
   The v2 message list accepted `?cursor=` and passed `None` down, so each page
   returned the same first window with the same `next` cursor; a client walking
@@ -134,6 +154,12 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   and `archived` were accepted and ignored, so older history was unreachable
   through the offset-style cursor the endpoint advertises. It now applies the
   reference's `time_updated` window and emits `x-next-cursor`.
+- **A failed plugin sidecar spawn is not retried forever.** A host without a
+  working `bun`/`node` re-materialized the host files and attempted a spawn
+  every config poll (2 s). The failure is now recorded once
+  (`ocserve_plugin_spawn_total{result}`) and discovery is disabled until
+  restart; the discovery pass is also bounded to 10 s so it cannot stall
+  config hot-reload.
 - **Plugin discovery happens off the request path.** `GET /api/plugin` did
   synchronous directory scans and could spawn the plugin sidecar while a
   launcher polled it every ~50 ms; discovery now runs on the config poller and

@@ -77,6 +77,7 @@ fn numstat(dir: &str, ref_: &str) -> std::collections::HashMap<String, (i64, i64
             "--no-renames",
             "--numstat",
             "-z",
+            "--end-of-options",
             ref_,
             "--",
             ".",
@@ -370,6 +371,7 @@ fn tracked_patches(
             "--no-ext-diff",
             "--no-renames",
             &format!("--unified={context}"),
+            "--end-of-options",
             ref_,
             "--",
             ".",
@@ -495,19 +497,57 @@ pub fn diff_with(
     if !is_git(dir) {
         return Value::Array(vec![]);
     }
-    let mut explicit = None;
     let ref_ = match base.map(str::trim).filter(|b| !b.is_empty()) {
         Some(b) => {
-            explicit = Some(b.to_string());
-            b.to_string()
+            // A caller-supplied ref is UNTRUSTED (it arrives on an
+            // unauthenticated GET). `git diff <ref>` treats a leading `-` as an
+            // OPTION, so `base=--output=/path` made the server write an
+            // attacker-chosen file and `base=--ext-diff` re-enabled the repo's
+            // external diff driver after `--no-ext-diff` (arbitrary command
+            // execution where a driver is configured).
+            //
+            // Two layers, because either alone is easy to regress:
+            //   1. reject anything that is not a plausible ref (no leading `-`,
+            //      no control chars, no `..` traversal into a path);
+            //   2. resolve it with `rev-parse --verify --end-of-options`, which
+            //      treats the argument as a revision whatever it looks like, and
+            //      reject an unknown ref instead of letting git guess.
+            let Some(resolved) = resolve_ref(dir, b) else {
+                return Value::Array(vec![]);
+            };
+            resolved
         }
         None => match diff_ref_for(dir, mode) {
             Some(r) => r,
             None => return Value::Array(vec![]),
         },
     };
-    let _ = &explicit;
     diff_body(dir, &ref_, context, untracked)
+}
+
+/// Validate and resolve a caller-supplied ref.
+///
+/// Returns the resolved object name, or `None` when the value is not a ref this
+/// server will hand to git. `--end-of-options` is the load-bearing part: it
+/// stops option parsing so a value like `--output=/x` can never be read as a
+/// flag, even if the character filter is later relaxed.
+fn resolve_ref(dir: &str, raw: &str) -> Option<String> {
+    if raw.is_empty()
+        || raw.starts_with('-')
+        || raw.chars().any(|c| c.is_control() || c == '\0')
+        || raw.contains("..")
+    {
+        return None;
+    }
+    let (out, code) = run_git(dir, &["rev-parse", "--verify", "--end-of-options", raw])?;
+    if code != 0 {
+        return None;
+    }
+    let resolved = out.trim();
+    if resolved.is_empty() {
+        return None;
+    }
+    Some(resolved.to_string())
 }
 
 /// The mode-derived ref (`git` → HEAD, `branch` → merge-base with origin/HEAD).

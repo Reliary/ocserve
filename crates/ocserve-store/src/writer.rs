@@ -63,7 +63,19 @@ struct Batch {
 /// when the version is UNKNOWN/newer (that path bails in migrate anyway).
 /// Non-fatal: a failed backup warns and proceeds (the backup is a convenience,
 /// not a boot gate — the same fail-soft rule as post_maintenance).
-fn backup_before_migration(conn: &Connection, path: &Path) -> Result<()> {
+pub(crate) fn backup_before_migration(conn: &Connection) -> Result<()> {
+    // `PRAGMA database_list` reports the main DB file, so no caller has to
+    // thread a path through (and none can pass the wrong one).
+    let path: PathBuf = conn
+        .query_row("PRAGMA database_list", [], |r| {
+            let file: String = r.get(2)?;
+            Ok(PathBuf::from(file))
+        })
+        .unwrap_or_default();
+    if path.as_os_str().is_empty() {
+        return Ok(()); // in-memory database
+    }
+    let path = path.as_path();
     let from: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap_or(0);
@@ -116,7 +128,8 @@ impl Writer {
         // best-effort `VACUUM INTO` snapshot into a `.safety/` sibling BEFORE
         // the version advances, so the previous tag can be restored. Skipped
         // when already current (the common boot) and non-fatal on failure.
-        backup_before_migration(&conn, &path)?;
+        // The pre-migration snapshot happens inside `migrate` now (it must run
+        // for every caller, including the boot checks that migrate first).
         crate::schema::migrate(&conn)?;
         let handle = std::thread::Builder::new()
             .name("ocserve-writer".into())

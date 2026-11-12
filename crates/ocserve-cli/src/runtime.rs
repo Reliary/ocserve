@@ -312,8 +312,19 @@ fn read_catalog(path: &Path) -> Value {
 /// keys added via PUT /auth reach actual prompts, not just the display routes
 /// (was a real gap: registry read legacy-only).
 fn load_auth(data_dir: &Path) -> Result<Value> {
+    load_auth_with(data_dir, None)
+}
+
+/// `legacy_home` is a TEST SEAM: when set, the legacy `auth.json` is read from
+/// `<legacy_home>/auth.json` instead of `$HOME/.local/share/opencode/auth.json`,
+/// so a loader test cannot read the developer's real credentials. Production
+/// passes `None` and keeps the documented path.
+fn load_auth_with(data_dir: &Path, legacy_home: Option<&Path>) -> Result<Value> {
     let home = std::env::var("HOME").unwrap_or_default();
-    let auth_path = Path::new(&home).join(".local/share/opencode/auth.json");
+    let auth_path = match legacy_home {
+        Some(h) => h.join("auth.json"),
+        None => Path::new(&home).join(".local/share/opencode/auth.json"),
+    };
     let auth = if auth_path.exists() {
         read_json(&auth_path)?
     } else {
@@ -887,6 +898,7 @@ impl Runtime {
             env_config_path,
             env_content,
             ocserve_store::platform::opencode_config_dir(),
+            None, // production: overlay + legacy auth use their documented paths
         )
     }
 
@@ -904,12 +916,20 @@ impl Runtime {
         env_config_path: Option<std::path::PathBuf>,
         env_content: Option<String>,
         config_dir: Option<std::path::PathBuf>,
+        test_root: Option<&std::path::Path>,
     ) -> Result<Self> {
         let home = std::env::var("HOME").unwrap_or_default();
         // Upstream precedence: OPENCODE_CONFIG_DIR > XDG_CONFIG_HOME/opencode
         // > ~/.config/opencode. A launcher provisioning a dedicated config dir
         // must find its opencode.json/plugins read from the same place.
+        //
+        // `config_dir` is explicit in the test seam so no test can read the
+        // developer's `~/.config/opencode`. The overlay below is derived from
+        // the SAME directory, so pointing the seam at a temp dir also isolates
+        // the `~/.config/ocserve/config.json` overlay (previously ambient, which
+        // a review flagged as a masked dependency).
         let config_path = config_dir
+            .as_ref()
             .map(|d| d.join("opencode.json"))
             .unwrap_or_else(|| Path::new(&home).join(".config/opencode/opencode.json"));
         // K-MODELS: OPENCODE_MODELS_URL/_PATH aware (upstream read precedence)
@@ -919,7 +939,12 @@ impl Runtime {
         // W4 overlay: a ocserve-owned patch file (OCSERVE_CONFIG_WRITE=overlay
         // writes it) deep-merges OVER the shared opencode.json on every load —
         // never mutates the user's other server's config unless told to.
-        let overlay_path = Path::new(&home).join(".config/ocserve/config.json");
+        let overlay_path = match test_root {
+            // Test seam: an overlay under the caller's temp root, so a test
+            // cannot pick up the developer's real `~/.config/ocserve`.
+            Some(r) => r.join("ocserve-overlay.json"),
+            None => Path::new(&home).join(".config/ocserve/config.json"),
+        };
         if overlay_path.exists() {
             let overlay = read_json(&overlay_path)?;
             ocserve_http::deep_merge(&mut raw_config, overlay);
@@ -931,7 +956,13 @@ impl Runtime {
             env_content.as_deref(),
             &base_dir,
         )?;
-        let auth = load_auth(data_dir)?;
+        // `config_dir` is a REAL input (resolved from OPENCODE_CONFIG_DIR /
+        // XDG_CONFIG_HOME in production), so it must not double as the test
+        // seam — the legacy auth file lives under `~/.local/share/opencode`,
+        // not under the config dir. Using it for both made production read
+        // `$XDG_CONFIG_HOME/opencode/auth.json` and drop every provider key
+        // (caught by the differential replay, 2026-11-12).
+        let auth = load_auth_with(data_dir, test_root)?;
         let cache = read_catalog(&cache_path);
         Self::from_parts(data_dir, raw_config, auth, cache)
     }
@@ -2754,6 +2785,7 @@ mod env_config_tests {
                     .into(),
             ),
             Some(empty_cfg),
+            Some(dir.path()),
         )
         .unwrap();
         let specs = crate::plugin_specs(&rt.config);
@@ -2771,14 +2803,26 @@ mod env_config_tests {
         std::fs::write(&file, r#"{"model":"from/file","plugin":["file-plugin"]}"#).unwrap();
         let empty_cfg = dir.path().join("cfgdir");
         std::fs::create_dir_all(&empty_cfg).unwrap();
+        // The developer's real overlay must NOT leak in; the seam's own
+        // overlay must be the one applied.
+        std::fs::write(
+            dir.path().join("ocserve-overlay.json"),
+            r#"{"__seam_overlay": true}"#,
+        )
+        .unwrap();
         let rt = Runtime::load_for_with(
             dir.path(),
             Some(file),
             Some(r#"{"model":"from/content","plugin":["content-plugin"]}"#.into()),
             Some(empty_cfg),
+            Some(dir.path()),
         )
         .unwrap();
         assert_eq!(rt.config["model"], "from/content");
+        assert_eq!(
+            rt.config["__seam_overlay"], true,
+            "the seam's overlay is applied, so no ambient ~/.config/ocserve leak"
+        );
         let specs = crate::plugin_specs(&rt.config);
         let names: Vec<&str> = specs.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(names, vec!["file-plugin", "content-plugin"]);

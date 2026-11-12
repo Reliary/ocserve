@@ -454,6 +454,11 @@ impl WatchOpts {
     }
 }
 
+/// Upper bound on one plugin-discovery pass inside the config poller. Chosen
+/// below the 30 s sidecar RPC timeout so a wedged plugin host cannot hold the
+/// config hot-reload loop for a full RPC budget.
+const DISCOVERY_BUDGET: Duration = Duration::from_secs(10);
+
 /// Watcher task (spawned by serve): poll → changed → reconcile.
 /// Owns no state beyond the Arc; exits only on abort/process end.
 pub async fn watch_loop(st: Arc<AppState>, opts: WatchOpts) {
@@ -485,8 +490,29 @@ pub async fn watch_loop(st: Arc<AppState>, opts: WatchOpts) {
         // sidecar — a state-mutating, potentially slow GET that a 50 ms poll
         // would hammer. The poller already exists, already runs off the request
         // path, and is bounded by the same discovery cap.
+        //
+        // BOUNDED: this pass must not delay the config reconcile that shares
+        // this loop. Discovery does synchronous `read_dir` and can block on a
+        // sidecar RPC (up to 30 s), so a wedged plugin or a slow config
+        // filesystem would otherwise stall hot-reload indefinitely. A timed-out
+        // pass is simply skipped; the next tick retries the cheap parts and the
+        // spec-level negative cache stops the expensive ones from repeating.
         if st.plugin_discovery {
-            crate::v2::load_discovered_plugins(&st).await;
+            let discovery = crate::v2::load_discovered_plugins(&st);
+            match tokio::time::timeout(DISCOVERY_BUDGET, discovery).await {
+                Ok(()) => {}
+                Err(_) => {
+                    ocserve_metrics::labeled_counter(
+                        "ocserve_plugin_discovery_total",
+                        "result=\"timeout\"",
+                        1,
+                    );
+                    tracing::warn!(
+                        "plugin discovery exceeded {}s; skipped this tick",
+                        DISCOVERY_BUDGET.as_secs()
+                    );
+                }
+            }
         }
     }
 }

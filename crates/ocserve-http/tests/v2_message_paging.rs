@@ -504,3 +504,65 @@ async fn patch(app: &axum::Router, uri: &str, body: &Value) -> (StatusCode, Valu
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
 }
+
+// ---------------------------------------------------------------------------
+// VCS ref injection (SRE S1 / security VCS-1)
+// ---------------------------------------------------------------------------
+
+/// `?base=` arrives on an unauthenticated GET and used to flow straight into
+/// `git diff <base>`. Git reads a leading `-` as an option, so
+/// `base=--output=/tmp/x` wrote an attacker-chosen file and `base=--ext-diff`
+/// re-enabled the repo's external diff driver after `--no-ext-diff`.
+#[test]
+fn vcs_ref_validation_rejects_options_and_bad_refs() {
+    let dir = std::env::temp_dir().join(format!(
+        "ocserve-vcsref-{}-{}",
+        std::process::id(),
+        next_fixture()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap()
+    };
+    run(&["init", "-q", "-b", "main"]);
+    run(&["config", "user.email", "t@example.com"]);
+    run(&["config", "user.name", "t"]);
+    std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+    run(&["add", "."]);
+    run(&["commit", "-qm", "one"]);
+
+    let d = dir.to_str().unwrap();
+    // An option-shaped value must never reach git as a flag.
+    let pwn = dir.join("pwn.txt");
+    let got = ocserve_http::vcs::diff_with(
+        d,
+        "git",
+        None,
+        Some(&format!("--output={}", pwn.display())),
+        true,
+    );
+    assert!(
+        got.as_array().map(|a| a.is_empty()).unwrap_or(false),
+        "an option-shaped base must not produce a diff: {got}"
+    );
+    assert!(
+        !pwn.exists(),
+        "SECURITY: --output must not have written {:?}",
+        pwn
+    );
+
+    // A ref that does not exist is empty, not an error and not a guess.
+    let got = ocserve_http::vcs::diff_with(d, "git", None, Some("no-such-ref"), true);
+    assert!(
+        got.as_array().map(|a| a.is_empty()).unwrap_or(false),
+        "{got}"
+    );
+
+    // A real ref still works (the feature is not broken by the validation).
+    let got = ocserve_http::vcs::diff_with(d, "git", None, Some("HEAD"), true);
+    assert!(got.is_array(), "{got}");
+}

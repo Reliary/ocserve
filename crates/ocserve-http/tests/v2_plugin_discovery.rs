@@ -125,3 +125,45 @@ async fn failed_discovery_reports_failed_instead_of_absent() -> anyhow::Result<(
     );
     Ok(())
 }
+
+/// M1: a failed spawn must not be retried on every poll.
+///
+/// Before the negative cache, a host without a working `bun`/`node` re-ran
+/// `materialize_host` (which rewrites files) and attempted a process spawn
+/// every 2 s forever. The flag is set on failure and the pass returns early.
+#[tokio::test]
+async fn spawn_failure_is_not_retried_on_every_poll() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let st = state(dir.path()).await;
+    // Simulate a previous failed spawn (what the error paths now record).
+    st.plugin_spawn_failed
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    // Discovery over a directory that DOES have a plugin: without the cache
+    // this would try to materialize + spawn a host.
+    let cfg_dir = dir.path().join("cfg");
+    std::fs::create_dir_all(cfg_dir.join("plugins/discovered"))?;
+    std::fs::write(
+        cfg_dir.join("plugins/discovered/package.json"),
+        r#"{"name":"discovered","private":true,"type":"module","exports":{"./server":"./server.js"}}"#,
+    )?;
+    std::fs::write(
+        cfg_dir.join("plugins/discovered/server.js"),
+        "export default { id: 'discovered', setup() {} }\n",
+    )?;
+    let before = st.data_dir.join("plugin-host");
+    let before_entries = std::fs::read_dir(&before).map(|d| d.count()).unwrap_or(0);
+    // Two passes: neither may create a host or a sidecar.
+    for _ in 0..2 {
+        ocserve_http::v2::load_discovered_from(&st, &cfg_dir).await;
+    }
+    let after_entries = std::fs::read_dir(&before).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(
+        before_entries, after_entries,
+        "a cached spawn failure must not re-materialize the host"
+    );
+    assert!(
+        st.plugins.get().is_none(),
+        "a cached spawn failure must not start a sidecar"
+    );
+    Ok(())
+}
