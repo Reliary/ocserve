@@ -319,22 +319,18 @@ fn load_auth(data_dir: &Path) -> Result<Value> {
 }
 
 /// `legacy_home` is a TEST SEAM: when set, the legacy `auth.json` is read from
-/// `<legacy_home>/auth.json` instead of `$HOME/.local/share/opencode/auth.json`,
-/// so a loader test cannot read the developer's real credentials. Production
-/// passes `None` and keeps the documented path.
+/// `<legacy_home>/auth.json` instead of OpenCode's data directory
+/// (`XDG_DATA_HOME/opencode` or `~/.local/share/opencode`), so a loader test
+/// cannot read the developer's real credentials. Production passes `None` and
+/// honors the documented XDG precedence.
 fn load_auth_with(data_dir: &Path, legacy_home: Option<&Path>) -> Result<Value> {
+    if let Some(home) = legacy_home {
+        return load_auth_from_path(&home.join("auth.json"), data_dir);
+    }
+
     let home = std::env::var("HOME").unwrap_or_default();
     let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from);
-    let auth_path = legacy_home
-        .map(|h| h.join("auth.json"))
-        .unwrap_or_else(|| {
-            ocserve_store::platform::opencode_data_dir_for(
-                Path::new(&home),
-                xdg_data_home.as_deref(),
-            )
-            .join("auth.json")
-        });
-    load_auth_from_path(&auth_path, data_dir)
+    load_auth_for(Path::new(&home), xdg_data_home.as_deref(), data_dir)
 }
 
 fn load_auth_for(home: &Path, xdg_data_home: Option<&Path>, data_dir: &Path) -> Result<Value> {
