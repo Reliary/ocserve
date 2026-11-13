@@ -2676,6 +2676,46 @@ mod config_variable_tests {
 mod provider_key_tests {
     use super::*;
 
+    /// Build a fake OpenCode 2.x credential database with one active Mistral
+    /// key row. The schema and value union are the upstream ones
+    /// (`Credential.Key` = `{type:"key",key:…}`); the key is a fixture,
+    /// never a real credential.
+    fn fake_mistral_credentials(
+        dir: &std::path::Path,
+    ) -> std::collections::BTreeMap<String, String> {
+        let db = dir.join("opencode.db");
+        let conn = ocserve_store::pragma::create_new(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE credential (
+                id TEXT PRIMARY KEY,
+                integration_id TEXT,
+                label TEXT NOT NULL,
+                value TEXT NOT NULL,
+                connector_id TEXT,
+                method_id TEXT,
+                active INTEGER,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO credential
+                (id, integration_id, label, value, connector_id, method_id,
+                 active, time_created, time_updated)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, 1, 1, 1)",
+            rusqlite::params![
+                "cred_mistral_fake",
+                "mistral",
+                "default",
+                r#"{"type":"key","key":"fake-mistral-key"}"#
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        ocserve_store::opencode_credential_keys(&db).unwrap()
+    }
+
     /// Issue #28 root cause at the endpoint layer: a config provider with a
     /// baseURL and `options.apiKey` and NO auth-layer entry used to be built
     /// with `("", …)`. The registry must carry the config key.
@@ -2917,38 +2957,7 @@ mod provider_key_tests {
     #[test]
     fn mistral_active_opencode_key_uses_builtin_endpoint_and_connects_v2_picker() {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("opencode.db");
-        let conn = ocserve_store::pragma::create_new(&db).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE credential (
-                id TEXT PRIMARY KEY,
-                integration_id TEXT,
-                label TEXT NOT NULL,
-                value TEXT NOT NULL,
-                connector_id TEXT,
-                method_id TEXT,
-                active INTEGER,
-                time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL
-            );",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO credential
-                (id, integration_id, label, value, connector_id, method_id,
-                 active, time_created, time_updated)
-             VALUES (?1, ?2, ?3, ?4, NULL, NULL, 1, 1, 1)",
-            rusqlite::params![
-                "cred_mistral_fake",
-                "mistral",
-                "default",
-                r#"{"type":"key","key":"fake-mistral-key"}"#
-            ],
-        )
-        .unwrap();
-        drop(conn);
-
-        let credentials = ocserve_store::opencode_credential_keys(&db).unwrap();
+        let credentials = fake_mistral_credentials(dir.path());
         assert_eq!(
             credentials.get("mistral").map(String::as_str),
             Some("fake-mistral-key"),
@@ -2999,6 +3008,88 @@ mod provider_key_tests {
                 .unwrap()
                 .contains("fake-mistral-key"),
             "the SQLite API key must not be returned on the v2 wire"
+        );
+    }
+
+    /// The resolved credential is only useful if it reaches the provider.
+    /// Point Mistral at a local mock (the same configured-baseURL path a proxy
+    /// uses), resolve the key through the shared OpenCode credential table,
+    /// and drive the real LLM client: the mock must see the fake bearer key on
+    /// `/chat/completions`. No real Mistral traffic.
+    #[tokio::test]
+    async fn mistral_resolved_key_authenticates_a_local_mock_endpoint() {
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut got = String::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                got.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if got.contains("\r\n\r\n") || n == 0 {
+                    break;
+                }
+            }
+            let _ = tx.send(got);
+            // Close without a response: the request bytes are the assertion
+            // point, and the client's stream error is deliberately ignored.
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = fake_mistral_credentials(dir.path());
+        let cfg = json!({
+            "providers": {"mistral": {"options": {"baseURL": format!("http://{addr}")}}}
+        });
+        let cache = json!({
+            "mistral": {
+                "npm": "@ai-sdk/mistral",
+                "models": {"mistral-large-latest": {"name": "Mistral Large"}}
+            }
+        });
+        let rt = Runtime::from_parts_with_opencode_credentials(
+            dir.path(),
+            cfg,
+            json!({}),
+            cache,
+            credentials,
+        )
+        .unwrap();
+        let registry = rt.llm_registry_from_auth(json!({})).unwrap();
+        let (base, key) = registry
+            .endpoints
+            .get("mistral")
+            .cloned()
+            .expect("Mistral endpoint resolves from the shared credential");
+        assert_eq!(base, format!("http://{addr}"));
+        assert_eq!(key, "fake-mistral-key");
+
+        let client = ocserve_llm::Client::new(base, key);
+        let messages = vec![ocserve_llm::ChatMessage::text("user", "hi")];
+        let _ = client
+            .chat_stream(
+                "mistral-large-latest",
+                &messages,
+                &ocserve_llm::ChatOpts::default(),
+                None,
+                None,
+            )
+            .await;
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("mock endpoint captured the request")
+            .unwrap();
+        let lower = request.to_ascii_lowercase();
+        assert!(
+            lower.contains("authorization: bearer fake-mistral-key"),
+            "the resolved OpenCode key must reach the provider request:\n{request}"
+        );
+        assert!(
+            request.starts_with("POST /chat/completions "),
+            "the generic OpenAI-compatible path must be used:\n{request}"
         );
     }
 

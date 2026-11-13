@@ -42,7 +42,9 @@ pub fn deep_merge(base: &mut serde_json::Value, patch: serde_json::Value) {
 
 /// Resolve the endpoint supported by ocserve's generic OpenAI-compatible
 /// request path. A catalog entry or saved credential alone is not enough to
-/// make a provider prompt-ready.
+/// make a provider prompt-ready. Built-ins cover the providers whose public
+/// API is OpenAI-compatible at a stable URL (OpenAI, DeepSeek, OpenRouter,
+/// Mistral, OpenCode Go); `opencode` reads its URL from the catalog.
 pub fn prompt_endpoint_base_url(pid: &str, config: &Value, catalog: &Value) -> Option<String> {
     let providers = config
         .get("providers")
@@ -65,6 +67,7 @@ pub fn prompt_endpoint_base_url(pid: &str, config: &Value, catalog: &Value) -> O
         "openai" => Some("https://api.openai.com/v1"),
         "deepseek" => Some("https://api.deepseek.com/v1"),
         "openrouter" => Some("https://openrouter.ai/api/v1"),
+        "mistral" => Some("https://api.mistral.ai/v1"),
         "opencode-go" => Some("https://opencode.ai/inference/go/openai/v1"),
         "opencode" => catalog
             .pointer("/opencode/api")

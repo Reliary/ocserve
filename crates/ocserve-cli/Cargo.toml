@@ -43,6 +43,7 @@ sha1 = "0.11"
 
 [dev-dependencies]
 tempfile = "3"
+ocserve-llm.workspace = true
 
 # musl has no malloc_trim, and its allocator retained the freed catalog build
 # pages (measured 447 MB RSS vs 193 MB on glibc for the same boot). mimalloc

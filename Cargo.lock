@@ -1743,6 +1743,7 @@ dependencies = [
  "ocserve-core",
  "ocserve-http",
  "ocserve-importer",
+ "ocserve-llm",
  "ocserve-mcp",
  "ocserve-metrics",
  "ocserve-plugin",
