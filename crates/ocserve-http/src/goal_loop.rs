@@ -1131,3 +1131,48 @@ fn continue_with_text(st: &Arc<AppState>, sid: &str, text: &str, goal_id: &str, 
     // here except for the `synthetic` flag (a notice vs the user's message).
     spawn_driver(st, sid, text.to_string(), goal_id.to_string(), !as_user);
 }
+
+#[cfg(test)]
+mod deletion_fence_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "red: K-GOAL-DELETE-RACE; follow-up to PR #41"]
+    async fn driver_cannot_register_while_session_delete_is_fenced() {
+        let st = AppState::with_payloads_and_v2(None, Default::default(), true);
+        let sid = "ses_goal_delete_fence";
+        ocserve_store::insert_session(
+            &st.writer,
+            &json!({
+                "id": sid,
+                "projectID": "global",
+                "directory": "/w",
+                "path": sid,
+                "slug": sid,
+                "title": "t",
+                "version": "1",
+                "time": {"created": 1, "updated": 2},
+            }),
+        )
+        .unwrap();
+        let fence = crate::v2::begin_session_delete(&st, sid)
+            .await
+            .unwrap_or_else(|e| panic!("delete fence: {}", e.message));
+        // Hold the session lock so an unfenced control cannot finish and hide
+        // its registry entry before this assertion.
+        let release = crate::lock_session(&st, sid)
+            .await
+            .unwrap_or_else(|e| panic!("session lock: {}", e.message));
+        let guard = release.arc().lock().await;
+        spawn_driver(&st, sid, "continue".into(), "goal_delete".into(), true);
+        assert!(
+            !st.goal_tasks.lock().contains_key(sid),
+            "delete fence must reject a goal driver registered after deletion started"
+        );
+        drop(guard);
+        drop(release);
+        fence.finish().await;
+        // CONTROL: remove the admission check from spawn_driver; with the
+        // session lock held, the driver registry entry makes this test red.
+    }
+}

@@ -81,6 +81,80 @@ fn spawn_provider(verdict: &'static str) -> std::net::SocketAddr {
     addr
 }
 
+/// The kickoff gets a normal answer, but the reviewer stays open until its
+/// request is cancelled. Deleting the session must abort that tracked review.
+fn spawn_provider_holding_reviewer() -> (
+    std::net::SocketAddr,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Receiver<()>,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for sock in listener.incoming().flatten() {
+            let entered_tx = entered_tx.clone();
+            let closed_tx = closed_tx.clone();
+            std::thread::spawn(move || {
+                let mut sock = sock;
+                let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                let mut got = Vec::new();
+                let mut buf = [0u8; 8192];
+                let head_end = loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) => return,
+                        Ok(k) => got.extend_from_slice(&buf[..k]),
+                        Err(_) => return,
+                    }
+                    if let Some(pos) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&got[..head_end]).to_string();
+                let clen = head
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while got.len() < head_end + clen {
+                    match sock.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(k) => got.extend_from_slice(&buf[..k]),
+                        Err(_) => break,
+                    }
+                }
+                let body = String::from_utf8_lossy(&got[head_end..]).to_string();
+                if body.contains("You are now the reviewer") {
+                    let _ = entered_tx.send(());
+                    loop {
+                        match sock.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = closed_tx.send(());
+                    return;
+                }
+                let sse = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                    cache-control: no-cache\r\nconnection: close\r\n\r\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\"working on it\"}}]}\n\n\
+                    data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                    data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\n\
+                    data: [DONE]\n\n";
+                let _ = sock.write_all(sse.as_bytes());
+                let _ = sock.flush();
+            });
+        }
+    });
+    (addr, entered_rx, closed_rx)
+}
+
 fn setup(addr: std::net::SocketAddr, sid: &str) -> Arc<AppState> {
     setup_with_goal_cmd(addr, sid, true)
 }
@@ -909,6 +983,52 @@ async fn abort_pauses_the_goal_and_stops_the_loop() {
         "no further reviewer call may run after the abort"
     );
     let _ = arm.await;
+}
+
+/// A goal reviewer is a separate background task from the turn driver. DELETE
+/// must cancel it too, or a reviewer that finishes after deletion can attempt
+/// to persist a continuation and register another driver.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "red: K-GOAL-DELETE-RACE; follow-up to PR #41"]
+async fn delete_cancels_a_pending_goal_review() {
+    let (addr, entered, closed) = spawn_provider_holding_reviewer();
+    let st = setup(addr, "ses_goaldelete_review");
+    let app = router(&st);
+    let kickoff = req(
+        &app,
+        "POST",
+        "/session/ses_goaldelete_review/command",
+        Some(json!({"command": "goal", "arguments": "finish the task"})),
+    )
+    .await;
+    assert_eq!(kickoff.status(), StatusCode::OK);
+    tokio::task::spawn_blocking(move || {
+        entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("goal reviewer must reach the held provider")
+    })
+    .await
+    .unwrap();
+
+    let deleted = req(&app, "DELETE", "/session/ses_goaldelete_review", None).await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(json(deleted).await, Value::Bool(true));
+    tokio::task::spawn_blocking(move || {
+        closed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("deleting a session must close its pending reviewer request")
+    })
+    .await
+    .unwrap();
+    assert!(st.goal_wakes.lock().is_empty());
+    assert!(!st.goal_tasks.lock().contains_key("ses_goaldelete_review"));
+    assert!(
+        ocserve_store::get_goal(&st.db, "ses_goaldelete_review")
+            .unwrap()
+            .is_none()
+    );
+    // CONTROL: leave pending goal reviews out of cancel_driver; the provider
+    // connection remains open and the close assertion goes red.
 }
 
 /// The kill switch must disable the feature on the REAL HTTP path, not only in
