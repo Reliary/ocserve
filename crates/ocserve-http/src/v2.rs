@@ -5233,7 +5233,7 @@ pub async fn question_reject(
 /// GET /api/session/{sessionID}/permission/{requestID} — one ask.
 pub async fn session_permission_one(
     State(st): State<Arc<AppState>>,
-    Path((_sid, rid)): Path<(String, String)>,
+    Path((sid, rid)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     if !rid.starts_with("per") {
         return Err(ApiError {
@@ -5698,18 +5698,23 @@ pub async fn permission_create(
     }
     let pid = format!("per_{}", ocserve_core::ids::ascending_tail());
     // `ask` registers a real pending request (upstream `create`); other effects
-    // do not. The request body mirrors the v1 event shape so GET /permission
-    // and the reply routes see it.
+    // do not. Keep the gate value in v2 grammar; each HTTP family projects it
+    // at its own read boundary because the gate is shared with v1.
     if effect == "ask" {
-        let request = json!({
+        let mut request = json!({
             "id": pid,
             "sessionID": id,
             "action": action,
             "resources": resources,
-            "patterns": resources,
-            "always": resources,
+            "save": body.get("save").filter(|value| value.is_array()).cloned().unwrap_or(json!([])),
             "metadata": body.get("metadata").cloned().unwrap_or(json!({})),
         });
+        if let Some(source) = body.get("source") {
+            request["source"] = source.clone();
+        }
+        if let Some(message) = body.get("message").filter(|value| value.is_string()) {
+            request["message"] = message.clone();
+        }
         st.gate.register_persistent(&pid, request);
     }
     Ok(Json(json!({"data": {"id": pid, "effect": effect}})))
