@@ -272,6 +272,11 @@ from `reliary8/.../schema.rs:45-52`).
   `substr(data, offset, len)` 4 MB windows straight into the zstd encoder — never
   materialized, never `serde_json::from_slice`'d whole (stream-deserializers do NOT stream a
   single 122 MB value). Verification by incremental canonical-JSON **hash**, not Value==Value.
+- OpenCode credential discovery: `opencode_credential_keys` reads active `key` rows from the
+  shared host DB through `open_reader` (query-only), selects named columns, caps the scan at
+  256 rows and values at 16 KiB, and never writes host schema or data. OAuth rows, invalid
+  values, and over-cap rows are skipped. The watcher fingerprints only this bounded
+  projection, never the growing database file.
 
 ## 6. Architecture notes
 
