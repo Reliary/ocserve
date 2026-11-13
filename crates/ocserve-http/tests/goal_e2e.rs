@@ -989,7 +989,6 @@ async fn abort_pauses_the_goal_and_stops_the_loop() {
 /// must cancel it too, or a reviewer that finishes after deletion can attempt
 /// to persist a continuation and register another driver.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "red: K-GOAL-DELETE-RACE; follow-up to PR #41"]
 async fn delete_cancels_a_pending_goal_review() {
     let (addr, entered, closed) = spawn_provider_holding_reviewer();
     let st = setup(addr, "ses_goaldelete_review");

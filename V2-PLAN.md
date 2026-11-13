@@ -124,6 +124,10 @@ requirement land here as edits, never silently in code.
   recheck admission after taking the per-session prompt lock. A delete waits
   for already-admitted work to finish before removing rows. This closes the
   empty-registry-to-delete race without blocking admissions for other sessions.
+- Goal reviewer tasks are tracked (bounded at 128) and share the deletion
+  fence: a delete cancels a pending review, and any review that reaches driver
+  registration after deletion starts is refused. This prevents a late reviewer
+  result from persisting a continuation after the deletion cancellation pass.
 - Named divergences: `D-REVERT-NODELETE` (mark-only kept), compaction anchors kept.
 - Kill switches: `OCSERVE_V2=1` gates runtime. Tests: E2E ordering, cancel/update,
   interrupt/resume, kill -9 mid-turn recovery, planted controls.

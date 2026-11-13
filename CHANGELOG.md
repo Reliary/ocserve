@@ -11,6 +11,8 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   turn was interrupted. Drain capacity and reservation waiters are bounded;
   session deletion fences new work and waits for admitted turns before removing
   session rows.
+- Session deletion also cancels pending goal reviews and prevents a reviewer
+  from registering a continuation driver after the delete fence opens.
 
 ## 0.7.1 - 2026-11-10
 

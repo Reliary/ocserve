@@ -115,6 +115,10 @@ tokio::runtime::Builder::new_multi_thread()
   than retaining another request or background task.
 - V2 session deletion fences are capped at 128 concurrent sessions by
   `MAX_V2_SESSION_DELETES`; a full cap returns bounded backpressure.
+- Pending goal-review tasks are capped at 128 entries by
+  `MAX_PENDING_GOAL_REVIEWS`; the tracked registry is allocated with that
+  capacity, and a wake beyond the cap logs and defers without spawning a task
+  (`D-GOAL-REVIEW-CAP`).
 - V2 drains waiting on the shared prompt-lock map are bounded by the same 128
   drain slots. The map itself is capped at `MAX_PROMPT_LOCKS` (64); its
   `Notify` keeps no per-waiter message queue. Waiters enable their notification

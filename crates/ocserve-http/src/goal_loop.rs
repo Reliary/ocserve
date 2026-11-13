@@ -237,8 +237,7 @@ pub async fn after_turn(st: &Arc<AppState>, sid: &str) -> bool {
                 );
             }
             let text = continuation(&latest.objective, &verdict);
-            spawn_driver(st, sid, text, latest.id.clone(), true);
-            true
+            spawn_driver(st, sid, text, latest.id.clone(), true).await
         }
     }
 }
@@ -551,23 +550,75 @@ pub(crate) async fn run_turn_now(
 /// `wake_inbox_after_turn`, which calls this function again; the dedup guard
 /// then suppressed the inner call and the reviewer never ran (caught by the
 /// goal e2e on the first run).
-pub(crate) fn spawn_wake_public(st: &Arc<AppState>, sid: &str) {
+pub(crate) const MAX_PENDING_GOAL_REVIEWS: usize = 128;
+
+pub(crate) fn spawn_wake_public(st: &Arc<AppState>, sid: &str) -> bool {
+    // Deletion opens its fence while holding the drain-registry mutex. Share
+    // that critical section so delete either sees this handle and cancels it,
+    // or the wake sees the fence and never starts.
+    let _tasks = st.v2_drain_tasks.lock();
+    if let Err(error) = crate::check_v1_session_admission(st, sid) {
+        tracing::debug!(
+            "goal review skipped for unavailable session={sid}: {}",
+            error.message
+        );
+        return false;
+    }
+    static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // One pending review per session. Overlapping wakes (a user turn and a
     // goal turn finishing together) would both call the reviewer and both
     // spawn a continuation, doubling rounds and cost (2026-11-05 review).
-    {
-        let mut w = st.goal_wakes.lock();
-        if w.contains(sid) {
-            return;
-        }
-        w.insert(sid.to_string());
+    let mut wakes = st.goal_wakes.lock();
+    if wakes.contains_key(sid) {
+        return false;
+    }
+    if wakes.len() >= MAX_PENDING_GOAL_REVIEWS {
+        tracing::warn!(
+            "goal reviewer capacity ({MAX_PENDING_GOAL_REVIEWS}) full; deferring session={sid}"
+        );
+        return false;
     }
     let st2 = st.clone();
     let sid2 = sid.to_string();
-    tokio::spawn(async move {
+    // The one-shot ensures a fast reviewer cannot finish and remove its slot
+    // before its JoinHandle is in the registry.
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        if start_rx.await.is_err() {
+            return;
+        }
+        let _slot = GoalWakeSlot {
+            st: st2.clone(),
+            sid: sid2.clone(),
+            token,
+        };
         after_turn(&st2, &sid2).await;
-        st2.goal_wakes.lock().remove(&sid2);
     });
+    wakes.insert(sid.to_string(), (token, handle));
+    drop(wakes);
+    let _ = start_tx.send(());
+    true
+}
+
+/// Remove a completed reviewer without letting an old task erase a newer
+/// wake registered for the same session.
+struct GoalWakeSlot {
+    st: Arc<AppState>,
+    sid: String,
+    token: u64,
+}
+
+impl Drop for GoalWakeSlot {
+    fn drop(&mut self) {
+        let mut wakes = self.st.goal_wakes.lock();
+        if wakes
+            .get(&self.sid)
+            .is_some_and(|(token, _)| *token == self.token)
+        {
+            wakes.remove(&self.sid);
+        }
+    }
 }
 
 /// A short assistant notice for a control word (`pause`/`resume`/`clear`).
@@ -685,11 +736,31 @@ impl Drop for DriverSlot {
 /// and not the process (review L6).
 const MAX_CONCURRENT_DRIVERS: usize = 4;
 
-fn spawn_driver(st: &Arc<AppState>, sid: &str, text: String, goal_id: String, synthetic: bool) {
+async fn spawn_driver(
+    st: &Arc<AppState>,
+    sid: &str,
+    text: String,
+    goal_id: String,
+    synthetic: bool,
+) -> bool {
+    // Serialize the existence/fence check and registry insertion with delete.
+    // Delete cancels any driver that registered before opening its fence.
+    let _admission = st.v2_session_admission_gate.read().await;
+    if let Err(error) = crate::check_v1_session_admission(st, sid) {
+        tracing::debug!(
+            "goal driver registration skipped for unavailable session={sid}: {}",
+            error.message
+        );
+        return false;
+    }
     static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let st2 = st.clone();
+    let sid2 = sid.to_string();
+    let goal_for_id = goal_id.clone();
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
     // One driver per session: replace (and cancel) a stale one.
-    {
+    let accepted = {
         let mut tasks = st.goal_tasks.lock();
         if let Some((_, old)) = tasks.remove(sid) {
             old.abort();
@@ -702,175 +773,181 @@ fn spawn_driver(st: &Arc<AppState>, sid: &str, text: String, goal_id: String, sy
             tracing::warn!(
                 "goal: {MAX_CONCURRENT_DRIVERS} loops already driving; deferring session={sid}"
             );
-            drop(tasks);
-            // Pause rather than leave an ACTIVE goal nothing will drive: a
-            // deferred goal the operator can see and resume beats one that
-            // quietly never runs.
-            let st2 = st.clone();
-            let sid2 = sid.to_string();
-            tokio::spawn(async move {
-                pause_goal(
-                    &st2,
-                    &sid2,
-                    &format!("Deferred: {MAX_CONCURRENT_DRIVERS} goals are already running"),
-                )
-                .await;
+            false
+        } else {
+            let slot = DriverSlot {
+                st: st2.clone(),
+                sid: sid2.clone(),
+                token,
+            };
+            let task_st = st2.clone();
+            let task_sid = sid2.clone();
+            let handle = tokio::spawn(async move {
+                if start_rx.await.is_err() {
+                    return;
+                }
+                run_driver_task(task_st, task_sid, text, goal_for_id, synthetic, slot).await;
             });
-            return;
+            tasks.insert(sid2, (token, handle));
+            true
         }
-    }
-    let st2 = st.clone();
-    let sid2 = sid.to_string();
-    let slot = DriverSlot {
-        st: st2.clone(),
-        sid: sid2.clone(),
-        token,
     };
-    let goal_for_id = goal_id.clone();
-    let handle = tokio::spawn(async move {
-        // Dropped on every exit path, including the early returns below.
-        let _slot = slot;
-        let goal_id = goal_for_id;
-        // Re-check right before the turn: the goal may have been paused,
-        // cleared or replaced while this task waited for the lock.
-        let current = crate::run_blocking(&st2.db, {
-            let db = st2.db.clone();
-            let sid3 = sid2.clone();
-            move |_| ocserve_store::get_goal(&db, &sid3)
-        })
-        .await
-        .ok()
-        .flatten();
-        let still_active = current.as_ref().is_some_and(|g| {
-            g.id == goal_id && g.status == Status::Active.as_str() && g.boot == boot_id()
-        });
-        if !still_active {
-            return;
-        }
-        let release = match crate::lock_session(&st2, &sid2).await {
-            Ok(r) => r,
-            Err(e) => {
-                // Persisted state says ACTIVE but no turn can run: pause
-                // rather than leaving a goal that looks alive and is not.
-                pause_goal(
-                    &st2,
-                    &sid2,
-                    &format!("The goal could not start: {}", e.message),
-                )
-                .await;
-                return;
-            }
-        };
-        let guard = release.arc().lock().await;
-        // Second check under the lock: a pause that landed between the read
-        // and the acquire must still win.
-        let current = crate::run_blocking(&st2.db, {
-            let db = st2.db.clone();
-            let sid3 = sid2.clone();
-            move |_| ocserve_store::get_goal(&db, &sid3)
-        })
-        .await
-        .ok()
-        .flatten();
-        let still_active = current.as_ref().is_some_and(|g| {
-            g.id == goal_id && g.status == Status::Active.as_str() && g.boot == boot_id()
-        });
-        if !still_active {
-            drop(guard);
-            return;
-        }
-        let req = ocserve_core::wire::PromptRequest {
-            message_id: None,
-            model: None,
-            parts: vec![goal_part(&text, &goal_id, synthetic)],
-            ..Default::default()
-        };
-        let ctx = match crate::build_prompt_context(&st2, &req, &sid2) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("goal turn context failed session={sid2}: {}", e.message);
-                drop(guard);
-                pause_goal(
-                    &st2,
-                    &sid2,
-                    &format!("The goal could not start: {}", e.message),
-                )
-                .await;
-                return;
-            }
-        };
-        let writer = st2.writer.clone();
-        let turn = ocserve_core::prompt::run_prompt_with(
-            &ctx,
-            &writer,
-            &sid2,
-            &req,
-            ocserve_core::prompt::RunOpts {
-                auto_title: false,
-                ..Default::default()
-            },
+    if !accepted {
+        // Pause rather than leave an ACTIVE goal nothing will drive: a
+        // deferred goal the operator can see and resume beats one that quietly
+        // never runs.
+        pause_goal(
+            st,
+            sid,
+            &format!("Deferred: {MAX_CONCURRENT_DRIVERS} goals are already running"),
         )
         .await;
-        drop(guard);
-        if let Err(e) = turn {
-            // A failing continuation must PAUSE, not retry. Without this the
-            // loop re-reviews, is told "continue", fails the same way, and
-            // burns a provider call per cycle forever (2026-11-05 review:
-            // only `run_turn_now` handled this, and only for the kickoff).
-            tracing::error!("goal turn failed session={sid2}: {e:#}");
-            ocserve_metrics::labeled_counter("ocserve_goal_total", "event=\"turn_failed\"", 1);
-            // SURFACE the failure: this path calls `run_prompt_with` directly,
-            // so `run_prompt`'s wrapper (durable session.error + [turn
-            // stopped] part + finalize + idle) never ran and a client that saw
-            // `busy` would spin forever (2026-11-05 SRE review). Same shape the
-            // wrapper emits, so the client sees one kind of error.
-            crate::emit_session_error_event(
+        return false;
+    }
+    let _ = start_tx.send(());
+    true
+}
+
+async fn run_driver_task(
+    st2: Arc<AppState>,
+    sid2: String,
+    text: String,
+    goal_id: String,
+    synthetic: bool,
+    _slot: DriverSlot,
+) {
+    // Re-check right before the turn: the goal may have been paused, cleared
+    // or replaced while this task waited for the lock.
+    let current = crate::run_blocking(&st2.db, {
+        let db = st2.db.clone();
+        let sid3 = sid2.clone();
+        move |_| ocserve_store::get_goal(&db, &sid3)
+    })
+    .await
+    .ok()
+    .flatten();
+    let still_active = current.as_ref().is_some_and(|g| {
+        g.id == goal_id && g.status == Status::Active.as_str() && g.boot == boot_id()
+    });
+    if !still_active {
+        return;
+    }
+    let release = match crate::lock_session(&st2, &sid2).await {
+        Ok(r) => r,
+        Err(e) => {
+            // Persisted state says ACTIVE but no turn can run: pause rather
+            // than leaving a goal that looks alive and is not.
+            pause_goal(
                 &st2,
                 &sid2,
-                &format!("The goal stopped after an error: {e:#}"),
-            );
-            let db = st2.db.clone();
-            let sid3 = sid2.clone();
-            if let Ok(Some(mut g)) = crate::run_blocking(&db, {
-                let db = st2.db.clone();
-                let sid4 = sid3.clone();
-                move |_| ocserve_store::get_goal(&db, &sid4)
-            })
-            .await
-                && g.id == goal_id
-                && g.status == Status::Active.as_str()
-            {
-                settle(
-                    &st2,
-                    &sid3,
-                    &mut g,
-                    Status::Paused,
-                    &format!("The goal stopped after an error: {e:#}"),
-                )
-                .await;
-            }
+                &format!("The goal could not start: {}", e.message),
+            )
+            .await;
             return;
         }
-        // The turn finished: judge again (this is the loop). Only if the goal
-        // is still active; a paused/cleared goal must not be resurrected.
-        let current = crate::run_blocking(&st2.db, {
+    };
+    let guard = release.arc().lock().await;
+    // Second check under the lock: a pause that landed between the read and
+    // the acquire must still win.
+    let current = crate::run_blocking(&st2.db, {
+        let db = st2.db.clone();
+        let sid3 = sid2.clone();
+        move |_| ocserve_store::get_goal(&db, &sid3)
+    })
+    .await
+    .ok()
+    .flatten();
+    let still_active = current.as_ref().is_some_and(|g| {
+        g.id == goal_id && g.status == Status::Active.as_str() && g.boot == boot_id()
+    });
+    if !still_active {
+        drop(guard);
+        return;
+    }
+    let req = ocserve_core::wire::PromptRequest {
+        message_id: None,
+        model: None,
+        parts: vec![goal_part(&text, &goal_id, synthetic)],
+        ..Default::default()
+    };
+    let ctx = match crate::build_prompt_context(&st2, &req, &sid2) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("goal turn context failed session={sid2}: {}", e.message);
+            drop(guard);
+            pause_goal(
+                &st2,
+                &sid2,
+                &format!("The goal could not start: {}", e.message),
+            )
+            .await;
+            return;
+        }
+    };
+    let writer = st2.writer.clone();
+    let turn = ocserve_core::prompt::run_prompt_with(
+        &ctx,
+        &writer,
+        &sid2,
+        &req,
+        ocserve_core::prompt::RunOpts {
+            auto_title: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    drop(guard);
+    if let Err(e) = turn {
+        // A failing continuation must PAUSE, not retry. Without this the loop
+        // re-reviews, is told "continue", fails the same way, and burns a
+        // provider call per cycle forever.
+        tracing::error!("goal turn failed session={sid2}: {e:#}");
+        ocserve_metrics::labeled_counter("ocserve_goal_total", "event=\"turn_failed\"", 1);
+        // This path calls run_prompt_with directly, so run_prompt's wrapper
+        // (durable session.error + stopped part + finalize + idle) never ran.
+        crate::emit_session_error_event(
+            &st2,
+            &sid2,
+            &format!("The goal stopped after an error: {e:#}"),
+        );
+        let db = st2.db.clone();
+        let sid3 = sid2.clone();
+        if let Ok(Some(mut g)) = crate::run_blocking(&db, {
             let db = st2.db.clone();
-            let sid3 = sid2.clone();
-            move |_| ocserve_store::get_goal(&db, &sid3)
+            let sid4 = sid3.clone();
+            move |_| ocserve_store::get_goal(&db, &sid4)
         })
         .await
-        .ok()
-        .flatten();
-        let still_active = current.as_ref().is_some_and(|g| {
-            g.id == goal_id && g.status == Status::Active.as_str() && g.boot == boot_id()
-        });
-        if still_active {
-            crate::wake_inbox_after_turn(&st2, &sid2).await;
+            && g.id == goal_id
+            && g.status == Status::Active.as_str()
+        {
+            settle(
+                &st2,
+                &sid3,
+                &mut g,
+                Status::Paused,
+                &format!("The goal stopped after an error: {e:#}"),
+            )
+            .await;
         }
+        return;
+    }
+    // The turn finished: judge again only if the goal is still active; a
+    // paused/cleared goal must not be resurrected.
+    let current = crate::run_blocking(&st2.db, {
+        let db = st2.db.clone();
+        let sid3 = sid2.clone();
+        move |_| ocserve_store::get_goal(&db, &sid3)
+    })
+    .await
+    .ok()
+    .flatten();
+    let still_active = current.as_ref().is_some_and(|g| {
+        g.id == goal_id && g.status == Status::Active.as_str() && g.boot == boot_id()
     });
-    st.goal_tasks
-        .lock()
-        .insert(sid.to_string(), (token, handle));
+    if still_active {
+        crate::wake_inbox_after_turn(&st2, &sid2).await;
+    }
 }
 
 /// Public pause used by the abort/interrupt paths (upstream pauses an active
@@ -892,8 +969,12 @@ async fn pause_goal(st: &Arc<AppState>, sid: &str, reason: &str) {
     }
 }
 
-/// Cancel a session's goal driver (abort / delete / pause / clear).
+/// Cancel a session's pending reviewer and goal driver (abort / delete / pause / clear).
 pub fn cancel_driver(st: &Arc<AppState>, sid: &str) {
+    let wake = st.goal_wakes.lock().remove(sid).map(|(_, handle)| handle);
+    if let Some(handle) = wake {
+        handle.abort();
+    }
     if let Some((_, h)) = st.goal_tasks.lock().remove(sid) {
         h.abort();
     }
@@ -1016,7 +1097,7 @@ pub async fn start_goal(
             // A prompt can carry attachments; a synthetic notice cannot. With
             // attachments the kickoff goes through as the user's own message
             // (upstream's `attached` branch).
-            continue_with_text(st, sid, &text, &row.id, attached);
+            continue_with_text(st, sid, &text, &row.id, attached).await;
             Ok(row.to_json())
         }
     }
@@ -1085,7 +1166,7 @@ async fn control(st: &Arc<AppState>, sid: &str, which: &str) -> Result<serde_jso
                     next_step: None,
                 },
             );
-            continue_with_text(st, sid, &text, &goal.id, false);
+            continue_with_text(st, sid, &text, &goal.id, false).await;
             Ok(goal.to_json())
         }
         _ => {
@@ -1126,10 +1207,16 @@ fn usage(goal: Option<&ocserve_store::GoalRow>) -> String {
 
 /// Kickoff/resume delivery: synthetic by default (the timeline shows one
 /// notice row), or a real user message when the command carried attachments.
-fn continue_with_text(st: &Arc<AppState>, sid: &str, text: &str, goal_id: &str, as_user: bool) {
+async fn continue_with_text(
+    st: &Arc<AppState>,
+    sid: &str,
+    text: &str,
+    goal_id: &str,
+    as_user: bool,
+) -> bool {
     // Upstream's `attached` branch runs a real prompt; both are the same turn
     // here except for the `synthetic` flag (a notice vs the user's message).
-    spawn_driver(st, sid, text.to_string(), goal_id.to_string(), !as_user);
+    spawn_driver(st, sid, text.to_string(), goal_id.to_string(), !as_user).await
 }
 
 #[cfg(test)]
@@ -1137,7 +1224,6 @@ mod deletion_fence_tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "red: K-GOAL-DELETE-RACE; follow-up to PR #41"]
     async fn driver_cannot_register_while_session_delete_is_fenced() {
         let st = AppState::with_payloads_and_v2(None, Default::default(), true);
         let sid = "ses_goal_delete_fence";
@@ -1164,7 +1250,7 @@ mod deletion_fence_tests {
             .await
             .unwrap_or_else(|e| panic!("session lock: {}", e.message));
         let guard = release.arc().lock().await;
-        spawn_driver(&st, sid, "continue".into(), "goal_delete".into(), true);
+        spawn_driver(&st, sid, "continue".into(), "goal_delete".into(), true).await;
         assert!(
             !st.goal_tasks.lock().contains_key(sid),
             "delete fence must reject a goal driver registered after deletion started"
@@ -1174,5 +1260,44 @@ mod deletion_fence_tests {
         fence.finish().await;
         // CONTROL: remove the admission check from spawn_driver; with the
         // session lock held, the driver registry entry makes this test red.
+    }
+
+    #[tokio::test]
+    async fn pending_goal_review_registry_enforces_its_cap() {
+        let st = AppState::with_payloads_and_v2(None, Default::default(), true);
+        let sid = "ses_goal_review_cap";
+        ocserve_store::insert_session(
+            &st.writer,
+            &json!({
+                "id": sid,
+                "projectID": "global",
+                "directory": "/w",
+                "path": sid,
+                "slug": sid,
+                "title": "t",
+                "version": "1",
+                "time": {"created": 1, "updated": 2},
+            }),
+        )
+        .unwrap();
+        {
+            let mut wakes = st.goal_wakes.lock();
+            for index in 0..MAX_PENDING_GOAL_REVIEWS {
+                wakes.insert(
+                    format!("pending-{index}"),
+                    (index as u64, tokio::spawn(std::future::pending())),
+                );
+            }
+        }
+        assert!(!spawn_wake_public(&st, sid));
+        {
+            let mut wakes = st.goal_wakes.lock();
+            assert_eq!(wakes.len(), MAX_PENDING_GOAL_REVIEWS);
+            assert!(!wakes.contains_key(sid));
+            for handle in wakes.drain().map(|(_, (_, handle))| handle) {
+                handle.abort();
+            }
+        }
+        // CONTROL: remove the cap check; this wake adds one extra task entry.
     }
 }

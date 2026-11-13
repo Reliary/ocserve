@@ -463,8 +463,10 @@ pub struct AppState {
     /// review). Bound: one entry per armed goal, removed by its own task.
     pub goal_tasks:
         parking_lot::Mutex<std::collections::HashMap<String, (u64, tokio::task::JoinHandle<()>)>>,
-    /// Sessions with a pending goal wake (dedup: one reviewer per idle point).
-    pub goal_wakes: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Pending goal reviewers (one per session), tracked so abort/delete can
+    /// stop them. The registry is capped at `MAX_PENDING_GOAL_REVIEWS`.
+    pub goal_wakes:
+        parking_lot::Mutex<std::collections::HashMap<String, (u64, tokio::task::JoinHandle<()>)>>,
 }
 
 /// LLM endpoint resolution for the prompt runner (assembled by Runtime).
@@ -834,7 +836,9 @@ impl AppState {
             goals_enabled: goals_enabled_from_env(),
             fs_watches: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
             goal_tasks: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            goal_wakes: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            goal_wakes: parking_lot::Mutex::new(std::collections::HashMap::with_capacity(
+                crate::goal_loop::MAX_PENDING_GOAL_REVIEWS,
+            )),
             db: w.db,
             blobs: w.blobs,
             writer: w.writer,
