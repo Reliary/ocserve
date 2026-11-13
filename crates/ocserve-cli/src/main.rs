@@ -718,7 +718,14 @@ async fn serve(
 
     // H1: external-edit hot-reload — poll the exact files Runtime reads,
     // reconcile on change (fail-safe: broken config keeps old state serving)
-    state.watch.write().paths = crate::runtime::watch_paths(&data_dir);
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let mut watch = state.watch.write();
+        watch.paths = crate::runtime::watch_paths(&data_dir);
+        watch.opencode_auth_db = Some(crate::runtime::opencode_auth_db_path(std::path::Path::new(
+            &home,
+        )));
+    }
     ocserve_http::watch::observe(&state);
     // boot: hand the initial load pipeline's freed pages back (Tier-0 lab:
     // full catalog settles 237→91 MB with trim; tiny-catalog control = 19 MB)
