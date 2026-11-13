@@ -603,6 +603,7 @@ current anywhere.
 | `D-V2-PERM-EVAL` | `permission.evaluate` is not bridged as a v2 hook; the server's own gate is authoritative. | accepted |
 | `D-V2-RPC-EVENTS` | `rpc.events.emit` is not bridged: there is no v2 RPC event SSE surface. | accepted |
 | `D-V2-SESSION-LIFECYCLE` | Transport-level v2 hooks (`model.request`, `http.*`, `retry`, `title`, `generate`) are not bridged. | accepted |
+| `D-V2-DRAIN-CAP` | At most 128 v2 sessions may hold an active drain slot. A request that needs a new slot receives `ServiceUnavailableError` before its inbox row is written; background wake sources wait for a slot. This bounds the per-session drain task registry and preserves durable admitted work. | accepted |
 | `D-V2-STORAGE-MEM` | `ctx.storage` is in-memory for the life of the sidecar; it is not disk-backed. | accepted |
 | `D-V2-SESSION-GENERATE` | The transient generate path runs, but the v2 `session.generate` hook is not dispatched. | accepted |
 | `D-V2-TOOL-EDITOR` | `tool.transform` registers and records, but the tool registry is static, so it is not applied; `tool.list` returns `[]`. | closed (the callback runs against a live editor; added tools are advertised with their JSON Schema and dispatched; a disposed registration removes its names) |

@@ -1891,14 +1891,37 @@ pub async fn session_remove_api(
     Path(id): Path<String>,
 ) -> Result<StatusCode, HttpError> {
     // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
-    // The goal driver is a bare task: aborting prompt_tasks does not stop it,
-    // so the loop could keep spending against a row that is being deleted
+    let delete_fence = begin_session_delete(&st, &id)
+        .await
+        .map_err(crate::HttpError::Api)?;
+    // The goal driver is separate from both prompt_tasks and tracked v2
+    // drains; cancel it before stopping execution and deleting its session
     // (2026-11-05 review M3).
     crate::goal_loop::cancel_driver(&st, &id);
+    cancel_drains_for_delete(&st, &id).await;
+    #[cfg(test)]
+    let delete_gap_barriers = { st.v2_session_delete_gap_test_barriers.lock().take() };
+    #[cfg(test)]
+    if let Some(barriers) = delete_gap_barriers {
+        barriers.0.wait().await;
+        barriers.1.wait().await;
+    }
+    #[cfg(test)]
+    if let Some(hook) = st.v2_session_remove_after_cancel_hook.lock().take() {
+        hook();
+    }
     if let Some((_, handle)) = st.prompt_tasks.lock().remove(&id) {
         handle.abort();
     }
-    let found = ocserve_store::delete_session(&st.writer, &st.db, &id).map_err(internal)?;
+    let delete_result = {
+        let release = crate::lock_session(&st, &id)
+            .await
+            .map_err(crate::HttpError::Api)?;
+        let _session_guard = release.arc().lock().await;
+        ocserve_store::delete_session(&st.writer, &st.db, &id)
+    };
+    delete_fence.finish().await;
+    let found = delete_result.map_err(internal)?;
     if !found {
         return Err(session_not_found(&id));
     }
@@ -2690,9 +2713,13 @@ async fn admit_typed(
     delivery: &str,
     resume: bool,
 ) -> Result<StatusCode, HttpError> {
-    if !ocserve_store::session_exists(&st.db, sid).map_err(internal)? {
-        return Err(session_not_found(sid));
-    }
+    let _admission = st.v2_session_admission_gate.read().await;
+    check_session_admission(st, sid)?;
+    let drain_slot = if resume {
+        Some(reserve_drain_slot(st, sid)?)
+    } else {
+        None
+    };
     let msg_id = msg_id.unwrap_or_else(new_v2_msg_id);
     let (seq, _evt) = ocserve_store::emit_event(
         &st.writer,
@@ -2709,13 +2736,10 @@ async fn admit_typed(
         } else {
             ocserve_core::coordinator::WakeScope::Steer
         };
-        if st.coordinators.wake(sid, scope) {
-            let st2 = st.clone();
-            let sid2 = sid.to_string();
-            tokio::spawn(async move {
-                drain_session(st2, sid2).await;
-            });
-        }
+        let Some(slot) = drain_slot else {
+            return Err(drain_capacity_error());
+        };
+        wake_drain(st.clone(), sid.to_string(), scope, slot);
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2936,6 +2960,12 @@ pub async fn session_generate_api(
     };
     if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
         return Err(session_not_found(&id));
+    }
+    let release = crate::lock_session(&st, &id).await?;
+    let _session_guard = release.arc().lock().await;
+    {
+        let _admission = st.v2_session_admission_gate.read().await;
+        check_session_admission(&st, &id)?;
     }
     let req = ocserve_core::wire::PromptRequest {
         message_id: None,
@@ -3878,11 +3908,18 @@ pub async fn prompt(
             }
         }
     }
+    let _admission = st.v2_session_admission_gate.read().await;
+    check_session_admission(&st, &id)?;
+    let msg_id = input.id.clone().unwrap_or_else(new_v2_msg_id);
+    let delivery = input.delivery.clone().unwrap_or_else(|| "steer".into());
+    let drain_slot = if input.resume != Some(false) {
+        Some(reserve_drain_slot(&st, &id)?)
+    } else {
+        None
+    };
     // Revert-commit cleanup before admission (upstream session.ts:165-166:
     // staged revert commits after prepare, before admit).
     ocserve_store::revert_cleanup(&st.writer, &st.db, &id).map_err(internal)?;
-    let msg_id = input.id.clone().unwrap_or_else(new_v2_msg_id);
-    let delivery = input.delivery.clone().unwrap_or_else(|| "steer".into());
     let payload = json!({
         "text": input.prompt_text,
         "files": input.prompt_files,
@@ -3923,13 +3960,10 @@ pub async fn prompt(
         } else {
             ocserve_core::coordinator::WakeScope::Steer
         };
-        if st.coordinators.wake(&id, scope) {
-            let st2 = st.clone();
-            let sid = id.clone();
-            tokio::spawn(async move {
-                drain_session(st2, sid).await;
-            });
-        }
+        let Some(slot) = drain_slot else {
+            return Err(drain_capacity_error());
+        };
+        wake_drain(st.clone(), id.clone(), scope, slot);
     }
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3976,12 +4010,416 @@ fn new_v2_msg_id() -> String {
     out
 }
 
+fn drain_capacity_error() -> HttpError {
+    HttpError::TaggedData {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        tag: "ServiceUnavailableError",
+        fields: json!({"message": "too many active v2 sessions; retry shortly"}),
+    }
+}
+
+/// Reserve one of the fixed v2 drain slots before admitting durable work.
+/// Reuse the current session's slot when a drain already owns it.
+pub(crate) fn reserve_drain_slot(
+    st: &AppState,
+    sid: &str,
+) -> Result<Arc<tokio::sync::OwnedSemaphorePermit>, HttpError> {
+    if let Some(slot) = st
+        .v2_drain_tasks
+        .lock()
+        .get(sid)
+        .map(|task| task.slot.clone())
+    {
+        return Ok(slot);
+    }
+    match st.v2_drain_slots.clone().try_acquire_owned() {
+        Ok(slot) => Ok(Arc::new(slot)),
+        Err(_) => st
+            .v2_drain_tasks
+            .lock()
+            .get(sid)
+            .map(|task| task.slot.clone())
+            .ok_or_else(drain_capacity_error),
+    }
+}
+
+/// Background wake sources may wait for active capacity, but the reservation
+/// queue itself is capped. A full waiter cap fails immediately so floods of
+/// interrupts/scheduler wakes cannot retain unbounded request or task state.
+pub(crate) async fn reserve_drain_slot_wait(
+    st: &AppState,
+    sid: &str,
+) -> Result<Arc<tokio::sync::OwnedSemaphorePermit>, HttpError> {
+    if let Some(slot) = st
+        .v2_drain_tasks
+        .lock()
+        .get(sid)
+        .map(|task| task.slot.clone())
+    {
+        return Ok(slot);
+    }
+    if let Ok(slot) = st.v2_drain_slots.clone().try_acquire_owned() {
+        return Ok(Arc::new(slot));
+    }
+    let waiter = st
+        .v2_drain_waiters
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| drain_capacity_error())?;
+    let slot = Arc::new(
+        st.v2_drain_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| drain_capacity_error())?,
+    );
+    drop(waiter);
+    if let Some(existing) = st
+        .v2_drain_tasks
+        .lock()
+        .get(sid)
+        .map(|task| task.slot.clone())
+    {
+        return Ok(existing);
+    }
+    Ok(slot)
+}
+
+/// Make the coordinator wake and registry transition atomic with cancellation.
+/// Without the shared registry lock, a new wake can set `pending` after cancel
+/// removes the old drain but before it aborts coordinator state, losing the
+/// newly admitted work.
+pub(crate) fn wake_drain(
+    st: Arc<AppState>,
+    sid: String,
+    scope: ocserve_core::coordinator::WakeScope,
+    slot: Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> bool {
+    let mut tasks = st.v2_drain_tasks.lock();
+    if session_is_deleting(&st, &sid) {
+        return false;
+    }
+    let should_spawn = st.coordinators.wake(&sid, scope);
+    if should_spawn {
+        register_drain_locked(&st, sid, slot, &mut tasks);
+    }
+    should_spawn
+}
+
+/// Test helper for a caller that has already armed the coordinator. Production
+/// wake paths use `wake_drain` so wake, registration, and cancellation share
+/// one registry critical section.
+#[cfg(test)]
+pub(crate) fn spawn_drain(
+    st: Arc<AppState>,
+    sid: String,
+    slot: Arc<tokio::sync::OwnedSemaphorePermit>,
+) {
+    let mut tasks = st.v2_drain_tasks.lock();
+    register_drain_locked(&st, sid, slot, &mut tasks);
+}
+
+fn register_drain_locked(
+    st: &Arc<AppState>,
+    sid: String,
+    slot: Arc<tokio::sync::OwnedSemaphorePermit>,
+    tasks: &mut std::collections::HashMap<String, crate::V2DrainTask>,
+) {
+    if session_is_deleting(st, &sid) {
+        st.coordinators.abort(&sid);
+        return;
+    }
+    let generation = st
+        .v2_drain_gen
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(task) = tasks.get_mut(&sid) {
+        // The coordinator was re-armed after its prior loop found no work, but
+        // before that task emitted its terminal event and removed the entry.
+        // Let it complete that event, then run the newly pending scope using
+        // the existing permit and registry entry.
+        task.rerun = true;
+        return;
+    }
+    // watch stores only the latest cancellation bit; the oneshot carries one
+    // start signal so the registry entry is visible before the drain runs.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let (completion_tx, completion_rx) = tokio::sync::watch::channel(None);
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let st_task = st.clone();
+    let sid_task = sid.clone();
+    let task_cancel = cancel_rx.clone();
+    let handle = tokio::spawn(async move {
+        if start_rx.await.is_err() {
+            let _ = completion_tx.send(Some(false));
+            return false;
+        }
+        loop {
+            let outcome =
+                drain_session_inner(st_task.clone(), sid_task.clone(), Some(task_cancel.clone()))
+                    .await;
+            #[cfg(test)]
+            if outcome.was_interrupted() {
+                let barriers = st_task.v2_drain_terminal_test_barriers.lock().take();
+                if let Some(barriers) = barriers {
+                    barriers.0.wait().await;
+                    barriers.1.wait().await;
+                }
+            }
+            let interrupted = terminal_interrupt_result(&outcome, *cancel_rx.borrow());
+            let completed = finish_drain_events(&st_task, &sid_task, outcome);
+            // Do not promote a late cancel bit into an interruption: the inner
+            // loop records interruption only when cancellation wins before the
+            // active turn reaches a terminal state.
+            let mut tasks = st_task.v2_drain_tasks.lock();
+            let registered = tasks
+                .get_mut(&sid_task)
+                .filter(|task| task.generation == generation)
+                .map(|task| (task.rerun, task.slot.clone()));
+            let rerun = if let Some((queued_rerun, slot)) = registered {
+                let pending = st_task.coordinators.pending_scope(&sid_task).is_some();
+                let cancelled = *cancel_rx.borrow();
+                if (queued_rerun || pending) && !cancelled {
+                    if let Some(task) = tasks.get_mut(&sid_task) {
+                        task.rerun = false;
+                    }
+                    true
+                } else if (queued_rerun || pending) && cancelled {
+                    // A prompt admitted after interrupt began must wait until
+                    // the interrupted event is published and the old turn has
+                    // released its session lock and claim. Hand its doorbell
+                    // to a fresh task while the registry lock still prevents
+                    // a second concurrent replacement.
+                    tasks.remove(&sid_task);
+                    register_drain_locked(&st_task, sid_task.clone(), slot, &mut tasks);
+                    false
+                } else {
+                    // Every terminal path clears any coordinator state left by
+                    // a consumed-but-cancelled scope (or a terminal error).
+                    // This remains serialized against production wake paths.
+                    st_task.coordinators.abort(&sid_task);
+                    tasks.remove(&sid_task);
+                    false
+                }
+            } else {
+                false
+            };
+            drop(tasks);
+            if completed {
+                crate::goal_loop::spawn_wake_public(&st_task, &sid_task);
+            }
+            if !rerun {
+                let _ = completion_tx.send(Some(interrupted));
+                return interrupted;
+            }
+        }
+    });
+    tasks.insert(
+        sid.clone(),
+        crate::V2DrainTask {
+            generation,
+            cancel: cancel_tx,
+            handle,
+            completion: completion_rx,
+            slot,
+            rerun: false,
+        },
+    );
+    if start_tx.send(()).is_err() {
+        tracing::warn!("v2 drain task could not be started for {sid}");
+    }
+}
+
+/// Cooperatively stop a registered v2 drain. The task owns claim release and
+/// terminal-event publication; this transition resets coordinator state while
+/// serialized against every production wake. Concurrent callers observe the
+/// same completion signal, so a delete cannot outrun the first interrupter.
+pub(crate) async fn cancel_drain(st: &Arc<AppState>, sid: &str) -> bool {
+    let completion_rx = {
+        let mut tasks = st.v2_drain_tasks.lock();
+        let completion_rx = if let Some(task) = tasks.get_mut(sid) {
+            task.cancel.send_replace(true);
+            task.rerun = false;
+            Some(task.completion.clone())
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if let Some(hook) = st.v2_cancel_transition_hook.lock().take() {
+            hook();
+        }
+        // Keep the registry lock through coordinator reset. Every production
+        // wake obtains this same lock before setting its coordinator doorbell,
+        // so no post-cancel wake can be erased by this abort. The registered
+        // task remains as a retirement marker until its terminal event is
+        // published; a later wake is handed off by its completion path.
+        st.coordinators.abort(sid);
+        completion_rx
+    };
+    let Some(mut completion_rx) = completion_rx else {
+        return false;
+    };
+    loop {
+        if let Some(interrupted) = *completion_rx.borrow() {
+            return interrupted;
+        }
+        if completion_rx.changed().await.is_err() {
+            tracing::warn!("v2 drain completion signal dropped for {sid}");
+            return false;
+        }
+    }
+}
+
+/// Session deletion must also stop a fresh drain handed off for work that was
+/// admitted while the previous cancelled drain was retiring.
+pub(crate) async fn cancel_drains_for_delete(st: &Arc<AppState>, sid: &str) -> bool {
+    let mut interrupted = false;
+    loop {
+        if !st.v2_drain_tasks.lock().contains_key(sid) {
+            return interrupted;
+        }
+        interrupted |= cancel_drain(st, sid).await;
+    }
+}
+
+/// Prevent prompt/inbox admission from registering a new drain while a
+/// session is being deleted. The read side is held only over the admission
+/// writes; delete holds the write side when opening and closing its fence.
+pub(crate) async fn begin_session_delete(
+    st: &Arc<AppState>,
+    sid: &str,
+) -> Result<SessionDeleteFence, crate::ApiError> {
+    let permit = st
+        .v2_session_delete_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| crate::ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            name: "ServiceUnavailableError",
+            message: "too many session deletions; retry shortly".into(),
+        })?;
+    let _admission = st.v2_session_admission_gate.write().await;
+    let _tasks = st.v2_drain_tasks.lock();
+    let mut deleting = st.v2_deleting_sessions.lock();
+    if !deleting.insert(sid.to_string()) {
+        return Err(crate::ApiError::not_found(format!(
+            "Session not found: {sid}"
+        )));
+    }
+    drop(deleting);
+    drop(_tasks);
+    Ok(SessionDeleteFence {
+        st: st.clone(),
+        sid: sid.to_string(),
+        _permit: permit,
+    })
+}
+
+/// True while the delete fence is active. `wake_drain` checks this under the
+/// same registry lock used when the fence opens and closes.
+pub(crate) fn session_is_deleting(st: &AppState, sid: &str) -> bool {
+    st.v2_deleting_sessions.lock().contains(sid)
+}
+
+/// Revalidate the session after acquiring the admission read lock. A request
+/// that passed an earlier existence check may have waited through deletion.
+pub(crate) fn check_session_admission(st: &AppState, sid: &str) -> Result<(), HttpError> {
+    if session_is_deleting(st, sid)
+        || !ocserve_store::session_exists(&st.db, sid).map_err(internal)?
+    {
+        return Err(session_not_found(sid));
+    }
+    Ok(())
+}
+
+pub(crate) struct SessionDeleteFence {
+    st: Arc<AppState>,
+    sid: String,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl SessionDeleteFence {
+    pub(crate) async fn finish(self) {
+        {
+            let _admission = self.st.v2_session_admission_gate.write().await;
+            let _tasks = self.st.v2_drain_tasks.lock();
+            self.st.v2_deleting_sessions.lock().remove(&self.sid);
+        }
+    }
+}
+
+impl Drop for SessionDeleteFence {
+    fn drop(&mut self) {
+        let _tasks = self.st.v2_drain_tasks.lock();
+        self.st.v2_deleting_sessions.lock().remove(&self.sid);
+    }
+}
+
+#[derive(Debug)]
+enum DrainOutcome {
+    NotStarted,
+    Terminal {
+        failure: Option<Value>,
+        interrupted: bool,
+    },
+}
+
+impl DrainOutcome {
+    fn was_interrupted(&self) -> bool {
+        matches!(
+            self,
+            Self::Terminal {
+                interrupted: true,
+                ..
+            }
+        )
+    }
+}
+
+/// The inner `select!` latches whether cancellation won before the turn
+/// completed. A later watch update is only a request against an already
+/// terminal drain and must not rewrite success/failure as interruption.
+fn terminal_interrupt_result(
+    outcome: &DrainOutcome,
+    _cancel_requested_after_terminal: bool,
+) -> bool {
+    outcome.was_interrupted()
+}
+
+async fn wait_drain_cancel(cancel: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    let Some(cancel) = cancel else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if *cancel.borrow() || cancel.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn drain_cancelled(cancel: &Option<tokio::sync::watch::Receiver<bool>>) -> bool {
+    cancel.as_ref().is_some_and(|cancel| *cancel.borrow())
+}
+
 /// v2 drain loop for one session: promote-one + run-one-turn via the shared
 /// `run_prompt` executor, until nothing is promotable. Claims wrap the drain
 /// (write-ahead on start, released on terminal states).
 ///
-/// `pub(crate)` so inbox-update wakes (steer flips) share the exact drain.
+/// Keep the direct form for focused unit tests; production wakes go through
+/// `spawn_drain` so their JoinHandle is registered before execution starts.
+#[cfg(test)]
 pub(crate) async fn drain_session(st: Arc<AppState>, sid: String) {
+    let outcome = drain_session_inner(st.clone(), sid.clone(), None).await;
+    if finish_drain_events(&st, &sid, outcome) {
+        crate::goal_loop::spawn_wake_public(&st, &sid);
+    }
+}
+
+async fn drain_session_inner(
+    st: Arc<AppState>,
+    sid: String,
+    mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
+) -> DrainOutcome {
     use ocserve_core::coordinator::WakeScope;
     let now_ms = || {
         std::time::SystemTime::now()
@@ -4002,38 +4440,62 @@ pub(crate) async fn drain_session(st: Arc<AppState>, sid: String) {
     // busy class already fixed once). Claims stay as the durable status record
     // that `/api/session/active` reads.
     //
-    // Busy means "leave the work queued and come back": consuming an inbox row
-    // here would drop the user's message. The wake that ends the v1 turn
-    // re-arms the drain (see `wake_inbox_after_turn`).
-    let Ok(release) = crate::lock_session(&st, &sid).await else {
-        return;
+    // A drain waits for both prompt-lock registry capacity and the per-session
+    // lock. The process drain semaphore bounds those waiters, cancellation
+    // drops them, and admitted inbox rows cannot be stranded by a failed
+    // startup race with a concurrent wake.
+    let release = tokio::select! {
+        biased;
+        _ = wait_drain_cancel(&mut cancel) => {
+            return DrainOutcome::NotStarted;
+        }
+        release = crate::lock_session_wait(&st, &sid) => release,
     };
-    let Ok(guard) = release.arc().try_lock() else {
-        // A v1 prompt holds the session: leave everything queued, release the
-        // coordinator so a later wake can start a fresh drain.
-        st.coordinators.abort(&sid);
-        return;
+    let guard = tokio::select! {
+        biased;
+        _ = wait_drain_cancel(&mut cancel) => {
+            return DrainOutcome::NotStarted;
+        }
+        guard = release.arc().lock() => guard,
     };
     // Write-ahead claim in the same batch as the started event.
     let _ = ocserve_store::claim::claim(&st.writer, &sid, now_ms());
     let _ = crate::emit_durable_http(&st, &sid, "session.execution.started", json!({}));
+    let mut failure = None;
+    let mut interrupted = false;
+    let mut input_scope_enabled = false;
     loop {
-        // Doorbell first, work-continuation second (upstream `advanceToStep`
-        // loops on promotability, not doorbells — otherwise a wake that
-        // arrives mid-turn strands the rest of the queue). `next_scope`
-        // keeps `draining` armed while work remains, so no second drain can
-        // spawn mid-loop.
-        let work_remains = ocserve_core::coordinator::next_for_scope(
-            &st.db,
-            &sid,
-            ocserve_core::coordinator::WakeScope::Input,
-        )
-        .ok()
-        .flatten()
-        .is_some();
-        let Some(scope) = st.coordinators.next_scope(&sid, work_remains) else {
+        if drain_cancelled(&cancel) {
+            interrupted = true;
+            break;
+        }
+        // Doorbell first, work-continuation second. A steer-only wake keeps
+        // draining steers; Input continuation is enabled only after an Input
+        // wake, so interrupt resume cannot fall through into queued prompts.
+        let continuation = if input_scope_enabled {
+            ocserve_core::coordinator::WakeScope::Input
+        } else {
+            ocserve_core::coordinator::WakeScope::Steer
+        };
+        let work_remains = ocserve_core::coordinator::next_for_scope(&st.db, &sid, continuation)
+            .ok()
+            .flatten()
+            .is_some()
+            .then_some(continuation);
+        let Some(scope) = st.coordinators.next_scope_for(&sid, work_remains) else {
             break;
         };
+        #[cfg(test)]
+        if scope == WakeScope::Input {
+            let barriers = st.v2_input_scope_test_barriers.lock().take();
+            if let Some(barriers) = barriers {
+                barriers.0.wait().await;
+                barriers.1.wait().await;
+            }
+        }
+        if scope == WakeScope::Input {
+            input_scope_enabled = true;
+        }
         let next = ocserve_core::coordinator::next_for_scope(&st.db, &sid, scope);
         let Ok(Some(item_id)) = next else {
             // Nothing promotable in this scope: idle-scope falls through to
@@ -4043,21 +4505,86 @@ pub(crate) async fn drain_session(st: Arc<AppState>, sid: String) {
             }
             continue;
         };
-        let turn = run_v2_turn(&st, &sid, &item_id).await;
+        let turn = tokio::select! {
+            biased;
+            _ = wait_drain_cancel(&mut cancel) => {
+                interrupted = true;
+                break;
+            }
+            turn = run_v2_turn(&st, &sid, &item_id) => turn,
+        };
         if let Err(e) = turn {
             tracing::warn!("v2 drain turn failed for {sid}: {e:#}");
+            let message: String = format!("{e:#}").chars().take(2000).collect();
+            failure = Some(json!({
+                "sessionID": sid,
+                "error": {"name": "UnknownError", "data": {"message": message}},
+            }));
             break;
         }
+    }
+    if drain_cancelled(&cancel) {
+        interrupted = true;
     }
     drop(guard);
     drop(release);
     let _ = ocserve_store::claim::release(&st.writer, &sid);
-    let _ = crate::emit_durable_http(&st, &sid, "session.execution.succeeded", json!({}));
-    // The idle hook must fire for the v2 grammar too: a goal armed through
-    // `/api/session/{id}/command` was advanced by the v1 prompt path only, so
-    // a v2-only deployment could arm a goal that never reviews (2026-11-05
-    // review). Deduplicated + non-blocking inside the hook.
-    crate::goal_loop::spawn_wake_public(&st, &sid);
+    DrainOutcome::Terminal {
+        failure,
+        interrupted,
+    }
+}
+
+fn finish_drain_events(st: &Arc<AppState>, sid: &str, outcome: DrainOutcome) -> bool {
+    match outcome {
+        DrainOutcome::NotStarted => false,
+        DrainOutcome::Terminal {
+            failure: _,
+            interrupted: true,
+        } => {
+            if let Err(e) = crate::emit_durable_http(
+                st,
+                sid,
+                "session.execution.interrupted",
+                json!({"sessionID": sid, "reason": "user"}),
+            ) {
+                tracing::warn!(
+                    "v2 execution interruption event emit failed for {sid}: {} {}",
+                    e.name,
+                    e.message
+                );
+            }
+            true
+        }
+        DrainOutcome::Terminal {
+            failure: Some(error),
+            interrupted: false,
+        } => {
+            if let Err(e) = crate::emit_durable_http(st, sid, "session.execution.failed", error) {
+                tracing::warn!(
+                    "v2 execution failure event emit failed for {sid}: {} {}",
+                    e.name,
+                    e.message
+                );
+            }
+            true
+        }
+        DrainOutcome::Terminal {
+            failure: None,
+            interrupted: false,
+        } => {
+            if let Err(e) =
+                crate::emit_durable_http(st, sid, "session.execution.succeeded", json!({}))
+            {
+                tracing::warn!(
+                    "v2 execution success event emit failed for {sid}: {} {}",
+                    e.name,
+                    e.message
+                );
+            }
+            true
+        }
+    }
 }
 
 /// Run one admitted inbox item through the shared executor: deliver (delete
@@ -4936,26 +5463,30 @@ pub async fn inbox_update(
             fields: json!({"message": "delivery must be \"steer\" | \"queue\""}),
         });
     };
-    if !ocserve_store::session_exists(&st.db, &id).map_err(internal)? {
-        return Err(session_not_found(&id));
-    }
+    let _admission = st.v2_session_admission_gate.read().await;
+    check_session_admission(&st, &id)?;
     match ocserve_store::inbox::get(&st.db, &inbox_id).map_err(internal)? {
         Some((sid, _, _, _, _)) if sid == id => {
+            let drain_slot = if delivery == "steer" {
+                Some(reserve_drain_slot(&st, &id)?)
+            } else {
+                None
+            };
             if !ocserve_store::inbox::set_delivery(&st.writer, &inbox_id, delivery)
                 .map_err(internal)?
             {
                 return Err(session_not_found(&id));
             }
-            if delivery == "steer"
-                && st
-                    .coordinators
-                    .wake(&id, ocserve_core::coordinator::WakeScope::Steer)
-            {
-                let st2 = st.clone();
-                let sid2 = id.clone();
-                tokio::spawn(async move {
-                    drain_session(st2, sid2).await;
-                });
+            if delivery == "steer" {
+                let Some(slot) = drain_slot else {
+                    return Err(drain_capacity_error());
+                };
+                wake_drain(
+                    st.clone(),
+                    id.clone(),
+                    ocserve_core::coordinator::WakeScope::Steer,
+                    slot,
+                );
             }
         }
         _ => return Err(session_not_found(&id)),
@@ -4963,32 +5494,83 @@ pub async fn inbox_update(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /api/session/{sessionID}/interrupt — NoContent (abort the task).
+/// POST /api/session/{sessionID}/interrupt — `{interrupted:boolean}`.
+#[derive(serde::Deserialize, Default)]
+pub struct InterruptParams {
+    resume: Option<bool>,
+}
+
 pub async fn interrupt(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
+    Query(params): Query<InterruptParams>,
+) -> Result<Json<Value>, HttpError> {
     // Stop the LOOP too, and pause the goal. Upstream pauses an active goal on
     // `session.execution.interrupted` with reason "user" (goal.ts:296-305): the
     // interrupt itself must not be undone by the next reviewer "continue".
-    // Aborting only the current prompt let the driver finish the turn and
-    // start another (2026-11-05 review M1).
+    // Stopping only the current turn let the driver finish and start another
+    // (2026-11-05 review M1); pause it before either v1 or v2 work unwinds.
     crate::goal_loop::cancel_driver(&st, &id);
+    let mut interrupted = false;
     if let Some((_, handle)) = st.prompt_tasks.lock().remove(&id) {
         handle.abort();
+        interrupted = true;
     }
+    interrupted |= cancel_drain(&st, &id).await;
     crate::goal_loop::pause_if_active(&st, &id, "Stopped by the user").await;
-    Ok(StatusCode::NO_CONTENT)
+
+    // Upstream resumes steer/control items on interrupt by default, leaving
+    // queued prompts parked. The interrupted drain clears its in-memory
+    // doorbell, so re-arm only if promotable steer/control work remains.
+    let steer_pending = ocserve_core::coordinator::next_for_scope(
+        &st.db,
+        &id,
+        ocserve_core::coordinator::WakeScope::Steer,
+    )
+    .ok()
+    .flatten()
+    .is_some();
+    if params.resume.unwrap_or(true) && steer_pending {
+        let slot = reserve_drain_slot_wait(&st, &id).await?;
+        let _admission = st.v2_session_admission_gate.read().await;
+        if !session_is_deleting(&st, &id)
+            && ocserve_store::session_exists(&st.db, &id).unwrap_or(false)
+            && ocserve_core::coordinator::next_for_scope(
+                &st.db,
+                &id,
+                ocserve_core::coordinator::WakeScope::Steer,
+            )
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            wake_drain(
+                st.clone(),
+                id.clone(),
+                ocserve_core::coordinator::WakeScope::Steer,
+                slot,
+            );
+        }
+    }
+    Ok(Json(json!({"interrupted": interrupted})))
 }
 
 /// POST /api/session/{sessionID}/compact — NoContent (triggers summarize).
 pub async fn compact(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<StatusCode, HttpError> {
     // Freeze: ServiceUnavailable when no model is available; ocserve maps to
     // the same when the session has no resolvable model. Otherwise summarize.
     let payload = ocserve_core::wire::PromptRequest::default();
+    let release = crate::lock_session(&st, &id).await?;
+    let Ok(_guard) = release.arc().try_lock() else {
+        return Err(crate::session_busy(&id).into());
+    };
+    {
+        let _admission = st.v2_session_admission_gate.read().await;
+        check_session_admission(&st, &id)?;
+    }
     let ctx = match crate::build_prompt_context(&st, &payload, &id) {
         Ok(c) => c,
         Err(e) => {
@@ -4996,12 +5578,9 @@ pub async fn compact(
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 name: "ServiceUnavailableError",
                 message: e.message,
-            });
+            }
+            .into());
         }
-    };
-    let release = crate::lock_session(&st, &id).await?;
-    let Ok(_guard) = release.arc().try_lock() else {
-        return Err(crate::session_busy(&id));
     };
     let writer = st.writer.clone();
     let _ = crate::run_compact(&st, &ctx, &writer, &id).await;
@@ -8091,6 +8670,904 @@ fn client_mcp_refused() -> crate::HttpError {
         status: StatusCode::FORBIDDEN,
         tag: "ForbiddenError",
         fields: json!({"message": "Invalid client MCP connect token request"}),
+    }
+}
+
+#[cfg(test)]
+mod v2_drain_outcome_tests {
+    use super::{
+        DrainOutcome, InterruptParams, cancel_drain, interrupt, session_remove_api, spawn_drain,
+        terminal_interrupt_result,
+    };
+    use crate::{AppState, MAX_PROMPT_LOCKS, V2DrainTask};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn insert_session(st: &Arc<AppState>, sid: &str) {
+        ocserve_store::insert_session(
+            &st.writer,
+            &json!({
+                "id": sid, "projectID": "global", "directory": "/w", "path": sid,
+                "slug": sid, "title": "drain test", "version": "1",
+                "time": {"created": 1, "updated": 2},
+            }),
+        )
+        .unwrap();
+    }
+
+    async fn post_text(app: &axum::Router, sid: &str, text: &str) -> StatusCode {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/session/{sid}/prompt"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"text": text}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        response.status()
+    }
+
+    fn event_seqs(st: &Arc<AppState>, sid: &str, event_type: &str) -> Vec<i64> {
+        let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT seq FROM event WHERE session_id = ?1 AND type IN (?2, ?3) ORDER BY seq",
+            )
+            .unwrap();
+        stmt.query_map(
+            rusqlite::params![sid, event_type, format!("{event_type}@v1")],
+            |row| row.get(0),
+        )
+        .unwrap()
+        .collect::<Result<Vec<i64>, _>>()
+        .unwrap()
+    }
+
+    fn spawn_holding_provider() -> (std::net::SocketAddr, std::sync::mpsc::Receiver<()>) {
+        use std::io::Read;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for socket in listener.incoming().flatten() {
+                let entered_tx = entered_tx.clone();
+                std::thread::spawn(move || {
+                    let mut socket = socket;
+                    let mut buffer = [0u8; 4096];
+                    if socket.read(&mut buffer).unwrap_or(0) > 0 {
+                        let _ = entered_tx.send(());
+                        while socket.read(&mut buffer).unwrap_or(0) > 0 {}
+                    }
+                });
+            }
+        });
+        (addr, entered_rx)
+    }
+
+    fn state_with_holding_provider() -> (
+        tempfile::TempDir,
+        Arc<AppState>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let (addr, provider_entered) = spawn_holding_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let db = ocserve_store::writer::db_path(dir.path());
+        let writer = Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
+        let blobs = Arc::new(ocserve_store::BlobStore::new(dir.path().join("blobs")).unwrap());
+        let llm = crate::LlmRegistry {
+            modalities: Default::default(),
+            endpoints: [("fake".into(), (format!("http://{addr}"), "test-key".into()))]
+                .into_iter()
+                .collect(),
+            pricing: Default::default(),
+            limits: Default::default(),
+            default_model: ("fake".into(), "m".into()),
+            systems: Default::default(),
+            default_agent: "build".into(),
+        };
+        let st = AppState::with_wiring_and_v2(
+            None,
+            Default::default(),
+            crate::Wires {
+                db,
+                blobs,
+                writer,
+                llm,
+            },
+            true,
+        );
+        (dir, st, provider_entered)
+    }
+
+    async fn wait_for_started(st: &Arc<AppState>, sid: &str, count: usize) -> Vec<i64> {
+        for _ in 0..200 {
+            let seqs = event_seqs(st, sid, "session.execution.started");
+            if seqs.len() >= count {
+                return seqs;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        event_seqs(st, sid, "session.execution.started")
+    }
+
+    #[test]
+    fn late_cancel_does_not_reclassify_a_terminal_success() {
+        let outcome = DrainOutcome::Terminal {
+            failure: None,
+            interrupted: false,
+        };
+        assert!(!terminal_interrupt_result(&outcome, true));
+        // Negative control: making the late cancellation bit override the
+        // terminal outcome makes this assertion red.
+    }
+
+    #[test]
+    fn cancellation_latched_by_the_running_drain_is_reported() {
+        let outcome = DrainOutcome::Terminal {
+            failure: Some(json!({"error": "provider stopped"})),
+            interrupted: true,
+        };
+        assert!(terminal_interrupt_result(&outcome, false));
+    }
+
+    #[tokio::test]
+    async fn duplicate_wake_queues_rerun_without_cancelling_registered_drain() {
+        let st = AppState::with_payloads_and_v2(None, Default::default(), true);
+        let sid = "ses_drain_rerun".to_string();
+        let slot = Arc::new(st.v2_drain_slots.clone().try_acquire_owned().unwrap());
+        let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
+        let (completion_tx, completion) = tokio::sync::watch::channel(None);
+        drop(completion_tx);
+        let handle = tokio::spawn(async { false });
+        st.v2_drain_tasks.lock().insert(
+            sid.clone(),
+            V2DrainTask {
+                generation: 17,
+                cancel,
+                handle,
+                completion,
+                slot,
+                rerun: false,
+            },
+        );
+
+        let duplicate_slot = Arc::new(st.v2_drain_slots.clone().try_acquire_owned().unwrap());
+        spawn_drain(st.clone(), sid.clone(), duplicate_slot);
+
+        assert!(
+            !*cancel_rx.borrow(),
+            "a duplicate wake must not cancel the old drain"
+        );
+        assert!(
+            st.v2_drain_tasks
+                .lock()
+                .get(&sid)
+                .is_some_and(|task| task.rerun)
+        );
+        let task = st.v2_drain_tasks.lock().remove(&sid).unwrap();
+        let _ = task.handle.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_serializes_coordinator_reset_with_drain_registry() {
+        let st = AppState::with_payloads_and_v2(None, Default::default(), true);
+        let sid = "ses_drain_cancel_race".to_string();
+        let slot = Arc::new(st.v2_drain_slots.clone().try_acquire_owned().unwrap());
+        assert!(
+            st.coordinators
+                .wake(&sid, ocserve_core::coordinator::WakeScope::Steer)
+        );
+        let (cancel, _) = tokio::sync::watch::channel(false);
+        let (completion_tx, completion) = tokio::sync::watch::channel(None);
+        drop(completion_tx);
+        let handle = tokio::spawn(async { false });
+        st.v2_drain_tasks.lock().insert(
+            sid.clone(),
+            V2DrainTask {
+                generation: 23,
+                cancel,
+                handle,
+                completion,
+                slot,
+                rerun: false,
+            },
+        );
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let hook_barrier = barrier.clone();
+        let hook_state = st.clone();
+        let registry_was_held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_registry_was_held = registry_was_held.clone();
+        *st.v2_cancel_transition_hook.lock() = Some(Box::new(move || {
+            hook_registry_was_held.store(
+                hook_state.v2_drain_tasks.try_lock().is_none(),
+                std::sync::atomic::Ordering::Release,
+            );
+            let _ = entered_tx.send(());
+            hook_barrier.wait();
+        }));
+
+        let cancel_st = st.clone();
+        let cancel_sid = sid.clone();
+        let cancel_task = tokio::spawn(async move { cancel_drain(&cancel_st, &cancel_sid).await });
+        entered_rx.await.unwrap();
+        // The hook pauses between the cancellation signal and coordinator
+        // reset. A wake uses this same registry lock, so it cannot set a new
+        // pending scope that the abort would then erase.
+        barrier.wait();
+        assert!(!cancel_task.await.unwrap());
+        assert!(registry_was_held.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            st.coordinators
+                .wake(&sid, ocserve_core::coordinator::WakeScope::Steer)
+        );
+        st.coordinators.abort(&sid);
+        // Negative control: dropping the registry guard before coordinator
+        // abort makes the hook observe an unlocked registry and this test red.
+    }
+
+    #[tokio::test]
+    async fn v2_drain_waits_for_prompt_lock_capacity() {
+        let st = AppState::with_payloads_and_v2(None, Default::default(), true);
+        let mut held = Vec::new();
+        for index in 0..MAX_PROMPT_LOCKS {
+            let lock = match crate::lock_session(&st, &format!("ses_lock_cap_{index}")).await {
+                Ok(lock) => lock,
+                Err(error) => panic!(
+                    "lock slot {index} was unexpectedly refused: {}",
+                    error.message
+                ),
+            };
+            held.push(lock);
+        }
+
+        let wait_st = st.clone();
+        let mut waiter =
+            tokio::spawn(
+                async move { crate::lock_session_wait(&wait_st, "ses_lock_cap_waiter").await },
+            );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiter)
+                .await
+                .is_err(),
+            "a v2 drain must remain registered until a bounded lock slot opens"
+        );
+
+        drop(held.pop());
+        let acquired = tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiter)
+            .await
+            .expect("released lock capacity should wake the v2 drain")
+            .unwrap();
+        drop(acquired);
+        // Negative control: removing LockRelease's notify_one leaves the
+        // waiter parked until timeout, exposing a durable inbox stall.
+    }
+
+    #[tokio::test]
+    async fn prompt_lock_capacity_notify_wakes_multiple_waiters() {
+        let st = AppState::with_payloads_and_v2(None, Default::default(), true);
+        let mut held = Vec::new();
+        for index in 0..MAX_PROMPT_LOCKS {
+            let lock = match crate::lock_session(&st, &format!("ses_multi_cap_{index}")).await {
+                Ok(lock) => lock,
+                Err(error) => panic!(
+                    "lock slot {index} was unexpectedly refused: {}",
+                    error.message
+                ),
+            };
+            held.push(lock);
+        }
+
+        const WAITERS: usize = 3;
+        let barriers = Arc::new((
+            tokio::sync::Barrier::new(WAITERS + 1),
+            tokio::sync::Barrier::new(WAITERS + 1),
+        ));
+        *st.v2_lock_wait_test_barriers.lock() = Some(barriers.clone());
+        let mut waiters = Vec::new();
+        for index in 0..WAITERS {
+            let waiter_st = st.clone();
+            waiters.push(tokio::spawn(async move {
+                crate::lock_session_wait(&waiter_st, &format!("ses_multi_waiter_{index}")).await
+            }));
+        }
+
+        // Each waiter has observed the full map and enabled its Notified future
+        // before any capacity is released. Notify's permits are not a queue;
+        // without enable(), these three releases coalesce and strand waiters.
+        barriers.0.wait().await;
+        for _ in 0..WAITERS {
+            drop(held.pop());
+        }
+        barriers.1.wait().await;
+
+        for waiter in waiters {
+            let acquired = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .expect("every released map slot should wake a waiter")
+                .unwrap();
+            drop(acquired);
+        }
+        // Negative control: constructing Notified without calling enable()
+        // leaves all but one waiter asleep after simultaneous notifications.
+    }
+
+    #[tokio::test]
+    async fn cancelled_pending_input_does_not_strand_a_later_prompt() {
+        let st = AppState::with_payloads_and_v2(None, Default::default(), true);
+        let sid = "ses_cancel_input_scope";
+        let inbox_id = "msg_cancel_input_scope";
+        insert_session(&st, sid);
+        ocserve_store::inbox::admit(
+            &st.writer,
+            sid,
+            inbox_id,
+            "prompt",
+            &json!({"text": "cancel me"}),
+            "queue",
+            1,
+        )
+        .unwrap();
+
+        let barriers = Arc::new((tokio::sync::Barrier::new(2), tokio::sync::Barrier::new(2)));
+        *st.v2_input_scope_test_barriers.lock() = Some(barriers.clone());
+        assert!(
+            st.coordinators
+                .wake(sid, ocserve_core::coordinator::WakeScope::Input)
+        );
+        let slot = Arc::new(st.v2_drain_slots.clone().try_acquire_owned().unwrap());
+        spawn_drain(st.clone(), sid.to_string(), slot);
+
+        barriers.0.wait().await;
+        assert!(ocserve_store::inbox::cancel(&st.writer, inbox_id).unwrap());
+        barriers.1.wait().await;
+        for _ in 0..200 {
+            if !st.v2_drain_tasks.lock().contains_key(sid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(!st.v2_drain_tasks.lock().contains_key(sid));
+        assert_eq!(event_seqs(&st, sid, "session.execution.started").len(), 1);
+
+        let app = crate::router(st.clone());
+        assert_eq!(
+            post_text(&app, sid, "prompt after inbox cancellation").await,
+            StatusCode::OK
+        );
+        let started = wait_for_started(&st, sid, 2).await;
+        assert_eq!(
+            started.len(),
+            2,
+            "a new prompt must start after an empty Input scope is cleaned up"
+        );
+        // Negative control: omitting coordinator cleanup leaves `draining`
+        // set, so the later prompt is admitted but never starts a drain.
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_finalization_serializes_a_new_prompt_after_interrupted_event() {
+        let (addr, provider_entered) = spawn_holding_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let db = ocserve_store::writer::db_path(dir.path());
+        let writer = Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
+        let blobs = Arc::new(ocserve_store::BlobStore::new(dir.path().join("blobs")).unwrap());
+        let llm = crate::LlmRegistry {
+            modalities: Default::default(),
+            endpoints: [("fake".into(), (format!("http://{addr}"), String::new()))]
+                .into_iter()
+                .collect(),
+            pricing: Default::default(),
+            limits: Default::default(),
+            default_model: ("fake".into(), "m".into()),
+            systems: Default::default(),
+            default_agent: "build".into(),
+        };
+        let st = AppState::with_wiring_and_v2(
+            None,
+            Default::default(),
+            crate::Wires {
+                db,
+                blobs,
+                writer,
+                llm,
+            },
+            true,
+        );
+        let sid = "ses_cancel_finalize";
+        insert_session(&st, sid);
+        let barriers = Arc::new((tokio::sync::Barrier::new(2), tokio::sync::Barrier::new(2)));
+        *st.v2_drain_terminal_test_barriers.lock() = Some(barriers.clone());
+        let app = crate::router(st.clone());
+
+        assert_eq!(
+            post_text(&app, sid, "first held turn").await,
+            StatusCode::OK
+        );
+        tokio::task::spawn_blocking(move || {
+            provider_entered
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("first prompt must reach the provider")
+        })
+        .await
+        .unwrap();
+
+        let cancel_st = st.clone();
+        let cancel_sid = sid.to_string();
+        let cancel_task = tokio::spawn(async move { cancel_drain(&cancel_st, &cancel_sid).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), barriers.0.wait())
+            .await
+            .expect("cancelled drain must reach terminal publication seam");
+
+        assert_eq!(
+            post_text(&app, sid, "prompt during cancel finalization").await,
+            StatusCode::OK
+        );
+        let before_terminal = wait_for_started(&st, sid, 2).await.len() >= 2;
+        barriers.1.wait().await;
+        assert!(
+            cancel_task.await.unwrap(),
+            "the held first turn was interrupted"
+        );
+
+        let starts = wait_for_started(&st, sid, 2).await;
+        assert_eq!(
+            starts.len(),
+            2,
+            "the prompt queued during cancellation must run"
+        );
+        let interrupted = event_seqs(&st, sid, "session.execution.interrupted")
+            .into_iter()
+            .next()
+            .expect("the first drain must publish its interruption");
+        assert!(
+            !before_terminal,
+            "a replacement drain started while the previous interruption was unpublished"
+        );
+        assert!(
+            interrupted < starts[1],
+            "the old terminal event must precede the replacement drain start"
+        );
+        // Negative control: removing the retiring task before awaiting it lets
+        // the replacement start first and this ordering assertion reds.
+
+        assert!(
+            cancel_drain(&st, sid).await,
+            "clean up the held replacement turn"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_drain_is_shared_by_interrupt_and_delete() {
+        let (addr, provider_entered) = spawn_holding_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let db = ocserve_store::writer::db_path(dir.path());
+        let writer = Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
+        let blobs = Arc::new(ocserve_store::BlobStore::new(dir.path().join("blobs")).unwrap());
+        let llm = crate::LlmRegistry {
+            modalities: Default::default(),
+            endpoints: [("fake".into(), (format!("http://{addr}"), String::new()))]
+                .into_iter()
+                .collect(),
+            pricing: Default::default(),
+            limits: Default::default(),
+            default_model: ("fake".into(), "m".into()),
+            systems: Default::default(),
+            default_agent: "build".into(),
+        };
+        let st = AppState::with_wiring_and_v2(
+            None,
+            Default::default(),
+            crate::Wires {
+                db,
+                blobs,
+                writer,
+                llm,
+            },
+            true,
+        );
+        let sid = "ses_cancel_shared";
+        insert_session(&st, sid);
+        let barriers = Arc::new((tokio::sync::Barrier::new(2), tokio::sync::Barrier::new(2)));
+        *st.v2_drain_terminal_test_barriers.lock() = Some(barriers.clone());
+        let app = crate::router(st.clone());
+
+        assert_eq!(
+            post_text(&app, sid, "first held turn").await,
+            StatusCode::OK
+        );
+        tokio::task::spawn_blocking(move || {
+            provider_entered
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("first prompt must reach the provider")
+        })
+        .await
+        .unwrap();
+
+        let interrupt_st = st.clone();
+        let interrupt_sid = sid.to_string();
+        let interrupt_task = tokio::spawn(async move {
+            interrupt(
+                axum::extract::State(interrupt_st),
+                axum::extract::Path(interrupt_sid),
+                axum::extract::Query(InterruptParams::default()),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), barriers.0.wait())
+            .await
+            .expect("interrupted drain must reach terminal publication seam");
+        // The first request may disconnect while its drain is still retiring.
+        // That must not consume the only completion handle or release a later
+        // delete caller early.
+        interrupt_task.abort();
+        match interrupt_task.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("interrupted request should still be waiting for drain retirement"),
+        }
+
+        let (second_cancel_entered_tx, second_cancel_entered_rx) = tokio::sync::oneshot::channel();
+        *st.v2_cancel_transition_hook.lock() = Some(Box::new(move || {
+            let _ = second_cancel_entered_tx.send(());
+        }));
+        let (after_cancel_tx, mut after_cancel_rx) = tokio::sync::oneshot::channel();
+        *st.v2_session_remove_after_cancel_hook.lock() = Some(Box::new(move || {
+            let _ = after_cancel_tx.send(());
+        }));
+        let delete_st = st.clone();
+        let delete_sid = sid.to_string();
+        let delete_task = tokio::spawn(async move {
+            session_remove_api(
+                axum::extract::State(delete_st),
+                axum::extract::Path(delete_sid),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), second_cancel_entered_rx)
+            .await
+            .expect("delete must enter drain cancellation")
+            .expect("test hook sender remains available");
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut after_cancel_rx)
+                .await
+                .is_err(),
+            "delete must await the shared drain retirement before deleting the session"
+        );
+        barriers.1.wait().await;
+        assert_eq!(
+            delete_task
+                .await
+                .unwrap()
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            StatusCode::NO_CONTENT
+        );
+        assert!(
+            after_cancel_rx.await.is_ok(),
+            "delete reached its boundary after the shared wait"
+        );
+        // Negative control: a second cancellation caller with no JoinHandle
+        // used to return early and reach the delete boundary before the old
+        // drain published its terminal event.
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_fences_prompt_admitted_after_drain_retirement_check() {
+        let st = AppState::with_payloads_and_v2(None, Default::default(), true);
+        let sid = "ses_delete_admission_gap";
+        insert_session(&st, sid);
+        let barriers = Arc::new((tokio::sync::Barrier::new(2), tokio::sync::Barrier::new(2)));
+        *st.v2_session_delete_gap_test_barriers.lock() = Some(barriers.clone());
+
+        let delete_st = st.clone();
+        let delete_sid = sid.to_string();
+        let delete_task = tokio::spawn(async move {
+            session_remove_api(
+                axum::extract::State(delete_st),
+                axum::extract::Path(delete_sid),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), barriers.0.wait())
+            .await
+            .expect("delete must reach the post-cancellation admission gap");
+
+        let app = crate::router(st.clone());
+        let late_prompt = post_text(&app, sid, "prompt while deleting").await;
+        barriers.1.wait().await;
+        assert_eq!(
+            delete_task
+                .await
+                .unwrap()
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            late_prompt,
+            StatusCode::NOT_FOUND,
+            "a prompt entering after the drain check must not be admitted or start a drain"
+        );
+        // Negative control: without the admission fence, this prompt receives
+        // 200 and can register a fresh drain after delete's final empty check.
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_fences_v1_prompt_async_after_drain_retirement_check() {
+        let (_dir, st, _provider_entered) = state_with_holding_provider();
+        let sid = "ses_delete_v1_prompt_async";
+        insert_session(&st, sid);
+        let barriers = Arc::new((tokio::sync::Barrier::new(2), tokio::sync::Barrier::new(2)));
+        *st.v2_session_delete_gap_test_barriers.lock() = Some(barriers.clone());
+
+        let delete_st = st.clone();
+        let delete_sid = sid.to_string();
+        let delete_task = tokio::spawn(async move {
+            session_remove_api(
+                axum::extract::State(delete_st),
+                axum::extract::Path(delete_sid),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), barriers.0.wait())
+            .await
+            .expect("delete must reach the post-cancellation admission gap");
+
+        let response = crate::router(st.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/session/{sid}/prompt_async"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "parts": [{"type": "text", "text": "late v1 prompt"}],
+                            "model": {"providerID": "fake", "modelID": "m"},
+                            "agent": "build"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let admitted_task = st.prompt_tasks.lock().remove(sid);
+        let task_was_registered = admitted_task.is_some();
+        if let Some((_, handle)) = admitted_task {
+            handle.abort();
+        }
+
+        barriers.1.wait().await;
+        assert_eq!(
+            delete_task
+                .await
+                .unwrap()
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "v1 async prompt must not be admitted during session deletion"
+        );
+        assert!(
+            !task_was_registered,
+            "a rejected v1 prompt must not leave a background task"
+        );
+        // Negative control: without a shared admission fence, this route
+        // returns 204 and registers a prompt task after delete canceled tasks.
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_fences_v1_sync_message_after_drain_retirement_check() {
+        let (_dir, st, _provider_entered) = state_with_holding_provider();
+        let sid = "ses_delete_v1_message";
+        insert_session(&st, sid);
+        let barriers = Arc::new((tokio::sync::Barrier::new(2), tokio::sync::Barrier::new(2)));
+        *st.v2_session_delete_gap_test_barriers.lock() = Some(barriers.clone());
+
+        let delete_st = st.clone();
+        let delete_sid = sid.to_string();
+        let delete_task = tokio::spawn(async move {
+            session_remove_api(
+                axum::extract::State(delete_st),
+                axum::extract::Path(delete_sid),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), barriers.0.wait())
+            .await
+            .expect("delete must reach the post-cancellation admission gap");
+
+        let request_app = crate::router(st.clone());
+        let mut request = tokio::spawn(async move {
+            request_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/session/{sid}/message"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "parts": [{"type": "text", "text": "late v1 message"}],
+                                "model": {"providerID": "fake", "modelID": "m"},
+                                "agent": "build"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        });
+        let status = tokio::time::timeout(std::time::Duration::from_millis(500), &mut request)
+            .await
+            .ok()
+            .and_then(Result::ok);
+        if status.is_none() {
+            request.abort();
+        }
+
+        barriers.1.wait().await;
+        assert_eq!(
+            delete_task
+                .await
+                .unwrap()
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            status,
+            Some(StatusCode::NOT_FOUND),
+            "v1 sync message must be rejected before it can enter the provider"
+        );
+        // Negative control: without the fence the sync request reaches the
+        // holding provider and cannot complete while deletion is paused.
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_fences_v1_command_after_drain_retirement_check() {
+        let (_dir, st, provider_entered) = state_with_holding_provider();
+        let sid = "ses_delete_v1_command";
+        insert_session(&st, sid);
+        st.payloads.write().command = vec![json!({
+            "name": "test-command",
+            "template": "late command prompt",
+        })];
+        let barriers = Arc::new((tokio::sync::Barrier::new(2), tokio::sync::Barrier::new(2)));
+        *st.v2_session_delete_gap_test_barriers.lock() = Some(barriers.clone());
+
+        let delete_st = st.clone();
+        let delete_sid = sid.to_string();
+        let delete_task = tokio::spawn(async move {
+            session_remove_api(
+                axum::extract::State(delete_st),
+                axum::extract::Path(delete_sid),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), barriers.0.wait())
+            .await
+            .expect("delete must reach the post-cancellation admission gap");
+
+        let request_app = crate::router(st.clone());
+        let mut request = tokio::spawn(async move {
+            request_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/session/{sid}/command"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"command": "test-command", "arguments": ""}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        let response =
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut request).await;
+        let reached_provider = provider_entered
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_ok();
+        if response.is_err() {
+            request.abort();
+            let _ = request.await;
+        }
+        barriers.1.wait().await;
+        assert_eq!(
+            delete_task
+                .await
+                .unwrap()
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            StatusCode::NO_CONTENT
+        );
+        assert!(
+            response.is_ok(),
+            "a v1 command admitted after deletion began must be rejected before provider execution"
+        );
+        assert!(
+            !reached_provider,
+            "a command rejected by the delete fence must not start a provider request"
+        );
+        assert_eq!(response.unwrap().unwrap().status(), StatusCode::NOT_FOUND);
+        // Negative control: without a post-lock admission check, this request
+        // reaches the held provider and times out while deletion waits on it.
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_fences_v2_session_generate_after_drain_retirement_check() {
+        let (_dir, st, provider_entered) = state_with_holding_provider();
+        let sid = "ses_delete_v2_generate";
+        insert_session(&st, sid);
+        let barriers = Arc::new((tokio::sync::Barrier::new(2), tokio::sync::Barrier::new(2)));
+        *st.v2_session_delete_gap_test_barriers.lock() = Some(barriers.clone());
+
+        let delete_st = st.clone();
+        let delete_sid = sid.to_string();
+        let delete_task = tokio::spawn(async move {
+            session_remove_api(
+                axum::extract::State(delete_st),
+                axum::extract::Path(delete_sid),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), barriers.0.wait())
+            .await
+            .expect("delete must reach the post-cancellation admission gap");
+
+        let request_app = crate::router(st.clone());
+        let mut request = tokio::spawn(async move {
+            request_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/session/{sid}/generate"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(json!({"prompt": "late generate"}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        let response =
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut request).await;
+        let reached_provider = provider_entered
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_ok();
+        if response.is_err() {
+            request.abort();
+            let _ = request.await;
+        }
+        barriers.1.wait().await;
+        assert_eq!(
+            delete_task
+                .await
+                .unwrap()
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            StatusCode::NO_CONTENT
+        );
+        assert!(
+            response.is_ok(),
+            "session generate admitted after deletion began must be rejected before provider execution"
+        );
+        assert!(
+            !reached_provider,
+            "session generate rejected by the delete fence must not start a provider request"
+        );
+        assert_eq!(response.unwrap().unwrap().status(), StatusCode::NOT_FOUND);
+        // Negative control: the old handler reached the provider and could
+        // persist its assistant response after the session rows were removed.
     }
 }
 

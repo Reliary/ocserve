@@ -472,6 +472,13 @@ pub(crate) async fn run_turn_now(
         }
     };
     let guard = release.arc().lock().await;
+    {
+        let _admission = st.v2_session_admission_gate.read().await;
+        if let Err(e) = crate::check_v1_session_admission(st, sid) {
+            drop(guard);
+            return Err(anyhow::anyhow!("{}", e.message));
+        }
+    }
     // With attachments the kickoff rides as the user's own message (upstream's
     // `attached` branch); a bare kickoff is a synthetic notice.
     let attached = !extra_parts.is_empty();

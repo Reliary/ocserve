@@ -4,6 +4,14 @@ All notable changes to ocserve. The wire contract targets the frozen opencode
 1.19.5 release and the v2 surface the 2.2.5 client; anything that differs is a
 named `D-*` row in the ledger at `PLAN.md` section 18.
 
+## Unreleased
+
+### Fixed
+- V2 interrupts now cancel registered provider drains and report whether a
+  turn was interrupted. Drain capacity and reservation waiters are bounded;
+  session deletion fences new work and waits for admitted turns before removing
+  session rows.
+
 ## 0.7.1 - 2026-11-10
 
 ### Added

@@ -101,6 +101,29 @@ requirement land here as edits, never silently in code.
   a decoded-row loop. Instruction `observe/commit/apply/advanceEpoch/reset` wired;
   rendering feeds `estimate_request_bytes`; epoch memo designed, built on
   measurement only.
+- Live drains are capped at 128 sessions by a semaphore. A request that needs a
+  new drain slot gets 503 before inbox admission when the cap is full; already
+  admitted durable work is resumed by its existing drain. Background wake
+  sources can wait for active capacity, with their waiters capped at 128 by a
+  separate semaphore; a full waiter cap returns 503 or defers the background
+  retry without creating another waiting future. Drains also wait for the
+  bounded 64-entry shared prompt-lock map and the per-session lock, with
+  cancellation covering both waits. A canceled drain stays registered through
+  terminal-event publication; wakes arriving during retirement are handed to a
+  fresh drain afterward. Every terminal path clears coordinator state when no
+  doorbell remains, including when a pending Input item was canceled after
+  scope selection but before promotion. Production wake + registration and
+  cancellation's coordinator reset share the drain-registry lock, so a new
+  doorbell cannot be erased in the cancellation window. This named
+  drain-capacity divergence is `D-V2-DRAIN-CAP`.
+- Both session-delete routes acquire one of 128 bounded deletion fences before
+  canceling drains. The fence excludes new v1/v2 prompt and inbox admission
+  until the session rows are deleted; wake registration also rejects fenced
+  sessions. Direct v1 message, async prompt, command, shell, summarize, and
+  built-in goal kickoff routes, plus v2 prompt and session-generate/compact,
+  recheck admission after taking the per-session prompt lock. A delete waits
+  for already-admitted work to finish before removing rows. This closes the
+  empty-registry-to-delete race without blocking admissions for other sessions.
 - Named divergences: `D-REVERT-NODELETE` (mark-only kept), compaction anchors kept.
 - Kill switches: `OCSERVE_V2=1` gates runtime. Tests: E2E ordering, cancel/update,
   interrupt/resume, kill -9 mid-turn recovery, planted controls.

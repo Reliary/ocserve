@@ -167,8 +167,19 @@ async fn step(st: &Arc<AppState>, row: &Value, now: i64) -> anyhow::Result<()> {
         && !prev.is_empty()
         && ocserve_store::inbox::get(&st.db, prev)?.is_some()
     {
-        st.coordinators
-            .wake(sid, ocserve_core::coordinator::WakeScope::Input);
+        let slot = crate::v2::reserve_drain_slot_wait(st, sid)
+            .await
+            .map_err(|_| anyhow::anyhow!("v2 drain capacity reservation failed"))?;
+        let _admission = st.v2_session_admission_gate.read().await;
+        if crate::v2::session_is_deleting(st, sid) || !ocserve_store::session_exists(&st.db, sid)? {
+            return Ok(());
+        }
+        crate::v2::wake_drain(
+            st.clone(),
+            sid.to_string(),
+            ocserve_core::coordinator::WakeScope::Input,
+            slot,
+        );
         let next = following(row, now);
         let done = finished(row, next, row["remaining_runs"].as_i64());
         crate::v2::schedule_mark(
@@ -212,6 +223,13 @@ async fn step(st: &Arc<AppState>, row: &Value, now: i64) -> anyhow::Result<()> {
             }
         },
     });
+    let drain_slot = crate::v2::reserve_drain_slot_wait(st, sid)
+        .await
+        .map_err(|_| anyhow::anyhow!("v2 drain capacity reservation failed"))?;
+    let _admission = st.v2_session_admission_gate.read().await;
+    if crate::v2::session_is_deleting(st, sid) || !ocserve_store::session_exists(&st.db, sid)? {
+        return Ok(());
+    }
     let (seq, _evt) = ocserve_store::emit_event(
         &st.writer,
         Some(sid),
@@ -221,13 +239,12 @@ async fn step(st: &Arc<AppState>, row: &Value, now: i64) -> anyhow::Result<()> {
     let fresh =
         ocserve_store::inbox::admit(&st.writer, sid, &msg_id, "user", &payload, "steer", seq)?;
     if fresh {
-        st.coordinators
-            .wake(sid, ocserve_core::coordinator::WakeScope::Steer);
-        let st2 = st.clone();
-        let sid2 = sid.to_string();
-        tokio::spawn(async move {
-            crate::v2::drain_session(st2, sid2).await;
-        });
+        crate::v2::wake_drain(
+            st.clone(),
+            sid.to_string(),
+            ocserve_core::coordinator::WakeScope::Steer,
+            drain_slot,
+        );
         ocserve_metrics::labeled_counter("ocserve_schedule_fired_total", "outcome=\"fired\"", 1);
     } else {
         // Already admitted by an earlier pass: record the run anyway so the

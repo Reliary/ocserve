@@ -10,6 +10,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use ocserve_http::{AppState, LlmRegistry, Payloads, Wires};
+use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use std::io::Read as _;
 use std::sync::Arc;
@@ -65,6 +66,28 @@ fn spawn_stub_provider() -> std::net::SocketAddr {
         }
     });
     addr
+}
+
+fn spawn_holding_provider() -> (std::net::SocketAddr, std::sync::mpsc::Receiver<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for sock in listener.incoming().flatten() {
+            let entered_tx = entered_tx.clone();
+            std::thread::spawn(move || {
+                let mut sock = sock;
+                let mut buf = [0u8; 4096];
+                if sock.read(&mut buf).unwrap_or(0) > 0 {
+                    let _ = entered_tx.send(());
+                    // Hold the provider response open until the request future
+                    // is cancelled and closes its socket.
+                    while sock.read(&mut buf).unwrap_or(0) > 0 {}
+                }
+            });
+        }
+    });
+    (addr, entered_rx)
 }
 
 fn setup_with_v2(addr: std::net::SocketAddr, v2: bool) -> Arc<AppState> {
@@ -145,9 +168,23 @@ async fn wait_drain(st: &Arc<AppState>) {
         let inbox_empty = ocserve_store::inbox::list(&st.db, "ses_v2a")
             .map(|v| v.is_empty())
             .unwrap_or(false);
-        if inbox_empty && !ocserve_store::claim::held(&st.db, "ses_v2a").unwrap_or(true) {
-            // Give the turn body a beat to land its message rows.
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let terminal_published = ocserve_store::pragma::open_reader(&st.db)
+            .and_then(|conn| {
+                let count = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM event WHERE session_id='ses_v2a' \
+                     AND type IN ('session.execution.succeeded@v1', \
+                                  'session.execution.failed@v1', \
+                                  'session.execution.interrupted@v1'))",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                Ok(count > 0)
+            })
+            .unwrap_or(false);
+        if inbox_empty
+            && terminal_published
+            && !ocserve_store::claim::held(&st.db, "ses_v2a").unwrap_or(true)
+        {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -1388,6 +1425,384 @@ async fn v2_drain_runs_turn_and_releases_claim() {
     // CONTROL: drain that skips claim release → held stays true, red.
 }
 
+#[tokio::test]
+async fn v2_drain_reports_provider_failure_as_terminal_failure() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let st = setup_with_v2(addr, true);
+    let app = ocserve_http::router(st.clone());
+
+    let (status, _) = post_prompt(&app, json!({"text": "hello v2"})).await;
+    assert_eq!(status, StatusCode::OK);
+    wait_drain(&st).await;
+
+    assert!(!ocserve_store::claim::held(&st.db, "ses_v2a").unwrap());
+    let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
+    let failed_payload: Option<String> = conn
+        .query_row(
+            "SELECT payload FROM event WHERE session_id='ses_v2a' \
+             AND type IN ('session.execution.failed', 'session.execution.failed@v1')",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap();
+    let succeeded: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM event WHERE session_id='ses_v2a' \
+             AND type IN ('session.execution.succeeded', 'session.execution.succeeded@v1')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let failed_payload = failed_payload.expect("failed drain must emit a terminal failure event");
+    let props: Value = serde_json::from_str(&failed_payload).unwrap();
+    assert_eq!(props["sessionID"], "ses_v2a");
+    assert!(
+        props["error"].is_object(),
+        "failure event needs its error: {props}"
+    );
+    assert_eq!(succeeded, 0, "a failed drain must not also report success");
+    // V2 consumers receive the structured terminal error on
+    // session.execution.failed; this direct provider failure does not emit
+    // the legacy session.error event used by the v1 prompt surface.
+
+    // A failed terminal turn must release the coordinator so a later prompt
+    // can register and run a fresh drain instead of leaving `draining=true`.
+    let (status, _) = post_prompt(&app, json!({"text": "prompt after provider failure"})).await;
+    assert_eq!(status, StatusCode::OK);
+    let mut attempts = 0;
+    let failed_again = loop {
+        let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
+        let failed_again: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM event WHERE session_id='ses_v2a' \
+                 AND type IN ('session.execution.failed', 'session.execution.failed@v1')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        attempts += 1;
+        if failed_again == 2 || attempts == 80 {
+            break failed_again;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    assert_eq!(failed_again, 2, "a later prompt must start a second drain");
+    assert!(!ocserve_store::claim::held(&st.db, "ses_v2a").unwrap());
+}
+
+#[tokio::test]
+async fn v2_interrupt_cancels_registered_drain_and_reports_status() {
+    let (addr, provider_entered) = spawn_holding_provider();
+    let st = setup_with_v2(addr, true);
+    let app = ocserve_http::router(st.clone());
+
+    let (status, admitted) = post_prompt(&app, json!({"text": "hold this turn"})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(admitted["data"]["id"].as_str().unwrap().starts_with("msg_"));
+    tokio::task::spawn_blocking(move || {
+        provider_entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("drain must reach the held provider")
+    })
+    .await
+    .unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/session/ses_v2a/interrupt?resume=false")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body, json!({"interrupted": true}));
+    assert!(!ocserve_store::claim::held(&st.db, "ses_v2a").unwrap());
+    let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
+    let interrupted: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM event WHERE session_id='ses_v2a' \
+             AND type IN ('session.execution.interrupted', 'session.execution.interrupted@v1')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        interrupted, 1,
+        "one terminal interruption event is required"
+    );
+
+    let idle = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/session/ses_v2a/interrupt?resume=false")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(idle.status(), StatusCode::OK);
+    let body = idle.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"interrupted": false})
+    );
+
+    // The interrupted turn releases the shared prompt lock so a later prompt
+    // can enter the session normally.
+    if let Some(lock) = st.prompt_locks.lock().get("ses_v2a").cloned() {
+        let guard = lock.try_lock();
+        assert!(
+            guard.is_ok(),
+            "interrupted drain must release the session lock"
+        );
+        drop(guard);
+    }
+}
+
+#[tokio::test]
+async fn v2_interrupt_waiting_for_session_lock_reports_not_interrupted() {
+    let addr = spawn_stub_provider();
+    let st = setup_with_v2(addr, true);
+    let app = ocserve_http::router(st.clone());
+    let session_lock = st
+        .prompt_locks
+        .lock()
+        .entry("ses_v2a".to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let guard = session_lock.lock().await;
+
+    let (status, _) = post_prompt(&app, json!({"text": "wait for the session lock"})).await;
+    assert_eq!(status, StatusCode::OK);
+    for _ in 0..100 {
+        if st.v2_drain_tasks.lock().contains_key("ses_v2a") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(st.v2_drain_tasks.lock().contains_key("ses_v2a"));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/session/ses_v2a/interrupt?resume=false")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"interrupted": false}),
+        "a drain that never acquired the session lock did not interrupt execution"
+    );
+
+    let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
+    let starts: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM event WHERE session_id='ses_v2a' \
+             AND type IN ('session.execution.started', 'session.execution.started@v1')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let interruptions: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM event WHERE session_id='ses_v2a' \
+             AND type IN ('session.execution.interrupted', 'session.execution.interrupted@v1')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(starts, 0);
+    assert_eq!(interruptions, 0);
+    drop(guard);
+}
+
+#[tokio::test]
+async fn v2_drain_capacity_rejects_before_inbox_admission() {
+    let addr = spawn_stub_provider();
+    let st = setup_with_v2(addr, true);
+    let app = ocserve_http::router(st.clone());
+    let mut held_slots = Vec::with_capacity(ocserve_http::MAX_V2_DRAIN_TASKS);
+    for _ in 0..ocserve_http::MAX_V2_DRAIN_TASKS {
+        held_slots.push(st.v2_drain_slots.clone().try_acquire_owned().unwrap());
+    }
+
+    let (status, body) = post_prompt(
+        &app,
+        json!({"id": "msg_capacity_probe0000001", "text": "must not be admitted"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["_tag"], "ServiceUnavailableError");
+    assert!(
+        ocserve_store::inbox::list(&st.db, "ses_v2a")
+            .unwrap()
+            .is_empty(),
+        "over-cap request must not leave durable work with no drain slot"
+    );
+    let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
+    let admitted_events: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM event WHERE session_id='ses_v2a' \
+             AND type IN ('session.inbox.enqueued', 'session.inbox.enqueued@v1') \
+             AND json_extract(payload, '$.inboxID')='msg_capacity_probe0000001'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        admitted_events, 0,
+        "capacity rejection must precede the event"
+    );
+    drop(held_slots);
+    // Negative control: bypassing the reservation admits the inbox row even
+    // though the registry has no slot, so this assertion is red.
+}
+
+#[tokio::test]
+async fn v2_interrupt_resume_rejects_when_drain_waiter_cap_is_full() {
+    let addr = spawn_stub_provider();
+    let st = setup_with_v2(addr, true);
+    let app = ocserve_http::router(st.clone());
+    let held_slots: Vec<_> = (0..ocserve_http::MAX_V2_DRAIN_TASKS)
+        .map(|_| st.v2_drain_slots.clone().try_acquire_owned().unwrap())
+        .collect();
+    let held_waiters: Vec<_> = (0..ocserve_http::MAX_V2_DRAIN_WAITERS)
+        .map(|_| st.v2_drain_waiters.clone().try_acquire_owned().unwrap())
+        .collect();
+
+    let (status, _) = post_prompt(
+        &app,
+        json!({
+            "id": "msg_interrupt_capacity0001",
+            "text": "park until resume",
+            "resume": false
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/session/ses_v2a/interrupt?resume=true")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("a full waiter cap must return bounded backpressure")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!ocserve_store::claim::held(&st.db, "ses_v2a").unwrap());
+    assert_eq!(
+        ocserve_store::inbox::list(&st.db, "ses_v2a").unwrap().len(),
+        1
+    );
+    drop(held_slots);
+    drop(held_waiters);
+    // Negative control: omitting the bounded waiter reservation parks this
+    // request past the timeout despite all waiter permits being held.
+}
+
+#[tokio::test]
+async fn v2_interrupt_resume_runs_steer_and_leaves_queued_prompt_parked() {
+    let addr = spawn_stub_provider();
+    let st = setup_with_v2(addr, true);
+    let app = ocserve_http::router(st.clone());
+
+    let (queued_status, _) = post_prompt(
+        &app,
+        json!({
+            "id": "msg_interrupt_queue00000001",
+            "text": "keep parked",
+            "delivery": "queue",
+            "resume": false
+        }),
+    )
+    .await;
+    let (steer_status, _) = post_prompt(
+        &app,
+        json!({
+            "id": "msg_interrupt_steer0000001",
+            "text": "resume this steer",
+            "delivery": "steer",
+            "resume": false
+        }),
+    )
+    .await;
+    assert_eq!(
+        (queued_status, steer_status),
+        (StatusCode::OK, StatusCode::OK)
+    );
+
+    // An idle interrupt reports false but its default resume=true still runs
+    // steer/control work. The queued prompt must remain parked.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/session/ses_v2a/interrupt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"interrupted": false})
+    );
+
+    for _ in 0..200 {
+        let pending = ocserve_store::inbox::list(&st.db, "ses_v2a").unwrap();
+        if pending.len() == 1
+            && pending[0].0 == "msg_interrupt_queue00000001"
+            && !ocserve_store::claim::held(&st.db, "ses_v2a").unwrap()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let pending = ocserve_store::inbox::list(&st.db, "ses_v2a").unwrap();
+    assert_eq!(pending.len(), 1, "resume must leave queued prompts parked");
+    assert_eq!(pending[0].0, "msg_interrupt_queue00000001");
+    assert_eq!(pending[0].3, "queue");
+    assert!(!ocserve_store::claim::held(&st.db, "ses_v2a").unwrap());
+
+    let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
+    let assistants: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM msg WHERE session_id='ses_v2a' AND role='assistant'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        assistants > 0,
+        "resume=true must run the pending steer item"
+    );
+}
 // ---------------------------------------------------------------------------
 // Gap closure e2e: environment PUT → turn injection → provider cleanliness.
 // ---------------------------------------------------------------------------

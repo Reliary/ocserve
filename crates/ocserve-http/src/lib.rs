@@ -270,6 +270,30 @@ impl IntoResponse for HttpError {
 /// session → (generation, background prompt task) for POST /abort.
 pub type PromptTask = (u64, tokio::task::JoinHandle<()>);
 
+/// Tracked v2 drain task. Cooperative cancellation lets it release its claim
+/// and publish one terminal execution event before the caller returns.
+pub struct V2DrainTask {
+    pub generation: u64,
+    pub cancel: tokio::sync::watch::Sender<bool>,
+    /// Retained with the registry entry for task lifecycle and diagnostics.
+    pub handle: tokio::task::JoinHandle<bool>,
+    /// Shared terminal result so cancellation does not depend on one caller
+    /// retaining and awaiting the JoinHandle.
+    pub completion: tokio::sync::watch::Receiver<Option<bool>>,
+    pub slot: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+    pub rerun: bool,
+}
+
+/// Bound the number of live v2 drain sessions. The semaphore is the admission
+/// cap for the registry; durable inbox rows remain the source of queued work.
+pub const MAX_V2_DRAIN_TASKS: usize = 128;
+/// Maximum background/request reservations allowed to wait for a drain slot.
+pub const MAX_V2_DRAIN_WAITERS: usize = 128;
+/// Maximum concurrent session-delete admission fences.
+pub const MAX_V2_SESSION_DELETES: usize = 128;
+/// Maximum prompt-session lock entries, including active holders and waiters.
+pub(crate) const MAX_PROMPT_LOCKS: usize = 64;
+
 /// App state shared by handlers.
 pub struct AppState {
     /// Config-derived route payloads (W4: swappable after PATCH /config —
@@ -345,6 +369,8 @@ pub struct AppState {
             std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
         >,
     >,
+    /// Wakes bounded v2 drains waiting for a prompt-lock registry slot.
+    pub prompt_lock_available: std::sync::Arc<tokio::sync::Notify>,
     /// When each held prompt lock was first requested. Purely observational:
     /// the sampler turns the oldest into `ocserve_prompt_lock_age_seconds` and
     /// warns past the watchdog. A wedged blocking task cannot be cancelled, so
@@ -375,6 +401,47 @@ pub struct AppState {
     /// v2 runtime stays dark until acceptance; the set exists so construction
     /// is uniform, but no v2 route touches it while disabled).
     pub coordinators: ocserve_core::coordinator::SharedCoordinators,
+    /// Active v2 drains, one per in-flight session and capped process-wide by
+    /// `v2_drain_slots` (`MAX_V2_DRAIN_TASKS`).
+    pub v2_drain_tasks:
+        std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, V2DrainTask>>>,
+    /// Fixed active-session cap for v2 drains (see `MAX_V2_DRAIN_TASKS`).
+    pub v2_drain_slots: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Fixed cap on futures queued while waiting for an active drain slot.
+    pub v2_drain_waiters: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Shared admission readers; delete writers fence a session through
+    /// cancellation and row deletion without serializing other sessions.
+    pub(crate) v2_session_admission_gate: tokio::sync::RwLock<()>,
+    /// Session ids currently fenced by a delete; bounded by delete slots.
+    pub(crate) v2_deleting_sessions: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Bounds concurrent session deletion fences.
+    pub(crate) v2_session_delete_slots: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Monotonic generation source for v2 drain task cleanup.
+    pub v2_drain_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Deterministic interleaving seam for the drain cancellation race test.
+    #[cfg(test)]
+    pub v2_cancel_transition_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Signals the delete boundary after its drain-cancellation wait.
+    #[cfg(test)]
+    pub v2_session_remove_after_cancel_hook: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Holds a delete exactly after drain cancellation to test late admission.
+    #[cfg(test)]
+    pub v2_session_delete_gap_test_barriers:
+        parking_lot::Mutex<Option<std::sync::Arc<(tokio::sync::Barrier, tokio::sync::Barrier)>>>,
+    /// Deterministic seam for waking multiple lock-capacity waiters at once.
+    #[cfg(test)]
+    pub v2_lock_wait_test_barriers:
+        parking_lot::Mutex<Option<std::sync::Arc<(tokio::sync::Barrier, tokio::sync::Barrier)>>>,
+    /// Deterministic seam for cancelling a queued Input item after the drain
+    /// selected its scope but before it checks the inbox row.
+    #[cfg(test)]
+    pub v2_input_scope_test_barriers:
+        parking_lot::Mutex<Option<std::sync::Arc<(tokio::sync::Barrier, tokio::sync::Barrier)>>>,
+    /// Deterministic seam for admitting a new prompt after an interrupted
+    /// drain released its session lock but before its terminal event publishes.
+    #[cfg(test)]
+    pub v2_drain_terminal_test_barriers:
+        parking_lot::Mutex<Option<std::sync::Arc<(tokio::sync::Barrier, tokio::sync::Barrier)>>>,
     /// /tui/control rendezvous queues (v1 shared/tui-control.ts)
     pub tui: crate::tui::TuiControl,
     /// Web-UI reverse proxy (Phase 7; upstream serveUIEffect parity)
@@ -721,6 +788,7 @@ impl AppState {
             prompt_locks: std::sync::Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            prompt_lock_available: std::sync::Arc::new(tokio::sync::Notify::new()),
             lock_ages: std::sync::Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -734,6 +802,31 @@ impl AppState {
             shells: ocserve_core::shell::ShellRegistry::new(),
             v2_enabled: v2,
             coordinators: std::sync::Arc::new(ocserve_core::coordinator::CoordinatorSet::new()),
+            v2_drain_tasks: std::sync::Arc::new(parking_lot::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            v2_drain_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_V2_DRAIN_TASKS)),
+            v2_drain_waiters: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_V2_DRAIN_WAITERS,
+            )),
+            v2_session_admission_gate: tokio::sync::RwLock::new(()),
+            v2_deleting_sessions: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            v2_session_delete_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_V2_SESSION_DELETES,
+            )),
+            v2_drain_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            #[cfg(test)]
+            v2_cancel_transition_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            v2_session_remove_after_cancel_hook: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            v2_session_delete_gap_test_barriers: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            v2_lock_wait_test_barriers: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            v2_input_scope_test_barriers: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            v2_drain_terminal_test_barriers: parking_lot::Mutex::new(None),
             tui: crate::tui::TuiControl::default(),
             ui: crate::ui::UiProxy::from_env(),
             pty,
@@ -2632,6 +2725,10 @@ async fn post_summarize(
     let Ok(_guard) = release.arc().try_lock() else {
         return Err(session_busy(&sid));
     };
+    {
+        let _admission = st.v2_session_admission_gate.read().await;
+        check_v1_session_admission(&st, &sid)?;
+    }
 
     // C5 retrofit (M6, COMPACTION.md §3): manual summarize = v1 source
     // (handlers/session.ts:273-293 at the FREEZE TAG v1.18.31, verified):
@@ -3870,6 +3967,7 @@ struct LockRelease {
         >,
     >,
     ages: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
+    available: std::sync::Arc<tokio::sync::Notify>,
     sid: String,
     lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
@@ -3892,6 +3990,7 @@ impl Drop for LockRelease {
         {
             map.remove(&self.sid);
             self.ages.lock().remove(&self.sid);
+            self.available.notify_one();
         }
     }
 }
@@ -3904,7 +4003,7 @@ impl Drop for LockRelease {
 pub(crate) async fn lock_session(st: &Arc<AppState>, sid: &str) -> Result<LockRelease, ApiError> {
     let lock = {
         let mut map = st.prompt_locks.lock();
-        if map.len() >= 64 && !map.contains_key(sid) {
+        if map.len() >= MAX_PROMPT_LOCKS && !map.contains_key(sid) {
             return Err(ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 name: "ServiceUnavailableError",
@@ -3927,18 +4026,57 @@ pub(crate) async fn lock_session(st: &Arc<AppState>, sid: &str) -> Result<LockRe
     Ok(LockRelease {
         locks: std::sync::Arc::clone(&st.prompt_locks),
         ages: std::sync::Arc::clone(&st.lock_ages),
+        available: std::sync::Arc::clone(&st.prompt_lock_available),
         sid: sid.to_string(),
         lock,
     })
 }
 
+/// Acquire a prompt-session lock for a bounded background v2 drain. HTTP v1
+/// prompt admission still returns 503 when the 64-entry map is full; a v2
+/// inbox row is already durable, so its registered drain waits for a slot.
+/// The waiter count is bounded by `MAX_V2_DRAIN_TASKS`.
+pub(crate) async fn lock_session_wait(st: &Arc<AppState>, sid: &str) -> LockRelease {
+    loop {
+        // Enable the notification before checking the map. Merely constructing
+        // `Notified` does not register it; multiple capacity releases before
+        // first poll would otherwise collapse into Notify's single permit.
+        let mut available = Box::pin(st.prompt_lock_available.notified());
+        available.as_mut().enable();
+        match lock_session(st, sid).await {
+            Ok(release) => return release,
+            Err(error) if error.message == "too many concurrent prompts" => {
+                #[cfg(test)]
+                let test_barriers = st.v2_lock_wait_test_barriers.lock().clone();
+                #[cfg(test)]
+                if let Some(barriers) = test_barriers {
+                    barriers.0.wait().await;
+                    barriers.1.wait().await;
+                }
+                available.await;
+            }
+            Err(error) => {
+                // The current lock API only fails for its explicit capacity
+                // bound. Keep the durable v2 item pending if a future failure
+                // class is added, retrying with cancellation handled by the
+                // caller's select instead of silently abandoning the wake.
+                tracing::warn!(
+                    "v2 prompt-lock acquisition deferred for {sid}: {} {}",
+                    error.name,
+                    error.message
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
 /// Re-arm the v2 coordinator after a v1 turn releases the session lock.
 ///
-/// The v2 drain now declines to run while a v1 prompt holds the lock (one
-/// mutex, both grammars) and leaves the inbox row alone rather than dropping
-/// the user's message. Without this wake, a message queued by a v2 client
-/// during a v1 turn would sit until some *later* v2 request happened to wake
-/// the coordinator — a silent stall, which is worse than the race it fixes.
+/// V2 drains wait on the shared per-session lock while retaining the durable
+/// inbox row. This completion wake is a fallback for work whose prior drain
+/// was cancelled while a v1 prompt held the lock; without it that row could
+/// sit until some later request happened to wake the coordinator.
 ///
 /// Cheap by construction: one indexed `EXISTS`-shaped query, and only when the
 /// session actually has queued work. A v1-only deployment pays one query per
@@ -3964,16 +4102,26 @@ pub(crate) async fn wake_inbox_after_turn(st: &Arc<AppState>, sid: &str) {
     })
     .await
     .unwrap_or(0);
-    if pending > 0
-        && st
-            .coordinators
-            .wake(sid, ocserve_core::coordinator::WakeScope::Input)
-    {
-        let st2 = st.clone();
-        let sid2 = sid.to_string();
-        tokio::spawn(async move {
-            crate::v2::drain_session(st2, sid2).await;
-        });
+    if pending > 0 {
+        let slot = match crate::v2::reserve_drain_slot_wait(st, sid).await {
+            Ok(slot) => slot,
+            Err(_) => {
+                tracing::warn!("v2 drain capacity unavailable after v1 turn for {sid}");
+                return;
+            }
+        };
+        let _admission = st.v2_session_admission_gate.read().await;
+        if crate::v2::session_is_deleting(st, sid)
+            || !ocserve_store::session_exists(&st.db, sid).unwrap_or(false)
+        {
+            return;
+        }
+        crate::v2::wake_drain(
+            st.clone(),
+            sid.to_string(),
+            ocserve_core::coordinator::WakeScope::Input,
+            slot,
+        );
     }
 }
 
@@ -3990,6 +4138,21 @@ pub(crate) fn prompt_err(e: anyhow::Error) -> ApiError {
     }
 }
 
+/// v1 prompt admission uses the frozen v1 NotFoundError envelope while
+/// sharing the delete fence with v2 inbox/drain admission.
+fn check_v1_session_admission(st: &AppState, sid: &str) -> Result<(), ApiError> {
+    if crate::v2::session_is_deleting(st, sid)
+        || !ocserve_store::session_exists(&st.db, sid).map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            name: "InternalError",
+            message: format!("{e:#}"),
+        })?
+    {
+        return Err(ApiError::not_found(format!("Session not found: {sid}")));
+    }
+    Ok(())
+}
+
 async fn post_message(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -4001,6 +4164,10 @@ async fn post_message(
     let ctx = build_prompt_context(&st, &req, &id)?;
     let _release = lock_session(&st, &id).await?;
     let _guard = _release.arc().lock().await;
+    {
+        let _admission = st.v2_session_admission_gate.read().await;
+        check_v1_session_admission(&st, &id)?;
+    }
     let writer = st.writer.clone();
     let result = ocserve_core::prompt::run_prompt(&ctx, &writer, &id, &req)
         .await
@@ -4024,23 +4191,17 @@ async fn post_prompt_async(
     // decode FIRST (probe: `prompt_async {}` → 400 Missing key, never 204;
     // HttpApi payload decode precedes both 204 and the session check).
     let req = decode_v1(ocserve_core::wire::PromptRequest::decode(&payload))?;
-    let exists_id = id.clone();
-    if !run_blocking(&st.db, move |db| {
-        ocserve_store::session_exists(db, &exists_id)
-    })
-    .await
-    .map_err(|e| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        name: "InternalError",
-        message: format!("{e:#}"),
-    })? {
-        return Err(ApiError::not_found(format!("Session not found: {id}")).into());
+    {
+        let _admission = st.v2_session_admission_gate.read().await;
+        check_v1_session_admission(&st, &id)?;
     }
     let ctx = build_prompt_context(&st, &req, &id)?;
     // release MOVES INTO the task: the handler returns 204 immediately, so a
     // handler-scoped guard would drop (and evict the lock entry) while the
     // prompt is still running (antagonism A2 — ownership, not just RAII).
     let release = lock_session(&st, &id).await?;
+    let _admission = st.v2_session_admission_gate.read().await;
+    check_v1_session_admission(&st, &id)?;
     let writer = st.writer.clone();
     let sid = id.clone();
     let generation = st
@@ -4259,17 +4420,25 @@ async fn patch_session(
     Ok(Json(info))
 }
 
-/// DELETE /session/{id} → true (v1 Schema.Boolean). Aborts any in-flight
-/// async prompt first (it would write into a deleted session otherwise).
+/// DELETE /session/{id} → true (v1 Schema.Boolean). Stops in-flight v1/v2
+/// work before the session rows are deleted.
 async fn delete_session_route(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    let delete_fence = crate::v2::begin_session_delete(&st, &id).await?;
     crate::goal_loop::cancel_driver(&st, &id);
+    crate::v2::cancel_drains_for_delete(&st, &id).await;
     if let Some((_, handle)) = st.prompt_tasks.lock().remove(&id) {
         handle.abort();
     }
-    let found = ocserve_store::delete_session(&st.writer, &st.db, &id).map_err(|e| ApiError {
+    let delete_result = {
+        let release = lock_session(&st, &id).await?;
+        let _session_guard = release.arc().lock().await;
+        ocserve_store::delete_session(&st.writer, &st.db, &id)
+    };
+    delete_fence.finish().await;
+    let found = delete_result.map_err(|e| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         name: "InternalError",
         message: format!("{e:#}"),
@@ -4299,6 +4468,7 @@ async fn post_abort(
     // A goal loop re-spawns turns, so aborting the current prompt alone would
     // let it continue: cancel the driver FIRST, then the turn.
     crate::goal_loop::cancel_driver(&st, &id);
+    crate::v2::cancel_drain(&st, &id).await;
     if let Some((_, handle)) = st.prompt_tasks.lock().remove(&id) {
         handle.abort();
         tracing::info!("abort: cancelled prompt task for {id}");
@@ -5104,7 +5274,12 @@ async fn post_command(
         && st.goals_enabled
         && template.as_deref().map(str::is_empty).unwrap_or(true);
     if is_builtin_goal {
-        return match crate::goal_loop::arm(&st, &id, arguments).await {
+        let arm = {
+            let _admission = st.v2_session_admission_gate.read().await;
+            check_v1_session_admission(&st, &id)?;
+            crate::goal_loop::arm(&st, &id, arguments).await
+        };
+        return match arm {
             // Control words change state and start no turn. The response is
             // still a valid `SessionV1.WithParts`: a persisted assistant
             // notice, so a strict Message parser cannot choke on a goal-state
@@ -5212,6 +5387,10 @@ async fn post_command(
     let Ok(_guard) = _release.arc().try_lock() else {
         return Err(session_busy(&id).into());
     };
+    {
+        let _admission = st.v2_session_admission_gate.read().await;
+        check_v1_session_admission(&st, &id)?;
+    }
     let writer = st.writer.clone();
     let (info, parts) = ocserve_core::prompt::run_prompt_with(
         &ctx,
@@ -5262,6 +5441,10 @@ async fn post_shell(
     let Ok(_guard) = _release.arc().try_lock() else {
         return Err(session_busy(&id).into());
     };
+    {
+        let _admission = st.v2_session_admission_gate.read().await;
+        check_v1_session_admission(&st, &id)?;
+    }
     let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
 
     // busy → run → idle (client spinner parity)
@@ -6971,9 +7154,9 @@ mod drain_lock {
 
     use super::*;
 
-    /// Holding the session lock makes the drain decline the turn.
+    /// A drain waits on the session lock, then consumes its durable inbox item.
     #[tokio::test]
-    async fn drain_defers_while_a_prompt_holds_the_lock() {
+    async fn drain_waits_while_a_prompt_holds_the_lock() {
         let st = AppState::with_payloads_and_v2(None, Default::default(), true);
         let sid = "ses_drain_lock";
         st.writer
@@ -7010,17 +7193,32 @@ mod drain_lock {
         // which made the drain actually do work).
         let guard = release.arc().lock().await;
 
-        v2::drain_session(st.clone(), sid.to_string()).await;
+        let drain_st = st.clone();
+        let drain_sid = sid.to_string();
+        let mut drain = tokio::spawn(async move { v2::drain_session(drain_st, drain_sid).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut drain)
+                .await
+                .is_err(),
+            "drain must wait while the v1 prompt owns the shared lock"
+        );
 
         let remaining = ocserve_store::inbox::list(&st.db, sid).expect("list");
         assert_eq!(
             remaining.len(),
             1,
-            "drain consumed queued work while a prompt held the session lock"
+            "drain consumed queued work before acquiring the session lock"
         );
 
         drop(guard);
         drop(release);
+        drain.await.unwrap();
+        assert!(
+            ocserve_store::inbox::list(&st.db, sid)
+                .expect("list after lock release")
+                .is_empty(),
+            "waiting drain must resume the admitted inbox item"
+        );
     }
 }
 
