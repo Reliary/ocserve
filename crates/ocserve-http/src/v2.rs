@@ -51,15 +51,13 @@ pub async fn location(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 /// `options.apiKey` in config, a non-empty legacy auth key, an active OpenCode
 /// 2.x key credential, or is a custom provider absent from the models catalog
 /// (hence with no integration record). Credentials act as an active connection
-/// for the v2 picker; the projection never returns the key itself.
+/// in provider metadata. The model projection applies a separate endpoint
+/// check, and neither projection returns the key itself.
 fn available_provider_ids(payloads: &crate::Payloads) -> Vec<String> {
-    // `connected` is ALREADY the auth/config-derived set (auth.json order,
-    // built-in opencode, then config-only providers). The old extra filter
-    // dropped every provider that exists in the models catalog but carries
-    // its key in auth.json instead of `provider.<id>.options.apiKey` — which
-    // is exactly how `opencode auth login` stores `opencode-go`. The v2
-    // provider/model lists therefore hid a provider the v1 surface showed.
-    let mut ids: Vec<String> = payloads
+    // `connected` is the auth/config-derived set. Keep those providers
+    // visible even if ocserve cannot resolve a generic prompt endpoint for
+    // them: endpoint support is a prompt-time concern, not a metadata filter.
+    let connected: Vec<String> = payloads
         .provider
         .get("connected")
         .and_then(|v| v.as_array())
@@ -70,11 +68,10 @@ fn available_provider_ids(payloads: &crate::Payloads) -> Vec<String> {
         })
         .unwrap_or_default();
     let mut seen = std::collections::HashSet::new();
-    ids.retain(|id| {
-        seen.insert(id.clone())
-            && crate::prompt_endpoint_base_url(id, &payloads.config, &payloads.catalog).is_some()
-    });
-    ids
+    connected
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
 }
 
 /// Project a v1 model entry to the v2 `ModelV2Info` shape (freeze-probed).
@@ -249,9 +246,9 @@ pub fn providers_body(p: &crate::Payloads, location: &Value) -> Value {
 }
 
 /// Pure model-list projection (the `/api/model` body).
-pub fn models_body(p: &crate::Payloads, location: &Value) -> Value {
-    let avail = available_provider_ids(p);
-    let all = p
+pub fn models_body(payloads: &crate::Payloads, location: &Value) -> Value {
+    let avail = available_provider_ids(payloads);
+    let all = payloads
         .provider
         .get("all")
         .and_then(|v| v.as_array())
@@ -260,7 +257,9 @@ pub fn models_body(p: &crate::Payloads, location: &Value) -> Value {
     let mut data: Vec<Value> = Vec::new();
     for p in all {
         let pid = p.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        if !avail.iter().any(|a| a == pid) {
+        if !avail.iter().any(|a| a == pid)
+            || crate::prompt_endpoint_base_url(pid, &payloads.config, &payloads.catalog).is_none()
+        {
             continue;
         }
         if let Some(models) = p.get("models").and_then(|m| m.as_object()) {
