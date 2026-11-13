@@ -51,7 +51,11 @@ fn payloads() -> ocserve_http::Payloads {
                 {"id": "unavail", "name": "Unavailable", "models": {
                     "x": {"id": "x", "providerID": "unavail", "name": "X",
                           "status": "active", "api": {"npm": "@u/sdk", "url": "https://x"}}}},
-                {"id": "authonly", "name": "Auth Only", "env": ["AUTHONLY_KEY"], "models": {}}
+                {"id": "authonly", "name": "Auth Only", "env": ["AUTHONLY_KEY"], "models": {
+                    "auth-model": {"id": "auth-model", "providerID": "authonly",
+                                   "name": "Auth Model", "status": "active",
+                                   "api": {"npm": "@auth/sdk", "url": "https://x"}}
+                }}
             ]
         }),
         catalog: std::sync::Arc::new(serde_json::json!({
@@ -167,6 +171,20 @@ async fn v2_metadata_wire_bytes_equal_projection_builders() {
     assert!(
         !ids.contains(&"unavail"),
         "unavailable provider must be filtered: {v}"
+    );
+
+    // The provider itself remains visible because it is connected, but a
+    // model must not enter the picker when ocserve has no prompt endpoint.
+    let (status, bytes, _) = get(&app, "/api/model", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let models: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        !models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| { m.get("providerID").and_then(|v| v.as_str()) == Some("authonly") }),
+        "provider without a prompt endpoint must not contribute picker models: {models}"
     );
 }
 
