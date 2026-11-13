@@ -3736,8 +3736,20 @@ pub async fn permission_saved(
 
 /// GET /api/permission/request — `{location, data:[...]}` pending asks.
 pub async fn permission_request(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let data = st.gate.list();
+    let data = project_permission_requests(&st, None);
     Json(json!({"location": api_location(&st), "data": data}))
+}
+
+fn project_permission_requests(st: &AppState, session_id: Option<&str>) -> Vec<Value> {
+    st.gate
+        .list()
+        .into_iter()
+        .filter(|request| {
+            session_id
+                .is_none_or(|sid| request.get("sessionID").and_then(Value::as_str) == Some(sid))
+        })
+        .map(|request| ocserve_core::event::permission_request_v2(&request))
+        .collect()
 }
 
 /// GET /api/question/request — `{location, data:[...]}` pending questions.
@@ -3749,9 +3761,9 @@ pub async fn question_request(State(st): State<Arc<AppState>>) -> impl IntoRespo
 /// GET /api/session/{sessionID}/permission — `{data:[]}` (per-session asks).
 pub async fn session_permission(
     State(st): State<Arc<AppState>>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
 ) -> impl IntoResponse {
-    Json(json!({"data": st.gate.list()}))
+    Json(json!({"data": project_permission_requests(&st, Some(&id))}))
 }
 
 /// GET /api/session/{sessionID}/question — `{data:[]}` (per-session questions).
@@ -5230,13 +5242,14 @@ pub async fn session_permission_one(
             message: format!("Expected a string starting with \"per\", got \"{rid}\""),
         });
     }
-    let found = st
-        .gate
-        .list()
-        .into_iter()
-        .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(rid.as_str()));
+    let found = st.gate.list().into_iter().find(|p| {
+        p.get("id").and_then(Value::as_str) == Some(rid.as_str())
+            && p.get("sessionID").and_then(Value::as_str) == Some(sid.as_str())
+    });
     match found {
-        Some(p) => Ok(Json(json!({"data": p}))),
+        Some(p) => Ok(Json(json!({
+            "data": ocserve_core::event::permission_request_v2(&p)
+        }))),
         None => Err(ApiError::not_found(format!(
             "Permission request not found: {rid}"
         ))),
@@ -5539,11 +5552,55 @@ pub async fn session_event(State(st): State<Arc<AppState>>) -> axum::response::R
 /// ocserve's gate is a rendezvous for the RUNNING prompt; a standalone
 /// create is acknowledged with the evaluated effect (freeze shape
 /// `{data:{id,effect}}`). Full blocking semantics belong to the prompt path.
+fn invalid_permission_field(path: &str, expected: &str, value: &Value) -> HttpError {
+    HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidRequestError",
+        fields: json!({
+            "message": format!("Expected {expected}, got {value}\n  at {path}"),
+            "kind": "Payload",
+        }),
+    }
+}
+
+fn validate_permission_string_array(key: &str, values: &[Value]) -> Result<(), HttpError> {
+    for (index, value) in values.iter().enumerate() {
+        if !value.is_string() {
+            return Err(invalid_permission_field(
+                &format!("[\"{key}\",{index}]"),
+                "string",
+                value,
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub async fn permission_create(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, HttpError> {
+    if let Some(bad) = body.as_object().and_then(|fields| {
+        fields.keys().find(|key| {
+            ![
+                "id",
+                "action",
+                "resources",
+                "save",
+                "metadata",
+                "source",
+                "agent",
+            ]
+            .contains(&key.as_str())
+        })
+    }) {
+        return Err(HttpError::TaggedData {
+            status: StatusCode::BAD_REQUEST,
+            tag: "InvalidRequestError",
+            fields: json!({"message": format!("unknown key {bad}")}),
+        });
+    }
     let action = body.get("action").and_then(|v| v.as_str());
     let resources = body.get("resources").and_then(|v| v.as_array());
     let (Some(action), Some(resources)) = (action, resources) else {
@@ -5554,8 +5611,9 @@ pub async fn permission_create(
         };
         return Err(payload_err(key));
     };
-    if let Some(sv) = body.get("save").filter(|v| !v.is_null() && !v.is_array()) {
-        // probe-pinned bytes (save:false → freeze v2 envelope); null = absent
+    validate_permission_string_array("resources", resources)?;
+    if let Some(sv) = body.get("save").filter(|v| !v.is_array()) {
+        // `save` is an optional array in the frozen create schema; null is not absent.
         return Err(HttpError::TaggedData {
             status: StatusCode::BAD_REQUEST,
             tag: "InvalidRequestError",
@@ -5564,6 +5622,48 @@ pub async fn permission_create(
                 "kind": "Payload",
             }),
         });
+    }
+    if let Some(save) = body.get("save").and_then(Value::as_array) {
+        validate_permission_string_array("save", save)?;
+    }
+    if let Some(metadata) = body.get("metadata")
+        && !metadata.is_object()
+    {
+        return Err(invalid_permission_field(
+            "[\"metadata\"]",
+            "object",
+            metadata,
+        ));
+    }
+    if let Some(source) = body.get("source") {
+        let valid = source.as_object().is_some_and(|fields| {
+            fields.len() == 3
+                && fields.get("type").and_then(Value::as_str) == Some("tool")
+                && fields.get("messageID").is_some_and(Value::is_string)
+                && fields.get("id").is_some_and(Value::is_string)
+        });
+        if !valid {
+            return Err(invalid_permission_field(
+                "[\"source\"]",
+                "Permission.Source",
+                source,
+            ));
+        }
+    }
+    if let Some(message) = body.get("message")
+        && !message.is_string()
+    {
+        return Err(invalid_permission_field("[\"message\"]", "string", message));
+    }
+    if let Some(agent) = body.get("agent")
+        && !agent.is_null()
+        && !agent.is_string()
+    {
+        return Err(invalid_permission_field(
+            "[\"agent\"]",
+            "string | null",
+            agent,
+        ));
     }
     // The v2 create IS the permission oracle: it returns the evaluated effect
     // (upstream PermissionV2.ask) with NO tool execution. It must evaluate the
