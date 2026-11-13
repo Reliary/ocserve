@@ -3285,6 +3285,55 @@ pub fn credential_list(db: &std::path::Path) -> anyhow::Result<Vec<Credential>> 
         .map_err(Into::into)
 }
 
+/// Active API keys from OpenCode 2.x's shared credential database. This is a
+/// read-only compatibility source: use the shared reader (no schema writes or
+/// PRAGMA changes to the foreign database), project only named columns, and
+/// keep both row count and individual values bounded.
+pub fn opencode_credential_keys(
+    db: &std::path::Path,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    const ROW_LIMIT: i64 = 256;
+    const VALUE_LIMIT: i64 = 16_384;
+    if !db.exists() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let conn = pragma::open_reader(db)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT integration_id, value FROM credential \
+         WHERE active = 1 AND integration_id IS NOT NULL \
+           AND length(integration_id) <= 128 AND length(value) <= 16384 \
+         ORDER BY time_updated DESC, integration_id ASC LIMIT 256",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut keys = std::collections::BTreeMap::new();
+    for row in rows {
+        let (integration, value) = row?;
+        if integration.is_empty() || integration.len() > 128 || value.len() > VALUE_LIMIT as usize {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&value) else {
+            continue;
+        };
+        if value.get("type").and_then(|v| v.as_str()) != Some("key") {
+            continue;
+        }
+        let Some(key) = value
+            .get("key")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty() && v.len() <= 8_192)
+        else {
+            continue;
+        };
+        // Rows arrive newest first; retain the newest active key if a foreign
+        // database temporarily contains more than one active row.
+        keys.entry(integration).or_insert_with(|| key.to_string());
+        if keys.len() >= ROW_LIMIT as usize {
+            break;
+        }
+    }
+    Ok(keys)
+}
+
 /// Insert a credential; when `active`, same-integration siblings deactivate
 /// (single-active per integration, verified live). Returns the entry.
 pub fn credential_create(
