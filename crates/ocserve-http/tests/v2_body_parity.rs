@@ -28,7 +28,9 @@ fn payloads() -> ocserve_http::Payloads {
     ocserve_http::Payloads {
         config: serde_json::json!({
             "model": "acme/big",
-            "provider": {"acme": {"name": "Acme", "options": {"apiKey": "sk-test"}},
+            "provider": {"acme": {"name": "Acme", "options": {
+                              "apiKey": "sk-test",
+                              "baseURL": "https://api.acme.example/v1"}},
                           "custom1": {"name": "Custom One"}},
         }),
         provider: serde_json::json!({

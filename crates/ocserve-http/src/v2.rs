@@ -48,9 +48,10 @@ pub async fn location(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 ///                              no integration at all)
 /// Translated to ocserve's data: a provider is available when it is the
 /// built-in `opencode` (keyless `public`), has an explicit non-empty
-/// `options.apiKey` in config, or is a custom provider absent from the models
-/// catalog (hence with no integration record). This reproduces the observed
-/// freeze set `{opencode, entrim, nube}` from this box's config.
+/// `options.apiKey` in config, a non-empty legacy auth key, an active OpenCode
+/// 2.x key credential, or is a custom provider absent from the models catalog
+/// (hence with no integration record). Credentials act as an active connection
+/// for the v2 picker; the projection never returns the key itself.
 fn available_provider_ids(payloads: &crate::Payloads) -> Vec<String> {
     // `connected` is ALREADY the auth/config-derived set (auth.json order,
     // built-in opencode, then config-only providers). The old extra filter
@@ -69,7 +70,10 @@ fn available_provider_ids(payloads: &crate::Payloads) -> Vec<String> {
         })
         .unwrap_or_default();
     let mut seen = std::collections::HashSet::new();
-    ids.retain(|id| seen.insert(id.clone()));
+    ids.retain(|id| {
+        seen.insert(id.clone())
+            && crate::prompt_endpoint_base_url(id, &payloads.config, &payloads.catalog).is_some()
+    });
     ids
 }
 
