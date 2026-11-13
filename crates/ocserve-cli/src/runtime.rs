@@ -2908,6 +2908,100 @@ mod provider_key_tests {
         );
     }
 
+    /// OpenCode 2.x stores an API-key credential as `{type:"key",key:…}` in
+    /// the shared `credential` table under `integration_id = "mistral"`
+    /// (upstream schema `Credential.Key`). Mistral's API is OpenAI-compatible
+    /// at `https://api.mistral.ai/v1`, so an active key must resolve an
+    /// endpoint and connect the provider in the v2 picker even when no
+    /// baseURL is configured. Fake key only; no network.
+    #[test]
+    fn mistral_active_opencode_key_uses_builtin_endpoint_and_connects_v2_picker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("opencode.db");
+        let conn = ocserve_store::pragma::create_new(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE credential (
+                id TEXT PRIMARY KEY,
+                integration_id TEXT,
+                label TEXT NOT NULL,
+                value TEXT NOT NULL,
+                connector_id TEXT,
+                method_id TEXT,
+                active INTEGER,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO credential
+                (id, integration_id, label, value, connector_id, method_id,
+                 active, time_created, time_updated)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, 1, 1, 1)",
+            rusqlite::params![
+                "cred_mistral_fake",
+                "mistral",
+                "default",
+                r#"{"type":"key","key":"fake-mistral-key"}"#
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let credentials = ocserve_store::opencode_credential_keys(&db).unwrap();
+        assert_eq!(
+            credentials.get("mistral").map(String::as_str),
+            Some("fake-mistral-key"),
+            "the shared credential reader must project an active Mistral key row"
+        );
+        let cache = json!({
+            "mistral": {
+                "npm": "@ai-sdk/mistral",
+                "models": {"mistral-large-latest": {"name": "Mistral Large"}}
+            }
+        });
+        let rt = Runtime::from_parts_with_opencode_credentials(
+            dir.path(),
+            json!({}),
+            json!({}),
+            cache,
+            credentials,
+        )
+        .unwrap();
+        let registry = rt.llm_registry_from_auth(json!({})).unwrap();
+        assert_eq!(
+            registry.endpoints.get("mistral"),
+            Some(&(
+                "https://api.mistral.ai/v1".to_string(),
+                "fake-mistral-key".to_string(),
+            )),
+            "an active OpenCode Mistral key needs the documented OpenAI-compatible endpoint"
+        );
+
+        let payloads = rt.into_payloads();
+        assert!(
+            payloads.provider["connected"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|id| id == "mistral")),
+            "the active OpenCode key must count as a connected provider"
+        );
+        let models = ocserve_http::v2::models_body(&payloads, &json!({"url": "test"}));
+        assert!(
+            models["data"].as_array().is_some_and(|items| {
+                items.iter().any(|model| {
+                    model["providerID"] == "mistral" && model["id"] == "mistral-large-latest"
+                })
+            }),
+            "the provider's catalog models must appear in the v2 picker"
+        );
+        assert!(
+            !serde_json::to_string(&models)
+                .unwrap()
+                .contains("fake-mistral-key"),
+            "the SQLite API key must not be returned on the v2 wire"
+        );
+    }
+
     /// Third source (2.x): an ACTIVE key credential in OUR database feeds the
     /// provider, because opencode 2.x no longer writes auth.json.
     #[test]
