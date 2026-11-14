@@ -78,6 +78,7 @@ for the normal behaviour.
 
 | Variable | Default | Accepted | Meaning |
 |---|---|---|---|
+| `OCSERVE_DRAIN_CANCEL_SECS` | 30 | seconds (0 = unbounded) | How long DELETE waits for a cancelled v2 drain to confirm before proceeding with teardown. 0 restores the old unbounded wait, which can hold a deletion fence for the provider stall budget. |
 | `OCSERVE_CGROUP_PARTITION` | auto (only under systemd) | 0 \| 1 \| unset | Kids/ cgroup partition for child processes. |
 | `OCSERVE_KIDS_CGROUP` | (internal) | a cgroup directory | Set by the partition dance for child processes; do not set it yourself. |
 | `OCSERVE_KIDS_MEMORY_MAX_MB` | 700 | 32-1048576 | Aggregate memory cap for the kids/ cgroup. |

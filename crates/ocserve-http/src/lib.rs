@@ -106,6 +106,18 @@ where
         .map_err(|e| anyhow::anyhow!("blocking task join: {e}"))?
 }
 
+/// How long DELETE waits for a cancelled v2 drain to confirm. Default 30 s:
+/// short enough that an API client does not hang behind a provider stall,
+/// long enough that a drain finishing its teardown event normally confirms.
+/// `OCSERVE_DRAIN_CANCEL_SECS=0` restores the old unbounded wait (documented
+/// kill switch, not a recommendation).
+fn drain_cancel_timeout_secs() -> u64 {
+    std::env::var("OCSERVE_DRAIN_CANCEL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30)
+}
+
 mod artifact_store;
 pub mod compress;
 pub mod doc;
@@ -1521,7 +1533,13 @@ pub(crate) fn validate_permission_reply_key(
 
 /// GET /permission — pending permission requests.
 async fn get_permissions(State(st): State<Arc<AppState>>) -> Json<Value> {
-    Json(serde_json::Value::Array(st.gate.list()))
+    Json(Value::Array(
+        st.gate
+            .list()
+            .iter()
+            .map(ocserve_core::event::permission_request_v1)
+            .collect(),
+    ))
 }
 
 /// GET /vcs — {branch, default_branch} (values cwd-dependent; keys golden).
@@ -2731,7 +2749,7 @@ async fn post_summarize(
     };
     {
         let _admission = st.v2_session_admission_gate.read().await;
-        check_v1_session_admission(&st, &sid)?;
+        check_v1_session_admission(&st, &sid).await?;
     }
 
     // C5 retrofit (M6, COMPACTION.md §3): manual summarize = v1 source
@@ -4049,7 +4067,14 @@ pub(crate) async fn lock_session_wait(st: &Arc<AppState>, sid: &str) -> LockRele
         available.as_mut().enable();
         match lock_session(st, sid).await {
             Ok(release) => return release,
-            Err(error) if error.message == "too many concurrent prompts" => {
+            // Capacity is the only refusal lock_session returns today, and it
+            // is identified by status/name rather than the message text. The
+            // old string match meant a wording change silently fell into the
+            // 1 Hz retry branch while holding a drain slot.
+            Err(error)
+                if error.status == StatusCode::SERVICE_UNAVAILABLE
+                    && error.name == "ServiceUnavailableError" =>
+            {
                 #[cfg(test)]
                 let test_barriers = st.v2_lock_wait_test_barriers.lock().clone();
                 #[cfg(test)]
@@ -4144,14 +4169,25 @@ pub(crate) fn prompt_err(e: anyhow::Error) -> ApiError {
 
 /// v1 prompt admission uses the frozen v1 NotFoundError envelope while
 /// sharing the delete fence with v2 inbox/drain admission.
-fn check_v1_session_admission(st: &AppState, sid: &str) -> Result<(), ApiError> {
-    if crate::v2::session_is_deleting(st, sid)
-        || !ocserve_store::session_exists(&st.db, sid).map_err(|e| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            name: "InternalError",
-            message: format!("{e:#}"),
-        })?
-    {
+async fn check_v1_session_admission(st: &AppState, sid: &str) -> Result<(), ApiError> {
+    // The delete-fence read is in-memory and cheap; the existence query is
+    // SQLite and runs on the blocking pool (F1 class: a sync store call on a
+    // tokio worker parks it for the query's duration). Returning a TYPED error
+    // matters: `lock_session_wait` used to branch on this message string.
+    if crate::v2::session_is_deleting(st, sid) {
+        return Err(ApiError::not_found(format!("Session not found: {sid}")));
+    }
+    let sid_owned = sid.to_string();
+    let exists = run_blocking(&st.db, move |db| {
+        ocserve_store::session_exists(db, &sid_owned)
+    })
+    .await
+    .map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        name: "InternalError",
+        message: format!("{e:#}"),
+    })?;
+    if !exists {
         return Err(ApiError::not_found(format!("Session not found: {sid}")));
     }
     Ok(())
@@ -4170,7 +4206,7 @@ async fn post_message(
     let _guard = _release.arc().lock().await;
     {
         let _admission = st.v2_session_admission_gate.read().await;
-        check_v1_session_admission(&st, &id)?;
+        check_v1_session_admission(&st, &id).await?;
     }
     let writer = st.writer.clone();
     let result = ocserve_core::prompt::run_prompt(&ctx, &writer, &id, &req)
@@ -4197,7 +4233,7 @@ async fn post_prompt_async(
     let req = decode_v1(ocserve_core::wire::PromptRequest::decode(&payload))?;
     {
         let _admission = st.v2_session_admission_gate.read().await;
-        check_v1_session_admission(&st, &id)?;
+        check_v1_session_admission(&st, &id).await?;
     }
     let ctx = build_prompt_context(&st, &req, &id)?;
     // release MOVES INTO the task: the handler returns 204 immediately, so a
@@ -4205,7 +4241,7 @@ async fn post_prompt_async(
     // prompt is still running (antagonism A2 — ownership, not just RAII).
     let release = lock_session(&st, &id).await?;
     let _admission = st.v2_session_admission_gate.read().await;
-    check_v1_session_admission(&st, &id)?;
+    check_v1_session_admission(&st, &id).await?;
     let writer = st.writer.clone();
     let sid = id.clone();
     let generation = st
@@ -5280,7 +5316,7 @@ async fn post_command(
     if is_builtin_goal {
         let arm = {
             let _admission = st.v2_session_admission_gate.read().await;
-            check_v1_session_admission(&st, &id)?;
+            check_v1_session_admission(&st, &id).await?;
             crate::goal_loop::arm(&st, &id, arguments).await
         };
         return match arm {
@@ -5393,7 +5429,7 @@ async fn post_command(
     };
     {
         let _admission = st.v2_session_admission_gate.read().await;
-        check_v1_session_admission(&st, &id)?;
+        check_v1_session_admission(&st, &id).await?;
     }
     let writer = st.writer.clone();
     let (info, parts) = ocserve_core::prompt::run_prompt_with(
@@ -5447,7 +5483,7 @@ async fn post_shell(
     };
     {
         let _admission = st.v2_session_admission_gate.read().await;
-        check_v1_session_admission(&st, &id)?;
+        check_v1_session_admission(&st, &id).await?;
     }
     let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
 
@@ -5757,9 +5793,14 @@ fn encode_event_frame(stored: &str, fmt: EventFormat) -> Option<String> {
     let id = payload.get("id").cloned().unwrap_or(Value::Null);
     let ty = payload.get("type").cloned().unwrap_or(Value::Null);
     let props = payload.get("properties").cloned().unwrap_or(json!({}));
+    let data = if ty.as_str() == Some("permission.asked") {
+        ocserve_core::event::permission_request_v2(&props)
+    } else {
+        props.clone()
+    };
     Some(match fmt {
         EventFormat::Bare => json!({"id": id, "type": ty, "properties": props}).to_string(),
-        EventFormat::V2 => json!({"id": id, "type": ty, "data": props}).to_string(),
+        EventFormat::V2 => json!({"id": id, "type": ty, "data": data}).to_string(),
         EventFormat::Global => unreachable!(),
     })
 }
@@ -7276,6 +7317,30 @@ mod event_envelope_unit {
             encode_event_frame(V1_PLAIN, EventFormat::V2).is_some(),
             "v2 folds a v1 frame into data (documented projection)"
         );
+    }
+
+    #[test]
+    fn v2_permission_event_projects_the_permission_request_shape() {
+        let v1 = r#"{"directory":"/w","project":"global","payload":{"id":"evt_perm","type":"permission.asked","properties":{"id":"per_1","sessionID":"ses_1","permission":"bash","patterns":["echo *"],"always":["echo *"],"metadata":{"command":"echo hi"},"tool":{"messageID":"msg_1","callID":"call_1"}}}}"#;
+        let encoded = encode_event_frame(v1, EventFormat::V2).expect("v2 permission event");
+        let frame: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(frame["type"], "permission.asked");
+        assert_eq!(frame["data"]["action"], "bash");
+        assert_eq!(frame["data"]["resources"], serde_json::json!(["echo *"]));
+        assert_eq!(frame["data"]["save"], serde_json::json!(["echo *"]));
+        assert_eq!(frame["data"]["source"]["type"], "tool");
+        assert_eq!(frame["data"]["source"]["messageID"], "msg_1");
+        assert_eq!(frame["data"]["source"]["id"], "call_1");
+        assert!(frame["data"].get("patterns").is_none());
+
+        let bare = encode_event_frame(v1, EventFormat::Bare).expect("v1 permission event");
+        let frame: serde_json::Value = serde_json::from_str(&bare).unwrap();
+        assert_eq!(frame["properties"]["permission"], "bash");
+        assert_eq!(
+            frame["properties"]["patterns"],
+            serde_json::json!(["echo *"])
+        );
+        assert!(frame["properties"].get("resources").is_none());
     }
 }
 

@@ -109,7 +109,11 @@ tokio::runtime::Builder::new_multi_thread()
   repeated identifiers (tool names, agent names) with a hard intern-table cap.
 - V2 drain task registry: at most 128 active session entries, enforced by the
   slot semaphore created with `MAX_V2_DRAIN_TASKS`; overflow admission fails
-  before persisting inbox work (`V2-PLAN.md` P3, `D-V2-DRAIN-CAP`).
+  before persisting inbox work (`V2-PLAN.md` P3, `D-V2-DRAIN-CAP`). This is a
+  COUNT bound, not a memory bound: each active drain can hold up to
+  `PROMPT_HISTORY_MAX_BYTES`, and the shared prompt-lock map caps concurrent
+  turns at `MAX_PROMPT_LOCKS` (64), so the worst case is bounded by
+  min(128, 64) x history, which is why the budget is stated in both places.
 - V2 slot reservations can queue at most 128 additional waiters, enforced by
   `MAX_V2_DRAIN_WAITERS`; a full waiter cap returns bounded backpressure rather
   than retaining another request or background task.

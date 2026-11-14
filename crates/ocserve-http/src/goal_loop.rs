@@ -473,7 +473,7 @@ pub(crate) async fn run_turn_now(
     let guard = release.arc().lock().await;
     {
         let _admission = st.v2_session_admission_gate.read().await;
-        if let Err(e) = crate::check_v1_session_admission(st, sid) {
+        if let Err(e) = crate::check_v1_session_admission(st, sid).await {
             drop(guard);
             return Err(anyhow::anyhow!("{}", e.message));
         }
