@@ -1721,7 +1721,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -1750,7 +1750,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-core"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -1772,7 +1772,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-http"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -1817,7 +1817,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-importer"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "ocserve-store",
@@ -1830,7 +1830,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-llm"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "boring",
@@ -1851,7 +1851,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-mcp"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "ocserve-metrics",
@@ -1866,11 +1866,11 @@ dependencies = [
 
 [[package]]
 name = "ocserve-metrics"
-version = "0.7.2"
+version = "0.7.3"
 
 [[package]]
 name = "ocserve-plugin"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "hex",
@@ -1889,7 +1889,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-pty"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "libc",
  "ocserve-core",
@@ -1902,7 +1902,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-store"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1920,7 +1920,7 @@ dependencies = [
 
 [[package]]
 name = "ocserve-tools"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "libc",
@@ -1938,27 +1938,27 @@ dependencies = [
 
 [[package]]
 name = "ocserve-ui-v1-a"
-version = "0.7.2"
+version = "0.7.3"
 
 [[package]]
 name = "ocserve-ui-v1-b"
-version = "0.7.2"
+version = "0.7.3"
 
 [[package]]
 name = "ocserve-ui-v2-a"
-version = "0.7.2"
+version = "0.7.3"
 
 [[package]]
 name = "ocserve-ui-v2-b"
-version = "0.7.2"
+version = "0.7.3"
 
 [[package]]
 name = "ocserve-ui-v2-c"
-version = "0.7.2"
+version = "0.7.3"
 
 [[package]]
 name = "ocserve-ui-v2-d"
-version = "0.7.2"
+version = "0.7.3"
 
 [[package]]
 name = "once_cell"

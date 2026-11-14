@@ -4,7 +4,7 @@ All notable changes to ocserve. The wire contract targets the frozen opencode
 1.19.5 release and the v2 surface the 2.2.5 client; anything that differs is a
 named `D-*` row in the ledger at `PLAN.md` section 18.
 
-## Unreleased
+## 0.7.3 - 2026-11-14
 
 ### Fixed
 - Permission requests now serialize in the correct v1 or v2 shape at each API
