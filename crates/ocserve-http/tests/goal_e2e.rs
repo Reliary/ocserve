@@ -1065,3 +1065,61 @@ async fn kill_switch_off_refuses_goal_and_writes_no_state() {
         "a disabled goal command must write no state"
     );
 }
+
+/// A review deferred at capacity must be retried, not dropped. The reviewer
+/// slot table is saturated, then a goal is armed; once a slot frees, the retry
+/// must fire without any further user turn. Before the retry owner existed the
+/// only trigger was the next turn's completion, so an overnight goal stopped
+/// until a human spoke again.
+#[tokio::test(flavor = "multi_thread")]
+async fn deferred_review_is_retried_without_another_user_turn() {
+    let addr = spawn_provider(r#"{"verdict":"done","reason":"finished"}"#);
+    let st = setup(addr, "ses_goalretry");
+    let app = router(&st);
+
+    // Saturate the reviewer table with placeholder entries for OTHER sessions.
+    let held: Vec<String> = (0..ocserve_http::goal_loop::MAX_PENDING_GOAL_REVIEWS)
+        .map(|i| format!("ses_held_{i}"))
+        .collect();
+    {
+        let mut wakes = st.goal_wakes.lock();
+        for sid in &held {
+            wakes.insert(
+                sid.clone(),
+                (
+                    u64::MAX,
+                    tokio::spawn(async { std::future::pending::<()>().await }),
+                ),
+            );
+        }
+        assert_eq!(
+            wakes.len(),
+            ocserve_http::goal_loop::MAX_PENDING_GOAL_REVIEWS
+        );
+    }
+
+    let _ = req(
+        &app,
+        "POST",
+        "/session/ses_goalretry/command",
+        Some(json!({"command": "goal", "arguments": "get it done"})),
+    )
+    .await;
+    // Wait until the deferral is OBSERVED before freeing a slot; freeing early
+    // would let the first attempt succeed and make this test pass without ever
+    // exercising the retry (the race that makes such tests theatre).
+    let mut deferred = false;
+    for _ in 0..200 {
+        if ocserve_metrics::render().contains("review_deferred") {
+            deferred = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(deferred, "the review must be deferred at capacity first");
+    // Free ONE slot. The retry owner must find it with no further turn.
+    st.goal_wakes.lock().remove(&held[0]);
+
+    let goal = wait_goal(&st, "ses_goalretry", "complete", 90).await;
+    assert_eq!(goal["reason"], "finished");
+}

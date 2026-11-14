@@ -519,7 +519,7 @@ pub(crate) async fn run_turn_now(
             // reviewer is a real model call, and the v1 command response must
             // not wait on a second completion. Upstream's command returns once
             // the synthetic kickoff is delivered, for the same reason.
-            spawn_wake_public(st, sid);
+            kick_goal_review(st.clone(), sid.to_string());
             Ok((info, parts))
         }
         Err(e) => {
@@ -537,7 +537,7 @@ pub(crate) async fn run_turn_now(
                 )
                 .await;
             }
-            spawn_wake_public(st, sid);
+            kick_goal_review(st.clone(), sid.to_string());
             Err(e)
         }
     }
@@ -550,18 +550,22 @@ pub(crate) async fn run_turn_now(
 /// `wake_inbox_after_turn`, which calls this function again; the dedup guard
 /// then suppressed the inner call and the reviewer never ran (caught by the
 /// goal e2e on the first run).
-pub(crate) const MAX_PENDING_GOAL_REVIEWS: usize = 128;
+pub const MAX_PENDING_GOAL_REVIEWS: usize = 128;
 
 pub(crate) fn spawn_wake_public(st: &Arc<AppState>, sid: &str) -> bool {
     // Deletion opens its fence while holding the drain-registry mutex. Share
     // that critical section so delete either sees this handle and cancels it,
     // or the wake sees the fence and never starts.
+    //
+    // The admission check is IN-MEMORY only. Calling the store's
+    // `session_exists` here would run a SQLite query on an async worker while
+    // holding `v2_drain_tasks` — the two things this file's review exists to
+    // prevent (F1 class: blocking IO on the executor, plus lock-held I/O).
+    // The durable goal row already implies the session; a session deleted
+    // between here and the reviewer is caught by the turn itself, which 404s.
     let _tasks = st.v2_drain_tasks.lock();
-    if let Err(error) = crate::check_v1_session_admission(st, sid) {
-        tracing::debug!(
-            "goal review skipped for unavailable session={sid}: {}",
-            error.message
-        );
+    if crate::v2::session_is_deleting(st, sid) {
+        tracing::debug!("goal review skipped for deleting session={sid}");
         return false;
     }
     static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -574,6 +578,12 @@ pub(crate) fn spawn_wake_public(st: &Arc<AppState>, sid: &str) -> bool {
         return false;
     }
     if wakes.len() >= MAX_PENDING_GOAL_REVIEWS {
+        // A deferred review must not be silent, and it must not be final: the
+        // only other trigger is the next turn's completion, so an overnight
+        // goal would stop until a human speaks again. Re-arm on a bounded
+        // timer with a retry budget, and make both the deferral and the
+        // eventual give-up visible.
+        ocserve_metrics::labeled_counter("ocserve_goal_total", "event=\"review_deferred\"", 1);
         tracing::warn!(
             "goal reviewer capacity ({MAX_PENDING_GOAL_REVIEWS}) full; deferring session={sid}"
         );
@@ -599,6 +609,59 @@ pub(crate) fn spawn_wake_public(st: &Arc<AppState>, sid: &str) -> bool {
     drop(wakes);
     let _ = start_tx.send(());
     true
+}
+
+/// Bounded retry for a review deferred at capacity.
+///
+/// This is the ONE owner of the retry chain: `spawn_wake_public` tries once
+/// and reports whether it started. Backoff doubles from 2 s to a 60 s cap over
+/// `MAX_REVIEW_RETRIES` attempts. On exhaustion the goal is PAUSED with an
+/// operator-visible reason rather than left silently stalled — a deferred
+/// review whose only other trigger is the next human turn is exactly the
+/// overnight-goal failure mode.
+const MAX_REVIEW_RETRIES: u32 = 6;
+
+pub(crate) fn kick_goal_review(st: Arc<AppState>, sid: String) {
+    tokio::spawn(async move {
+        for attempt in 0..MAX_REVIEW_RETRIES {
+            if spawn_wake_public(&st, &sid) {
+                return;
+            }
+            if !goal_is_active(&st, &sid).await {
+                return;
+            }
+            let secs = (2u64 << attempt.min(4)).min(60);
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        }
+        ocserve_metrics::labeled_counter(
+            "ocserve_goal_total",
+            "event=\"review_deferred_gave_up\"",
+            1,
+        );
+        tracing::warn!("goal review retries exhausted for session={sid}; pausing the goal");
+        if let Ok(Some(mut goal)) = ocserve_store::get_goal(&st.db, &sid)
+            && goal.status == Status::Active.as_str()
+        {
+            settle(
+                &st,
+                &sid,
+                &mut goal,
+                Status::Paused,
+                "The goal paused: the reviewer stayed at capacity.",
+            )
+            .await;
+        }
+    });
+}
+
+/// Same rule as every other store touch in an async task: off the worker.
+async fn goal_is_active(st: &Arc<AppState>, sid: &str) -> bool {
+    let sid_owned = sid.to_string();
+    crate::run_blocking(&st.db, move |db| ocserve_store::get_goal(db, &sid_owned))
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|g| g.status == Status::Active.as_str())
 }
 
 /// Remove a completed reviewer without letting an old task erase a newer

@@ -95,7 +95,7 @@ pub struct Payloads {
 /// duration. Baseline measured exactly that convoy: one 6s search held a
 /// worker and every other route queued behind it (config p95 998ms for a
 /// payload read; starvation signature: tail explodes while CPU ≪100%).
-async fn run_blocking<T, F>(db: &std::path::Path, op: F) -> anyhow::Result<T>
+pub(crate) async fn run_blocking<T, F>(db: &std::path::Path, op: F) -> anyhow::Result<T>
 where
     F: FnOnce(&std::path::Path) -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
@@ -4095,7 +4095,7 @@ pub(crate) async fn wake_inbox_after_turn(st: &Arc<AppState>, sid: &str) {
     // for a second full completion (2026-11-05 review). `spawn_wake` runs the
     // hook on the runtime; the hook itself already spawns the next turn.
     if st.goals_enabled {
-        crate::goal_loop::spawn_wake_public(st, sid);
+        crate::goal_loop::kick_goal_review(st.clone(), sid.to_string());
     }
     if !st.v2_enabled {
         return;
