@@ -809,7 +809,7 @@ async fn spawn_driver(
     // Serialize the existence/fence check and registry insertion with delete.
     // Delete cancels any driver that registered before opening its fence.
     let _admission = st.v2_session_admission_gate.read().await;
-    if let Err(error) = crate::check_v1_session_admission(st, sid) {
+    if let Err(error) = crate::check_v1_session_admission(st, sid).await {
         tracing::debug!(
             "goal driver registration skipped for unavailable session={sid}: {}",
             error.message
