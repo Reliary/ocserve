@@ -39,6 +39,9 @@ pub struct Runtime {
     pub command: Vec<Value>,
     pub config_providers: Value,
     pub provider: Value,
+    /// Active `key` credentials from OpenCode 2.x's shared database. Runtime
+    /// only: these values never enter provider/model payloads.
+    opencode_credentials: BTreeMap<String, String>,
     pub console: Value,
     pub capabilities: Value,
 }
@@ -316,17 +319,29 @@ fn load_auth(data_dir: &Path) -> Result<Value> {
 }
 
 /// `legacy_home` is a TEST SEAM: when set, the legacy `auth.json` is read from
-/// `<legacy_home>/auth.json` instead of `$HOME/.local/share/opencode/auth.json`,
-/// so a loader test cannot read the developer's real credentials. Production
-/// passes `None` and keeps the documented path.
+/// `<legacy_home>/auth.json` instead of OpenCode's data directory
+/// (`XDG_DATA_HOME/opencode` or `~/.local/share/opencode`), so a loader test
+/// cannot read the developer's real credentials. Production passes `None` and
+/// honors the documented XDG precedence.
 fn load_auth_with(data_dir: &Path, legacy_home: Option<&Path>) -> Result<Value> {
+    if let Some(home) = legacy_home {
+        return load_auth_from_path(&home.join("auth.json"), data_dir);
+    }
+
     let home = std::env::var("HOME").unwrap_or_default();
-    let auth_path = match legacy_home {
-        Some(h) => h.join("auth.json"),
-        None => Path::new(&home).join(".local/share/opencode/auth.json"),
-    };
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from);
+    load_auth_for(Path::new(&home), xdg_data_home.as_deref(), data_dir)
+}
+
+fn load_auth_for(home: &Path, xdg_data_home: Option<&Path>, data_dir: &Path) -> Result<Value> {
+    let auth_path =
+        ocserve_store::platform::opencode_data_dir_for(home, xdg_data_home).join("auth.json");
+    load_auth_from_path(&auth_path, data_dir)
+}
+
+fn load_auth_from_path(auth_path: &Path, data_dir: &Path) -> Result<Value> {
     let auth = if auth_path.exists() {
-        read_json(&auth_path)?
+        read_json(auth_path)?
     } else {
         json!({})
     };
@@ -339,6 +354,36 @@ fn load_auth_with(data_dir: &Path, legacy_home: Option<&Path>) -> Result<Value> 
     }
 }
 
+/// OpenCode 2.x keeps current credentials in this shared SQLite database.
+/// `home` is explicit; `XDG_DATA_HOME` comes from the process environment.
+/// Tests that need a fully deterministic path use `opencode_auth_db_path_for`.
+pub fn opencode_auth_db_path(home: &Path) -> std::path::PathBuf {
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from);
+    opencode_auth_db_path_for(home, xdg_data_home.as_deref())
+}
+
+pub fn opencode_auth_db_path_for(home: &Path, xdg_data_home: Option<&Path>) -> std::path::PathBuf {
+    ocserve_store::platform::opencode_data_dir_for(home, xdg_data_home).join("opencode.db")
+}
+
+fn read_opencode_credentials(db: &Path) -> BTreeMap<String, String> {
+    match ocserve_store::opencode_credential_keys(db) {
+        Ok(keys) => keys,
+        Err(e) => {
+            tracing::warn!(
+                "OpenCode credential database unreadable; active keys unavailable: {e:#}"
+            );
+            BTreeMap::new()
+        }
+    }
+}
+
+fn configured_provider_map(cfg: &Value) -> Option<&serde_json::Map<String, Value>> {
+    cfg.get("providers")
+        .and_then(Value::as_object)
+        .or_else(|| cfg.get("provider").and_then(Value::as_object))
+}
+
 /// Pure layering rule (unit-tested): overlay patches OVER legacy — overlay
 /// wins on scalars, legacy-only entries survive (deep_merge semantics).
 fn layer_auth(mut legacy: Value, overlay: Value) -> Value {
@@ -346,8 +391,9 @@ fn layer_auth(mut legacy: Value, overlay: Value) -> Value {
     legacy
 }
 
-/// The exact files Runtime reads (load_for + llm_registry) — the hot-reload
-/// watch set (H1). Keep in sync when load_for gains a read.
+/// File-backed inputs Runtime reads (load_for + llm_registry) — the hot-reload
+/// watch set (H1). OpenCode's shared SQLite credential DB is polled separately
+/// through a bounded key-only snapshot; never content-hash that growing DB.
 pub fn watch_paths(data_dir: &Path) -> Vec<std::path::PathBuf> {
     // OPENCODE_CONFIG is a real read input now; a changed file must reload.
     // OPENCODE_CONFIG_CONTENT is process env, not a file — restart to change.
@@ -368,20 +414,31 @@ fn watch_paths_with(
     config_json: std::path::PathBuf,
 ) -> Vec<std::path::PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
-    let h = Path::new(&home);
-    let mut paths = vec![
-        config_json,
-        h.join(".config/ocserve/config.json"),
-        h.join(".local/share/opencode/auth.json"),
-        data_dir.join("auth-overlay.json"),
-        // K-MODELS: the catalog ocserve READS (source-aware + fixture flag)
-        crate::models_dev::read_path(),
-        h.join(".local/state/opencode/model.json"),
-    ];
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from);
+    let mut paths = watch_paths_for(Path::new(&home), xdg_data_home.as_deref(), data_dir);
+    if let Some(default_config) = paths.first_mut() {
+        *default_config = config_json;
+    }
     if let Some(p) = opencode_config {
         paths.push(p);
     }
     paths
+}
+
+fn watch_paths_for(
+    home: &Path,
+    xdg_data_home: Option<&Path>,
+    data_dir: &Path,
+) -> Vec<std::path::PathBuf> {
+    vec![
+        home.join(".config/opencode/opencode.json"),
+        home.join(".config/ocserve/config.json"),
+        ocserve_store::platform::opencode_data_dir_for(home, xdg_data_home).join("auth.json"),
+        data_dir.join("auth-overlay.json"),
+        // K-MODELS: the catalog ocserve READS (source-aware + fixture flag)
+        crate::models_dev::read_path(),
+        home.join(".local/state/opencode/model.json"),
+    ]
 }
 
 use std::path::Path;
@@ -840,6 +897,7 @@ impl Runtime {
     /// 470→665→749MB then the cap killed dispose) — the reloader moves the
     /// fields instead of duplicating the whole payload set every call.
     pub fn into_payloads(self) -> ocserve_http::Payloads {
+        let active_credential_providers = self.opencode_credentials.keys().cloned().collect();
         // Publish `config.shell` for the bash tool. This is the single choke
         // point every payload build passes through (boot, file reload, plugin
         // `config` hook derive), so a hot-edited shell is visible to the very
@@ -865,6 +923,7 @@ impl Runtime {
             command: self.command,
             config_providers: self.config_providers,
             provider: self.provider,
+            active_credential_providers,
             console: self.console,
             capabilities: self.capabilities,
             compaction,
@@ -963,8 +1022,20 @@ impl Runtime {
         // `$XDG_CONFIG_HOME/opencode/auth.json` and drop every provider key
         // (caught by the differential replay, 2026-11-12).
         let auth = load_auth_with(data_dir, test_root)?;
+        // Tests use their isolated root for the shared credential database;
+        // production reads the OpenCode database selected by HOME/XDG_DATA_HOME.
+        let credential_db = test_root
+            .map(|root| root.join("opencode.db"))
+            .unwrap_or_else(|| opencode_auth_db_path(Path::new(&home)));
+        let opencode_credentials = read_opencode_credentials(&credential_db);
         let cache = read_catalog(&cache_path);
-        Self::from_parts(data_dir, raw_config, auth, cache)
+        Self::from_parts_with_opencode_credentials(
+            data_dir,
+            raw_config,
+            auth,
+            cache,
+            opencode_credentials,
+        )
     }
 
     /// Build a Runtime from an explicit config value (plugin `config` hook).
@@ -972,19 +1043,46 @@ impl Runtime {
     /// reload, and it keeps ONE derivation path for both.
     pub fn from_config(data_dir: &std::path::Path, config: Value) -> Result<Self> {
         let auth = load_auth(data_dir)?;
+        let home = std::env::var("HOME").unwrap_or_default();
+        let opencode_credentials =
+            read_opencode_credentials(&opencode_auth_db_path(Path::new(&home)));
         let cache = read_catalog(&crate::models_dev::read_path());
-        Self::from_parts(data_dir, config, auth, cache)
+        Self::from_parts_with_opencode_credentials(
+            data_dir,
+            config,
+            auth,
+            cache,
+            opencode_credentials,
+        )
     }
 
+    #[cfg(test)]
     fn from_parts(
         data_dir: &std::path::Path,
         raw_config: Value,
         auth: Value,
         cache: Value,
     ) -> Result<Self> {
+        Self::from_parts_with_opencode_credentials(
+            data_dir,
+            raw_config,
+            auth,
+            cache,
+            BTreeMap::new(),
+        )
+    }
+
+    fn from_parts_with_opencode_credentials(
+        data_dir: &std::path::Path,
+        raw_config: Value,
+        auth: Value,
+        cache: Value,
+        opencode_credentials: BTreeMap<String, String>,
+    ) -> Result<Self> {
         let (agent, api_agent) = build_agents(&raw_config);
         let command = build_commands(&raw_config)?;
-        let (config_providers, provider) = build_providers(&raw_config, &auth, &cache);
+        let (config_providers, provider) =
+            build_providers(&raw_config, &auth, &cache, &opencode_credentials);
         // Pair gate (2026-10-06): freeze's config loader ALWAYS answers
         // agent/command/mode ({} when unset) + username. Applied to the SERVED
         // config only; derivations above use the raw value (unchanged order).
@@ -1010,6 +1108,7 @@ impl Runtime {
 
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
+            opencode_credentials,
             config,
             catalog: cache,
             agent,
@@ -1051,15 +1150,26 @@ pub(crate) fn model_is_offered(model: &Value, experimental: bool) -> bool {
     }
 }
 
-fn build_providers(cfg: &Value, auth: &Value, cache: &Value) -> (Value, Value) {
+fn build_providers(
+    cfg: &Value,
+    auth: &Value,
+    cache: &Value,
+    opencode_credentials: &BTreeMap<String, String>,
+) -> (Value, Value) {
     let cfg_providers = cfg.get("provider").and_then(|v| v.as_object());
     let auth_obj = auth.as_object();
     let cache_obj = cache.as_object();
 
-    // state provider order: auth.json key order, then built-in opencode, then config-only
+    // state provider order: saved-auth order, active OpenCode DB keys, built-in
+    // opencode, then config-only providers.
     let mut state_order: Vec<String> = auth_obj
         .map(|a| a.keys().cloned().collect())
         .unwrap_or_default();
+    for pid in opencode_credentials.keys() {
+        if !state_order.contains(pid) {
+            state_order.push(pid.clone());
+        }
+    }
     if !state_order.iter().any(|p| p == "opencode") {
         state_order.push("opencode".into());
     }
@@ -1074,7 +1184,9 @@ fn build_providers(cfg: &Value, auth: &Value, cache: &Value) -> (Value, Value) {
     let source_of = |pid: &str| -> &'static str {
         if cfg_providers.map(|c| c.contains_key(pid)).unwrap_or(false) {
             "config"
-        } else if auth_obj.map(|a| a.contains_key(pid)).unwrap_or(false) {
+        } else if auth_obj.map(|a| a.contains_key(pid)).unwrap_or(false)
+            || opencode_credentials.contains_key(pid)
+        {
             "api"
         } else {
             "custom"
@@ -1132,7 +1244,8 @@ fn build_providers(cfg: &Value, auth: &Value, cache: &Value) -> (Value, Value) {
             || cb
                 .and_then(|b| b.pointer("/options/apiKey"))
                 .and_then(|v| v.as_str())
-                .is_some_and(|v| !v.is_empty());
+                .is_some_and(|v| !v.is_empty())
+            || opencode_credentials.get(pid).is_some_and(|v| !v.is_empty());
         apply_public_tier_filter(pid, has_key, &mut models);
         // re-transform cache models into wire shape (config inserts already transformed)
         let mut wire: serde_json::Map<String, Value> = serde_json::Map::new();
@@ -1546,15 +1659,17 @@ impl Runtime {
     /// Assemble the LLM registry from auth/config/models-cache/state
     /// (endpoints, pricing, default model, agent systems).
     pub fn llm_registry(&self) -> Result<LlmRegistry> {
+        let auth = load_auth(&self.data_dir)?;
+        self.llm_registry_from_auth(auth)
+    }
+
+    fn llm_registry_from_auth(&self, auth: Value) -> Result<LlmRegistry> {
         let home = std::env::var("HOME").unwrap_or_default();
         let read_json = |p: &str| -> Option<Value> {
             std::fs::read_to_string(p)
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
         };
-        // layered (legacy + overlay) — same rule as load_for; Result so a
-        // broken overlay fails the whole reload (fail-safe: keep old registry)
-        let auth = load_auth(&self.data_dir)?;
         // One derivation source: the Runtime's OWN parsed config (which the
         // plugin `config` hook may have replaced via `from_config`). Reading
         // the file again here silently discarded hook-mutated providers and
@@ -1566,13 +1681,6 @@ impl Runtime {
         let state_model = read_json(&format!("{home}/.local/state/opencode/model.json"))
             .unwrap_or_else(|| json!({}));
 
-        // Known default endpoints for auth'd providers without config baseURL
-        // (provider quirks live in code-data, PLAN §8 — extend as needed).
-        let defaults: [(&str, &str); 2] = [
-            ("deepseek", "https://api.deepseek.com/v1"),
-            ("openrouter", "https://openrouter.ai/api/v1"),
-        ];
-
         let mut endpoints = std::collections::HashMap::new();
         if let Some(obj) = auth.as_object() {
             for (pid, entry) in obj {
@@ -1580,66 +1688,60 @@ impl Runtime {
                 if key.is_empty() {
                     continue; // oauth-typed entries: M2 supports key auth only
                 }
-                let base = cfg
-                    .pointer(&format!("/provider/{pid}/options/baseURL"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    // The models.dev catalog carries the provider's API base
-                    // (`api`); opencode-go is auth-only, so the hardcoded
-                    // defaults list alone left `opencode auth login` users
-                    // with no endpoint and no provider on the v2 wire.
-                    .or_else(|| {
-                        cache
-                            .get(pid)
-                            .and_then(|p| p.get("api"))
-                            .and_then(|v| v.as_str())
-                            .map(String::from)
-                    })
-                    .or_else(|| {
-                        defaults
-                            .iter()
-                            .find(|(d, _)| d == pid)
-                            .map(|(_, u)| (*u).to_string())
-                    });
-                if let Some(base) = base {
+                if let Some(base) = ocserve_http::prompt_endpoint_base_url(pid, &cfg, cache) {
                     endpoints.insert(pid.clone(), (base, key.to_string()));
                 }
             }
         }
         // config providers without auth entries (baseURL + env-less key)
-        if let Some(provs) = cfg.get("provider").and_then(|v| v.as_object()) {
+        if let Some(provs) = configured_provider_map(&cfg) {
             for (pid, p) in provs {
                 if endpoints.contains_key(pid) {
                     continue;
                 }
-                if let Some(base) = p.pointer("/options/baseURL").and_then(|v| v.as_str()) {
-                    // issue #28: auth layer first, then the provider's own
-                    // config key. `{env:}`/`{file:}` are already expanded by
-                    // the loader, so this is the literal secret here.
-                    let key = auth
-                        .pointer(&format!("/{pid}/key"))
-                        .and_then(|v| v.as_str())
-                        .filter(|k| !k.is_empty())
-                        .or_else(|| {
-                            p.pointer("/options/apiKey")
-                                .and_then(|v| v.as_str())
-                                .filter(|k| !k.is_empty())
-                        })
-                        .unwrap_or("");
-                    if key.is_empty() {
-                        tracing::warn!(
-                            "provider {pid} has a baseURL but resolves to an empty API key \
-                             (checked auth.json, auth-overlay, credential store, provider.options.apiKey)"
-                        );
-                    }
-                    endpoints.insert(pid.clone(), (base.to_string(), key.to_string()));
+                let Some(base) = ocserve_http::prompt_endpoint_base_url(pid, &cfg, cache) else {
+                    continue;
+                };
+                // issue #28: auth layer first, then the provider's own
+                // config key. `{env:}`/`{file:}` are already expanded by
+                // the loader, so this is the literal secret here.
+                let key = auth
+                    .pointer(&format!("/{pid}/key"))
+                    .and_then(|v| v.as_str())
+                    .filter(|k| !k.is_empty())
+                    .or_else(|| {
+                        p.pointer("/options/apiKey")
+                            .or_else(|| p.pointer("/settings/apiKey"))
+                            .and_then(|v| v.as_str())
+                            .filter(|k| !k.is_empty())
+                    })
+                    .unwrap_or("");
+                if key.is_empty() {
+                    tracing::warn!(
+                        "provider {pid} has a baseURL but resolves to an empty API key \
+                         (checked auth.json, auth-overlay, credential store, provider.options.apiKey)"
+                    );
                 }
+                endpoints.insert(pid.clone(), (base, key.to_string()));
             }
         }
 
         // B2 (K-MODEL-STATE): opencode public-tier endpoint (pure fn below).
         if let Some(pair) = opencode_public_endpoint(&cfg, &auth, cache) {
             endpoints.insert("opencode".into(), pair);
+        }
+
+        // OpenCode 2.x writes current credentials to its shared SQLite DB.
+        // They supersede stale migrated auth.json entries for requests, but
+        // remain runtime-only and are never projected into provider payloads.
+        for (pid, key) in &self.opencode_credentials {
+            if let Some(slot) = endpoints.get_mut(pid) {
+                slot.1 = key.clone();
+                continue;
+            }
+            if let Some(base) = ocserve_http::prompt_endpoint_base_url(pid, &cfg, cache) {
+                endpoints.insert(pid.clone(), (base, key.clone()));
+            }
         }
 
         // Third auth source (issue #28, 2.x): active `credential`-table keys in
@@ -1741,7 +1843,8 @@ impl Runtime {
         // poisons the currentModel route the app sends back
         // catalog source for default-pick filtering (same inputs load_for
         // uses — cheap JSON assembly, no I/O)
-        let (config_providers, _provider) = build_providers(&cfg, &auth, cache);
+        let (config_providers, _provider) =
+            build_providers(&cfg, &auth, cache, &self.opencode_credentials);
         let default_model = pick_default_model(&state_model, &cfg, &config_providers, &endpoints);
         if let Some(r0) = state_model.pointer("/recent/0") {
             let rp = r0.get("providerID").and_then(|v| v.as_str()).unwrap_or("");
@@ -1983,8 +2086,12 @@ mod tests {
                 }
             }
         });
-        let (_cp, provider) =
-            build_providers(&serde_json::json!({}), &serde_json::json!({}), &cache);
+        let (_cp, provider) = build_providers(
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+            &cache,
+            &BTreeMap::new(),
+        );
         let p = provider["all"]
             .as_array()
             .unwrap()
@@ -2188,6 +2295,60 @@ mod tests {
         let with_env = watch_paths_with(dp, Some(explicit.clone()), cfg);
         assert_eq!(with_env.len(), 7);
         assert_eq!(with_env[6], explicit);
+    }
+
+    #[test]
+    fn xdg_data_home_controls_opencode_auth_db_and_watch_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let opencode_dir = xdg.path().join("opencode");
+        std::fs::create_dir_all(&opencode_dir).unwrap();
+        std::fs::write(
+            opencode_dir.join("auth.json"),
+            r#"{"openai":{"type":"api","key":"xdg-auth-key"}}"#,
+        )
+        .unwrap();
+        let db = opencode_dir.join("opencode.db");
+        let conn = ocserve_store::pragma::create_new(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE credential (
+                id TEXT PRIMARY KEY,
+                integration_id TEXT,
+                value TEXT NOT NULL,
+                active INTEGER,
+                time_updated INTEGER
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO credential (id, integration_id, value, active, time_updated)
+             VALUES ('active', 'openai', '{\"type\":\"key\",\"key\":\"xdg-db-key\"}', 1, 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let auth = load_auth_for(home.path(), Some(xdg.path()), data_dir.path()).unwrap();
+        assert_eq!(
+            auth.pointer("/openai/key").and_then(Value::as_str),
+            Some("xdg-auth-key")
+        );
+        assert_eq!(opencode_auth_db_path_for(home.path(), Some(xdg.path())), db);
+        assert_eq!(
+            read_opencode_credentials(&opencode_auth_db_path_for(home.path(), Some(xdg.path())))
+                .get("openai")
+                .map(String::as_str),
+            Some("xdg-db-key")
+        );
+        let paths = watch_paths_for(home.path(), Some(xdg.path()), data_dir.path());
+        assert_eq!(paths[2], opencode_dir.join("auth.json"));
+        assert!(
+            paths
+                .iter()
+                .all(|path| { path != &home.path().join(".local/share/opencode/auth.json") }),
+            "the watcher must not keep polling the fallback auth file"
+        );
     }
 
     #[test]
@@ -2511,6 +2672,46 @@ mod config_variable_tests {
 mod provider_key_tests {
     use super::*;
 
+    /// Build a fake OpenCode 2.x credential database with one active Mistral
+    /// key row. The schema and value union are the upstream ones
+    /// (`Credential.Key` = `{type:"key",key:…}`); the key is a fixture,
+    /// never a real credential.
+    fn fake_mistral_credentials(
+        dir: &std::path::Path,
+    ) -> std::collections::BTreeMap<String, String> {
+        let db = dir.join("opencode.db");
+        let conn = ocserve_store::pragma::create_new(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE credential (
+                id TEXT PRIMARY KEY,
+                integration_id TEXT,
+                label TEXT NOT NULL,
+                value TEXT NOT NULL,
+                connector_id TEXT,
+                method_id TEXT,
+                active INTEGER,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO credential
+                (id, integration_id, label, value, connector_id, method_id,
+                 active, time_created, time_updated)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, 1, 1, 1)",
+            rusqlite::params![
+                "cred_mistral_fake",
+                "mistral",
+                "default",
+                r#"{"type":"key","key":"fake-mistral-key"}"#
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        ocserve_store::opencode_credential_keys(&db).unwrap()
+    }
+
     /// Issue #28 root cause at the endpoint layer: a config provider with a
     /// baseURL and `options.apiKey` and NO auth-layer entry used to be built
     /// with `("", …)`. The registry must carry the config key.
@@ -2548,6 +2749,344 @@ mod provider_key_tests {
         let rt = Runtime::from_parts(dir.path(), cfg, json!({}), json!({})).unwrap();
         let reg = rt.llm_registry().unwrap();
         assert_eq!(reg.endpoints.get("p").unwrap().1, "from-auth");
+    }
+
+    /// OpenCode 2.x keeps active API keys in its shared `credential` table.
+    /// The reader must project only active `key` rows (never OAuth) and keep
+    /// the newest row when a foreign database briefly has duplicates.
+    #[test]
+    fn reads_only_active_key_credentials_from_opencode_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("opencode.db");
+        let conn = ocserve_store::pragma::create_new(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE credential (
+                id TEXT PRIMARY KEY,
+                integration_id TEXT,
+                value TEXT NOT NULL,
+                active INTEGER,
+                time_updated INTEGER
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO credential (id, integration_id, value, active, time_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "inactive",
+                "opencode-go",
+                r#"{"type":"key","key":"old-inactive-key"}"#,
+                0,
+                1
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO credential (id, integration_id, value, active, time_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "oauth",
+                "github-copilot",
+                r#"{"type":"oauth","access":"not-a-key"}"#,
+                1,
+                3
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO credential (id, integration_id, value, active, time_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "active",
+                "opencode-go",
+                r#"{"type":"key","key":"current-active-key"}"#,
+                1,
+                2
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let keys = ocserve_store::opencode_credential_keys(&db).unwrap();
+        assert_eq!(
+            keys.get("opencode-go").map(String::as_str),
+            Some("current-active-key")
+        );
+        assert!(
+            !keys.contains_key("github-copilot"),
+            "OAuth entries are skipped"
+        );
+    }
+
+    #[test]
+    fn openai_active_key_uses_builtin_endpoint_and_appears_in_v2_picker() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = json!({
+            "openai": {
+                "npm": "@ai-sdk/openai-compatible",
+                "models": {"gpt-5": {"name": "GPT-5"}}
+            }
+        });
+        let credentials = BTreeMap::from([("openai".to_string(), "openai-test-key".to_string())]);
+        let rt = Runtime::from_parts_with_opencode_credentials(
+            dir.path(),
+            json!({}),
+            json!({}),
+            cache,
+            credentials,
+        )
+        .unwrap();
+        let registry = rt.llm_registry_from_auth(json!({})).unwrap();
+        assert_eq!(
+            registry.endpoints.get("openai"),
+            Some(&(
+                "https://api.openai.com/v1".to_string(),
+                "openai-test-key".to_string(),
+            )),
+            "a saved OpenAI key needs the standard OpenAI-compatible endpoint"
+        );
+        let payloads = rt.into_payloads();
+        let models = ocserve_http::v2::models_body(&payloads, &json!({"url": "test"}));
+        assert!(models["data"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|model| model["providerID"] == "openai" && model["id"] == "gpt-5")
+        }));
+    }
+
+    #[test]
+    fn opencode_active_key_authenticates_and_connects_v2_model_picker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("opencode.db");
+        let conn = ocserve_store::pragma::create_new(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE credential (
+                id TEXT PRIMARY KEY,
+                integration_id TEXT,
+                value TEXT NOT NULL,
+                active INTEGER,
+                time_updated INTEGER
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO credential (id, integration_id, value, active, time_updated)
+             VALUES (?1, ?2, ?3, 0, 1), (?4, ?2, ?5, 1, 2)",
+            rusqlite::params![
+                "old",
+                "opencode-go",
+                r#"{"type":"key","key":"inactive-key"}"#,
+                "current",
+                r#"{"type":"key","key":"current-active-key"}"#
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        let credentials = ocserve_store::opencode_credential_keys(&db).unwrap();
+        let cache = json!({
+            "opencode-go": {
+                "npm": "@ai-sdk/openai-compatible",
+                "models": {"deepseek-v4.1-flash": {"name": "DeepSeek V4.1 Flash"}}
+            }
+        });
+        let rt = Runtime::from_parts_with_opencode_credentials(
+            dir.path(),
+            json!({}),
+            json!({}),
+            cache,
+            credentials,
+        )
+        .unwrap();
+        let registry = rt
+            .llm_registry_from_auth(json!({
+                "opencode-go": {"type": "api", "key": "expired-legacy-key"}
+            }))
+            .unwrap();
+        assert_eq!(
+            registry.endpoints.get("opencode-go"),
+            Some(&(
+                "https://opencode.ai/inference/go/openai/v1".to_string(),
+                "current-active-key".to_string(),
+            )),
+            "active OpenCode SQLite credentials supersede stale auth.json"
+        );
+
+        let payloads = rt.into_payloads();
+        assert!(
+            payloads.provider["connected"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|id| id == "opencode-go")),
+            "current OpenCode credentials count as a connected provider"
+        );
+        let models = ocserve_http::v2::models_body(&payloads, &json!({"url": "test"}));
+        assert!(
+            models["data"].as_array().is_some_and(|a| {
+                a.iter().any(|model| {
+                    model["providerID"] == "opencode-go" && model["id"] == "deepseek-v4.1-flash"
+                })
+            }),
+            "the provider's catalog models appear in the v2 picker"
+        );
+        let wire = serde_json::to_string(&models).unwrap();
+        assert!(
+            !wire.contains("current-active-key"),
+            "the SQLite API key must not be returned on the v2 wire"
+        );
+        let provider_wire = serde_json::to_string(&payloads.provider).unwrap();
+        assert!(
+            !provider_wire.contains("current-active-key"),
+            "the SQLite API key must not be projected into the v1 provider payload"
+        );
+        let config_wire = serde_json::to_string(&payloads.config_providers).unwrap();
+        assert!(
+            !config_wire.contains("current-active-key"),
+            "the SQLite API key must not be projected into config providers"
+        );
+    }
+
+    /// OpenCode 2.x stores an API-key credential as `{type:"key",key:…}` in
+    /// the shared `credential` table under `integration_id = "mistral"`
+    /// (upstream schema `Credential.Key`). Mistral's API is OpenAI-compatible
+    /// at `https://api.mistral.ai/v1`, so an active key must resolve an
+    /// endpoint and connect the provider in the v2 picker even when no
+    /// baseURL is configured. Fake key only; no network.
+    #[test]
+    fn mistral_active_opencode_key_uses_builtin_endpoint_and_connects_v2_picker() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = fake_mistral_credentials(dir.path());
+        assert_eq!(
+            credentials.get("mistral").map(String::as_str),
+            Some("fake-mistral-key"),
+            "the shared credential reader must project an active Mistral key row"
+        );
+        let cache = json!({
+            "mistral": {
+                "npm": "@ai-sdk/mistral",
+                "models": {"mistral-large-latest": {"name": "Mistral Large"}}
+            }
+        });
+        let rt = Runtime::from_parts_with_opencode_credentials(
+            dir.path(),
+            json!({}),
+            json!({}),
+            cache,
+            credentials,
+        )
+        .unwrap();
+        let registry = rt.llm_registry_from_auth(json!({})).unwrap();
+        assert_eq!(
+            registry.endpoints.get("mistral"),
+            Some(&(
+                "https://api.mistral.ai/v1".to_string(),
+                "fake-mistral-key".to_string(),
+            )),
+            "an active OpenCode Mistral key needs the documented OpenAI-compatible endpoint"
+        );
+
+        let payloads = rt.into_payloads();
+        assert!(
+            payloads.provider["connected"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|id| id == "mistral")),
+            "the active OpenCode key must count as a connected provider"
+        );
+        let models = ocserve_http::v2::models_body(&payloads, &json!({"url": "test"}));
+        assert!(
+            models["data"].as_array().is_some_and(|items| {
+                items.iter().any(|model| {
+                    model["providerID"] == "mistral" && model["id"] == "mistral-large-latest"
+                })
+            }),
+            "the provider's catalog models must appear in the v2 picker"
+        );
+        assert!(
+            !serde_json::to_string(&models)
+                .unwrap()
+                .contains("fake-mistral-key"),
+            "the SQLite API key must not be returned on the v2 wire"
+        );
+    }
+
+    /// The resolved credential is only useful if it reaches the provider.
+    /// Point Mistral at a local mock (the same configured-baseURL path a proxy
+    /// uses), resolve the key through the shared OpenCode credential table,
+    /// and drive the real LLM client: the mock must see the fake bearer key on
+    /// `/chat/completions`. No real Mistral traffic.
+    #[tokio::test]
+    async fn mistral_resolved_key_authenticates_a_local_mock_endpoint() {
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut got = String::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                got.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if got.contains("\r\n\r\n") || n == 0 {
+                    break;
+                }
+            }
+            let _ = tx.send(got);
+            // Close without a response: the request bytes are the assertion
+            // point, and the client's stream error is deliberately ignored.
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = fake_mistral_credentials(dir.path());
+        let cfg = json!({
+            "providers": {"mistral": {"options": {"baseURL": format!("http://{addr}")}}}
+        });
+        let cache = json!({
+            "mistral": {
+                "npm": "@ai-sdk/mistral",
+                "models": {"mistral-large-latest": {"name": "Mistral Large"}}
+            }
+        });
+        let rt = Runtime::from_parts_with_opencode_credentials(
+            dir.path(),
+            cfg,
+            json!({}),
+            cache,
+            credentials,
+        )
+        .unwrap();
+        let registry = rt.llm_registry_from_auth(json!({})).unwrap();
+        let (base, key) = registry
+            .endpoints
+            .get("mistral")
+            .cloned()
+            .expect("Mistral endpoint resolves from the shared credential");
+        assert_eq!(base, format!("http://{addr}"));
+        assert_eq!(key, "fake-mistral-key");
+
+        let client = ocserve_llm::Client::new(base, key);
+        let messages = vec![ocserve_llm::ChatMessage::text("user", "hi")];
+        let _ = client
+            .chat_stream(
+                "mistral-large-latest",
+                &messages,
+                &ocserve_llm::ChatOpts::default(),
+                None,
+                None,
+            )
+            .await;
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("mock endpoint captured the request")
+            .unwrap();
+        let lower = request.to_ascii_lowercase();
+        assert!(
+            lower.contains("authorization: bearer fake-mistral-key"),
+            "the resolved OpenCode key must reach the provider request:\n{request}"
+        );
+        assert!(
+            request.starts_with("POST /chat/completions "),
+            "the generic OpenAI-compatible path must be used:\n{request}"
+        );
     }
 
     /// Third source (2.x): an ACTIVE key credential in OUR database feeds the
@@ -2702,6 +3241,7 @@ mod registry_catalog_tests {
         let dir = tempfile::tempdir().unwrap();
         let rt = Runtime {
             data_dir: dir.path().to_path_buf(),
+            opencode_credentials: BTreeMap::new(),
             config: json!({}),
             catalog: json!({"opencode": {"api": "https://from-stored.invalid"}}),
             agent: vec![],

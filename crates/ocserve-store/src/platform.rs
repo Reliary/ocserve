@@ -14,7 +14,16 @@
 //! parity choice and the choice that does not orphan an existing database on
 //! upgrade.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Resolve the shared OpenCode data directory from an explicit XDG root.
+/// Kept pure so path precedence can be checked without changing process env.
+pub fn opencode_data_dir_for(home: &Path, xdg_data_home: Option<&Path>) -> PathBuf {
+    match xdg_data_home.filter(|path| !path.as_os_str().is_empty()) {
+        Some(root) => root.join("opencode"),
+        None => home.join(".local/share/opencode"),
+    }
+}
 
 /// The user's home directory, or `None` when the platform gives us nothing.
 ///
@@ -505,6 +514,29 @@ pub fn wal_safe_filesystem(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_data_directory_honors_xdg_data_home() {
+        let home = tempfile::tempdir().unwrap();
+        let xdg_data_home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            opencode_data_dir_for(home.path(), Some(xdg_data_home.path())),
+            xdg_data_home.path().join("opencode")
+        );
+    }
+
+    #[test]
+    fn opencode_data_directory_falls_back_when_xdg_is_missing_or_empty() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            opencode_data_dir_for(home.path(), None),
+            home.path().join(".local/share/opencode")
+        );
+        assert_eq!(
+            opencode_data_dir_for(home.path(), Some(Path::new(""))),
+            home.path().join(".local/share/opencode")
+        );
+    }
 
     /// `exe` must be idempotent and platform-correct.
     #[test]

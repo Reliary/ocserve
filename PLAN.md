@@ -575,7 +575,7 @@ current anywhere.
 | `D-FS-CONTAIN` | Filesystem routes resolve and verify through a handle (`openat2`/`F_GETPATH`/`GetFinalPathNameByHandleW`); a path outside the allowed root is refused rather than lexically rewritten. | accepted |
 | `D-MODELS-1` | No embedded model-catalog snapshot, so a first boot with no network and no cache has an empty catalog. | accepted |
 | `D-MODELS-2` | The fetched catalog is parse-validated before it replaces the previous file. | accepted |
-| `D-MODELS-3` | Catalog paths stay `$HOME`-based; the XDG environment variables are ignored, matching the rest of the runtime path resolution. | accepted |
+| `D-MODELS-3` | The models.dev catalog cache stays `$HOME/.cache/opencode`-based; `XDG_CACHE_HOME` is ignored by the catalog resolver. OpenCode user data paths such as auth and the credential database honor `XDG_DATA_HOME` (`D-V2-LEGACY-AUTH`). | accepted |
 | `D-PARITY-METRICS` | Upstream has no public `/metrics` (it serves the SPA there), so differential harnesses report ocserve's counters and `n/a` for the reference rather than a fabricated zero. There is nothing to compare metric-by-metric. | accepted |
 | `D-PLATFORM-XDG` | Data and config roots stay XDG-shaped on macOS and Windows, which is both upstream's own resolution and the choice that does not orphan an existing database. | accepted |
 | `D-PLATFORM-UNVERIFIED` | A platform shipped without a differential run against its own freeze binary. | closed (macOS and Windows each ran `pair-check` against their own binary) |
@@ -583,6 +583,8 @@ current anywhere.
 | `D-PROMPT-BUDGET` | Prompt history is tail-weighted to an 8 MiB byte budget; upstream sends the whole session. Oldest messages are dropped first, newest always kept. | accepted |
 | `D-PROMPT-LOAD` | History is loaded as a provable `seq` suffix (O(8 MB)) with a full-load fallback, instead of reading the whole session. | accepted |
 | `D-PROV-SECRETS` | Provider `settings` carry non-secret values only; API keys stay in config and never appear on the v2 wire. | accepted |
+| `D-PROV-ENDPOINTS` | OpenCode's provider-specific SDK adapters are not ported. The v2 provider/model picker only treats a provider as prompt-ready when ocserve resolves a base URL for its generic OpenAI-compatible request path; configured endpoints and the built-in `openai`, `deepseek`, `openrouter`, `mistral`, and `opencode-go` URLs qualify. A saved key for another catalog provider without a configured endpoint remains stored in OpenCode but is not shown as connected here. | accepted |
+| `D-V2-LEGACY-AUTH` | Non-empty legacy `auth.json` keys and active `key` credentials from OpenCode 2.x's shared database, located under `XDG_DATA_HOME/opencode` or `~/.local/share/opencode`, count as connections for the v2 provider/model picker only when a prompt endpoint is resolvable; active SQLite keys supersede stale migrated legacy keys for prompts, but the key itself is never returned. OAuth-only entries remain unavailable because ocserve does not implement their exchange flow. | accepted |
 | `D-PTY-1` | The PTY output cursor counts UTF-16 code units (JS `chunk.length`), and the connect-token accepts a request with no `Origin` header (safe on loopback). | accepted |
 | `D-PTY-2` | The `workspace` query is ignored: one directory per server. | accepted |
 | `D-REPORT` | A few internal report documents use a different shape than the shipped tool output (diagnostics only, no model-facing surface). | accepted |

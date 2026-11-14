@@ -86,9 +86,11 @@ pub fn trim_heap() -> bool {
     }
 }
 
-/// Watched-file state. `paths` set once at boot (the bounded set
-/// `Runtime::load_for` reads — the fixed files plus `OPENCODE_CONFIG` when
-/// set); `observed` tracks last-seen
+/// Watched-file state. `paths` is the bounded set read by `Runtime::load_for`
+/// (including `OPENCODE_CONFIG` when set). The shared OpenCode database is
+/// checked separately through a bounded credential-only snapshot, so session
+/// writes do not reload the catalog or cause a full database hash.
+/// `observed` tracks last-seen
 /// (mtime,len)+content-hash so the watcher fires only on real CONTENT
 /// changes. The hash matters: their opencode rewrites `models.json`
 /// ~hourly with IDENTICAL bytes (fresh-TTL fetch) — mtime churn without a
@@ -98,6 +100,24 @@ pub fn trim_heap() -> bool {
 pub struct WatchState {
     pub paths: Vec<PathBuf>,
     observed: HashMap<PathBuf, (Observed, u64)>,
+    /// OpenCode's shared SQLite source for credentials, set by the CLI at
+    /// boot. Only the bounded key projection is fingerprinted.
+    pub opencode_auth_db: Option<PathBuf>,
+    opencode_auth_observed: Option<u64>,
+}
+
+/// Hash only the bounded active-key projection. OpenCode's DB also contains
+/// session history and may be large; reading/hashing the whole file here would
+/// violate the watcher memory and I/O bounds.
+fn opencode_credential_fingerprint(path: &std::path::Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let keys = ocserve_store::opencode_credential_keys(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (integration, key) in keys {
+        integration.hash(&mut hasher);
+        key.hash(&mut hasher);
+    }
+    Some(hasher.finish())
 }
 
 fn stat_one(p: &std::path::Path) -> Observed {
@@ -122,12 +142,20 @@ fn content_hash(p: &std::path::Path) -> u64 {
 /// Record current tuples for every watched path (call after each successful
 /// load AND once at boot so the first poll tick doesn't re-load fresh state).
 pub fn observe(st: &AppState) {
-    let paths = st.watch.read().paths.clone();
-    let mut w = st.watch.write();
-    w.observed = paths
+    let (paths, opencode_auth_db) = {
+        let w = st.watch.read();
+        (w.paths.clone(), w.opencode_auth_db.clone())
+    };
+    let observed = paths
         .iter()
         .map(|p| (p.clone(), (stat_one(p), content_hash(p))))
         .collect();
+    let opencode_auth_observed = opencode_auth_db
+        .as_deref()
+        .and_then(opencode_credential_fingerprint);
+    let mut w = st.watch.write();
+    w.observed = observed;
+    w.opencode_auth_observed = opencode_auth_observed;
 }
 
 /// True when any watched path's CONTENT differs from the last observed
@@ -167,6 +195,12 @@ pub fn changed(st: &AppState) -> bool {
             }
             None => any = true,
         }
+    }
+    if let Some(path) = w.opencode_auth_db.as_deref()
+        && let Some(current) = opencode_credential_fingerprint(path)
+        && w.opencode_auth_observed != Some(current)
+    {
+        any = true;
     }
     any
 }
@@ -514,5 +548,55 @@ pub async fn watch_loop(st: Arc<AppState>, opts: WatchOpts) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod opencode_credential_watch_tests {
+    use super::*;
+
+    #[test]
+    fn credential_snapshot_ignores_inactive_rows_and_tracks_active_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("opencode.db");
+        let conn = ocserve_store::pragma::create_new(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE credential (
+                id TEXT PRIMARY KEY,
+                integration_id TEXT,
+                value TEXT NOT NULL,
+                active INTEGER,
+                time_updated INTEGER
+            );",
+        )
+        .unwrap();
+        let empty = opencode_credential_fingerprint(&db).unwrap();
+        conn.execute(
+            "INSERT INTO credential (id, integration_id, value, active, time_updated)
+             VALUES (?1, ?2, ?3, 0, 1)",
+            rusqlite::params![
+                "inactive",
+                "opencode-go",
+                r#"{"type":"key","key":"old-key"}"#
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            opencode_credential_fingerprint(&db),
+            Some(empty),
+            "inactive keys do not trigger config rebuilds"
+        );
+        conn.execute(
+            "INSERT INTO credential (id, integration_id, value, active, time_updated)
+             VALUES (?1, ?2, ?3, 1, 2)",
+            rusqlite::params![
+                "active",
+                "opencode-go",
+                r#"{"type":"key","key":"current-key"}"#
+            ],
+        )
+        .unwrap();
+        let active = opencode_credential_fingerprint(&db).unwrap();
+        assert_ne!(active, empty, "active-key changes are observed");
     }
 }

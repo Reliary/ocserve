@@ -40,6 +40,44 @@ pub fn deep_merge(base: &mut serde_json::Value, patch: serde_json::Value) {
     }
 }
 
+/// Resolve the endpoint supported by ocserve's generic OpenAI-compatible
+/// request path. A catalog entry or saved credential alone is not enough to
+/// make a provider prompt-ready. Built-ins cover the providers whose public
+/// API is OpenAI-compatible at a stable URL (OpenAI, DeepSeek, OpenRouter,
+/// Mistral, OpenCode Go); `opencode` reads its URL from the catalog.
+pub fn prompt_endpoint_base_url(pid: &str, config: &Value, catalog: &Value) -> Option<String> {
+    let providers = config
+        .get("providers")
+        .and_then(Value::as_object)
+        .or_else(|| config.get("provider").and_then(Value::as_object));
+    let configured = providers
+        .and_then(|providers| providers.get(pid))
+        .and_then(|provider| {
+            provider
+                .pointer("/options/baseURL")
+                .or_else(|| provider.pointer("/settings/baseURL"))
+        })
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty());
+    if let Some(url) = configured {
+        return Some(url.to_string());
+    }
+
+    let builtin = match pid {
+        "openai" => Some("https://api.openai.com/v1"),
+        "deepseek" => Some("https://api.deepseek.com/v1"),
+        "openrouter" => Some("https://openrouter.ai/api/v1"),
+        "mistral" => Some("https://api.mistral.ai/v1"),
+        "opencode-go" => Some("https://opencode.ai/inference/go/openai/v1"),
+        "opencode" => catalog
+            .pointer("/opencode/api")
+            .and_then(Value::as_str)
+            .filter(|url| !url.is_empty()),
+        _ => None,
+    }?;
+    Some(builtin.to_string())
+}
+
 /// W4 config-write target: default = the SHARED opencode.json (drop-in
 /// contract — both servers read it); `OCSERVE_CONFIG_WRITE=overlay` switches
 /// to a ocserve-owned file that layers over the base at load (never touches
@@ -78,6 +116,10 @@ pub struct Payloads {
     pub command: Vec<serde_json::Value>,
     pub config_providers: serde_json::Value,
     pub provider: serde_json::Value,
+    /// Provider ids with active key credentials in OpenCode 2.x's shared
+    /// credential DB. Internal availability metadata only; keys never cross
+    /// this boundary and this field is not serialized on any route.
+    pub active_credential_providers: Vec<String>,
     pub console: serde_json::Value,
     pub capabilities: serde_json::Value,
     /// shared-config `compaction` section (M6 trigger/knobs).
