@@ -167,9 +167,18 @@ async fn step(st: &Arc<AppState>, row: &Value, now: i64) -> anyhow::Result<()> {
         && !prev.is_empty()
         && ocserve_store::inbox::get(&st.db, prev)?.is_some()
     {
-        let slot = crate::v2::reserve_drain_slot_wait(st, sid)
-            .await
-            .map_err(|_| anyhow::anyhow!("v2 drain capacity reservation failed"))?;
+        // Never await capacity in the single serial tick loop: one slow drain
+        // would stall every other schedule. A full table returns without
+        // marking the row, so it stays due and is retried on the next pass;
+        // the tick interval is the floor on that retry (MIN_SLEEP_MS, 1 s).
+        let Ok(slot) = crate::v2::reserve_drain_slot(st, sid) else {
+            ocserve_metrics::labeled_counter(
+                "ocserve_schedule_fired_total",
+                "outcome=\"deferred_capacity\"",
+                1,
+            );
+            return Ok(());
+        };
         let _admission = st.v2_session_admission_gate.read().await;
         if crate::v2::session_is_deleting(st, sid) || !ocserve_store::session_exists(&st.db, sid)? {
             return Ok(());
@@ -223,9 +232,14 @@ async fn step(st: &Arc<AppState>, row: &Value, now: i64) -> anyhow::Result<()> {
             }
         },
     });
-    let drain_slot = crate::v2::reserve_drain_slot_wait(st, sid)
-        .await
-        .map_err(|_| anyhow::anyhow!("v2 drain capacity reservation failed"))?;
+    let Ok(drain_slot) = crate::v2::reserve_drain_slot(st, sid) else {
+        ocserve_metrics::labeled_counter(
+            "ocserve_schedule_fired_total",
+            "outcome=\"deferred_capacity\"",
+            1,
+        );
+        return Ok(());
+    };
     let _admission = st.v2_session_admission_gate.read().await;
     if crate::v2::session_is_deleting(st, sid) || !ocserve_store::session_exists(&st.db, sid)? {
         return Ok(());

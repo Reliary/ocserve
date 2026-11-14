@@ -616,6 +616,7 @@ current anywhere.
 | `D-WIN-WAL-NETWORK` | A data directory on a network filesystem is refused at boot rather than degraded. | accepted |
 | `D-MACOS-TRIM` | `trim_heap()` is a no-op off glibc unless measurement justifies otherwise. | open |
 | `D-TOOLS-TASK` | The `task` subagent tool was advertised by the frozen provider but not implemented. | closed (the tool runs on the shared executor with a depth guard) |
+| `D-V2-INTERRUPT-STATUS` | `/api/session/{id}/interrupt` is in BOTH frozen contracts: v1 declares 204, v2 declares a 200 `SessionInterruptResponse`. One handler cannot return both, and the route is not in the v2-only table, so a v2-disabled server now answers 200 where its own v1 contract says 204. No shipped v1 client calls it (the 1.19.5 v1 SDK uses `/session/{id}/abort`), so the impact is contract-visible only. | open |
 
 Historical rows kept for the tokens' own history, all closed: `D-GENERATE-EPHEMERAL`,
 `D-REVERT-NOSNAP`, `D-VCS-NOAPPLY`, `D-HOOK-*` items are in §16.9 and

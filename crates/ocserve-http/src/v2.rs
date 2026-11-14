@@ -4258,13 +4258,35 @@ pub(crate) async fn cancel_drain(st: &Arc<AppState>, sid: &str) -> bool {
     let Some(mut completion_rx) = completion_rx else {
         return false;
     };
+    // Bounded wait. A drain can be parked in the provider stall watchdog
+    // (300 s TTFB + 120 s stream by default), and DELETE must not hold its
+    // deletion fence — one of a fixed number of slots — for that long with no
+    // ceiling. On timeout we report "cancellation requested" and let the
+    // fence/turn teardown finish; the drain's own generation check still
+    // removes its registry entry.
+    let budget = std::time::Duration::from_secs(crate::drain_cancel_timeout_secs());
     loop {
         if let Some(interrupted) = *completion_rx.borrow() {
             return interrupted;
         }
-        if completion_rx.changed().await.is_err() {
-            tracing::warn!("v2 drain completion signal dropped for {sid}");
-            return false;
+        match tokio::time::timeout(budget, completion_rx.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                tracing::warn!("v2 drain completion signal dropped for {sid}");
+                return false;
+            }
+            Err(_) => {
+                ocserve_metrics::labeled_counter(
+                    "ocserve_v2_drain_cancel_timeout_total",
+                    "outcome=\"deferred\"",
+                    1,
+                );
+                tracing::warn!(
+                    "v2 drain cancellation not confirmed within {}s for {sid}; continuing teardown",
+                    budget.as_secs()
+                );
+                return true;
+            }
         }
     }
 }
@@ -4272,10 +4294,30 @@ pub(crate) async fn cancel_drain(st: &Arc<AppState>, sid: &str) -> bool {
 /// Session deletion must also stop a fresh drain handed off for work that was
 /// admitted while the previous cancelled drain was retiring.
 pub(crate) async fn cancel_drains_for_delete(st: &Arc<AppState>, sid: &str) -> bool {
+    // BOTH loops must be bounded. Bounding only the inner wait is not enough:
+    // a drain that ignores cancellation stays registered, so this loop would
+    // simply call `cancel_drain` again and pay the budget repeatedly. The
+    // deadline is the whole teardown, not one attempt. Proven by
+    // `delete_returns_when_a_registered_drain_never_confirms_cancellation`,
+    // which hangs the full request without this cap.
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(crate::drain_cancel_timeout_secs());
     let mut interrupted = false;
     loop {
         if !st.v2_drain_tasks.lock().contains_key(sid) {
             return interrupted;
+        }
+        if std::time::Instant::now() >= deadline {
+            ocserve_metrics::labeled_counter(
+                "ocserve_v2_drain_cancel_timeout_total",
+                "outcome=\"deferred\"",
+                1,
+            );
+            tracing::warn!(
+                "v2 drain still registered after the cancellation budget for {sid}; \
+                 proceeding with the delete (the drain keeps its slot until it exits)"
+            );
+            return true;
         }
         interrupted |= cancel_drain(st, sid).await;
     }
@@ -5533,8 +5575,14 @@ pub async fn interrupt(
     if params.resume.unwrap_or(true) && steer_pending {
         let slot = reserve_drain_slot_wait(&st, &id).await?;
         let _admission = st.v2_session_admission_gate.read().await;
+        // A read error must not be read as "session gone": that silently drops
+        // the re-armed steer work the operator just asked for. Propagate.
         if !session_is_deleting(&st, &id)
-            && ocserve_store::session_exists(&st.db, &id).unwrap_or(false)
+            && ocserve_store::session_exists(&st.db, &id).map_err(|e| crate::ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                name: "InternalError",
+                message: format!("{e:#}"),
+            })?
             && ocserve_core::coordinator::next_for_scope(
                 &st.db,
                 &id,

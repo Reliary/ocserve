@@ -2284,3 +2284,59 @@ async fn v2_prompt_hook_mutates_the_admitted_row() {
         rows[0].2
     );
 }
+
+/// DELETE must not hold its deletion fence indefinitely on a drain that has
+/// registered but never reports completion. This reproduces the worst case
+/// directly: a registry entry whose completion channel is never written,
+/// which is what a drain stuck past the provider watchdog would look like.
+/// Without the bounded wait, `cancel_drains_for_delete` loops forever and the
+/// request never returns.
+#[tokio::test]
+async fn delete_returns_when_a_registered_drain_never_confirms_cancellation() {
+    let addr = spawn_stub_provider();
+    let st = setup_with_v2(addr, true);
+    let app = ocserve_http::router(st.clone());
+
+    // One real session row so the delete reaches the drain-cancel stage.
+    let (status, _) = post_prompt(&app, json!({"text": "seed"})).await;
+    assert_eq!(status, StatusCode::OK);
+    wait_drain(&st).await;
+
+    // Fabricate the stalled entry: a task that never sends completion.
+    let (_completion_tx, completion_rx) = tokio::sync::watch::channel(None);
+    let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
+    let slot = std::sync::Arc::new(st.v2_drain_slots.clone().try_acquire_owned().unwrap());
+    let handle = tokio::spawn(async { std::future::pending::<bool>().await });
+    st.v2_drain_tasks.lock().insert(
+        "ses_v2a".to_string(),
+        ocserve_http::V2DrainTask {
+            generation: u64::MAX,
+            cancel: cancel_tx,
+            handle,
+            completion: completion_rx,
+            slot,
+            rerun: false,
+        },
+    );
+
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        app.clone().oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/session/ses_v2a")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("DELETE must not block forever on a non-confirming drain")
+    .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        elapsed < std::time::Duration::from_secs(60),
+        "bounded wait (30 s default, 30 s here) took {elapsed:?}"
+    );
+}
