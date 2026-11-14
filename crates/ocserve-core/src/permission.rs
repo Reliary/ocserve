@@ -208,7 +208,11 @@ impl PermissionGate {
                     .or_else(|| req.get("action"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if let Some(always) = req.get("always").and_then(|v| v.as_array()) {
+                if let Some(always) = req
+                    .get("always")
+                    .or_else(|| req.get("save"))
+                    .and_then(|v| v.as_array())
+                {
                     for pat in always.iter().filter_map(|p| p.as_str()) {
                         self.grant_always(sid, permission, pat);
                     }
@@ -307,7 +311,11 @@ fn patterns_covered(request: &Value, granted: &[GrantRule]) -> bool {
         .or_else(|| request.get("action"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let Some(patterns) = request.get("patterns").and_then(|v| v.as_array()) else {
+    let Some(patterns) = request
+        .get("patterns")
+        .or_else(|| request.get("resources"))
+        .and_then(|v| v.as_array())
+    else {
         return false;
     };
     !patterns.is_empty()

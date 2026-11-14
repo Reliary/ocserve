@@ -1424,7 +1424,13 @@ pub(crate) fn validate_permission_reply_key(
 
 /// GET /permission — pending permission requests.
 async fn get_permissions(State(st): State<Arc<AppState>>) -> Json<Value> {
-    Json(serde_json::Value::Array(st.gate.list()))
+    Json(Value::Array(
+        st.gate
+            .list()
+            .iter()
+            .map(ocserve_core::event::permission_request_v1)
+            .collect(),
+    ))
 }
 
 /// GET /vcs — {branch, default_branch} (values cwd-dependent; keys golden).
@@ -5570,9 +5576,14 @@ fn encode_event_frame(stored: &str, fmt: EventFormat) -> Option<String> {
     let id = payload.get("id").cloned().unwrap_or(Value::Null);
     let ty = payload.get("type").cloned().unwrap_or(Value::Null);
     let props = payload.get("properties").cloned().unwrap_or(json!({}));
+    let data = if ty.as_str() == Some("permission.asked") {
+        ocserve_core::event::permission_request_v2(&props)
+    } else {
+        props.clone()
+    };
     Some(match fmt {
         EventFormat::Bare => json!({"id": id, "type": ty, "properties": props}).to_string(),
-        EventFormat::V2 => json!({"id": id, "type": ty, "data": props}).to_string(),
+        EventFormat::V2 => json!({"id": id, "type": ty, "data": data}).to_string(),
         EventFormat::Global => unreachable!(),
     })
 }
@@ -7074,6 +7085,30 @@ mod event_envelope_unit {
             encode_event_frame(V1_PLAIN, EventFormat::V2).is_some(),
             "v2 folds a v1 frame into data (documented projection)"
         );
+    }
+
+    #[test]
+    fn v2_permission_event_projects_the_permission_request_shape() {
+        let v1 = r#"{"directory":"/w","project":"global","payload":{"id":"evt_perm","type":"permission.asked","properties":{"id":"per_1","sessionID":"ses_1","permission":"bash","patterns":["echo *"],"always":["echo *"],"metadata":{"command":"echo hi"},"tool":{"messageID":"msg_1","callID":"call_1"}}}}"#;
+        let encoded = encode_event_frame(v1, EventFormat::V2).expect("v2 permission event");
+        let frame: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(frame["type"], "permission.asked");
+        assert_eq!(frame["data"]["action"], "bash");
+        assert_eq!(frame["data"]["resources"], serde_json::json!(["echo *"]));
+        assert_eq!(frame["data"]["save"], serde_json::json!(["echo *"]));
+        assert_eq!(frame["data"]["source"]["type"], "tool");
+        assert_eq!(frame["data"]["source"]["messageID"], "msg_1");
+        assert_eq!(frame["data"]["source"]["id"], "call_1");
+        assert!(frame["data"].get("patterns").is_none());
+
+        let bare = encode_event_frame(v1, EventFormat::Bare).expect("v1 permission event");
+        let frame: serde_json::Value = serde_json::from_str(&bare).unwrap();
+        assert_eq!(frame["properties"]["permission"], "bash");
+        assert_eq!(
+            frame["properties"]["patterns"],
+            serde_json::json!(["echo *"])
+        );
+        assert!(frame["properties"].get("resources").is_none());
     }
 }
 
