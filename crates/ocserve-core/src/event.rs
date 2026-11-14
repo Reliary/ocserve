@@ -345,20 +345,20 @@ pub fn normalize_props(event_type: &str, mut props: Value) -> Value {
 ///   tool.input` started/delta + `session.tool.called`
 /// - `message.updated` (assistant) → `session.step.started`
 /// - `session.status` busy/idle → `session.status` (v2 shape)
-/// - `permission.asked` → the v2 `Permission.Request` field names
+/// (`permission.asked` is NOT here: it is durable-only and is projected
+/// at the `/api/event` encoder instead — see the note in the body.)
 ///
 /// Returns `None` for events with no v2 twin. Deltas are ephemeral
 /// (live-only, never persisted — matches upstream's ephemeral Delta defs);
 /// lifecycle boundaries are durable (the choke persists them).
 /// Unmapped events stay v1-only (the client ignores them, no lie).
 pub fn v2_twin(event_type: &str, properties: &Value) -> Option<(String, Value, bool)> {
-    if event_type == "permission.asked" {
-        return Some((
-            "permission.asked".into(),
-            permission_request_v2(properties),
-            true,
-        ));
-    }
+    // NOTE: no `permission.asked` arm here on purpose. That event is emitted
+    // only through `emit_durable`/`emit_durable_http`, and neither calls
+    // v2_twin; a twin added here would be unreachable code whose test could
+    // never exercise production. The v2 permission *payload* is projected at
+    // the `/api/event` encoder (`encode_event_frame` -> permission_request_v2),
+    // which is the path the envelope unit test covers.
     let part = properties.get("part")?;
     match event_type {
         "message.part.updated" => {
@@ -669,6 +669,11 @@ mod tests {
         assert_eq!(data["name"], "read");
         // unmapped: no twin, never fabricated.
         assert!(v2_twin("session.updated", &json!({})).is_none());
+        // permission.asked is durable-only (emit_durable/emit_durable_http never
+        // call v2_twin); its v2 shape is projected by the /api/event encoder.
+        // Asserting None here keeps a dead arm from being re-added: if someone
+        // maps it here again, this reds and the encoder test is the real proof.
+        assert!(v2_twin("permission.asked", &json!({"id": "per_1"})).is_none());
         assert!(v2_twin("message.part.updated", &json!({"part": {"type": "patch"}})).is_none());
         // CONTROL: map patch parts to a twin → the last assertion reds.
     }

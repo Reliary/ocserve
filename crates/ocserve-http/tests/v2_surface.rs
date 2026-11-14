@@ -162,6 +162,56 @@ async fn v2_permission_requests_project_v1_shape_for_reads() {
     assert_eq!(detail["data"], *global_request);
 }
 
+/// K-V2-PERM-SHAPE: a pending ask created through the v2 route must be
+/// visible to BOTH grammars in the field names each frozen contract declares,
+/// and the v2 source key is `id` (2.2.5), never `callID` (1.19.5). This drives
+/// the real create handler so the gate stores a v2-shaped request, then reads
+/// it back through both projectors; a hand-built gate entry would not prove
+/// the create path.
+#[tokio::test]
+async fn v2_created_ask_is_readable_in_both_grammars() {
+    let (_st, app) = state_app();
+    let sid = "ses_perm_both";
+    let body = serde_json::json!({
+        "action": "bash",
+        "resources": ["echo *"],
+        "save": ["echo *"],
+        "metadata": {"command": "echo hi"},
+        "source": {"type": "tool", "messageID": "msg_src", "id": "call_src"},
+    });
+    let created = assert_json_post(&app, &format!("/api/session/{sid}/permission"), body).await;
+    assert_eq!(created["data"]["effect"], "ask", "{created}");
+    let per_id = created["data"]["id"].as_str().expect("id").to_string();
+
+    let v2 = assert_json(&app, "GET", &format!("/api/session/{sid}/permission")).await;
+    let req = v2["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == per_id.as_str())
+        .expect("v2 read finds the created ask");
+    assert_eq!(req["action"], "bash");
+    assert_eq!(req["resources"], serde_json::json!(["echo *"]));
+    assert_eq!(req["source"]["id"], "call_src");
+    assert!(
+        req["source"].get("callID").is_none(),
+        "v2 source uses id, not callID"
+    );
+    assert!(req.get("permission").is_none());
+
+    let v1 = assert_json(&app, "GET", "/permission").await;
+    let req1 = v1
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == per_id.as_str())
+        .expect("v1 read finds the same ask");
+    assert_eq!(req1["permission"], "bash");
+    assert_eq!(req1["patterns"], serde_json::json!(["echo *"]));
+    assert_eq!(req1["tool"]["callID"], "call_src");
+    assert!(req1.get("action").is_none(), "v1 shape has no action key");
+}
+
 #[tokio::test]
 async fn api_location_group_envelopes() {
     let app = app();
