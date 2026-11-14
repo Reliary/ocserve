@@ -14,12 +14,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn bin() -> std::path::PathBuf {
-    let mut p = std::env::current_exe().expect("test exe");
-    p.pop();
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.join("ocserve")
+    // Cargo-provided path to the same-package binary: independent of profile,
+    // target dir, and which targets built first. See drain_budget.rs.
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_ocserve"))
 }
 
 #[test]
