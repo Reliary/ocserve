@@ -18,6 +18,9 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   `OCSERVE_DRAIN_CANCEL_SECS` (default 30 s) so a drain stuck past the provider
   watchdog cannot hold a deletion fence indefinitely. Admission checks run on
   the blocking pool, not on a tokio worker.
+  session rows.
+- Session deletion also cancels pending goal reviews and prevents a reviewer
+  from registering a continuation driver after the delete fence opens.
 
 ## 0.7.1 - 2026-11-10
 

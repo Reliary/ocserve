@@ -4217,7 +4217,7 @@ fn register_drain_locked(
             };
             drop(tasks);
             if completed {
-                crate::goal_loop::spawn_wake_public(&st_task, &sid_task);
+                crate::goal_loop::kick_goal_review(st_task.clone(), sid_task.clone());
             }
             if !rerun {
                 let _ = completion_tx.send(Some(interrupted));
@@ -4465,7 +4465,7 @@ fn drain_cancelled(cancel: &Option<tokio::sync::watch::Receiver<bool>>) -> bool 
 pub(crate) async fn drain_session(st: Arc<AppState>, sid: String) {
     let outcome = drain_session_inner(st.clone(), sid.clone(), None).await;
     if finish_drain_events(&st, &sid, outcome) {
-        crate::goal_loop::spawn_wake_public(&st, &sid);
+        crate::goal_loop::kick_goal_review(st.clone(), sid.clone());
     }
 }
 
