@@ -192,6 +192,15 @@ pub const CONTRACT: &[Var] = &[
         "1 reads the whole session every turn instead of the proven suffix. Debug only; the sent messages are identical.",
     ),
     op(
+        "Cgroups and lifecycle",
+        "OCSERVE_DRAIN_CANCEL_SECS",
+        "30",
+        "seconds (0 = unbounded)",
+        "How long DELETE waits for a cancelled v2 drain to confirm before \
+         proceeding with teardown. 0 restores the old unbounded wait, which \
+         can hold a deletion fence for the provider stall budget.",
+    ),
+    op(
         "Prompts and providers",
         "OCSERVE_PROVIDER_STALL_SECS",
         "120",
