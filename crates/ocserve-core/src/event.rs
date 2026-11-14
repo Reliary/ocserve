@@ -345,8 +345,9 @@ pub fn normalize_props(event_type: &str, mut props: Value) -> Value {
 ///   tool.input` started/delta + `session.tool.called`
 /// - `message.updated` (assistant) → `session.step.started`
 /// - `session.status` busy/idle → `session.status` (v2 shape)
-/// (`permission.asked` is NOT here: it is durable-only and is projected
-/// at the `/api/event` encoder instead — see the note in the body.)
+///
+/// `permission.asked` is NOT here: it is durable-only and is projected at the
+/// `/api/event` encoder instead (see the note in the body).
 ///
 /// Returns `None` for events with no v2 twin. Deltas are ephemeral
 /// (live-only, never persisted — matches upstream's ephemeral Delta defs);
