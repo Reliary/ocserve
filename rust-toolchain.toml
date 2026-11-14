@@ -1,0 +1,13 @@
+[toolchain]
+# Pinned deliberately. CI gates on `-D warnings`, and cargo's manifest lints
+# (`unused_dependencies`, `unused_workspace_dependencies`, `redundant_homepage`)
+# are version-dependent: rustc 1.100.0 introduced them and turned every job red
+# on a stable-channel roll with no repository change. A floating channel makes
+# `main` hostage to a Rust release; bump this file on purpose instead.
+#
+# Bump procedure: change `channel`, run
+#   cargo +<ver> clippy --workspace --all-targets -- -D warnings
+#   cargo +<ver> test --workspace
+# then commit the pin with the fixes the new lints/semantics require.
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]

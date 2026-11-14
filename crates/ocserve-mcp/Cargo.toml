@@ -5,7 +5,6 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
@@ -14,7 +13,6 @@ description = "MCP client: stdio + StreamableHTTP + legacy SSE; OAuth token stor
 [dependencies]
 ocserve-store = { workspace = true }
 anyhow.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true

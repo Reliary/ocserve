@@ -34,12 +34,13 @@ fn hold_sse(port: u16) -> (std::sync::mpsc::Receiver<()>, std::thread::JoinHandl
 }
 
 fn bin() -> std::path::PathBuf {
-    let mut p = std::env::current_exe().expect("test exe");
-    p.pop();
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.join("ocserve")
+    // CARGO_BIN_EXE_<name> is set by cargo for integration tests of the same
+    // package and points at the real binary whatever the profile/target dir
+    // is. The previous `current_exe()` walk assumed the test executable sat in
+    // the same directory as the binary, which is false under a custom
+    // CARGO_TARGET_DIR + separate build of the bin target (and under the CI
+    // `cargo test --workspace` ordering that builds tests first).
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_ocserve"))
 }
 
 #[test]

@@ -5,7 +5,6 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
@@ -16,7 +15,6 @@ regex = "1"
 ocserve-pty = { workspace = true }
 rusqlite = { workspace = true }
 anyhow.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -40,7 +38,6 @@ ocserve-ui-v2-d.workspace = true
 ocserve-metrics.workspace = true
 ocserve-plugin.workspace = true
 futures-util.workspace = true
-metrics.workspace = true
 parking_lot.workspace = true
 sha2.workspace = true
 base64.workspace = true
