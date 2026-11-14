@@ -346,11 +346,20 @@ pub fn normalize_props(event_type: &str, mut props: Value) -> Value {
 /// - `message.updated` (assistant) → `session.step.started`
 /// - `session.status` busy/idle → `session.status` (v2 shape)
 ///
+/// `permission.asked` is NOT here: it is durable-only and is projected at the
+/// `/api/event` encoder instead (see the note in the body).
+///
 /// Returns `None` for events with no v2 twin. Deltas are ephemeral
 /// (live-only, never persisted — matches upstream's ephemeral Delta defs);
 /// lifecycle boundaries are durable (the choke persists them).
 /// Unmapped events stay v1-only (the client ignores them, no lie).
 pub fn v2_twin(event_type: &str, properties: &Value) -> Option<(String, Value, bool)> {
+    // NOTE: no `permission.asked` arm here on purpose. That event is emitted
+    // only through `emit_durable`/`emit_durable_http`, and neither calls
+    // v2_twin; a twin added here would be unreachable code whose test could
+    // never exercise production. The v2 permission *payload* is projected at
+    // the `/api/event` encoder (`encode_event_frame` -> permission_request_v2),
+    // which is the path the envelope unit test covers.
     let part = properties.get("part")?;
     match event_type {
         "message.part.updated" => {
@@ -406,6 +415,173 @@ pub fn v2_twin(event_type: &str, properties: &Value) -> Option<(String, Value, b
         }
         _ => None,
     }
+}
+
+/// Project ocserve's v1 permission-gate value into the frozen v2
+/// `Permission.Request` shape. The gate is shared by both API families, so
+/// keep its stored request untouched and apply this only at v2 boundaries.
+pub fn permission_request_v2(request: &Value) -> Value {
+    let mut projected = serde_json::Map::new();
+    projected.insert(
+        "id".into(),
+        request
+            .get("id")
+            .and_then(Value::as_str)
+            .map(Value::from)
+            .unwrap_or_else(|| json!("")),
+    );
+    projected.insert(
+        "sessionID".into(),
+        request
+            .get("sessionID")
+            .and_then(Value::as_str)
+            .map(Value::from)
+            .unwrap_or_else(|| json!("")),
+    );
+    projected.insert(
+        "action".into(),
+        request
+            .get("action")
+            .filter(|value| value.is_string())
+            .or_else(|| request.get("permission"))
+            .and_then(Value::as_str)
+            .map(Value::from)
+            .unwrap_or_else(|| json!("")),
+    );
+    projected.insert(
+        "resources".into(),
+        request
+            .get("resources")
+            .or_else(|| request.get("patterns"))
+            .and_then(project_permission_strings)
+            .unwrap_or_else(|| json!([])),
+    );
+
+    if let Some(save) = request
+        .get("save")
+        .or_else(|| request.get("always"))
+        .and_then(project_permission_strings)
+    {
+        projected.insert("save".into(), save);
+    }
+    if let Some(metadata) = request.get("metadata").filter(|value| value.is_object()) {
+        projected.insert("metadata".into(), metadata.clone());
+    }
+    if let Some(message) = request.get("message").filter(|value| value.is_string()) {
+        projected.insert("message".into(), message.clone());
+    }
+    if let Some(source) = request
+        .get("source")
+        .filter(|value| value.get("type").and_then(Value::as_str) == Some("tool"))
+    {
+        let mut source_out = serde_json::Map::new();
+        source_out.insert("type".into(), json!("tool"));
+        for key in ["messageID", "id"] {
+            if let Some(value) = source.get(key).filter(|value| value.is_string()) {
+                source_out.insert(key.into(), value.clone());
+            }
+        }
+        if source_out.len() == 3 {
+            projected.insert("source".into(), Value::Object(source_out));
+        }
+    } else if let Some(tool) = request.get("tool").filter(|value| value.is_object()) {
+        let message_id = tool.get("messageID").and_then(Value::as_str);
+        let call_id = tool.get("callID").and_then(Value::as_str);
+        if let (Some(message_id), Some(call_id)) = (message_id, call_id) {
+            projected.insert(
+                "source".into(),
+                json!({"type": "tool", "messageID": message_id, "id": call_id}),
+            );
+        }
+    }
+    Value::Object(projected)
+}
+
+/// Project a shared gate value into the frozen v1 `PermissionRequest` shape.
+/// V2 creates can share the gate with v1 callers, so v1 reads must translate
+/// action/resources/save back and strip v2-only fields before serialization.
+pub fn permission_request_v1(request: &Value) -> Value {
+    let mut projected = serde_json::Map::new();
+    for key in ["id", "sessionID"] {
+        projected.insert(
+            key.into(),
+            request
+                .get(key)
+                .filter(|value| value.is_string())
+                .cloned()
+                .unwrap_or_else(|| json!("")),
+        );
+    }
+    projected.insert(
+        "permission".into(),
+        request
+            .get("permission")
+            .filter(|value| value.is_string())
+            .or_else(|| request.get("action"))
+            .filter(|value| value.is_string())
+            .cloned()
+            .unwrap_or_else(|| json!("")),
+    );
+    for (output, sources) in [
+        ("patterns", ["patterns", "resources"]),
+        ("always", ["always", "save"]),
+    ] {
+        let value = sources
+            .iter()
+            .find_map(|key| request.get(*key).and_then(project_permission_strings))
+            .unwrap_or_else(|| json!([]));
+        projected.insert(output.into(), value);
+    }
+    projected.insert(
+        "metadata".into(),
+        request
+            .get("metadata")
+            .filter(|value| value.is_object())
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+    );
+
+    let tool = request
+        .get("tool")
+        .filter(|value| value.is_object())
+        .cloned()
+        .or_else(|| {
+            let source = request.get("source").filter(|value| value.is_object())?;
+            if source.get("type")?.as_str()? != "tool" {
+                return None;
+            }
+            let message_id = source.get("messageID").and_then(Value::as_str)?;
+            let call_id = source.get("id").and_then(Value::as_str)?;
+            Some(json!({
+                "messageID": message_id,
+                "callID": call_id,
+            }))
+        });
+    if let Some(tool) = tool {
+        let mut tool_out = serde_json::Map::new();
+        for key in ["messageID", "callID"] {
+            if let Some(value) = tool.get(key).filter(|value| value.is_string()) {
+                tool_out.insert(key.into(), value.clone());
+            }
+        }
+        if tool_out.len() == 2 {
+            projected.insert("tool".into(), Value::Object(tool_out));
+        }
+    }
+    Value::Object(projected)
+}
+
+/// Keep permission string-array fields wire-valid even if a legacy or
+/// malformed gate value reaches a projector.
+fn project_permission_strings(value: &Value) -> Option<Value> {
+    let values = value.as_array()?;
+    Some(Value::Array(
+        values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(Value::from)
+            .collect(),
+    ))
 }
 
 /// Encode a v2-grammar live frame (`{id,type,data}` — the `/api/event`
@@ -494,8 +670,65 @@ mod tests {
         assert_eq!(data["name"], "read");
         // unmapped: no twin, never fabricated.
         assert!(v2_twin("session.updated", &json!({})).is_none());
+        // permission.asked is durable-only (emit_durable/emit_durable_http never
+        // call v2_twin); its v2 shape is projected by the /api/event encoder.
+        // Asserting None here keeps a dead arm from being re-added: if someone
+        // maps it here again, this reds and the encoder test is the real proof.
+        assert!(v2_twin("permission.asked", &json!({"id": "per_1"})).is_none());
         assert!(v2_twin("message.part.updated", &json!({"part": {"type": "patch"}})).is_none());
         // CONTROL: map patch parts to a twin → the last assertion reds.
+    }
+
+    #[test]
+    fn permission_request_projects_v2_gate_values_into_the_v1_schema() {
+        let request = json!({
+            "id": "per_v2",
+            "sessionID": "ses_v2",
+            "action": "webfetch",
+            "resources": ["https://example.test"],
+            "save": ["https://example.test"],
+            "metadata": {"url": "https://example.test"},
+            "source": {"type": "tool", "messageID": "msg_1", "id": "call_1"},
+            "agent": "private-agent",
+        });
+        let projected = permission_request_v1(&request);
+        assert_eq!(
+            projected,
+            json!({
+                "id": "per_v2",
+                "sessionID": "ses_v2",
+                "permission": "webfetch",
+                "patterns": ["https://example.test"],
+                "always": ["https://example.test"],
+                "metadata": {"url": "https://example.test"},
+                "tool": {"messageID": "msg_1", "callID": "call_1"},
+            })
+        );
+        // Negative control: passing the stored value through leaks `action`,
+        // `resources`, and `source` and omits required v1 `permission`.
+    }
+
+    #[test]
+    fn v2_permission_projection_drops_malformed_fields_and_source_types() {
+        let request = json!({
+            "id": "per_v2",
+            "sessionID": "ses_v2",
+            "action": "webfetch",
+            "resources": ["https://example.test", 7],
+            "save": [false],
+            "metadata": "not-an-object",
+            "source": {"type": "user", "messageID": "msg_1", "id": "call_1"},
+            "message": 3,
+        });
+
+        let projected = permission_request_v2(&request);
+        assert_eq!(projected["resources"], json!(["https://example.test"]));
+        assert_eq!(projected["save"], json!([]));
+        assert!(projected.get("metadata").is_none());
+        assert!(projected.get("source").is_none());
+        assert!(projected.get("message").is_none());
+        // Negative control: passing array elements through and copying any
+        // string source.type makes these assertions violate Permission.Request.
     }
 
     /// normalize_props injects the required `time` on message.part.updated
