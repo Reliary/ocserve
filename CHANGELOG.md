@@ -11,6 +11,13 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   boundary, even when both API families share the same pending request. V2
   permission creation also rejects fields and values outside the frozen
   request schema before storing them.
+- V2 interrupts now cancel registered provider drains and report whether a
+  turn was interrupted. Drain capacity and reservation waiters are bounded;
+  session deletion fences new work and waits for admitted turns before removing
+  session rows. The delete-side wait is bounded by
+  `OCSERVE_DRAIN_CANCEL_SECS` (default 30 s) so a drain stuck past the provider
+  watchdog cannot hold a deletion fence indefinitely. Admission checks run on
+  the blocking pool, not on a tokio worker.
 
 ## 0.7.1 - 2026-11-10
 

@@ -103,13 +103,24 @@ impl CoordinatorSet {
     /// on work does NOT clear `draining`, so no second drain can spawn
     /// mid-loop (the bug a naive take-then-recheck would introduce).
     pub fn next_scope(&self, session_id: &str, work_remains: bool) -> Option<WakeScope> {
+        self.next_scope_for(session_id, work_remains.then_some(WakeScope::Input))
+    }
+
+    /// Take the pending scope or continue the caller's specific promotable
+    /// scope. A steer-only wake can continue through more steers without
+    /// widening itself into queued input.
+    pub fn next_scope_for(
+        &self,
+        session_id: &str,
+        continuation: Option<WakeScope>,
+    ) -> Option<WakeScope> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let coord = inner.get_mut(session_id)?;
         if let Some(scope) = coord.pending.take() {
             return Some(scope);
         }
-        if work_remains {
-            return Some(WakeScope::Input);
+        if let Some(scope) = continuation {
+            return Some(scope);
         }
         coord.draining = false;
         if !claim_would_hold(session_id) {
@@ -125,6 +136,17 @@ impl CoordinatorSet {
             coord.draining = false;
             coord.pending = None;
         }
+    }
+
+    /// Observe a pending doorbell while a registered drain's task registry
+    /// lock is held. Production callers use this to decide whether a failed
+    /// terminal turn must rerun before releasing its per-session task entry.
+    pub fn pending_scope(&self, session_id: &str) -> Option<WakeScope> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .and_then(|coord| coord.pending)
     }
 
     #[cfg(test)]
@@ -231,5 +253,22 @@ mod tests {
         assert_eq!(set.len(), 0);
         // CONTROL: clear draining on work-continue → the mid-test wake
         // returns true (second drain) → red.
+    }
+
+    #[test]
+    fn explicit_steer_continuation_does_not_widen_to_input() {
+        let set = CoordinatorSet::new();
+        assert!(set.wake("e", WakeScope::Steer));
+        assert_eq!(
+            set.next_scope_for("e", Some(WakeScope::Steer)),
+            Some(WakeScope::Steer)
+        );
+        assert_eq!(
+            set.next_scope_for("e", Some(WakeScope::Steer)),
+            Some(WakeScope::Steer),
+            "additional steer work keeps the same scope"
+        );
+        assert_eq!(set.next_scope_for("e", None), None);
+        // CONTROL: a boolean work-remains continuation widens this to Input.
     }
 }

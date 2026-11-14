@@ -107,6 +107,23 @@ tokio::runtime::Builder::new_multi_thread()
   borrowed `&str`/`Cow` fields on hot read paths (session list, event encode).
 - Strings: `Arc<str>` for shared session/project ids; `internment` only for genuinely
   repeated identifiers (tool names, agent names) with a hard intern-table cap.
+- V2 drain task registry: at most 128 active session entries, enforced by the
+  slot semaphore created with `MAX_V2_DRAIN_TASKS`; overflow admission fails
+  before persisting inbox work (`V2-PLAN.md` P3, `D-V2-DRAIN-CAP`). This is a
+  COUNT bound, not a memory bound: each active drain can hold up to
+  `PROMPT_HISTORY_MAX_BYTES`, and the shared prompt-lock map caps concurrent
+  turns at `MAX_PROMPT_LOCKS` (64), so the worst case is bounded by
+  min(128, 64) x history, which is why the budget is stated in both places.
+- V2 slot reservations can queue at most 128 additional waiters, enforced by
+  `MAX_V2_DRAIN_WAITERS`; a full waiter cap returns bounded backpressure rather
+  than retaining another request or background task.
+- V2 session deletion fences are capped at 128 concurrent sessions by
+  `MAX_V2_SESSION_DELETES`; a full cap returns bounded backpressure.
+- V2 drains waiting on the shared prompt-lock map are bounded by the same 128
+  drain slots. The map itself is capped at `MAX_PROMPT_LOCKS` (64); its
+  `Notify` keeps no per-waiter message queue. Waiters enable their notification
+  before checking capacity, so each release wakes one registered waiter instead
+  of coalescing releases into a single stored permit.
 - Collections: `SmallVec` for ≤4-element hot vectors; bounded `LruCache` (never `HashMap`
   that only grows); caches hold `Weak` where ownership allows (no `Arc` cycles).
 - `clippy::unwrap_used` denied in `ocserve-http`/`ocserve-core` (panic=abort ⇒ a panic is an
