@@ -571,6 +571,109 @@ async fn v2_form_lifecycle() {
 }
 
 #[tokio::test]
+async fn interrupt_settles_pending_questions_and_forms() {
+    let addr = spawn_stub_provider();
+    let st = setup_with_v2(addr, true);
+    let app = ocserve_http::router(st.clone());
+
+    let (qrx, _qguard) = st.question_gate.register(
+        "que_interrupt000000000001",
+        json!({"id": "que_interrupt000000000001", "sessionID": "ses_v2a",
+               "questions": [{"question": "q", "header": "h", "options": []}]}),
+    );
+    let frx = st
+        .form_gate
+        .register(
+            "frm_interrupt000000000001",
+            json!({"id": "frm_interrupt000000000001", "sessionID": "ses_v2a",
+                   "title": "t", "fields": []}),
+        )
+        .expect("under cap");
+    ocserve_store::form::create(
+        &st.writer,
+        "ses_v2a",
+        "frm_interrupt000000000001",
+        "t",
+        "{}",
+        "[]",
+    )
+    .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/session/ses_v2a/interrupt")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(matches!(
+        qrx.await.unwrap(),
+        ocserve_core::question::Outcome::Rejected
+    ));
+    assert!(matches!(
+        frx.await.unwrap(),
+        ocserve_core::form::FormOutcome::Cancelled
+    ));
+    assert!(
+        st.question_gate
+            .pending_ids_for_session("ses_v2a")
+            .is_empty()
+    );
+    assert!(st.form_gate.pending_ids_for_session("ses_v2a").is_empty());
+
+    // The cancelled turn is gone, so interrupt owns the events and the row.
+    for _ in 0..200 {
+        let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
+        let q: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM event WHERE session_id='ses_v2a' \
+                 AND type LIKE 'question.rejected%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let f: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM event WHERE session_id='ses_v2a' \
+                 AND type LIKE 'form.cancelled%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if q == 1 && f == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM form WHERE id='frm_interrupt000000000001'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "cancelled");
+    let q_event: String = conn
+        .query_row(
+            "SELECT payload FROM event WHERE session_id='ses_v2a' \
+             AND type LIKE 'question.rejected%' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let q_json: Value = serde_json::from_str(&q_event).unwrap();
+    assert_eq!(q_json["requestID"], "que_interrupt000000000001");
+    assert_eq!(q_json["sessionID"], "ses_v2a");
+}
+
+#[tokio::test]
 async fn v2_typed_writes_admit_and_execute() {
     // Phase D: command/shell/move/synthetic admit typed inbox items; the
     // drain executes each through the shared executor (branch-by-abstraction).

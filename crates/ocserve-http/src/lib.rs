@@ -4500,23 +4500,97 @@ async fn delete_session_route(
     Ok(Json(json!(true)))
 }
 
+/// Stop the session and fail-closed settle every ask that was pending when
+/// the stop arrived. Shared by v1 `POST /session/{id}/abort` and v2
+/// `POST /api/session/{id}/interrupt` (issue #46).
+///
+/// Ordering is the contract: snapshot the asks, cancel the turn, then settle.
+/// The cancelled turn never reaches its post-wait emit, so this function is
+/// the single publisher of `permission.replied` / `question.rejected` /
+/// `form.cancelled` for the ask set. Settling before the cancel would let a
+/// woken ask path race a second event; settling afterwards guarantees the ask
+/// future is already gone.
+pub(crate) async fn interrupt_session(st: &Arc<AppState>, sid: &str) -> bool {
+    // Snapshot BEFORE cancelling: the turn's Drop guards remove the entries.
+    let pending_perm = st.gate.pending_ids_for_session(sid);
+    let pending_questions = st.question_gate.pending_ids_for_session(sid);
+
+    // A goal loop re-spawns turns, so aborting the current prompt alone would
+    // let it continue: cancel the driver FIRST, then the turn.
+    crate::goal_loop::cancel_driver(st, sid);
+    let mut interrupted = false;
+    if let Some((_, handle)) = st.prompt_tasks.lock().remove(sid) {
+        handle.abort();
+        interrupted = true;
+        tracing::info!("abort: cancelled prompt task for {sid}");
+    }
+    interrupted |= crate::v2::cancel_drain(st, sid).await;
+
+    let publish = |ty: &str, props: Value| {
+        if let Err(e) = crate::emit_durable_http(st, sid, ty, props) {
+            tracing::warn!(
+                "ask cleanup: {ty} emit failed for {sid}: {} {}",
+                e.name,
+                e.message
+            );
+        }
+    };
+    for rid in pending_perm {
+        // The aborted ask path does not emit; the reject is ours.
+        let _ = st.gate.reply(&rid, "reject");
+        publish(
+            "permission.replied",
+            json!({"sessionID": sid, "requestID": rid, "reply": "reject"}),
+        );
+    }
+    // A second wave (ask created between snapshot and cancel) is still
+    // cleaned; the turn is gone, so there is no emitter to race.
+    for rid in st.gate.reject_session(sid) {
+        publish(
+            "permission.replied",
+            json!({"sessionID": sid, "requestID": rid, "reply": "reject"}),
+        );
+    }
+    for qid in pending_questions {
+        let _ = st.question_gate.reject(&qid);
+        publish(
+            "question.rejected",
+            json!({"sessionID": sid, "requestID": qid}),
+        );
+    }
+    for qid in st.question_gate.reject_session(sid) {
+        publish(
+            "question.rejected",
+            json!({"sessionID": sid, "requestID": qid}),
+        );
+    }
+    // Forms: the durable rows are the authority. The dropped runner leaves
+    // them pending, so settle after the cancel (the runner can no longer
+    // re-settle or emit) and publish one cancellation per transition.
+    if let Ok(rows) = ocserve_store::form::list_pending(&st.db, sid) {
+        for (fid, ..) in rows {
+            match ocserve_store::form::settle(&st.writer, &fid, "cancelled", None) {
+                Ok(true) => publish("form.cancelled", json!({"id": fid, "sessionID": sid})),
+                Ok(false) => {}
+                Err(e) => tracing::warn!("ask cleanup: form settle failed for {fid}: {e:#}"),
+            }
+        }
+    }
+    let _ = st.form_gate.cancel_session(sid);
+
+    // Upstream pauses an active goal when the USER stops the session
+    // (goal.ts:296-305). Cancelling the driver alone left the row ACTIVE, and
+    // the next idle hook would restart the loop ("/abort did nothing").
+    crate::goal_loop::pause_if_active(st, sid, "Stopped by the user").await;
+    interrupted
+}
+
 /// POST /session/{id}/abort → true (idempotent: no active task = still true).
 async fn post_abort(
     State(st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    // A goal loop re-spawns turns, so aborting the current prompt alone would
-    // let it continue: cancel the driver FIRST, then the turn.
-    crate::goal_loop::cancel_driver(&st, &id);
-    crate::v2::cancel_drain(&st, &id).await;
-    if let Some((_, handle)) = st.prompt_tasks.lock().remove(&id) {
-        handle.abort();
-        tracing::info!("abort: cancelled prompt task for {id}");
-    }
-    // Upstream pauses an active goal when the USER stops the session
-    // (goal.ts:296-305). Cancelling the driver alone left the row ACTIVE, and
-    // the next idle hook would restart the loop ("/abort did nothing").
-    crate::goal_loop::pause_if_active(&st, &id, "Stopped by the user").await;
+    crate::interrupt_session(&st, &id).await;
     Ok(Json(json!(true)))
 }
 
