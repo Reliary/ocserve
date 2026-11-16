@@ -5223,7 +5223,9 @@ pub async fn form_create(
         &fields.to_string(),
     )
     .map_err(internal)?;
-    let _ = crate::emit_durable_http(&st, &id, "form.created", info.clone());
+    // Frozen `Form.Event.Created` envelope: `{form: Form.Info}` (the flat
+    // info shape broke v2 clients that read `event.data.form`).
+    let _ = crate::emit_durable_http(&st, &id, "form.created", json!({"form": info.clone()}));
     Ok(Json(
         json!({"data": form_info(&id, &fid, title, &metadata.to_string(), &fields.to_string(), None)}),
     ))
@@ -5293,8 +5295,15 @@ pub async fn form_reply(
     }
     ocserve_store::form::settle(&st.writer, &fid, "answered", Some(&answer.to_string()))
         .map_err(internal)?;
-    st.form_gate.reply(&fid, answer);
-    let _ = crate::emit_durable_http(&st, &id, "form.replied", json!({"id": fid}));
+    st.form_gate.reply(&fid, answer.clone());
+    // Frozen `Form.Event.Replied`: `{id, sessionID, answer}` — the id-only
+    // shape left v2 clients unable to route or render the settlement.
+    let _ = crate::emit_durable_http(
+        &st,
+        &id,
+        "form.replied",
+        json!({"id": fid, "sessionID": id, "answer": answer}),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -5311,7 +5320,13 @@ pub async fn form_cancel(
             let _ = ocserve_store::form::settle(&st.writer, &fid, "cancelled", None)
                 .map_err(internal)?;
             st.form_gate.cancel(&fid);
-            let _ = crate::emit_durable_http(&st, &id, "form.cancelled", json!({"id": fid}));
+            // Frozen `Form.Event.Cancelled`: `{id, sessionID}`.
+            let _ = crate::emit_durable_http(
+                &st,
+                &id,
+                "form.cancelled",
+                json!({"id": fid, "sessionID": id}),
+            );
         }
         _ => {}
     }

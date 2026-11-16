@@ -142,6 +142,12 @@ requirement land here as edits, never silently in code.
 - Dual-emit at the single choke: v1 grammar on `/event`+`/global/event`, v2
   grammar on `/api/event`; `log?after&follow` + `log.synced` exact.
 - Fill skeletal projections (`"content": []`, title-as-text) with real `content[]`.
+- Form service is also the **model question surface** under `OCSERVE_V2=1`: the
+  `question` tool creates a pending form (`form.created {form: Form.Info}`) and
+  settles through `form.replied {id,sessionID,answer}` / `form.cancelled
+  {id,sessionID}`. v2 clients never parse the v1 `question.asked` event, so
+  emitting only that left the turn parked for `QUESTION_WAIT` with no prompt.
+  v1 keeps the question gate unchanged (issue #47).
 - Kill: contract-differ rows for the phase green; pair vectors for the phase green.
 
 ### P5 — oracles (exit: proven against real 2.0.28 binary)

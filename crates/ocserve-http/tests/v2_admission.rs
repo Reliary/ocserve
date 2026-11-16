@@ -483,6 +483,27 @@ async fn v2_form_lifecycle() {
     }
 
     // Create with explicit id (upstream Field union requires `key`).
+    // Frozen Form.Event envelopes (a flat Info broke v2 clients that read
+    // `event.data.form`). Retry until the writer queue has flushed the row.
+    async fn event_payload(st: &Arc<AppState>, ty: &str) -> Value {
+        for _ in 0..200 {
+            let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
+            let row: Option<String> = conn
+                .query_row(
+                    "SELECT payload FROM event WHERE session_id='ses_v2a' \
+                     AND type LIKE ?1 ORDER BY seq LIMIT 1",
+                    [format!("{ty}%")],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(p) = row {
+                return serde_json::from_str(&p).unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{ty} event never persisted");
+    }
+
     let (s, v) = post(
         &app,
         "/api/session/ses_v2a/form",
@@ -492,6 +513,13 @@ async fn v2_form_lifecycle() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["data"]["id"], "frm_test00000000000001");
     assert_eq!(v["data"]["sessionID"], "ses_v2a");
+    let created = event_payload(&st, "form.created").await;
+    assert_eq!(created["form"]["id"], "frm_test00000000000001");
+    assert_eq!(created["form"]["sessionID"], "ses_v2a");
+    assert!(
+        created.get("id").is_none(),
+        "created must be {{form: Info}}, got {created}"
+    );
 
     // Empty fields → 400.
     let (s, _) = post(
@@ -533,6 +561,10 @@ async fn v2_form_lifecycle() {
     )
     .await;
     assert_eq!(s, StatusCode::CONFLICT);
+    let replied = event_payload(&st, "form.replied").await;
+    assert_eq!(replied["id"], "frm_test00000000000001");
+    assert_eq!(replied["sessionID"], "ses_v2a");
+    assert_eq!(replied["answer"]["a"], 1);
     let (_, d) = get(&app, "/api/session/ses_v2a/form/frm_test00000000000001").await;
     assert_eq!(d["data"]["state"]["status"], "answered");
     // Settled forms leave the pending list.
@@ -561,6 +593,9 @@ async fn v2_form_lifecycle() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let cancelled = event_payload(&st, "form.cancelled").await;
+    assert_eq!(cancelled["id"], fid.as_str());
+    assert_eq!(cancelled["sessionID"], "ses_v2a");
     let (_, d) = get(&app, &format!("/api/session/ses_v2a/form/{fid}")).await;
     assert_eq!(d["data"]["state"]["status"], "cancelled");
 
