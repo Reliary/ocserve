@@ -606,6 +606,71 @@ async fn v2_form_lifecycle() {
 }
 
 #[tokio::test]
+async fn v2_permission_reply_decodes_decision_and_answers_204() {
+    let addr = spawn_stub_provider();
+    let st = setup_with_v2(addr, true);
+    let app = ocserve_http::router(st.clone());
+
+    async fn post(app: &axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    // Frozen v2 body: {decision}; answer is 204. Paseo sends exactly this.
+    let (rx, guard) = st.gate.clone().register(
+        "per_v2replytest0000000001",
+        json!({"id": "per_v2replytest0000000001", "sessionID": "ses_v2a",
+               "permission": "bash", "patterns": ["echo *"]}),
+    );
+    let (s, body) = post(
+        &app,
+        "/api/session/ses_v2a/permission/per_v2replytest0000000001/reply",
+        json!({"decision": "always"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "got {body}");
+    assert_eq!(rx.await.unwrap(), "always");
+    drop(guard);
+
+    // The v1 key is not this contract's body: decode-first 400 in the v2
+    // envelope, and the real ask stays pending (never a silent settle).
+    let (_rx2, _guard2) = st.gate.clone().register(
+        "per_v2replytest0000000002",
+        json!({"id": "per_v2replytest0000000002", "sessionID": "ses_v2a",
+               "permission": "bash", "patterns": ["echo *"]}),
+    );
+    let (s, body) = post(
+        &app,
+        "/api/session/ses_v2a/permission/per_v2replytest0000000002/reply",
+        json!({"reply": "once"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(body["_tag"], "InvalidRequestError");
+    assert!(
+        body["message"].as_str().unwrap().contains("decision"),
+        "got {body}"
+    );
+    assert!(st.gate.reply("per_v2replytest0000000002", "reject"));
+}
+
+#[tokio::test]
 async fn v2_typed_writes_admit_and_execute() {
     // Phase D: command/shell/move/synthetic admit typed inbox items; the
     // drain executes each through the shared executor (branch-by-abstraction).

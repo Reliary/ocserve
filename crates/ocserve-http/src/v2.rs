@@ -5804,16 +5804,42 @@ fn payload_err(key: &str) -> HttpError {
 }
 
 /// POST /api/session/{sessionID}/permission/{requestID}/reply — reply to ask.
-/// Body decode precedes the 404 (same Payload envelope as v1); the old
-/// `unwrap_or("reject")` silently rejected a real ask on a malformed body.
+///
+/// The v2 body is `{decision: "once"|"always"|"reject", message?}` and the
+/// frozen answer is 204. Parsing the v1 `{reply: …}` key here made every
+/// generated v2 client (Paseo sends `decision`) fail with a 400 while its
+/// permission card spun forever: the ask stayed pending even though the user
+/// had answered. The v1 decode lives on `POST /permission/{id}/reply`.
 pub async fn permission_reply(
     State(st): State<Arc<AppState>>,
     Path((_sid, rid)): Path<(String, String)>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, crate::HttpError> {
-    let reply = crate::validate_permission_reply(&body)?;
-    if st.gate.reply(&rid, reply) {
-        Ok(Json(json!({"data": {}})))
+) -> Result<StatusCode, crate::HttpError> {
+    let invalid = |message: String| crate::HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidRequestError",
+        fields: json!({"message": message, "kind": "Payload", "field": "decision"}),
+    };
+    let Some(decision) = body.get("decision") else {
+        return Err(invalid("Missing key\n  at [\"decision\"]".into()));
+    };
+    let decision = match decision.as_str() {
+        Some("once") => "once",
+        Some("always") => "always",
+        Some("reject") => "reject",
+        Some(other) => {
+            return Err(invalid(format!(
+                "Expected \"once\" | \"always\" | \"reject\", got \"{other}\"\n  at [\"decision\"]"
+            )));
+        }
+        None => {
+            return Err(invalid(format!(
+                "Expected \"once\" | \"always\" | \"reject\", got {decision}\n  at [\"decision\"]"
+            )));
+        }
+    };
+    if st.gate.reply(&rid, decision) {
+        Ok(StatusCode::NO_CONTENT)
     } else {
         Err(crate::HttpError::TaggedData {
             status: StatusCode::NOT_FOUND,

@@ -142,6 +142,10 @@ requirement land here as edits, never silently in code.
 - Dual-emit at the single choke: v1 grammar on `/event`+`/global/event`, v2
   grammar on `/api/event`; `log?after&follow` + `log.synced` exact.
 - Fill skeletal projections (`"content": []`, title-as-text) with real `content[]`.
+- v2 permission replies decode the frozen `{decision: "once"|"always"|"reject",
+  message?}` body and answer 204. The handler used the v1 `{reply}` key, so
+  every generated v2 client (Paseo) got a 400 while its card spun forever and
+  the ask stayed pending. v1 keeps `{reply}` on `POST /permission/{id}/reply`.
 - Form service is also the **model question surface** under `OCSERVE_V2=1`: the
   `question` tool creates a pending form (`form.created {form: Form.Info}`) and
   settles through `form.replied {id,sessionID,answer}` / `form.cancelled
