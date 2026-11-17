@@ -522,6 +522,7 @@ current anywhere.
 
 | ID | Divergence | Status |
 |---|---|---|
+| `D-V2-BOOT-CLOSE` | A claim orphaned by a process that died mid-turn is closed at boot with `session.execution.failed` (`type: "ExecutionAbortedError"`, flat upstream error shape) and released, so the client releases the turn and the session is usable. Upstream resumes the orphaned turn with a synthetic "server restarted" message (`restart.ts`); ocserve cannot resume a half-finished step. Admitted inbox rows stay pending and run with the next wake. | open |
 | `D-AGENT-MODEL` | Compaction runs on the request's model; upstream honors a per-agent model pin (`agent.model`). | open |
 | `D-BACKGROUND-NOOP` | `POST /api/session/{id}/background` records the request and returns 204; turns run tools inline, so there is nothing to background. | accepted |
 | `D-BASH-SPLIT` | `bash_patterns::split_commands` approximates the shell (quote-aware only). Heredocs, `$( )`, backticks, `&>` and `2>&1` can split a sub-command, which can produce a slightly-off external-directory or arity ask. The tool still runs the whole command. | accepted |

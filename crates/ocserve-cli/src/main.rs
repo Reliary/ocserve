@@ -1183,6 +1183,10 @@ async fn serve(
     if state.goals_enabled {
         ocserve_http::goal_loop::pause_goals_from_earlier_boots(&state).await;
     }
+    // A process that died inside a turn leaves its durable claim behind. Close
+    // those executions before the router serves, so no v2 client is told that
+    // a session is still running by a process that no longer exists.
+    ocserve_http::close_orphaned_executions(&state);
     let app = ocserve_http::router(state.clone());
 
     // Scheduled session wake-ups: the runner re-reads the config flag each
