@@ -5874,14 +5874,27 @@ async fn post_shell(
     // metadata:{output}} — no exit field (capture-verified)
     // Build the final metadata in the literal: a post-hoc index-assignment on
     // a JSON map is the class rule 52 bans (it panics on a non-object).
-    tool_part["state"] = json!({
-        "status": status,
-        "input": {"command": command},
-        "output": output,
-        "title": "",
-        "metadata": {"output": output},
-        "time": {"start": started, "end": completed},
-    });
+    // Frozen terminal states differ by status (ToolStateError has `error`
+    // and forbids output/title); emitting one shape for both violated the
+    // union on every failed /shell (K-EVENT-CONTRACT).
+    tool_part["state"] = if status == "error" {
+        json!({
+            "status": "error",
+            "input": {"command": command},
+            "error": output,
+            "metadata": {"output": output},
+            "time": {"start": started, "end": completed},
+        })
+    } else {
+        json!({
+            "status": "completed",
+            "input": {"command": command},
+            "output": output,
+            "title": "",
+            "metadata": {"output": output},
+            "time": {"start": started, "end": completed},
+        })
+    };
     insert_message_http(
         &writer,
         &st,

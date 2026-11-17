@@ -4,9 +4,16 @@ All notable changes to ocserve. The wire contract targets the frozen opencode
 1.19.5 release and the v2 surface the 2.2.5 client; anything that differs is a
 named `D-*` row in the ledger at `PLAN.md` section 18.
 
-## Unreleased
+## 0.7.4 - 2026-11-17
 
 ### Fixed
+- Failed tool calls now persist the frozen `ToolStateError` shape
+  (`{status, input, error, time}`). They previously carried the *completed*
+  shape (`output`/`title`/`metadata` under `status:"error"`), which violates the
+  contract's `additionalProperties:false` union on every failure, and the
+  history rebuild read only `state.output`, so the model saw an empty tool
+  result on later turns. Fixed in the tool loop, the question tool and
+  `POST /session/{id}/shell`. Found by the event oracle before this release.
 - Provider endpoints derive from the models catalog again. A six-provider
   whitelist had replaced the catalog fallback, so 286 OpenAI-compatible
   providers with a URL and live models stopped resolving and `/api/model`
@@ -19,6 +26,23 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 - OpenCode data paths honour `XDG_DATA_HOME`. The loader and config watcher
   hardcoded `$HOME/.local/share/opencode`, so a user with XDG set lost every
   provider key silently. Thanks to @jrzmurray.
+- V2 permission replies accept both frozen body keys: 1.19.5 declares
+  `{reply}` and 2.2.5 declares `{decision}`, and the 1.19.5 v2 SDK sends
+  `{reply}` to the same URL. 0.7.3 required `{reply}` on that route, so the
+  2.2.5 v2 SDK's `{decision}` got a 400; either key is now accepted, with
+  `decision` preferred when both are present (`D-V2-PERM-REPLY-BODY`).
+- The v2 prompt decoder accepts the 1.19.5 nested body
+  `{prompt: {text, files, agents}, delivery, resume}` as well as the flat 2.2.5
+  shape. 0.7.3 required the flat form, so a 1.19.5 v2 SDK prompt got a 400 on a
+  body its own contract declares valid (`D-V2-PROMPT-BODY`).
+- Interrupting a turn now settles its pending permission and question asks
+  immediately instead of leaving the client waiting out the 300 s ask timeout.
+  Each ask is settled exactly once, and the form scan runs on the blocking
+  pool. Thanks to @glanzel (#49).
+- Under `OCSERVE_V2=1` the question tool serves both ask surfaces: the 2.2.5
+  form service and the 1.19.5-style `question.asked` event, and an answer on
+  either surface settles both. Recorded as `D-V2-ASK-DUAL`.
+  Thanks to @glanzel (#48).
 
 ## 0.7.3 - 2026-11-14
 
