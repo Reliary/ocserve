@@ -28,11 +28,13 @@ fn payloads() -> ocserve_http::Payloads {
     ocserve_http::Payloads {
         config: serde_json::json!({
             "model": "acme/big",
-            "provider": {"acme": {"name": "Acme", "options": {"apiKey": "sk-test"}},
+            "provider": {"acme": {"name": "Acme",
+                                    "options": {"apiKey": "sk-test",
+                                                "baseURL": "https://acme.test/v1"}},
                           "custom1": {"name": "Custom One"}},
         }),
         provider: serde_json::json!({
-            "connected": ["acme", "authonly"],
+            "connected": ["acme", "authonly", "nodialect"],
             "all": [
                 {"id": "acme", "name": "Acme", "env": ["ACME_KEY"],
                  "models": {
@@ -49,12 +51,23 @@ fn payloads() -> ocserve_http::Payloads {
                 {"id": "unavail", "name": "Unavailable", "models": {
                     "x": {"id": "x", "providerID": "unavail", "name": "X",
                           "status": "active", "api": {"npm": "@u/sdk", "url": "https://x"}}}},
-                {"id": "authonly", "name": "Auth Only", "env": ["AUTHONLY_KEY"], "models": {}}
+                {"id": "authonly", "name": "Auth Only", "env": ["AUTHONLY_KEY"],
+                 "models": {"a": {"id": "a", "providerID": "authonly", "name": "A",
+                                  "status": "active", "time": {"released": 10},
+                                  "api": {"npm": "@ai-sdk/openai-compatible",
+                                          "url": "https://authonly.test/v1"}}}},
+                {"id": "nodialect", "name": "Anthropic Only", "models": {
+                    "n": {"id": "n", "providerID": "nodialect", "name": "N",
+                          "status": "active", "time": {"released": 10},
+                          "api": {"npm": "@ai-sdk/anthropic", "url": "https://x"}}}}
             ]
         }),
         catalog: std::sync::Arc::new(serde_json::json!({
             "acme": {"name": "Acme", "env": ["ACME_KEY"]},
-            "authonly": {"name": "Auth Only", "env": ["AUTHONLY_KEY"]},
+            "authonly": {"name": "Auth Only", "env": ["AUTHONLY_KEY"],
+                         "api": "https://authonly.test/v1", "npm": "@ai-sdk/openai-compatible"},
+            "nodialect": {"name": "Anthropic Only", "api": "https://anthropic.test/v1",
+                          "npm": "@ai-sdk/anthropic"},
             "other": {"name": "Other", "env": ["OTHER_KEY"]}
         })),
         config_providers: serde_json::json!({
@@ -166,6 +179,13 @@ async fn v2_metadata_wire_bytes_equal_projection_builders() {
         !ids.contains(&"unavail"),
         "unavailable provider must be filtered: {v}"
     );
+    // The dialect gate: connected, has models, but its endpoint speaks a
+    // protocol this client does not implement. Advertising it here is the
+    // dead-end class (picker offers it, every prompt 400s).
+    assert!(
+        !ids.contains(&"nodialect"),
+        "a provider this client cannot prompt must not be advertised: {v}"
+    );
 }
 
 /// Compression is strictly additive: gzip/br decode to the identity bytes.
@@ -251,4 +271,46 @@ async fn planted_wire_drift_is_detected() {
         drift,
         "negative control failed: comparator did not flag planted drift"
     );
+}
+
+/// K-PROV-ROUTE: the two v2 metadata routes must agree. Every advertised
+/// provider must enumerate at least one model, and every model's provider must
+/// be advertised. The PR #43 draft filtered only `/api/model`, so
+/// `/api/provider` offered providers that resolved to zero models.
+#[tokio::test]
+async fn provider_and_model_routes_agree_on_prompt_ready() {
+    let app = app();
+    let (_, pbytes, _) = get(&app, "/api/provider", &[]).await;
+    let (_, mbytes, _) = get(&app, "/api/model", &[]).await;
+    let providers: serde_json::Value = serde_json::from_slice(&pbytes).unwrap();
+    let models: serde_json::Value = serde_json::from_slice(&mbytes).unwrap();
+
+    let advertised: std::collections::BTreeSet<&str> = providers["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p.get("id").and_then(|v| v.as_str()))
+        .collect();
+    let with_models: std::collections::BTreeSet<&str> = models["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m.get("providerID").and_then(|v| v.as_str()))
+        .collect();
+
+    // No dead entries: an advertised provider with zero models is the exact
+    // defect this test exists for.
+    for pid in &advertised {
+        assert!(
+            with_models.contains(pid),
+            "{pid} is advertised by /api/provider but has no model on /api/model"
+        );
+    }
+    // No orphans in the other direction.
+    for pid in &with_models {
+        assert!(
+            advertised.contains(pid),
+            "{pid} has models but /api/provider omits it"
+        );
+    }
 }

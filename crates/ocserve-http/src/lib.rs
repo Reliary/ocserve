@@ -40,6 +40,177 @@ pub fn deep_merge(base: &mut serde_json::Value, patch: serde_json::Value) {
     }
 }
 
+/// npm packages whose endpoint speaks the OpenAI chat-completions dialect this
+/// client implements. A provider with a catalog `api` but a different adapter
+/// must NOT resolve to an endpoint: the request would be built in the wrong
+/// dialect and fail at prompt time. `main` did exactly that for the nine
+/// Anthropic-shaped catalog providers (2026-11-14 review), so this is also a
+/// fix of an existing defect, not only a narrowing.
+const OPENAI_SHAPED_NPM: &[&str] = &[
+    "@ai-sdk/openai-compatible",
+    "@ai-sdk/openai",
+    "@openrouter/ai-sdk-provider",
+];
+
+/// The only providers allowed to resolve without catalog help, each with the
+/// reason the catalog cannot supply the URL. Everything derivable stays
+/// derived: a hand list of endpoints is the anti-pattern that rule 16 and
+/// `gen-v2-gate.py` already retired elsewhere. Adding an entry here is a
+/// reviewed decision, and the unit test enumerates this table.
+///
+/// `mistral`: the catalog entry is `@ai-sdk/mistral` with no `api`, but the
+/// vendor documents an OpenAI-compatible endpoint at
+/// `https://api.mistral.ai/v1` (chat completions, `Authorization: Bearer`;
+/// docs.mistral.ai migration guide). Documentation-derived, not live-tested
+/// from this host.
+const ENDPOINT_OVERRIDES: &[(&str, &str)] = &[
+    ("openai", "https://api.openai.com/v1"),
+    ("mistral", "https://api.mistral.ai/v1"),
+];
+
+/// Resolve the base URL this server can actually call for `pid`.
+///
+/// Precedence mirrors the rest of the auth chain (explicit config wins):
+///   1. `provider.<id>.settings.baseURL` / `.options.baseURL`
+///   2. catalog `api`, but only when the catalog's `npm` is OpenAI-shaped
+///   3. a named override (see `ENDPOINT_OVERRIDES`)
+///
+/// `None` means "we cannot prompt this provider"; every consumer must treat
+/// it as not-prompt-ready rather than advertising it.
+pub fn prompt_endpoint_base_url(pid: &str, config: &Value, catalog: &Value) -> Option<String> {
+    // Raw config uses the singular `provider`; `providers` is the derived
+    // payload shape and is accepted defensively for callers that pass it.
+    let providers = config
+        .get("provider")
+        .and_then(Value::as_object)
+        .or_else(|| config.get("providers").and_then(Value::as_object));
+    if let Some(url) = providers
+        .and_then(|p| p.get(pid))
+        .and_then(|p| {
+            p.pointer("/settings/baseURL")
+                .or_else(|| p.pointer("/options/baseURL"))
+        })
+        .and_then(Value::as_str)
+        .filter(|u| !u.is_empty())
+    {
+        return Some(url.to_string());
+    }
+    let entry = catalog.get(pid);
+    if let Some(api) = entry
+        .and_then(|e| e.get("api"))
+        .and_then(Value::as_str)
+        .filter(|u| !u.is_empty())
+    {
+        let npm = entry.and_then(|e| e.get("npm")).and_then(Value::as_str);
+        if npm.is_some_and(|n| OPENAI_SHAPED_NPM.contains(&n)) {
+            return Some(api.to_string());
+        }
+    }
+    ENDPOINT_OVERRIDES
+        .iter()
+        .find(|(id, _)| *id == pid)
+        .map(|(_, url)| (*url).to_string())
+}
+
+/// Prompt-readiness predicate shared by BOTH v2 metadata routes. Splitting it
+/// is how the earlier change produced a provider list that advertised ids the
+/// model list refused to enumerate; `tests/v2_body_parity.rs` asserts the two
+/// agree.
+pub fn is_prompt_ready(payloads: &Payloads, pid: &str) -> bool {
+    prompt_endpoint_base_url(pid, &payloads.config, &payloads.catalog).is_some()
+}
+
+#[cfg(test)]
+mod endpoint_resolution_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn catalog() -> Value {
+        json!({
+            // OpenAI-shaped, catalog supplies the URL.
+            "moonshotai": {"api": "https://api.moonshot.ai/v1",
+                           "npm": "@ai-sdk/openai-compatible",
+                           "models": {"kimi": {}}},
+            // Anthropic-shaped: we cannot call it with an OpenAI client.
+            "minimax": {"api": "https://api.minimax.io/anthropic/v1",
+                        "npm": "@ai-sdk/anthropic",
+                        "models": {"abab": {}}},
+            // No URL at all: only an override may resolve it.
+            "mistral": {"npm": "@ai-sdk/mistral", "models": {"large": {}}},
+            // No dialect marker: must not resolve.
+            "mystery": {"api": "https://mystery.test/v1", "models": {"m": {}}},
+        })
+    }
+
+    #[test]
+    fn catalog_url_resolves_only_for_openai_shaped_dialects() {
+        let c = catalog();
+        assert_eq!(
+            prompt_endpoint_base_url("moonshotai", &json!({}), &c).as_deref(),
+            Some("https://api.moonshot.ai/v1")
+        );
+        // The discriminating assertion: without the npm gate this returns
+        // Some(..) and the request is built in the wrong dialect.
+        assert_eq!(
+            prompt_endpoint_base_url("minimax", &json!({}), &c),
+            None,
+            "an Anthropic-shaped provider must not resolve for this client"
+        );
+        assert_eq!(
+            prompt_endpoint_base_url("mystery", &json!({}), &c),
+            None,
+            "a catalog entry with no known dialect must not resolve"
+        );
+    }
+
+    #[test]
+    fn explicit_config_wins_over_catalog_and_overrides() {
+        let c = catalog();
+        let cfg =
+            json!({"provider": {"moonshotai": {"options": {"baseURL": "http://127.0.0.1:9/v1"}}}});
+        assert_eq!(
+            prompt_endpoint_base_url("moonshotai", &cfg, &c).as_deref(),
+            Some("http://127.0.0.1:9/v1")
+        );
+        // v2-shaped provider config (`settings`) is accepted too.
+        let cfg2 = json!({"providers": {"moonshotai": {"settings": {"baseURL": "http://127.0.0.1:8/v1"}}}});
+        assert_eq!(
+            prompt_endpoint_base_url("moonshotai", &cfg2, &c).as_deref(),
+            Some("http://127.0.0.1:8/v1")
+        );
+        let cfg3 =
+            json!({"provider": {"mistral": {"settings": {"baseURL": "http://127.0.0.1:7/v1"}}}});
+        assert_eq!(
+            prompt_endpoint_base_url("mistral", &cfg3, &c).as_deref(),
+            Some("http://127.0.0.1:7/v1")
+        );
+    }
+
+    #[test]
+    fn overrides_cover_exactly_the_catalog_blind_spots() {
+        let c = catalog();
+        // Both documented in ENDPOINT_OVERRIDES with a reason the catalog
+        // cannot supply the URL (no `api`, non-OpenAI npm).
+        assert_eq!(
+            prompt_endpoint_base_url("mistral", &json!({}), &c).as_deref(),
+            Some("https://api.mistral.ai/v1")
+        );
+        // `openai` is an override with no catalog entry here, so the config
+        // argument is empty and the override supplies the URL.
+        assert_eq!(
+            prompt_endpoint_base_url("openai", &json!({}), &c).as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        // Every override is reachable; no dead entries.
+        for (pid, _) in ENDPOINT_OVERRIDES {
+            assert!(
+                prompt_endpoint_base_url(pid, &json!({}), &c).is_some(),
+                "override {pid} must resolve"
+            );
+        }
+    }
+}
+
 /// W4 config-write target: default = the SHARED opencode.json (drop-in
 /// contract — both servers read it); `OCSERVE_CONFIG_WRITE=overlay` switches
 /// to a ocserve-owned file that layers over the base at load (never touches
@@ -3881,6 +4052,9 @@ pub(crate) fn build_prompt_context(
         mcp: st.mcp.get().cloned(),
         plugins: st.plugins.get().cloned(),
         questions: st.question_gate.clone(),
+        // v2 clients (Paseo, the 2.x web pack) only consume the form surface.
+        // Under v1 the question tool keeps the v1 `question.asked` path.
+        forms: st.v2_enabled.then(|| st.form_gate.clone()),
         skills,
         model_limit,
         max_rounds: st.max_rounds,

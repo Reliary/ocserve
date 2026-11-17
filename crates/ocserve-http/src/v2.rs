@@ -232,15 +232,18 @@ pub fn providers_body(p: &crate::Payloads, location: &Value) -> Value {
         .and_then(|v| v.as_array())
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
-    let data: Vec<Value> = all
-        .iter()
-        .filter(|p| {
-            p.get("id")
-                .and_then(|v| v.as_str())
-                .is_some_and(|id| avail.iter().any(|a| a == id))
-        })
-        .map(project_provider_v2)
-        .collect();
+    // Same predicate as `models_body`: a provider is advertised exactly when
+    // this server can actually prompt it. Filtering only the model list (the
+    // PR #43 draft) left the picker offering providers with zero models.
+    let data: Vec<Value> =
+        all.iter()
+            .filter(|entry| {
+                entry.get("id").and_then(|v| v.as_str()).is_some_and(|id| {
+                    avail.iter().any(|a| a == id) && crate::is_prompt_ready(p, id)
+                })
+            })
+            .map(project_provider_v2)
+            .collect();
     json!({"location": location, "data": data})
 }
 
@@ -254,12 +257,12 @@ pub fn models_body(p: &crate::Payloads, location: &Value) -> Value {
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
     let mut data: Vec<Value> = Vec::new();
-    for p in all {
-        let pid = p.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        if !avail.iter().any(|a| a == pid) {
+    for entry in all {
+        let pid = entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if !avail.iter().any(|a| a == pid) || !crate::is_prompt_ready(p, pid) {
             continue;
         }
-        if let Some(models) = p.get("models").and_then(|m| m.as_object()) {
+        if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
             for m in models.values() {
                 if m.get("status").and_then(|s| s.as_str()) == Some("deprecated") {
                     continue;
@@ -5223,7 +5226,9 @@ pub async fn form_create(
         &fields.to_string(),
     )
     .map_err(internal)?;
-    let _ = crate::emit_durable_http(&st, &id, "form.created", info.clone());
+    // Frozen `Form.Event.Created` envelope: `{form: Form.Info}` (the flat
+    // info shape broke v2 clients that read `event.data.form`).
+    let _ = crate::emit_durable_http(&st, &id, "form.created", json!({"form": info.clone()}));
     Ok(Json(
         json!({"data": form_info(&id, &fid, title, &metadata.to_string(), &fields.to_string(), None)}),
     ))
@@ -5293,8 +5298,15 @@ pub async fn form_reply(
     }
     ocserve_store::form::settle(&st.writer, &fid, "answered", Some(&answer.to_string()))
         .map_err(internal)?;
-    st.form_gate.reply(&fid, answer);
-    let _ = crate::emit_durable_http(&st, &id, "form.replied", json!({"id": fid}));
+    st.form_gate.reply(&fid, answer.clone());
+    // Frozen `Form.Event.Replied`: `{id, sessionID, answer}` — the id-only
+    // shape left v2 clients unable to route or render the settlement.
+    let _ = crate::emit_durable_http(
+        &st,
+        &id,
+        "form.replied",
+        json!({"id": fid, "sessionID": id, "answer": answer}),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -5311,7 +5323,13 @@ pub async fn form_cancel(
             let _ = ocserve_store::form::settle(&st.writer, &fid, "cancelled", None)
                 .map_err(internal)?;
             st.form_gate.cancel(&fid);
-            let _ = crate::emit_durable_http(&st, &id, "form.cancelled", json!({"id": fid}));
+            // Frozen `Form.Event.Cancelled`: `{id, sessionID}`.
+            let _ = crate::emit_durable_http(
+                &st,
+                &id,
+                "form.cancelled",
+                json!({"id": fid, "sessionID": id}),
+            );
         }
         _ => {}
     }
@@ -5783,16 +5801,52 @@ fn payload_err(key: &str) -> HttpError {
 }
 
 /// POST /api/session/{sessionID}/permission/{requestID}/reply — reply to ask.
-/// Body decode precedes the 404 (same Payload envelope as v1); the old
-/// `unwrap_or("reject")` silently rejected a real ask on a malformed body.
+///
+/// This operation exists in BOTH frozen contracts with DIFFERENT required
+/// bodies: 1.19.5 declares `{reply}` and 2.2.5 declares `{decision}` (both
+/// `once|always|reject`). The 1.19.5 v2 SDK (`V2SessionPermissionReplyData`)
+/// sends `reply` to exactly this URL, so accepting only `decision` returns 400
+/// to a client whose own contract says the body is valid. Accept either key,
+/// prefer `decision` when both are present, and keep the frozen 204.
+/// Recorded as `D-V2-PERM-REPLY-BODY`.
 pub async fn permission_reply(
     State(st): State<Arc<AppState>>,
     Path((_sid, rid)): Path<(String, String)>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, crate::HttpError> {
-    let reply = crate::validate_permission_reply(&body)?;
-    if st.gate.reply(&rid, reply) {
-        Ok(Json(json!({"data": {}})))
+) -> Result<StatusCode, crate::HttpError> {
+    let invalid = |message: String| crate::HttpError::TaggedData {
+        status: StatusCode::BAD_REQUEST,
+        tag: "InvalidRequestError",
+        fields: json!({"message": message, "kind": "Payload", "field": "decision"}),
+    };
+    // Per-pin body split: 1.19.5 sends `reply`, 2.2.5 sends `decision`.
+    let field = if body.get("decision").is_some() {
+        "decision"
+    } else if body.get("reply").is_some() {
+        "reply"
+    } else {
+        return Err(invalid("Missing key\n  at [\"decision\"]".into()));
+    };
+    let Some(decision) = body.get(field) else {
+        return Err(invalid(format!("Missing key\n  at [\"{field}\"]")));
+    };
+    let decision = match decision.as_str() {
+        Some("once") => "once",
+        Some("always") => "always",
+        Some("reject") => "reject",
+        Some(other) => {
+            return Err(invalid(format!(
+                "Expected \"once\" | \"always\" | \"reject\", got \"{other}\"\n  at [\"{field}\"]"
+            )));
+        }
+        None => {
+            return Err(invalid(format!(
+                "Expected \"once\" | \"always\" | \"reject\", got {decision}\n  at [\"{field}\"]"
+            )));
+        }
+    };
+    if st.gate.reply(&rid, decision) {
+        Ok(StatusCode::NO_CONTENT)
     } else {
         Err(crate::HttpError::TaggedData {
             status: StatusCode::NOT_FOUND,

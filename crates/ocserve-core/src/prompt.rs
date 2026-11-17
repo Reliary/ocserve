@@ -62,6 +62,11 @@ pub struct PromptContext {
     pub plugins: Option<Arc<tokio::sync::Mutex<ocserve_plugin::Sidecar>>>,
     /// Question rendezvous (v1 Question service): `question` tool gate.
     pub questions: Arc<crate::question::QuestionGate>,
+    /// v2 form-service bridge (`None` under v1). Present when the server runs
+    /// with `OCSERVE_V2=1`: v2 clients only consume the `form.*` surface, so
+    /// the `question` tool must ask there instead of the invisible v1
+    /// `question.asked` event. See `question_via_form`.
+    pub forms: Option<Arc<crate::form::FormGate>>,
     /// Skills for the system-prompt block and the `skill` tool: name,
     /// description, location, content (K-CAPDIFF).
     pub skills: Vec<(String, String, String, String)>,
@@ -4247,6 +4252,25 @@ async fn question_tool_state(
         ));
     }
     let ask_start = now_ms();
+    // v2: the form surface is the question surface. Emitting only
+    // `question.asked` here would be an invisible, unhittable prompt for every
+    // v2 client (Paseo polls `form.list` and never parses `question.asked`),
+    // leaving the turn parked until QUESTION_WAIT.
+    if let Some(forms) = ctx.forms.clone() {
+        return question_via_form(
+            ctx,
+            writer,
+            session_id,
+            assistant_id,
+            call_id,
+            questions,
+            input,
+            ask_start,
+            forms,
+            seq,
+        )
+        .await;
+    }
     let qid = crate::ids::que_id();
     let request = json!({
         "id": qid,
@@ -4302,6 +4326,406 @@ async fn question_tool_state(
             "time": {"start": ask_start, "end": now_ms()},
         }),
     ))
+}
+
+/// v2 form-service variant of the `question` tool: the frozen v2 question
+/// surface is `form.*`, and v2 clients never parse `question.asked`.
+///
+/// One logical ask, one waiter, two representations avoided on purpose: the
+/// v1 gate is NOT primed here, so a `form.replied`/`form.cancelled` can never
+/// leave a second, invisible prompt behind. The event envelopes are the
+/// frozen `Form.Event` shapes (Paseo's bundled schema):
+/// `form.created {form: Form.Info}`, `form.replied {id,sessionID,answer}`,
+/// `form.cancelled {id,sessionID}`.
+#[allow(clippy::too_many_arguments)]
+async fn question_via_form(
+    ctx: &PromptContext,
+    writer: &ocserve_store::Writer,
+    session_id: &str,
+    assistant_id: &str,
+    call_id: &str,
+    questions: Value,
+    input: Value,
+    ask_start: i64,
+    forms: Arc<crate::form::FormGate>,
+    seq: &mut i64,
+) -> Result<(String, Value)> {
+    let fid = crate::form::frm_id();
+    let qid = crate::ids::que_id();
+    let title = question_form_title(&questions);
+    let fields = question_form_fields(&questions);
+    let metadata = json!({
+        "tool": {"messageID": assistant_id, "callID": call_id},
+        "questionID": qid,
+    });
+    let info = json!({
+        "id": fid,
+        "sessionID": session_id,
+        "title": title,
+        "metadata": metadata,
+        "fields": fields,
+    });
+    let question_request = json!({
+        "id": qid,
+        "sessionID": session_id,
+        "questions": questions,
+        "tool": {"messageID": assistant_id, "callID": call_id},
+    });
+
+    // DUAL SURFACE (2026-11-16 review of #48): the two client generations read
+    // DIFFERENT ask surfaces — 1.19.5 (our freeze) and oc-remote render
+    // `question.asked`; Paseo/2.2.5 render `form.*`. Priming only one leaves
+    // the other with no card while the turn parks. Register the SAME ask in
+    // both gates and settle whichever did not answer first; each initiating
+    // path keeps ownership of its own settlement event, and the DB transition
+    // (`settle` returning true) is the dedup for the partner side.
+    let (qrx, _qguard) = ctx.questions.register(&qid, question_request.clone());
+    let Some(frx) = forms.register(&fid, info.clone()) else {
+        ctx.questions.remove(&qid);
+        let msg = "Error: too many pending questions".to_string();
+        return Ok((
+            msg.clone(),
+            json!({
+                "status": "error",
+                "input": input,
+                "output": msg,
+                "title": "question",
+                "metadata": {},
+                "time": {"start": ask_start, "end": now_ms()},
+            }),
+        ));
+    };
+
+    // Durable row first so `form.list` (reconnect/poll) sees it even before the
+    // live frame is consumed; then both event families.
+    ocserve_store::form::create(
+        writer,
+        session_id,
+        &fid,
+        &title,
+        &metadata.to_string(),
+        &fields.to_string(),
+    )?;
+    emit_durable(
+        ctx,
+        writer,
+        session_id,
+        "form.created",
+        json!({"form": info}),
+        seq,
+    )?;
+    emit_durable(
+        ctx,
+        writer,
+        session_id,
+        "question.asked",
+        question_request,
+        seq,
+    )?;
+
+    enum Settled {
+        Form(crate::form::FormOutcome),
+        Question(crate::question::Outcome),
+    }
+    let settled = tokio::select! {
+        biased;
+        out = forms.wait(&fid, frx) => Settled::Form(out),
+        out = ctx.questions.wait(&qid, qrx) => Settled::Question(out),
+    };
+
+    let (status, out_title, output, out_metadata) = match settled {
+        // The form route (or a cancel/timeout) already settled its own gate and
+        // owns `form.*`. Settle the v1 partner here.
+        Settled::Form(crate::form::FormOutcome::Answered(answer)) => {
+            let answers = question_form_answers(&questions, &answer);
+            // The select dropped the v1 receiver when the form branch won, so
+            // settle the entry directly (same exactly-once rule).
+            if ctx.questions.settle_without_waiter(&qid) {
+                emit_durable(
+                    ctx,
+                    writer,
+                    session_id,
+                    "question.replied",
+                    json!({"sessionID": session_id, "requestID": qid, "answers": answers}),
+                    seq,
+                )?;
+            }
+            (
+                "completed".to_string(),
+                crate::question::format_title(&questions),
+                crate::question::format_output(&questions, &answers),
+                json!({"answers": answers}),
+            )
+        }
+        Settled::Form(crate::form::FormOutcome::Cancelled) => {
+            if ctx.questions.settle_without_waiter(&qid) {
+                emit_durable(
+                    ctx,
+                    writer,
+                    session_id,
+                    "question.rejected",
+                    json!({"sessionID": session_id, "requestID": qid}),
+                    seq,
+                )?;
+            }
+            (
+                "error".to_string(),
+                "question".to_string(),
+                crate::question::REJECTED_MESSAGE.to_string(),
+                json!({}),
+            )
+        }
+        // The v1 route answered; it emits nothing itself, so this waiter owns
+        // the v1 event and must also settle the form partner.
+        Settled::Question(crate::question::Outcome::Answers(answers)) => {
+            let answer = question_answers_to_form(&questions, &answers);
+            let _ = forms.reply(&fid, answer.clone());
+            if ocserve_store::form::settle(writer, &fid, "answered", Some(&answer.to_string()))? {
+                emit_durable(
+                    ctx,
+                    writer,
+                    session_id,
+                    "form.replied",
+                    json!({"id": fid, "sessionID": session_id, "answer": answer}),
+                    seq,
+                )?;
+            }
+            emit_durable(
+                ctx,
+                writer,
+                session_id,
+                "question.replied",
+                json!({"sessionID": session_id, "requestID": qid, "answers": answers}),
+                seq,
+            )?;
+            (
+                "completed".to_string(),
+                crate::question::format_title(&questions),
+                crate::question::format_output(&questions, &answers),
+                json!({"answers": answers}),
+            )
+        }
+        Settled::Question(crate::question::Outcome::Rejected) => {
+            let _ = forms.cancel(&fid);
+            if ocserve_store::form::settle(writer, &fid, "cancelled", None)? {
+                emit_durable(
+                    ctx,
+                    writer,
+                    session_id,
+                    "form.cancelled",
+                    json!({"id": fid, "sessionID": session_id}),
+                    seq,
+                )?;
+            }
+            emit_durable(
+                ctx,
+                writer,
+                session_id,
+                "question.rejected",
+                json!({"sessionID": session_id, "requestID": qid}),
+                seq,
+            )?;
+            (
+                "error".to_string(),
+                "question".to_string(),
+                crate::question::REJECTED_MESSAGE.to_string(),
+                json!({}),
+            )
+        }
+    };
+    Ok((
+        output.clone(),
+        json!({
+            "status": status,
+            "input": input,
+            "output": output,
+            "title": out_title,
+            "metadata": out_metadata,
+            "time": {"start": ask_start, "end": now_ms()},
+        }),
+    ))
+}
+
+/// Inverse of `question_form_answers`: v1 answer rows → the form answer object.
+/// A single selected label becomes a string, several become an array (the
+/// frozen `Form.Value` union).
+fn question_answers_to_form(questions: &Value, answers: &[Vec<String>]) -> Value {
+    let mut out = serde_json::Map::new();
+    for (i, row) in answers.iter().enumerate() {
+        let multiple = questions
+            .as_array()
+            .and_then(|qs| qs.get(i))
+            .and_then(|q| q.get("multiple"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let key = format!("q{i}");
+        let value = match (multiple, row.len()) {
+            (_, 0) => continue,
+            (false, _) => json!(row[0]),
+            (true, _) => json!(row),
+        };
+        out.insert(key, value);
+    }
+    Value::Object(out)
+}
+
+/// Map the v1 `question` tool input onto frozen `Form.Field` objects. The
+/// single-choice form of a question is a `string` field with `options` +
+/// `custom` (no separate select type); `multiple` maps to `multiselect`.
+fn question_form_fields(questions: &Value) -> Value {
+    let fields: Vec<Value> = questions
+        .as_array()
+        .map(|qs| {
+            qs.iter()
+                .enumerate()
+                .map(|(i, q)| {
+                    let multiple = q.get("multiple").and_then(Value::as_bool).unwrap_or(false);
+                    let custom = q.get("custom").and_then(Value::as_bool).unwrap_or(true);
+                    let header = q.get("header").and_then(Value::as_str).unwrap_or("");
+                    let text = q.get("question").and_then(Value::as_str).unwrap_or("");
+                    let title = if header.is_empty() { text } else { header };
+                    let options: Vec<Value> = q
+                        .get("options")
+                        .and_then(Value::as_array)
+                        .map(|opts| {
+                            opts.iter()
+                                .filter_map(|o| {
+                                    let label = o.get("label").and_then(Value::as_str)?;
+                                    let mut opt = serde_json::Map::new();
+                                    opt.insert("value".into(), json!(label));
+                                    opt.insert("label".into(), json!(label));
+                                    if let Some(d) = o.get("description").and_then(Value::as_str) {
+                                        opt.insert("description".into(), json!(d));
+                                    }
+                                    Some(Value::Object(opt))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    json!({
+                        "key": format!("q{i}"),
+                        "type": if multiple { "multiselect" } else { "string" },
+                        "title": title,
+                        "description": text,
+                        "options": options,
+                        "custom": custom,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Value::Array(fields)
+}
+
+fn question_form_title(questions: &Value) -> String {
+    let Some(qs) = questions.as_array() else {
+        return "Question".to_string();
+    };
+    if qs.len() == 1 {
+        let q = &qs[0];
+        let header = q.get("header").and_then(Value::as_str).unwrap_or("");
+        if !header.is_empty() {
+            return header.to_string();
+        }
+        return q
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or("Question")
+            .to_string();
+    }
+    format!("{} questions", qs.len())
+}
+
+/// Convert the form answer object (`{q0: "Blau"}` / `{q1: ["a","b"]}`) back
+/// into the v1 QuestionTool answer arrays (one per question, in order).
+fn question_form_answers(questions: &Value, answer: &Value) -> Vec<Vec<String>> {
+    let n = questions.as_array().map_or(0, |a| a.len());
+    (0..n)
+        .map(|i| {
+            let key = format!("q{i}");
+            match answer.get(&key) {
+                Some(Value::String(s)) if !s.is_empty() => vec![s.clone()],
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod question_form_tests {
+    use super::*;
+
+    fn questions() -> Value {
+        json!([
+            {"question": "Welche Farbe?", "header": "Farbe",
+             "options": [
+                {"label": "Blau", "description": "klassisch"},
+                {"label": "Grün"}
+             ]},
+            {"question": "Welche Tags?", "header": "Tags", "multiple": true,
+             "custom": false,
+             "options": [{"label": "a"}, {"label": "b"}]}
+        ])
+    }
+
+    #[test]
+    fn fields_map_v1_questions_to_frozen_form_fields() {
+        let fields = question_form_fields(&questions());
+        let arr = fields.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+
+        // single choice = string + options + custom (no separate select type)
+        assert_eq!(arr[0]["key"], "q0");
+        assert_eq!(arr[0]["type"], "string");
+        assert_eq!(arr[0]["title"], "Farbe");
+        assert_eq!(arr[0]["description"], "Welche Farbe?");
+        assert_eq!(arr[0]["custom"], true, "v1 default is custom-enabled");
+        assert_eq!(arr[0]["options"][0]["value"], "Blau");
+        assert_eq!(arr[0]["options"][0]["label"], "Blau");
+        assert_eq!(arr[0]["options"][0]["description"], "klassisch");
+        assert!(
+            arr[0]["options"][1].get("description").is_none(),
+            "absent stays omitted"
+        );
+
+        assert_eq!(arr[1]["type"], "multiselect");
+        assert_eq!(arr[1]["custom"], false);
+        assert_eq!(arr[1]["options"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn answers_map_back_in_question_order() {
+        let answers = question_form_answers(&questions(), &json!({"q0": "Blau", "q1": ["a", "b"]}));
+        let want: Vec<Vec<String>> = vec![
+            vec!["Blau".to_string()],
+            vec!["a".to_string(), "b".to_string()],
+        ];
+        assert_eq!(answers, want);
+        // CONTROL: an unknown key and an empty string must not fabricate an
+        // answer — the tool output says "Unanswered" for that slot.
+        let missing = question_form_answers(&questions(), &json!({"q9": "ignored"}));
+        assert_eq!(missing, vec![Vec::<String>::new(), Vec::<String>::new()]);
+        let empty = question_form_answers(&questions(), &json!({"q0": ""}));
+        assert!(empty[0].is_empty());
+    }
+
+    #[test]
+    fn form_title_uses_single_header_and_counts_many() {
+        assert_eq!(question_form_title(&questions()), "2 questions");
+        assert_eq!(
+            question_form_title(&json!([{"question": "Q?", "header": "H"}])),
+            "H"
+        );
+        assert_eq!(
+            question_form_title(&json!([{"question": "Q?", "header": ""}])),
+            "Q?"
+        );
+        assert_eq!(question_form_title(&json!([])), "0 questions");
+    }
 }
 
 fn compute_cost(pricing: &Option<(f64, f64, f64)>, u: &Usage) -> f64 {
