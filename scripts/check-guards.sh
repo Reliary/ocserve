@@ -17,6 +17,9 @@
 #   70. a declared query parameter is never read by its handler (the v2 message
 #      list replayed page 1 forever, and the shipped v2 web UI's
 #      ?parentID=null&archived=false returned zero sessions, 2026-11-11) [plant]
+#   71. a TRACEABILITY citation names a test/function/module that does not
+#      exist (PR #43 cited five invented test ids and one row contradicted its
+#      own PR body; the old check saw 22 of 76 citations) [suite: check-matrix]
 #   69. a built-in command's dispatch predicate tests `template.is_none()`
 #      (the advertised goal entry carries `template: ""`, which is Some("") —
 #      true only in an empty-list fixture, so `/goal` fell through to an empty

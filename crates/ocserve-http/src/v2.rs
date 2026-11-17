@@ -232,15 +232,18 @@ pub fn providers_body(p: &crate::Payloads, location: &Value) -> Value {
         .and_then(|v| v.as_array())
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
-    let data: Vec<Value> = all
-        .iter()
-        .filter(|p| {
-            p.get("id")
-                .and_then(|v| v.as_str())
-                .is_some_and(|id| avail.iter().any(|a| a == id))
-        })
-        .map(project_provider_v2)
-        .collect();
+    // Same predicate as `models_body`: a provider is advertised exactly when
+    // this server can actually prompt it. Filtering only the model list (the
+    // PR #43 draft) left the picker offering providers with zero models.
+    let data: Vec<Value> =
+        all.iter()
+            .filter(|entry| {
+                entry.get("id").and_then(|v| v.as_str()).is_some_and(|id| {
+                    avail.iter().any(|a| a == id) && crate::is_prompt_ready(p, id)
+                })
+            })
+            .map(project_provider_v2)
+            .collect();
     json!({"location": location, "data": data})
 }
 
@@ -254,12 +257,12 @@ pub fn models_body(p: &crate::Payloads, location: &Value) -> Value {
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
     let mut data: Vec<Value> = Vec::new();
-    for p in all {
-        let pid = p.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        if !avail.iter().any(|a| a == pid) {
+    for entry in all {
+        let pid = entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if !avail.iter().any(|a| a == pid) || !crate::is_prompt_ready(p, pid) {
             continue;
         }
-        if let Some(models) = p.get("models").and_then(|m| m.as_object()) {
+        if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
             for m in models.values() {
                 if m.get("status").and_then(|s| s.as_str()) == Some("deprecated") {
                     continue;

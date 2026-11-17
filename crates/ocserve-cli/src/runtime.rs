@@ -320,13 +320,23 @@ fn load_auth(data_dir: &Path) -> Result<Value> {
 /// so a loader test cannot read the developer's real credentials. Production
 /// passes `None` and keeps the documented path.
 fn load_auth_with(data_dir: &Path, legacy_home: Option<&Path>) -> Result<Value> {
+    if let Some(home) = legacy_home {
+        return load_auth_from_path(&home.join("auth.json"), data_dir);
+    }
     let home = std::env::var("HOME").unwrap_or_default();
-    let auth_path = match legacy_home {
-        Some(h) => h.join("auth.json"),
-        None => Path::new(&home).join(".local/share/opencode/auth.json"),
-    };
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from);
+    load_auth_for(Path::new(&home), xdg_data_home.as_deref(), data_dir)
+}
+
+fn load_auth_for(home: &Path, xdg_data_home: Option<&Path>, data_dir: &Path) -> Result<Value> {
+    let auth_path =
+        ocserve_store::platform::opencode_data_dir_for(home, xdg_data_home).join("auth.json");
+    load_auth_from_path(&auth_path, data_dir)
+}
+
+fn load_auth_from_path(auth_path: &Path, data_dir: &Path) -> Result<Value> {
     let auth = if auth_path.exists() {
-        read_json(&auth_path)?
+        read_json(auth_path)?
     } else {
         json!({})
     };
@@ -369,10 +379,12 @@ fn watch_paths_with(
 ) -> Vec<std::path::PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     let h = Path::new(&home);
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from);
     let mut paths = vec![
         config_json,
         h.join(".config/ocserve/config.json"),
-        h.join(".local/share/opencode/auth.json"),
+        ocserve_store::platform::opencode_data_dir_for(h, xdg_data_home.as_deref())
+            .join("auth.json"),
         data_dir.join("auth-overlay.json"),
         // K-MODELS: the catalog ocserve READS (source-aware + fixture flag)
         crate::models_dev::read_path(),
@@ -1566,13 +1578,6 @@ impl Runtime {
         let state_model = read_json(&format!("{home}/.local/state/opencode/model.json"))
             .unwrap_or_else(|| json!({}));
 
-        // Known default endpoints for auth'd providers without config baseURL
-        // (provider quirks live in code-data, PLAN §8 — extend as needed).
-        let defaults: [(&str, &str); 2] = [
-            ("deepseek", "https://api.deepseek.com/v1"),
-            ("openrouter", "https://openrouter.ai/api/v1"),
-        ];
-
         let mut endpoints = std::collections::HashMap::new();
         if let Some(obj) = auth.as_object() {
             for (pid, entry) in obj {
@@ -1580,28 +1585,13 @@ impl Runtime {
                 if key.is_empty() {
                     continue; // oauth-typed entries: M2 supports key auth only
                 }
-                let base = cfg
-                    .pointer(&format!("/provider/{pid}/options/baseURL"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    // The models.dev catalog carries the provider's API base
-                    // (`api`); opencode-go is auth-only, so the hardcoded
-                    // defaults list alone left `opencode auth login` users
-                    // with no endpoint and no provider on the v2 wire.
-                    .or_else(|| {
-                        cache
-                            .get(pid)
-                            .and_then(|p| p.get("api"))
-                            .and_then(|v| v.as_str())
-                            .map(String::from)
-                    })
-                    .or_else(|| {
-                        defaults
-                            .iter()
-                            .find(|(d, _)| d == pid)
-                            .map(|(_, u)| (*u).to_string())
-                    });
-                if let Some(base) = base {
+                // ONE resolver, shared with the v2 metadata routes. It keeps
+                // the catalog fallback (a hand list of endpoints dropped 286
+                // OpenAI-compatible providers in the PR #43 draft) and gates
+                // it on the catalog's own `npm` dialect marker, so an
+                // Anthropic-shaped provider can no longer be routed through
+                // this OpenAI-compatible client.
+                if let Some(base) = ocserve_http::prompt_endpoint_base_url(pid, &cfg, cache) {
                     endpoints.insert(pid.clone(), (base, key.to_string()));
                 }
             }
@@ -1612,7 +1602,7 @@ impl Runtime {
                 if endpoints.contains_key(pid) {
                     continue;
                 }
-                if let Some(base) = p.pointer("/options/baseURL").and_then(|v| v.as_str()) {
+                if let Some(base) = ocserve_http::prompt_endpoint_base_url(pid, &cfg, cache) {
                     // issue #28: auth layer first, then the provider's own
                     // config key. `{env:}`/`{file:}` are already expanded by
                     // the loader, so this is the literal secret here.
@@ -1622,6 +1612,7 @@ impl Runtime {
                         .filter(|k| !k.is_empty())
                         .or_else(|| {
                             p.pointer("/options/apiKey")
+                                .or_else(|| p.pointer("/settings/apiKey"))
                                 .and_then(|v| v.as_str())
                                 .filter(|k| !k.is_empty())
                         })
