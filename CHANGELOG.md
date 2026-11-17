@@ -4,6 +4,22 @@ All notable changes to ocserve. The wire contract targets the frozen opencode
 1.19.5 release and the v2 surface the 2.2.5 client; anything that differs is a
 named `D-*` row in the ledger at `PLAN.md` section 18.
 
+## Unreleased
+
+### Fixed
+- Provider endpoints derive from the models catalog again. A six-provider
+  whitelist had replaced the catalog fallback, so 286 OpenAI-compatible
+  providers with a URL and live models stopped resolving and `/api/model`
+  returned nothing for providers `/api/provider` still listed. The resolver is
+  now `config baseURL -> catalog api when the catalog's npm is OpenAI-shaped ->
+  two documented overrides (openai, mistral)`, and both v2 metadata routes
+  share one readiness predicate so they cannot disagree. Anthropic-shaped
+  providers no longer resolve, which fixes an existing wrong-dialect request
+  path. Thanks to @jrzmurray for the Mistral endpoint request.
+- OpenCode data paths honour `XDG_DATA_HOME`. The loader and config watcher
+  hardcoded `$HOME/.local/share/opencode`, so a user with XDG set lost every
+  provider key silently. Thanks to @jrzmurray.
+
 ## 0.7.3 - 2026-11-14
 
 ### Fixed
