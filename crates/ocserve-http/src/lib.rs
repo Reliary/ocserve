@@ -4741,8 +4741,16 @@ pub(crate) async fn interrupt_session(st: &Arc<AppState>, sid: &str) -> bool {
     // Forms: the durable rows are the authority. The dropped runner leaves
     // them pending, so settle after the cancel (the runner can no longer
     // re-settle or emit) and publish one cancellation per transition.
-    if let Ok(rows) = ocserve_store::form::list_pending(&st.db, sid) {
-        for (fid, ..) in rows {
+    // The form scan is a synchronous store read; it must not park a tokio
+    // worker (F1 class, fixed twice this week).
+    let sid_owned = sid.to_string();
+    let pending_form_rows = crate::run_blocking(&st.db, move |db| {
+        ocserve_store::form::list_pending(db, &sid_owned)
+    })
+    .await
+    .unwrap_or_default();
+    {
+        for (fid, ..) in pending_form_rows {
             match ocserve_store::form::settle(&st.writer, &fid, "cancelled", None) {
                 Ok(true) => publish("form.cancelled", json!({"id": fid, "sessionID": sid})),
                 Ok(false) => {}
