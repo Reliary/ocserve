@@ -301,6 +301,42 @@ impl PermissionGate {
     pub fn list(&self) -> Vec<Value> {
         self.requests.lock().values().cloned().collect()
     }
+
+    /// Pending ask ids owned by one session (interrupt snapshot; read-only).
+    pub fn pending_ids_for_session(&self, session_id: &str) -> Vec<String> {
+        self.requests
+            .lock()
+            .iter()
+            .filter(|(_, v)| v.get("sessionID").and_then(Value::as_str) == Some(session_id))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// Interrupt cleanup: settle every pending ask owned by the session as
+    /// `reject` and return the ids that were pending. The cancelled turn never
+    /// reaches its post-wait emit, so the caller publishes one
+    /// `permission.replied` per returned id (issue #46).
+    pub fn reject_session(&self, session_id: &str) -> Vec<String> {
+        let ids = self.pending_ids_for_session(session_id);
+        let mut settled = Vec::with_capacity(ids.len());
+        for id in ids {
+            // entry-existence verdict (same rule as `reply`: a persistent ask
+            // has a sender whose receiver is already gone).
+            let existed = self.requests.lock().remove(&id).is_some();
+            let sent = self
+                .pending
+                .lock()
+                .remove(&id)
+                .map(|tx| {
+                    let _ = tx.send("reject".to_string());
+                })
+                .is_some();
+            if existed || sent {
+                settled.push(id);
+            }
+        }
+        settled
+    }
 }
 
 /// Whether every pattern of a pending request is covered by the granted rules
@@ -417,5 +453,31 @@ mod forget_session_tests {
         gate.hydrated.lock().insert("ses_y".into());
         gate.forget_session("ses_x");
         assert!(gate.hydrated.lock().contains("ses_y"));
+    }
+}
+
+#[cfg(test)]
+mod session_cleanup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reject_session_settles_only_that_session() {
+        let gate = PermissionGate::new();
+        let (rx_a, _guard_a) = gate
+            .clone()
+            .register("per_a", serde_json::json!({"sessionID": "ses_a"}));
+        let (rx_b, _guard_b) = gate
+            .clone()
+            .register("per_b", serde_json::json!({"sessionID": "ses_b"}));
+
+        assert_eq!(gate.reject_session("ses_a"), vec!["per_a"]);
+        assert_eq!(rx_a.await.unwrap(), "reject");
+        assert_eq!(
+            gate.pending_ids_for_session("ses_b"),
+            vec!["per_b"],
+            "a different session's ask must stay pending"
+        );
+        assert!(gate.pending_ids_for_session("ses_a").is_empty());
+        drop(rx_b);
     }
 }

@@ -141,6 +141,27 @@ impl FormGate {
             .map(|p| p.request.clone())
             .collect()
     }
+
+    /// Pending form ids owned by one session (interrupt snapshot; read-only).
+    pub fn pending_ids_for_session(&self, session_id: &str) -> Vec<String> {
+        self.pending
+            .lock()
+            .iter()
+            .filter(|(_, p)| p.request.get("sessionID").and_then(Value::as_str) == Some(session_id))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// Interrupt cleanup: cancel every pending form owned by the session and
+    /// return the ids the waiter actually had. The durable row is settled by
+    /// the caller (it owns the store handle), which is also where the single
+    /// `form.cancelled` event is emitted.
+    pub fn cancel_session(&self, session_id: &str) -> Vec<String> {
+        self.pending_ids_for_session(session_id)
+            .into_iter()
+            .filter(|id| self.cancel(id))
+            .collect()
+    }
 }
 
 /// Mint a form id (`frm_` + 24 base62 — the frozen `^frm_` brand).
@@ -203,5 +224,33 @@ mod tests {
         let b = frm_id();
         assert!(a.starts_with("frm_") && a.len() == 28);
         assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod session_cleanup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancel_session_settles_only_that_session() {
+        let gate = FormGate::new();
+        let rx_a = gate
+            .register("frm_a", serde_json::json!({"sessionID": "ses_a"}))
+            .expect("under cap");
+        let _rx_b = gate
+            .register("frm_b", serde_json::json!({"sessionID": "ses_b"}))
+            .expect("under cap");
+
+        assert_eq!(gate.cancel_session("ses_a"), vec!["frm_a"]);
+        assert!(matches!(
+            gate.wait("frm_a", rx_a).await,
+            FormOutcome::Cancelled
+        ));
+        assert_eq!(
+            gate.pending_ids_for_session("ses_b"),
+            vec!["frm_b"],
+            "a different session's form must stay pending"
+        );
+        assert!(gate.pending_ids_for_session("ses_a").is_empty());
     }
 }

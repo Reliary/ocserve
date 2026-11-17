@@ -5582,14 +5582,8 @@ pub async fn interrupt(
     // interrupt itself must not be undone by the next reviewer "continue".
     // Stopping only the current turn let the driver finish and start another
     // (2026-11-05 review M1); pause it before either v1 or v2 work unwinds.
-    crate::goal_loop::cancel_driver(&st, &id);
-    let mut interrupted = false;
-    if let Some((_, handle)) = st.prompt_tasks.lock().remove(&id) {
-        handle.abort();
-        interrupted = true;
-    }
-    interrupted |= cancel_drain(&st, &id).await;
-    crate::goal_loop::pause_if_active(&st, &id, "Stopped by the user").await;
+    // The shared helper also fail-closed settles pending asks (issue #46).
+    let interrupted = crate::interrupt_session(&st, &id).await;
 
     // Upstream resumes steer/control items on interrupt by default, leaving
     // queued prompts parked. The interrupted drain clears its in-memory

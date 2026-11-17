@@ -38,9 +38,17 @@ SPEC = os.path.join(
     "../../crates/ocserve-core/assets/openapi/v1.json",
 )
 
-# Additive ocserve event types absent from the frozen union, each justified.
-# Empty today: ocserve emits only spec types (plus .N twins handled below).
-ALLOW_TYPES = set()
+# Additive ocserve event types absent from the frozen v1 union, each justified.
+#
+# `form.*` is the 2.2.5 ask surface: the v2 contract carries it (Form.Event.*)
+# but the v1 freeze does not, and under OCSERVE_V2 the same ask is served to
+# both client generations (D-V2-ASK-DUAL). Emission is additive: v1 clients
+# ignore unknown types, and the v1 partner event is emitted alongside.
+ALLOW_TYPES = {
+    "form.created",
+    "form.replied",
+    "form.cancelled",
+}
 
 SUFFIX = re.compile(r"\.\d+$")
 # Durable version suffix (V2-PLAN.md P2): stored types carry `@vN`

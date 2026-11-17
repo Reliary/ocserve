@@ -142,6 +142,12 @@ requirement land here as edits, never silently in code.
 - Dual-emit at the single choke: v1 grammar on `/event`+`/global/event`, v2
   grammar on `/api/event`; `log?after&follow` + `log.synced` exact.
 - Fill skeletal projections (`"content": []`, title-as-text) with real `content[]`.
+- Interrupt settles every ask pending when the stop arrives: snapshot the ask
+  ids, cancel the turn, then publish `permission.replied: reject`,
+  `question.rejected`, and settle pending forms with `form.cancelled` (the
+  cancelled ask path never reaches its post-wait emit, so the handler owns the
+  event). Without this a Stop left the client card alive until the ask timeout
+  (300 s permission, 1800 s question/form): issue #46.
 - v2 permission replies decode the frozen `{decision: "once"|"always"|"reject",
   message?}` body and answer 204. The handler used the v1 `{reply}` key, so
   every generated v2 client (Paseo) got a 400 while its card spun forever and

@@ -109,6 +109,26 @@ impl QuestionGate {
             .collect()
     }
 
+    /// Pending ask ids owned by one session (interrupt snapshot; read-only).
+    pub fn pending_ids_for_session(&self, session_id: &str) -> Vec<String> {
+        self.pending
+            .lock()
+            .iter()
+            .filter(|(_, p)| p.request.get("sessionID").and_then(Value::as_str) == Some(session_id))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// Interrupt cleanup: reject every pending ask owned by the session and
+    /// return the ids the waiter actually had (issue #46: the cancelled ask
+    /// path never emits, so the caller publishes `question.rejected`).
+    pub fn reject_session(&self, session_id: &str) -> Vec<String> {
+        self.pending_ids_for_session(session_id)
+            .into_iter()
+            .filter(|id| self.reject(id))
+            .collect()
+    }
+
     /// Runner wait with the bounded cap; timeout → Rejected + cleanup.
     pub async fn wait(&self, id: &str, rx: tokio::sync::oneshot::Receiver<Outcome>) -> Outcome {
         match tokio::time::timeout(QUESTION_WAIT, rx).await {
@@ -228,5 +248,30 @@ mod tests {
             gate.list().is_empty(),
             "drop removes pending (upstream ensuring)"
         );
+    }
+}
+
+#[cfg(test)]
+mod session_cleanup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reject_session_settles_only_that_session() {
+        let gate = QuestionGate::new();
+        let (rx_a, _guard_a) = gate
+            .clone()
+            .register("que_a", serde_json::json!({"sessionID": "ses_a"}));
+        let (_rx_b, _guard_b) = gate
+            .clone()
+            .register("que_b", serde_json::json!({"sessionID": "ses_b"}));
+
+        assert_eq!(gate.reject_session("ses_a"), vec!["que_a"]);
+        assert!(matches!(rx_a.await.unwrap(), Outcome::Rejected));
+        assert_eq!(
+            gate.pending_ids_for_session("ses_b"),
+            vec!["que_b"],
+            "a different session's ask must stay pending"
+        );
+        assert!(gate.pending_ids_for_session("ses_a").is_empty());
     }
 }
