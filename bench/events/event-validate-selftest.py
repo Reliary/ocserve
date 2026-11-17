@@ -48,6 +48,28 @@ cases = [
     # permission.replied missing `reply`
     ("permission.replied", {"sessionID": "ses_x", "requestID": "per_abc"}, False),
     ("permission.replied", {"sessionID": "ses_x", "requestID": "per_abc", "reply": "once"}, True),
+    # tool part terminal states: `error` requires {status,input,error,time} and
+    # forbids output/title (the 2026-11-17 shape: completed keys under
+    # status:"error" violated the frozen union on every failed tool call)
+    ("message.part.updated",
+     {"sessionID": "ses_x", "part": {"type": "tool", "id": "prt_x",
+      "sessionID": "ses_x", "messageID": "msg_x", "callID": "c1", "tool": "bash",
+      "state": {"status": "error", "input": {"command": "false"},
+                "output": "boom", "title": "bash",
+                "metadata": {}, "time": {"start": 1, "end": 2}}},
+      "time": 1}, False),
+    ("message.part.updated",
+     {"sessionID": "ses_x", "part": {"type": "tool", "id": "prt_x",
+      "sessionID": "ses_x", "messageID": "msg_x", "callID": "c1", "tool": "bash",
+      "state": {"status": "error", "input": {"command": "false"},
+                "error": "boom", "metadata": {}, "time": {"start": 1, "end": 2}}},
+     "time": 1}, True),
+    ("message.part.updated",
+     {"sessionID": "ses_x", "part": {"type": "tool", "id": "prt_x",
+      "sessionID": "ses_x", "messageID": "msg_x", "callID": "c1", "tool": "bash",
+      "state": {"status": "completed", "input": {"command": "true"},
+                "output": "ok", "title": "bash", "metadata": {},
+                "time": {"start": 1, "end": 2}}}, "time": 1}, True),
     # sync twin suffix resolves to the base type
     ("session.updated.1", {"sessionID": "ses_x", "info": FULL_SESSION}, True),
     # SNAPSHOT revert events require `timestamp` (added 2026-10-13)

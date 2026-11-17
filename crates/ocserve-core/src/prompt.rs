@@ -1142,8 +1142,12 @@ pub(crate) fn to_provider_messages_budget(
             .collect();
         out.push(ChatMessage::assistant_with_tools(text, calls));
         for p in &tool_parts {
+            // Terminal shape depends on status: completed carries `output`,
+            // error carries `error` (frozen union). Reading only `output`
+            // would send the model an empty tool result for every failure.
             let output = p["state"]["output"]
                 .as_str()
+                .or_else(|| p["state"]["error"].as_str())
                 .or_else(|| p["state"]["metadata"]["output"].as_str())
                 .unwrap_or_default();
             // provider-boundary sift (P1c): history rebuild must emit the
@@ -3534,24 +3538,45 @@ pub async fn run_prompt_with(
                     if !builtin {
                         output = ocserve_mcp::McpHub::guard_output(&call.name, output);
                     }
-                    running["state"] = json!({
-                        "status": if is_err { "error" } else { "completed" },
-                        "input": serde_json::from_str::<Value>(&call.arguments)
-                            .unwrap_or_else(|_| json!({"raw": call.arguments})),
-                        "output": output,
-                        "title": title,
-                        // meta = bash template {output:"",exit,truncated} OR the
-                        // tool's custom metadata (todowrite {todos}) — the old
-                        // destructure here DROPPED custom keys (field bug: todos
-                        // never reached state/persist — caught by live verify)
-                        "metadata": meta,
-                        "time": {"start": exec_start, "end": now_ms()},
-                    });
+                    // Frozen contract: the two terminal states have DIFFERENT
+                    // required fields (`ToolStateError` = {status,input,error,
+                    // time}; `ToolStateCompleted` = {status,input,output,title,
+                    // metadata,time}, additionalProperties:false). Emitting the
+                    // completed shape with status:"error" violates the union on
+                    // every failed call — caught by the live event oracle
+                    // (K-EVENT-CONTRACT), 86 rows on 2026-11-17.
+                    running["state"] = if is_err {
+                        json!({
+                            "status": "error",
+                            "input": serde_json::from_str::<Value>(&call.arguments)
+                                .unwrap_or_else(|_| json!({"raw": call.arguments})),
+                            // upstream processor.ts failToolCall: errorMessage(error)
+                            "error": output,
+                            // streamed progress detail survives the failure
+                            "metadata": meta,
+                            "time": {"start": exec_start, "end": now_ms()},
+                        })
+                    } else {
+                        json!({
+                            "status": "completed",
+                            "input": serde_json::from_str::<Value>(&call.arguments)
+                                .unwrap_or_else(|_| json!({"raw": call.arguments})),
+                            "output": output,
+                            "title": title,
+                            // meta = bash template {output:"",exit,truncated} OR the
+                            // tool's custom metadata (todowrite {todos}) — the old
+                            // destructure here DROPPED custom keys (field bug: todos
+                            // never reached state/persist — caught by live verify)
+                            "metadata": meta,
+                            "time": {"start": exec_start, "end": now_ms()},
+                        })
+                    };
                     // metadata.output mirrors output (capture fact) — except
-                    // todowrite parts, whose metadata is {todos} (v1 Output).
-                    // Defensive: a non-object here would panic on IndexMut
-                    // (release = abort), so coerce before indexing.
-                    if running["state"]["metadata"].get("todos").is_none() {
+                    // todowrite parts, whose metadata is {todos} (v1 Output) and
+                    // error states, whose only payload is `error`.
+                    if running["state"]["status"] == "completed"
+                        && running["state"]["metadata"].get("todos").is_none()
+                    {
                         let out = running["state"]["output"].clone();
                         metadata_mut(&mut running["state"]).insert("output".into(), out);
                     }
@@ -3689,7 +3714,10 @@ pub async fn run_prompt_with(
                         &mut seq,
                     )?;
                     {
-                        let out_str = running["state"]["output"].as_str().unwrap_or_default();
+                        let out_str = running["state"]["output"]
+                            .as_str()
+                            .or_else(|| running["state"]["error"].as_str())
+                            .unwrap_or_default();
                         // K4: throttled steps stay OUT of the window (their
                         // repetition is rate-limited by their own sleep).
                         if !crate::loop_guard::self_throttled(&call.arguments) {
@@ -4241,11 +4269,11 @@ async fn question_tool_state(
         let msg = "Error: questions must be a non-empty array".to_string();
         return Ok((
             msg.clone(),
+            // Frozen ToolStateError: `error`, not output/title.
             json!({
                 "status": "error",
                 "input": input,
-                "output": msg,
-                "title": "question",
+                "error": msg,
                 "metadata": {},
                 "time": {"start": now_ms(), "end": now_ms()},
             }),
@@ -4388,8 +4416,7 @@ async fn question_via_form(
             json!({
                 "status": "error",
                 "input": input,
-                "output": msg,
-                "title": "question",
+                "error": msg,
                 "metadata": {},
                 "time": {"start": ask_start, "end": now_ms()},
             }),
