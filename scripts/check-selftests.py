@@ -23,6 +23,10 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GATE_FILES = [
     "scripts/check-guards.sh",
+    # check-matrix.sh is a commit gate (AGENTS §3) and runs in CI, so a
+    # selftest it invokes is wired. It was missing from this list, which is
+    # why rule 39 could not see the citation checker added there.
+    "scripts/check-matrix.sh",
     "scripts/nightly.sh",
     "bench/snapshot-it/run.sh",
 ]
