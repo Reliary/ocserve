@@ -89,12 +89,14 @@ fn spawn_provider() -> (std::net::SocketAddr, Arc<Mutex<Vec<String>>>) {
                 }
                 let seq = {
                     let mut b = bodies.lock().unwrap();
-                    b.push(
-                        String::from_utf8_lossy(&got[head_end..head_end + clen]).to_string(),
-                    );
+                    b.push(String::from_utf8_lossy(&got[head_end..head_end + clen]).to_string());
                     b.len() - 1
                 };
-                let body = if seq == 0 { tool_call_sse() } else { FINAL_SSE.to_string() };
+                let body = if seq == 0 {
+                    tool_call_sse()
+                } else {
+                    FINAL_SSE.to_string()
+                };
                 let _ = std::io::Write::write_all(&mut sock, body.as_bytes());
                 let _ = std::io::Write::flush(&mut sock);
             });
@@ -109,11 +111,7 @@ fn setup(addr: std::net::SocketAddr) -> Arc<AppState> {
     // fixture-collision class the repo fixed in six other files).
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "ocserve-tes-{}-{}",
-        std::process::id(),
-        n
-    ));
+    let dir = std::env::temp_dir().join(format!("ocserve-tes-{}-{}", std::process::id(), n));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let db = ocserve_store::writer::db_path(&dir);
