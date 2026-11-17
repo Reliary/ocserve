@@ -22,18 +22,14 @@ use tower::ServiceExt;
 
 const MARKER: &str = "FAILED_XYZMARK";
 
-fn tool_call_sse() -> String {
-    format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+const TOOL_CALL_SSE: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
          cache-control: no-cache\r\nconnection: close\r\n\r\n\
-         data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\
-         \"id\":\"call_err_1\",\"type\":\"function\",\"function\":{{\
-         \"name\":\"bash\",\"arguments\":\"{{\\\"command\\\":\\\"printf 'FAILED_%s\\\\n' XYZMARK; printf 'FAILED_%s\\\\n' XYZMARK >&2; exit 3\\\"}}\"\
-         }}}}]}}}}]}}\n\n\
-         data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n\
-         data: [DONE]\n\n"
-    )
-}
+         data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\
+         \"id\":\"call_err_1\",\"type\":\"function\",\"function\":{\
+         \"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"printf 'FAILED_%s\\\\n' XYZMARK; printf 'FAILED_%s\\\\n' XYZMARK >&2; exit 3\\\"}\"\
+         }}]}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+         data: [DONE]\n\n";
 
 const FINAL_SSE: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
      cache-control: no-cache\r\nconnection: close\r\n\r\n\
@@ -92,11 +88,7 @@ fn spawn_provider() -> (std::net::SocketAddr, Arc<Mutex<Vec<String>>>) {
                     b.push(String::from_utf8_lossy(&got[head_end..head_end + clen]).to_string());
                     b.len() - 1
                 };
-                let body = if seq == 0 {
-                    tool_call_sse()
-                } else {
-                    FINAL_SSE.to_string()
-                };
+                let body = if seq == 0 { TOOL_CALL_SSE } else { FINAL_SSE };
                 let _ = std::io::Write::write_all(&mut sock, body.as_bytes());
                 let _ = std::io::Write::flush(&mut sock);
             });
