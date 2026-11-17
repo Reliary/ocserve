@@ -4052,6 +4052,9 @@ pub(crate) fn build_prompt_context(
         mcp: st.mcp.get().cloned(),
         plugins: st.plugins.get().cloned(),
         questions: st.question_gate.clone(),
+        // v2 clients (Paseo, the 2.x web pack) only consume the form surface.
+        // Under v1 the question tool keeps the v1 `question.asked` path.
+        forms: st.v2_enabled.then(|| st.form_gate.clone()),
         skills,
         model_limit,
         max_rounds: st.max_rounds,

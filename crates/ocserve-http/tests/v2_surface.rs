@@ -514,10 +514,11 @@ async fn permission_create_evaluates_ruleset() {
         &app,
         "POST",
         &format!("/api/session/{sid}/permission/{permission_id}/reply"),
-        Some(serde_json::json!({"reply":"always"})),
+        // v2 contract body is `decision` (v1 keeps `reply`).
+        Some(serde_json::json!({"decision":"always"})),
     )
     .await;
-    assert_eq!(reply.status(), StatusCode::OK);
+    assert_eq!(reply.status(), StatusCode::NO_CONTENT);
     assert!(
         st.gate
             .check_always(&sid, "webfetch", "https://example.test/page")
