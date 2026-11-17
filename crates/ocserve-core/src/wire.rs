@@ -642,6 +642,25 @@ impl V2PromptInput {
         };
         let mut path: Vec<Seg> = Vec::new();
         let mut req = V2PromptInput::default();
+
+        // Per-pin body split (D-V2-PROMPT-BODY): 1.19.5 declares
+        // `{prompt: PromptInput{text,files,agents}, delivery, resume}` and the
+        // 1.19.5 v2 SDK sends exactly that to this URL; 2.2.5 flattens the
+        // prompt fields to the top level. Accept the nested form by lifting it
+        // onto the flat shape the rest of this decoder expects; an explicit
+        // top-level key wins if both are present.
+        if let Some(Value::Object(prompt)) = map.get("prompt") {
+            let mut lifted = serde_json::Map::new();
+            for (k, v) in map {
+                if k != "prompt" {
+                    lifted.insert(k.clone(), v.clone());
+                }
+            }
+            for (k, v) in prompt {
+                lifted.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            return Self::decode(&Value::Object(lifted));
+        }
         if let Some(x) = map.get("id") {
             path.push(Seg::Key("id"));
             match x {
@@ -1280,5 +1299,54 @@ mod wire_tests {
                     .and_then(|p| p.get("/api/session/{sessionID}/prompt"))
                     .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod v2_prompt_pin_shapes {
+    use super::*;
+    use serde_json::json;
+
+    /// 2.2.5 flattened body.
+    #[test]
+    fn flat_v2_prompt_decodes() {
+        let d = V2PromptInput::decode(&json!({"text": "hi", "files": [], "agents": []})).unwrap();
+        assert_eq!(d.prompt_text, "hi");
+    }
+
+    /// 1.19.5 nested body, sent by `V2SessionPromptData` to the same URL.
+    /// Without the lift this is `Missing key at ["text"]` — a 400 to a client
+    /// whose own frozen contract declares the body valid (D-V2-PROMPT-BODY).
+    #[test]
+    fn nested_1_19_5_prompt_body_decodes() {
+        let d = V2PromptInput::decode(&json!({
+            "id": "msg_nested00000000000001",
+            "prompt": {"text": "hi", "files": [], "agents": []},
+            "delivery": "steer",
+            "resume": true
+        }))
+        .unwrap();
+        assert_eq!(d.prompt_text, "hi");
+        assert_eq!(d.id.as_deref(), Some("msg_nested00000000000001"));
+        assert_eq!(d.delivery.as_deref(), Some("steer"));
+        assert_eq!(d.resume, Some(true));
+    }
+
+    /// An explicit top-level field wins over the nested one.
+    #[test]
+    fn top_level_wins_over_nested() {
+        let d = V2PromptInput::decode(&json!({
+            "text": "flat",
+            "prompt": {"text": "nested"}
+        }))
+        .unwrap();
+        assert_eq!(d.prompt_text, "flat");
+    }
+
+    /// The nested form is still validated: a non-string text must fail.
+    #[test]
+    fn nested_prompt_still_validates() {
+        assert!(V2PromptInput::decode(&json!({"prompt": {"text": 5}})).is_err());
+        assert!(V2PromptInput::decode(&json!({"prompt": {}})).is_err());
     }
 }

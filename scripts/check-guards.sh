@@ -20,6 +20,9 @@
 #   71. a TRACEABILITY citation names a test/function/module that does not
 #      exist (PR #43 cited five invented test ids and one row contradicted its
 #      own PR body; the old check saw 22 of 76 citations) [suite: check-matrix]
+#   72. a shared operation's request body differs between the v1 and v2 pins
+#      and no declared handler covers both (v2 reply {reply}/{decision}, v2
+#      prompt nested/flat; both shipped as 400s in one review) [plant]
 #   69. a built-in command's dispatch predicate tests `template.is_none()`
 #      (the advertised goal entry carries `template: ""`, which is Some("") —
 #      true only in an empty-list fixture, so `/goal` fell through to an empty
@@ -1635,6 +1638,22 @@ else
   echo "FAIL: scripts/gen-v2-gate.py missing (rule 42)"; fail=1
 fi
 
+
+echo "== guard: shared operations with per-pin request bodies are handled (rule 72) =="
+# The v2 permission reply rejected the 1.19.5 `{reply}` body and the v2 prompt
+# rejected the 1.19.5 nested `{prompt}` body — the same class twice in one
+# review. The divergence set is generated from the two vendored contracts, so
+# a new shared body cannot ship without a declared row.
+if out=$(python3 bench/openapi/gen-shared-bodies.py 2>&1); then
+  echo "$(printf '%s\n' "$out" | head -1)"
+else
+  echo "$out"; echo "FAIL: shared operation body divergence not declared (rule 72)"; fail=1
+fi
+if python3 bench/openapi/gen-shared-bodies.py --selftest >/dev/null 2>&1; then
+  echo "ok (planted undeclared divergence detected)"
+else
+  echo "FAIL: rule 72 planted control not detected (vacuous)"; fail=1
+fi
 
 echo "== guard: platform-specific API must sit behind a platform guard (rule 44) =="
 # The Windows build failed on two ungated `std::os::unix` imports, and the blob
