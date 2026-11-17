@@ -4351,9 +4351,13 @@ async fn question_via_form(
     seq: &mut i64,
 ) -> Result<(String, Value)> {
     let fid = crate::form::frm_id();
+    let qid = crate::ids::que_id();
     let title = question_form_title(&questions);
     let fields = question_form_fields(&questions);
-    let metadata = json!({"tool": {"messageID": assistant_id, "callID": call_id}});
+    let metadata = json!({
+        "tool": {"messageID": assistant_id, "callID": call_id},
+        "questionID": qid,
+    });
     let info = json!({
         "id": fid,
         "sessionID": session_id,
@@ -4361,8 +4365,23 @@ async fn question_via_form(
         "metadata": metadata,
         "fields": fields,
     });
-    let Some(rx) = forms.register(&fid, info.clone()) else {
-        // Over the pending cap (512): fail closed, like an unanswered ask.
+    let question_request = json!({
+        "id": qid,
+        "sessionID": session_id,
+        "questions": questions,
+        "tool": {"messageID": assistant_id, "callID": call_id},
+    });
+
+    // DUAL SURFACE (2026-11-16 review of #48): the two client generations read
+    // DIFFERENT ask surfaces — 1.19.5 (our freeze) and oc-remote render
+    // `question.asked`; Paseo/2.2.5 render `form.*`. Priming only one leaves
+    // the other with no card while the turn parks. Register the SAME ask in
+    // both gates and settle whichever did not answer first; each initiating
+    // path keeps ownership of its own settlement event, and the DB transition
+    // (`settle` returning true) is the dedup for the partner side.
+    let (qrx, _qguard) = ctx.questions.register(&qid, question_request.clone());
+    let Some(frx) = forms.register(&fid, info.clone()) else {
+        ctx.questions.remove(&qid);
         let msg = "Error: too many pending questions".to_string();
         return Ok((
             msg.clone(),
@@ -4376,8 +4395,9 @@ async fn question_via_form(
             }),
         ));
     };
-    // Durable row first so `form.list` (reconnect/poll) sees it even before
-    // the live frame is consumed.
+
+    // Durable row first so `form.list` (reconnect/poll) sees it even before the
+    // live frame is consumed; then both event families.
     ocserve_store::form::create(
         writer,
         session_id,
@@ -4394,22 +4414,39 @@ async fn question_via_form(
         json!({"form": info}),
         seq,
     )?;
-    let (status, out_title, output, out_metadata) = match forms.wait(&fid, rx).await {
-        crate::form::FormOutcome::Answered(answer) => {
-            // A route reply settles the row AND publishes `form.replied`
-            // before waking us; only the runner-side path (no route) may
-            // publish here. `settle` returns true exactly when this call won
-            // the pending→answered transition, so the event is never doubled.
-            let transitioned =
-                ocserve_store::form::settle(writer, &fid, "answered", Some(&answer.to_string()))?;
+    emit_durable(
+        ctx,
+        writer,
+        session_id,
+        "question.asked",
+        question_request,
+        seq,
+    )?;
+
+    enum Settled {
+        Form(crate::form::FormOutcome),
+        Question(crate::question::Outcome),
+    }
+    let settled = tokio::select! {
+        biased;
+        out = forms.wait(&fid, frx) => Settled::Form(out),
+        out = ctx.questions.wait(&qid, qrx) => Settled::Question(out),
+    };
+
+    let (status, out_title, output, out_metadata) = match settled {
+        // The form route (or a cancel/timeout) already settled its own gate and
+        // owns `form.*`. Settle the v1 partner here.
+        Settled::Form(crate::form::FormOutcome::Answered(answer)) => {
             let answers = question_form_answers(&questions, &answer);
-            if transitioned {
+            // The select dropped the v1 receiver when the form branch won, so
+            // settle the entry directly (same exactly-once rule).
+            if ctx.questions.settle_without_waiter(&qid) {
                 emit_durable(
                     ctx,
                     writer,
                     session_id,
-                    "form.replied",
-                    json!({"id": fid, "sessionID": session_id, "answer": answer}),
+                    "question.replied",
+                    json!({"sessionID": session_id, "requestID": qid, "answers": answers}),
                     seq,
                 )?;
             }
@@ -4420,11 +4457,57 @@ async fn question_via_form(
                 json!({"answers": answers}),
             )
         }
-        crate::form::FormOutcome::Cancelled => {
-            // Same dedup rule as the answered arm: a DELETE route settles and
-            // publishes first; only a runner-side timeout owns the event.
-            let transitioned = ocserve_store::form::settle(writer, &fid, "cancelled", None)?;
-            if transitioned {
+        Settled::Form(crate::form::FormOutcome::Cancelled) => {
+            if ctx.questions.settle_without_waiter(&qid) {
+                emit_durable(
+                    ctx,
+                    writer,
+                    session_id,
+                    "question.rejected",
+                    json!({"sessionID": session_id, "requestID": qid}),
+                    seq,
+                )?;
+            }
+            (
+                "error".to_string(),
+                "question".to_string(),
+                crate::question::REJECTED_MESSAGE.to_string(),
+                json!({}),
+            )
+        }
+        // The v1 route answered; it emits nothing itself, so this waiter owns
+        // the v1 event and must also settle the form partner.
+        Settled::Question(crate::question::Outcome::Answers(answers)) => {
+            let answer = question_answers_to_form(&questions, &answers);
+            let _ = forms.reply(&fid, answer.clone());
+            if ocserve_store::form::settle(writer, &fid, "answered", Some(&answer.to_string()))? {
+                emit_durable(
+                    ctx,
+                    writer,
+                    session_id,
+                    "form.replied",
+                    json!({"id": fid, "sessionID": session_id, "answer": answer}),
+                    seq,
+                )?;
+            }
+            emit_durable(
+                ctx,
+                writer,
+                session_id,
+                "question.replied",
+                json!({"sessionID": session_id, "requestID": qid, "answers": answers}),
+                seq,
+            )?;
+            (
+                "completed".to_string(),
+                crate::question::format_title(&questions),
+                crate::question::format_output(&questions, &answers),
+                json!({"answers": answers}),
+            )
+        }
+        Settled::Question(crate::question::Outcome::Rejected) => {
+            let _ = forms.cancel(&fid);
+            if ocserve_store::form::settle(writer, &fid, "cancelled", None)? {
                 emit_durable(
                     ctx,
                     writer,
@@ -4434,6 +4517,14 @@ async fn question_via_form(
                     seq,
                 )?;
             }
+            emit_durable(
+                ctx,
+                writer,
+                session_id,
+                "question.rejected",
+                json!({"sessionID": session_id, "requestID": qid}),
+                seq,
+            )?;
             (
                 "error".to_string(),
                 "question".to_string(),
@@ -4453,6 +4544,29 @@ async fn question_via_form(
             "time": {"start": ask_start, "end": now_ms()},
         }),
     ))
+}
+
+/// Inverse of `question_form_answers`: v1 answer rows → the form answer object.
+/// A single selected label becomes a string, several become an array (the
+/// frozen `Form.Value` union).
+fn question_answers_to_form(questions: &Value, answers: &[Vec<String>]) -> Value {
+    let mut out = serde_json::Map::new();
+    for (i, row) in answers.iter().enumerate() {
+        let multiple = questions
+            .as_array()
+            .and_then(|qs| qs.get(i))
+            .and_then(|q| q.get("multiple"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let key = format!("q{i}");
+        let value = match (multiple, row.len()) {
+            (_, 0) => continue,
+            (false, _) => json!(row[0]),
+            (true, _) => json!(row),
+        };
+        out.insert(key, value);
+    }
+    Value::Object(out)
 }
 
 /// Map the v1 `question` tool input onto frozen `Form.Field` objects. The

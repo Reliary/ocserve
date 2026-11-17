@@ -648,9 +648,11 @@ async fn v2_permission_reply_decodes_decision_and_answers_204() {
     assert_eq!(rx.await.unwrap(), "always");
     drop(guard);
 
-    // The v1 key is not this contract's body: decode-first 400 in the v2
-    // envelope, and the real ask stays pending (never a silent settle).
-    let (_rx2, _guard2) = st.gate.clone().register(
+    // The SAME operation is `{reply}` in the 1.19.5 contract, and the 1.19.5
+    // v2 SDK sends exactly that to this URL (V2SessionPermissionReplyData).
+    // Accepting only `decision` would 400 a client whose own frozen contract
+    // says the body is valid, so both keys must decode. D-V2-PERM-REPLY-BODY.
+    let (rx2, guard2) = st.gate.clone().register(
         "per_v2replytest0000000002",
         json!({"id": "per_v2replytest0000000002", "sessionID": "ses_v2a",
                "permission": "bash", "patterns": ["echo *"]}),
@@ -661,13 +663,29 @@ async fn v2_permission_reply_decodes_decision_and_answers_204() {
         json!({"reply": "once"}),
     )
     .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "1.19.5 body must decode: {body}");
+    assert_eq!(rx2.await.unwrap(), "once");
+    drop(guard2);
+
+    // Neither key: decode-first 400 in the v2 envelope, ask stays pending.
+    let (_rx3, _guard3) = st.gate.clone().register(
+        "per_v2replytest0000000003",
+        json!({"id": "per_v2replytest0000000003", "sessionID": "ses_v2a",
+               "permission": "bash", "patterns": ["echo *"]}),
+    );
+    let (s, body) = post(
+        &app,
+        "/api/session/ses_v2a/permission/per_v2replytest0000000003/reply",
+        json!({}),
+    )
+    .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert_eq!(body["_tag"], "InvalidRequestError");
     assert!(
         body["message"].as_str().unwrap().contains("decision"),
         "got {body}"
     );
-    assert!(st.gate.reply("per_v2replytest0000000002", "reject"));
+    assert!(st.gate.reply("per_v2replytest0000000003", "reject"));
 }
 
 #[tokio::test]

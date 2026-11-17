@@ -86,6 +86,15 @@ impl QuestionGate {
         }
     }
 
+    /// Settle an ask whose waiter was dropped because a partner surface won
+    /// the race (v2 `form.*` answered first). Returns whether the entry
+    /// existed, so the caller emits the v1 settlement event exactly once.
+    /// No receiver is signalled: the select dropped it when it chose the
+    /// partner branch, so `reply` would always report false here.
+    pub fn settle_without_waiter(&self, id: &str) -> bool {
+        self.pending.lock().remove(id).is_some()
+    }
+
     /// Runner-side timeout cleanup (entry gone → list no longer shows it).
     pub fn remove(&self, id: &str) {
         self.pending.lock().remove(id);

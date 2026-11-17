@@ -90,8 +90,13 @@ fn spawn_provider(n: Arc<AtomicUsize>) -> std::net::SocketAddr {
 }
 
 fn setup(addr: std::net::SocketAddr, v2: bool) -> Arc<AppState> {
+    // Unique per CALL, not per flavour: two v2 tests run in parallel and a
+    // shared directory makes them see each other's form rows and events
+    // (measured: a form id from the sibling test appeared in the list).
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "ocserve-qf-{}-{}",
+        "ocserve-qf-{}-{}-{seq}",
         std::process::id(),
         if v2 { "v2" } else { "v1" }
     ));
@@ -238,8 +243,12 @@ fn tool_output(st: &AppState) -> String {
 
 fn pending_form_rows(st: &AppState) -> i64 {
     let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
-    conn.query_row("SELECT count(*) FROM form", [], |r| r.get(0))
-        .unwrap()
+    conn.query_row(
+        "SELECT count(*) FROM form WHERE state = 'pending'",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -288,15 +297,76 @@ async fn v2_question_tool_asks_through_the_form_surface() {
         1,
         "route + bridge must publish exactly one settlement"
     );
-    assert!(
-        events(&st, "question.asked").is_empty(),
-        "v2 must not emit the invisible v1 ask"
+    // DUAL SURFACE: the 1.19.5 TUI/oc-remote need the v1 ask even under v2.
+    assert_eq!(
+        events(&st, "question.asked").len(),
+        1,
+        "the v1 surface must see the same ask (freeze 1.19.5 renders it)"
     );
+    {
+        let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT type FROM event WHERE session_id='ses_qf' ORDER BY seq")
+            .unwrap();
+        let types: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(
+            events(&st, "question.replied").len(),
+            1,
+            "answering the form settles the v1 waiter exactly once; types={types:?}"
+        );
+    }
 
     let out = tool_output(&st);
     assert!(
         out.contains("Welche Farbe magst du am liebsten?") && out.contains("Blau"),
         "tool output must carry the answer: {out}"
+    );
+}
+
+/// Dual-surface reverse direction: with v2 enabled BOTH asks exist, and
+/// answering the v1 `question` surface must settle the form exactly once.
+/// This is the case the original bridge could not represent at all.
+#[tokio::test]
+async fn answering_the_v1_surface_settles_the_partner_form() {
+    let addr = spawn_provider(Arc::new(AtomicUsize::new(0)));
+    let st = setup(addr, true);
+    let app = ocserve_http::router(st.clone());
+    start_prompt(&app).await;
+
+    let asked = wait_for(&st, "question.asked").await;
+    let qid = asked["id"].as_str().expect("question id").to_string();
+    let created = wait_for(&st, "form.created").await;
+    let fid = created["form"]["id"].as_str().expect("form id").to_string();
+
+    // Both surfaces list the same ask.
+    let (status, list) = get(&app, "/api/session/ses_qf/form").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["data"][0]["id"], fid.as_str());
+
+    let status = post(
+        &app,
+        &format!("/question/{qid}/reply"),
+        json!({"answers": [["Blau"]]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    wait_done(&st).await;
+
+    assert_eq!(
+        events(&st, "form.replied").len(),
+        1,
+        "the v1 answer settles the form exactly once"
+    );
+    assert_eq!(events(&st, "question.replied").len(), 1);
+    assert_eq!(pending_form_rows(&st), 0, "no phantom pending form");
+    let out = tool_output(&st);
+    assert!(
+        out.contains("Blau"),
+        "tool output carries the answer: {out}"
     );
 }
 
