@@ -4,6 +4,21 @@ All notable changes to ocserve. The wire contract targets the frozen opencode
 1.19.5 release and the v2 surface the 2.2.5 client; anything that differs is a
 named `D-*` row in the ledger at `PLAN.md` section 18.
 
+## Unreleased
+
+### Fixed
+- A v2 turn now closes the way upstream does, so a loop-guard ask or a dead
+  process cannot leave a session looking busy. `session.execution.*` frames
+  carry `sessionID` inside `data` (v2 clients filter on it and dropped the
+  events, falling back to their 5 s poll); `execution.failed` uses the flat
+  `{type,message}` error shape; a declined permission or loop-guard ask
+  (including the post-exec spiral detector) stops the turn with the executed
+  results intact and `finish:"stop"` instead of failing the execution; the
+  300 s permission auto-reject is gone (upstream waits unbounded);
+  `/api/session/active` reports live drains only, and claims orphaned by a
+  dead process are closed at boot with a terminal event and released
+  (`D-V2-BOOT-CLOSE`).
+
 ## 0.7.5 - 2026-11-18
 
 ### Fixed
