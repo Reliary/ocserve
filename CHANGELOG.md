@@ -7,6 +7,19 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## 0.7.5 - 2026-11-18
 
 ### Fixed
+## Unreleased
+
+### Fixed
+- The served models catalog is scoped to usable providers by default. The
+  provider payload expanded every models.dev provider (324 on the stock
+  catalog) into `provider.all`/`/api/integration` and retained it in RAM,
+  although a provider without a key can never serve a model. Loading now keeps
+  full model bodies only for config, auth, credential-table and env-enabled
+  providers, the built-in `opencode` tier, and providers named by a model pin;
+  every other provider stays as a metadata stub with an empty model map, so the
+  connect/login UI still lists it. `OCSERVE_MODEL_CATALOG=all` restores the
+  full catalog (`D-CATALOG-SCOPE`).
+
 - Image attachments now reach the provider in the shape it accepts. The
   encoder emitted the AI SDK's UI file part (`{type:"file", url, mediaType}`)
   instead of the wire part the pinned openai-compatible SDK derives, so every

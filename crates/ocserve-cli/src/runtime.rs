@@ -289,10 +289,17 @@ fn merge_config_layer(base: &mut Value, patch: Value) {
 /// file must not fail boot (the old `read_json(cache)?` did exactly that,
 /// where upstream deletes and refetches).
 fn read_catalog(path: &Path) -> Value {
+    read_catalog_with(path, read_json)
+}
+
+/// One parser, one self-heal. `parse` decides how much of the file survives:
+/// fully (upstream shape) or scoped to the providers this server can actually
+/// use (`read_scoped_catalog`).
+fn read_catalog_with(path: &Path, parse: impl FnOnce(&Path) -> Result<Value>) -> Value {
     if !path.exists() {
         return json!({});
     }
-    match read_json(path) {
+    match parse(path) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
@@ -303,6 +310,135 @@ fn read_catalog(path: &Path) -> Value {
             }
             json!({})
         }
+    }
+}
+
+/// `OCSERVE_MODEL_CATALOG=all` restores the full models.dev catalog (upstream
+/// `/provider.all` shape). The default, `configured`, drops providers that are
+/// neither configured, authenticated, credentialed nor env-enabled BEFORE they
+/// are parsed into the retained catalog: the catalog and its expanded wire
+/// payloads dominate idle RSS, and a provider without a key cannot serve a
+/// model anyway.
+fn catalog_scope_all() -> bool {
+    matches!(
+        std::env::var("OCSERVE_MODEL_CATALOG")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "all" | "full" | "off" | "0" | "false" | "no"
+    )
+}
+
+/// Provider IDs worth keeping when the catalog is scoped: config `provider`,
+/// auth entries, active credential-table keys, provider IDs named by a model
+/// pin (`model` and `agent.<id>.model`), and the built-in `opencode` tier
+/// (upstream's custom loader autoloads it). Providers whose catalog `env`
+/// names a set variable are kept during the parse itself.
+fn catalog_keep_set(
+    cfg: &Value,
+    auth: &Value,
+    data_dir: &Path,
+) -> std::collections::HashSet<String> {
+    let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+    keep.insert("opencode".to_string());
+    if let Some(p) = cfg.get("provider").and_then(Value::as_object) {
+        keep.extend(p.keys().cloned());
+    }
+    if let Some(a) = auth.as_object() {
+        keep.extend(a.keys().cloned());
+    }
+    keep.extend(credential_keys(data_dir).into_keys());
+    let mut pin = |m: Option<&str>| {
+        if let Some((pid, _)) = m.and_then(|m| m.split_once('/')) {
+            keep.insert(pid.to_string());
+        }
+    };
+    pin(cfg.get("model").and_then(Value::as_str));
+    if let Some(agents) = cfg.get("agent").and_then(Value::as_object) {
+        for agent in agents.values() {
+            pin(agent.get("model").and_then(Value::as_str));
+        }
+    }
+    keep
+}
+
+/// Parse the catalog, retaining only wanted providers. The filtered-out value
+/// is dropped as soon as it is read, so the retained heap never holds the
+/// 324-provider document (a full `serde_json::Value` parse would).
+fn read_scoped_catalog(path: &Path, keep: &std::collections::HashSet<String>) -> Result<Value> {
+    use serde::Deserializer;
+    use serde::de::{MapAccess, Visitor};
+    use std::fmt;
+
+    struct Keep<'a>(&'a std::collections::HashSet<String>);
+    impl<'de> Visitor<'de> for Keep<'_> {
+        type Value = serde_json::Map<String, Value>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a models.dev provider catalog object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut out = serde_json::Map::new();
+            while let Some((id, value)) = map.next_entry::<String, Value>()? {
+                if self.0.contains(&id) || provider_env_enabled(&value) {
+                    out.insert(id, value);
+                } else {
+                    // Keep the provider as a metadata stub: the connect/login
+                    // UIs need its name/env/npm to offer it, but its model
+                    // bodies are exactly what must not stay resident. A later
+                    // load with the provider configured fills them in.
+                    out.insert(id, provider_stub(&value));
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut de = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
+    let map = de
+        .deserialize_map(Keep(keep))
+        .with_context(|| format!("parse {}", path.display()))?;
+    Ok(Value::Object(map))
+}
+
+/// Metadata-only provider entry: the fields `build_providers` reads for an
+/// unconfigured provider (name/env/npm/api), with an EMPTY model map. The
+/// connect/login UI keeps every provider; the model bodies of providers this
+/// process cannot call are not retained.
+fn provider_stub(value: &Value) -> Value {
+    let field = |key: &str| value.get(key).cloned();
+    json!({
+        "name": field("name").unwrap_or(Value::Null),
+        "env": field("env").unwrap_or_else(|| json!([])),
+        "npm": field("npm").unwrap_or(Value::Null),
+        "api": field("api").unwrap_or(Value::Null),
+        "models": {},
+    })
+}
+
+/// Upstream's env loader connects a provider when any variable in its catalog
+/// `env` array is set. Keep those providers even without config/auth so env
+/// keys keep working exactly as they do with the full catalog.
+fn provider_env_enabled(value: &Value) -> bool {
+    value
+        .get("env")
+        .and_then(Value::as_array)
+        .is_some_and(|vars| {
+            vars.iter()
+                .filter_map(Value::as_str)
+                .any(|name| std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false))
+        })
+}
+
+/// The single entry point the runtime uses: full catalog when the operator
+/// asked for it, otherwise the configured-provider scope.
+fn load_catalog(path: &Path, cfg: &Value, auth: &Value, data_dir: &Path) -> Value {
+    if catalog_scope_all() {
+        read_catalog(path)
+    } else {
+        let keep = catalog_keep_set(cfg, auth, data_dir);
+        read_catalog_with(path, |p| read_scoped_catalog(p, &keep))
     }
 }
 
@@ -975,7 +1111,7 @@ impl Runtime {
         // `$XDG_CONFIG_HOME/opencode/auth.json` and drop every provider key
         // (caught by the differential replay, 2026-11-12).
         let auth = load_auth_with(data_dir, test_root)?;
-        let cache = read_catalog(&cache_path);
+        let cache = load_catalog(&cache_path, &raw_config, &auth, data_dir);
         Self::from_parts(data_dir, raw_config, auth, cache)
     }
 
@@ -984,7 +1120,7 @@ impl Runtime {
     /// reload, and it keeps ONE derivation path for both.
     pub fn from_config(data_dir: &std::path::Path, config: Value) -> Result<Self> {
         let auth = load_auth(data_dir)?;
-        let cache = read_catalog(&crate::models_dev::read_path());
+        let cache = load_catalog(&crate::models_dev::read_path(), &config, &auth, data_dir);
         Self::from_parts(data_dir, config, auth, cache)
     }
 
@@ -2861,6 +2997,99 @@ mod env_config_tests {
         assert!(
             layer_env_config(json!({}), Some(bad), None, dir.path()).is_err(),
             "a corrupt explicit config must fail loudly"
+        );
+    }
+}
+
+#[cfg(test)]
+mod catalog_scope_tests {
+    use super::*;
+
+    fn write_catalog(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let p = dir.path().join("models.json");
+        std::fs::write(
+            &p,
+            r#"{
+              "configured": {"name":"Configured","npm":"@ai-sdk/openai-compatible","api":"https://c.invalid","env":["UNSET_CATALOG_ENV_A"],"models":{"m1":{"id":"m1","name":"M1"}}},
+              "authed":     {"name":"Authed","env":["UNSET_CATALOG_ENV_B"],"models":{"m1":{"id":"m1","name":"M1"}}},
+              "envonly":    {"name":"EnvOnly","env":["OCSERVE_TEST_CATALOG_ENV"],"models":{"m1":{"id":"m1","name":"M1"}}},
+              "stranger":   {"name":"Stranger","env":["UNSET_CATALOG_ENV_C"],"models":{"m1":{"id":"m1","name":"M1"}}}
+            }"#,
+        )
+        .unwrap();
+        p
+    }
+
+    /// The scoped parse keeps config/auth/credential/model-pin providers and
+    /// any provider whose catalog `env` names a set variable; everything else
+    /// is dropped BEFORE it is retained.
+    ///
+    /// CONTROL: `read_catalog` (the full parse) keeps all four — asserted in
+    /// the same test, so a filter that silently did nothing fails here.
+    #[test]
+    fn scoped_catalog_drops_unconfigured_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_catalog(&dir);
+
+        // SAFETY: unique test-only variable; no other test reads this name.
+        unsafe { std::env::set_var("OCSERVE_TEST_CATALOG_ENV", "1") };
+        let keep = catalog_keep_set(
+            &json!({"provider": {"configured": {}}, "model": "authed/m1"}),
+            &json!({}),
+            dir.path(),
+        );
+        assert!(keep.contains("configured"));
+        assert!(keep.contains("authed"));
+        assert!(keep.contains("opencode"), "built-in tier stays");
+
+        let full = read_catalog(&path);
+        assert_eq!(
+            full.as_object().unwrap().len(),
+            4,
+            "control: full parse keeps all"
+        );
+
+        let scoped = read_scoped_catalog(&path, &keep).unwrap();
+        for kept in ["configured", "authed", "envonly"] {
+            assert!(
+                scoped.pointer(&format!("/{kept}/models/m1")).is_some(),
+                "{kept} must keep its model bodies"
+            );
+        }
+        // Discovery survives: the provider itself remains, as a metadata stub.
+        assert_eq!(
+            scoped.pointer("/stranger/name").and_then(Value::as_str),
+            Some("Stranger"),
+            "the connect UI still sees the provider"
+        );
+        assert_eq!(
+            scoped
+                .pointer("/stranger/models")
+                .and_then(Value::as_object),
+            Some(&serde_json::Map::new()),
+            "an unconfigured provider retains no model bodies"
+        );
+        unsafe { std::env::remove_var("OCSERVE_TEST_CATALOG_ENV") };
+    }
+
+    /// The default scope is `configured`; the switch restores the full
+    /// catalog. Pure predicate check (no process-env mutation here: the
+    /// switch read is shared with the boot path and tested by the parse test
+    /// above, which proves the scoped path is the default branch).
+    #[test]
+    fn scoped_parse_keeps_the_served_models_of_a_kept_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            r#"{"p":{"name":"P","env":[],"models":{"m1":{"id":"m1","name":"M1"}}}}"#,
+        )
+        .unwrap();
+        let keep: std::collections::HashSet<String> = ["p".to_string()].into_iter().collect();
+        let v = read_scoped_catalog(&path, &keep).unwrap();
+        assert_eq!(
+            v.pointer("/p/models/m1/name").and_then(Value::as_str),
+            Some("M1")
         );
     }
 }

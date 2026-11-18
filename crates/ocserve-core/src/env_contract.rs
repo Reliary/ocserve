@@ -235,6 +235,13 @@ pub const CONTRACT: &[Var] = &[
         "0 disables",
         "Repeated/oscillating tool-call detection and its permission ask.",
     ),
+    op(
+        "Prompts and providers",
+        "OCSERVE_MODEL_CATALOG",
+        "configured",
+        "configured | all",
+        "`configured` keeps the full model list only for providers that are usable here (config, auth, credential-table keys, env keys named by the catalog, and the built-in `opencode` tier); every other provider stays as a metadata stub with an empty model map, so the connect/login UI still lists it. `all` restores the full upstream catalog.",
+    ),
     // ---- plugins and MCP ----
     op(
         "Plugins and MCP",

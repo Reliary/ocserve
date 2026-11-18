@@ -522,6 +522,7 @@ current anywhere.
 
 | ID | Divergence | Status |
 |---|---|---|
+| `D-CATALOG-SCOPE` | A models.dev provider that is neither in config, auth, the credential table, nor enabled by one of its catalog `env` variables, and not named by a model pin or the built-in `opencode` tier, keeps its model bodies resident only when it is usable; every other provider stays as a metadata stub with an empty model map, so `/provider.all` and `/api/integration` still list it for the connect UI (upstream keeps the full catalog including every model body). `OCSERVE_MODEL_CATALOG=all` restores the full catalog. Kept providers keep their complete model map. | open |
 | `D-AGENT-MODEL` | Compaction runs on the request's model; upstream honors a per-agent model pin (`agent.model`). | open |
 | `D-BACKGROUND-NOOP` | `POST /api/session/{id}/background` records the request and returns 204; turns run tools inline, so there is nothing to background. | accepted |
 | `D-BASH-SPLIT` | `bash_patterns::split_commands` approximates the shell (quote-aware only). Heredocs, `$( )`, backticks, `&>` and `2>&1` can split a sub-command, which can produce a slightly-off external-directory or arity ask. The tool still runs the whole command. | accepted |
