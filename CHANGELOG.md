@@ -18,7 +18,11 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   providers, the built-in `opencode` tier, and providers named by a model pin;
   every other provider stays as a metadata stub with an empty model map, so the
   connect/login UI still lists it. `OCSERVE_MODEL_CATALOG=all` restores the
-  full catalog (`D-CATALOG-SCOPE`).
+  full catalog (`D-CATALOG-SCOPE`). The boot/hourly models.dev refresh no
+  longer parses the download into a full `Value` just to validate it (syntax
+  check only) and writes the fetched bytes without a second copy; the
+  mtime-churn content check hashes in 64 KiB chunks instead of reading the
+  whole file.
 
 - Image attachments now reach the provider in the shape it accepts. The
   encoder emitted the AI SDK's UI file part (`{type:"file", url, mediaType}`)
