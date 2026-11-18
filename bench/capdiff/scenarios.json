@@ -98,6 +98,22 @@
           ]
         }
       ]
+    },
+    {
+      "name": "attachments-pdf",
+      "steps": [
+        {
+          "type": "prompt",
+          "text": "read this pdf",
+          "files": [
+            {
+              "mime": "application/pdf",
+              "filename": "one.pdf",
+              "url": "data:application/pdf;base64,JVBERi0xLjQKMSAwIG9iago8PC9UeXBlL0NhdGFsb2c+PgplbmRvYmoKdHJhaWxlcgo8PC9Sb290IDEgMCBSPj4KJSVFT0YK"
+            }
+          ]
+        }
+      ]
     }
   ]
 }

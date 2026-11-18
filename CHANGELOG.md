@@ -4,6 +4,20 @@ All notable changes to ocserve. The wire contract targets the frozen opencode
 1.19.5 release and the v2 surface the 2.2.5 client; anything that differs is a
 named `D-*` row in the ledger at `PLAN.md` section 18.
 
+## 0.7.5 - 2026-11-18
+
+### Fixed
+- Image attachments now reach the provider in the shape it accepts. The
+  encoder emitted the AI SDK's UI file part (`{type:"file", url, mediaType}`)
+  instead of the wire part the pinned openai-compatible SDK derives, so every
+  image turn failed with the gateway's "file content parts are not supported
+  here; send the image as an image_url part". Images now go out as
+  `image_url`, PDFs as `file.file_data`, audio as `input_audio`, and other
+  `text/*` files as decoded text; a type the provider cannot encode becomes
+  the same explanatory text upstream uses for a missing modality instead of
+  failing the turn. An image-only turn also stayed an empty string because the
+  array predicate looked for `type == "file"`.
+
 ## 0.7.4 - 2026-11-17
 
 ### Fixed
