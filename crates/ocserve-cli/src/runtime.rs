@@ -363,13 +363,76 @@ fn catalog_keep_set(
     keep
 }
 
-/// Parse the catalog, retaining only wanted providers. The filtered-out value
-/// is dropped as soon as it is read, so the retained heap never holds the
-/// 324-provider document (a full `serde_json::Value` parse would).
+/// One provider's metadata. Used for providers whose model bodies are NOT
+/// retained: serde skips the (large) `models` value with `IgnoredAny` instead
+/// of materializing it, so a dropped provider costs a few bytes, not its
+/// 382-model `Value`.
+#[derive(serde::Deserialize)]
+struct ProviderMeta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    env: Vec<String>,
+    #[serde(default)]
+    npm: Option<String>,
+    #[serde(default)]
+    api: Option<String>,
+}
+
+impl ProviderMeta {
+    fn into_stub(self) -> Value {
+        json!({
+            "name": self.name,
+            "env": self.env,
+            "npm": self.npm,
+            "api": self.api,
+            "models": {},
+        })
+    }
+}
+
+/// First pass: which providers would upstream connect from the environment?
+/// Unknown fields (the whole model map) are skipped, so this pass allocates
+/// only the provider's `env` array.
+fn read_env_enabled_providers(path: &Path) -> Result<std::collections::HashSet<String>> {
+    use serde::Deserializer;
+    use serde::de::{MapAccess, Visitor};
+    use std::fmt;
+
+    struct EnvVisitor;
+    impl<'de> Visitor<'de> for EnvVisitor {
+        type Value = std::collections::HashSet<String>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a models.dev provider catalog object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut out = std::collections::HashSet::new();
+            while let Some((id, probe)) = map.next_entry::<String, ProviderMeta>()? {
+                if probe.env.iter().any(|name| env_var_set(name)) {
+                    out.insert(id);
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut de = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
+    de.deserialize_map(EnvVisitor)
+        .with_context(|| format!("parse {}", path.display()))
+}
+
+/// Parse the catalog, retaining full model bodies only for wanted providers.
+/// Everything else becomes a metadata stub; its model value is skipped, never
+/// built, so the parse cannot leave a transient 382-model allocation behind
+/// (glibc keeps freed arenas, so "parse then drop" is not a memory saving).
 fn read_scoped_catalog(path: &Path, keep: &std::collections::HashSet<String>) -> Result<Value> {
     use serde::Deserializer;
     use serde::de::{MapAccess, Visitor};
     use std::fmt;
+
+    let mut keep = keep.clone();
+    keep.extend(read_env_enabled_providers(path)?);
 
     struct Keep<'a>(&'a std::collections::HashSet<String>);
     impl<'de> Visitor<'de> for Keep<'_> {
@@ -379,15 +442,11 @@ fn read_scoped_catalog(path: &Path, keep: &std::collections::HashSet<String>) ->
         }
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
             let mut out = serde_json::Map::new();
-            while let Some((id, value)) = map.next_entry::<String, Value>()? {
-                if self.0.contains(&id) || provider_env_enabled(&value) {
-                    out.insert(id, value);
+            while let Some(id) = map.next_key::<String>()? {
+                if self.0.contains(&id) {
+                    out.insert(id, map.next_value::<Value>()?);
                 } else {
-                    // Keep the provider as a metadata stub: the connect/login
-                    // UIs need its name/env/npm to offer it, but its model
-                    // bodies are exactly what must not stay resident. A later
-                    // load with the provider configured fills them in.
-                    out.insert(id, provider_stub(&value));
+                    out.insert(id, map.next_value::<ProviderMeta>()?.into_stub());
                 }
             }
             Ok(out)
@@ -397,38 +456,16 @@ fn read_scoped_catalog(path: &Path, keep: &std::collections::HashSet<String>) ->
     let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut de = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
     let map = de
-        .deserialize_map(Keep(keep))
+        .deserialize_map(Keep(&keep))
         .with_context(|| format!("parse {}", path.display()))?;
     Ok(Value::Object(map))
-}
-
-/// Metadata-only provider entry: the fields `build_providers` reads for an
-/// unconfigured provider (name/env/npm/api), with an EMPTY model map. The
-/// connect/login UI keeps every provider; the model bodies of providers this
-/// process cannot call are not retained.
-fn provider_stub(value: &Value) -> Value {
-    let field = |key: &str| value.get(key).cloned();
-    json!({
-        "name": field("name").unwrap_or(Value::Null),
-        "env": field("env").unwrap_or_else(|| json!([])),
-        "npm": field("npm").unwrap_or(Value::Null),
-        "api": field("api").unwrap_or(Value::Null),
-        "models": {},
-    })
 }
 
 /// Upstream's env loader connects a provider when any variable in its catalog
 /// `env` array is set. Keep those providers even without config/auth so env
 /// keys keep working exactly as they do with the full catalog.
-fn provider_env_enabled(value: &Value) -> bool {
-    value
-        .get("env")
-        .and_then(Value::as_array)
-        .is_some_and(|vars| {
-            vars.iter()
-                .filter_map(Value::as_str)
-                .any(|name| std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false))
-        })
+fn env_var_set(name: &str) -> bool {
+    std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false)
 }
 
 /// The single entry point the runtime uses: full catalog when the operator
