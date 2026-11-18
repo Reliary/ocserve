@@ -157,6 +157,103 @@ fn mime_to_modality(mime: &str) -> Option<&'static str> {
     }
 }
 
+/// Split a stored `data:` URL into `(media type, base64 payload)`.
+///
+/// Mirrors the AI SDK's `splitDataUrl` (`ai@6`: header before the first `,`,
+/// mime before the first `;`), which is what upstream's conversion uses. The
+/// URL's own header wins over the file part's `mime` field upstream; callers
+/// fall back to `mime` only when the header is absent.
+fn split_data_url(url: &str) -> Option<(String, &str)> {
+    let rest = url.strip_prefix("data:")?;
+    let (header, payload) = rest.split_once(',')?;
+    let mime = header.split(';').next().unwrap_or("").trim();
+    if mime.is_empty() {
+        return None;
+    }
+    Some((mime.to_string(), payload))
+}
+
+/// Encode one stored file part as the content part the openai-compatible
+/// provider actually expects.
+///
+/// The AI SDK has TWO shapes: the UI/`ModelMessage` file part
+/// (`{type:"file", url, mediaType, filename}`) that upstream builds in
+/// `message-v2.ts`, and the wire part that
+/// `@ai-sdk/openai-compatible@2.0.41` derives from it (`dist/index.js:152`):
+///
+///   image/*        -> {type:"image_url", image_url:{url:"data:<mime>;base64,<payload>"}}
+///   application/pdf -> {type:"file", file:{filename, file_data:"data:application/pdf;base64,<payload>"}}
+///   audio/wav|mp3|mpeg -> {type:"input_audio", input_audio:{data, format}}
+///   text/*         -> {type:"text", text:<decoded payload>}
+///   anything else  -> throws (the whole turn fails)
+///
+/// 0.7.4 sent the UI shape straight to the provider, so every image turn was
+/// rejected by the gateway ("file content parts are not supported here; send
+/// the image as an image_url part") — found on a live session 2026-11-18.
+fn provider_media_part(part: &Value) -> Result<Value, String> {
+    let fallback_mime = part["mime"].as_str().unwrap_or("");
+    let url = part["url"].as_str().unwrap_or("");
+    let Some((header_mime, payload)) = split_data_url(url) else {
+        return Err(if fallback_mime.is_empty() {
+            "unknown".to_string()
+        } else {
+            fallback_mime.to_string()
+        });
+    };
+    let mime = if header_mime.is_empty() {
+        fallback_mime.to_string()
+    } else {
+        header_mime
+    };
+    if mime.starts_with("image/") {
+        // SDK: a wildcard image type is sent as jpeg.
+        let mime = if mime == "image/*" {
+            "image/jpeg"
+        } else {
+            &mime
+        };
+        return Ok(json!({
+            "type": "image_url",
+            "image_url": {"url": format!("data:{mime};base64,{payload}")},
+        }));
+    }
+    if mime == "application/pdf" {
+        let filename = part["filename"]
+            .as_str()
+            .filter(|f| !f.is_empty())
+            .unwrap_or("document.pdf");
+        return Ok(json!({
+            "type": "file",
+            "file": {
+                "filename": filename,
+                "file_data": format!("data:application/pdf;base64,{payload}"),
+            },
+        }));
+    }
+    if mime.starts_with("audio/") {
+        let format = match mime.as_str() {
+            "audio/wav" => "wav",
+            // SDK accepts both spellings for mp3.
+            "audio/mp3" | "audio/mpeg" => "mp3",
+            _ => return Err(mime),
+        };
+        return Ok(json!({
+            "type": "input_audio",
+            "input_audio": {"data": payload, "format": format},
+        }));
+    }
+    if mime.starts_with("text/") {
+        let Some(bytes) = base64_decode(payload) else {
+            return Err(mime);
+        };
+        return Ok(json!({
+            "type": "text",
+            "text": String::from_utf8_lossy(&bytes),
+        }));
+    }
+    Err(mime)
+}
+
 /// `track()` off the tokio workers (git shells out — the F1 convoy rule).
 /// Times the operation and records `ocserve_snapshot_ops_seconds{op=track}` +
 /// `ocserve_snapshot_capture_total{result}` (SNAPSHOT.md §4; A1 evidence).
@@ -1041,6 +1138,10 @@ pub(crate) fn to_provider_messages_budget(
             // ingest, prompt.ts:795). A message with NO file/compaction part
             // becomes a plain string, exactly as before.
             let mut entries: Vec<Value> = Vec::new();
+            // Upstream's provider SDK collapses a single TEXT part to a string
+            // only when the V3 part IS text. A text/* FILE is still a file at
+            // that point, so it must remain an array with one text entry.
+            let mut encoded_from_file = false;
             for p in parts {
                 match p["type"].as_str().unwrap_or("") {
                     "text" => {
@@ -1081,12 +1182,31 @@ pub(crate) fn to_provider_messages_budget(
                             }));
                             continue;
                         }
-                        entries.push(json!({
-                            "type": "file",
-                            "url": p["url"],
-                            "mediaType": p["mime"],
-                            "filename": p["filename"],
-                        }));
+                        match provider_media_part(p) {
+                            Ok(entry) => {
+                                encoded_from_file = true;
+                                entries.push(entry)
+                            }
+                            Err(mime) => {
+                                // Upstream THROWS here (`UnsupportedFunctionality
+                                // Error`), which bricks the session: history is
+                                // re-encoded every turn, so one .docx fails
+                                // every future prompt. Substitute the same
+                                // explanatory-text pattern `unsupportedParts`
+                                // uses for a missing modality and record
+                                // D-MEDIA-UNSUPPORTED-TEXT.
+                                let name = p["filename"]
+                                    .as_str()
+                                    .map(|f| format!("\"{f}\""))
+                                    .unwrap_or_else(|| mime.clone());
+                                entries.push(json!({
+                                    "type": "text",
+                                    "text": format!(
+                                        "ERROR: Cannot read {name} (the provider cannot encode {mime} input). Inform the user."
+                                    ),
+                                }));
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -1098,8 +1218,12 @@ pub(crate) fn to_provider_messages_budget(
             // merged string, which changed the prompt shape.
             // A media entry is ALWAYS an array (even alone); otherwise only two
             // or more parts are (a lone text part stays a string).
-            let has_media = entries.iter().any(|e| e["type"] == "file");
-            if has_media || entries.len() > 1 {
+            // ANY non-text entry forces the array form. Using `type == "file"`
+            // here dropped image-ONLY turns: after the wire fix an image part
+            // is `image_url`, the predicate was false, and the single part
+            // collapsed to `Text("")` — the attachment vanished again.
+            let has_media = entries.iter().any(|e| e["type"] != "text");
+            if has_media || encoded_from_file || entries.len() > 1 {
                 out.push(ChatMessage {
                     role: role.to_string(),
                     content: ocserve_llm::Content::Parts(entries),
@@ -5564,11 +5688,14 @@ mod media_encoding_tests {
         vec![(json!({"role": "user", "id": "msg_u"}), parts)]
     }
 
-    /// An image turn must reach the provider as a content-PART ARRAY with a
-    /// `file` part. The pre-fix behaviour was a plain string, which drops the
-    /// image with no error anywhere (upstream: message-v2.ts:222-239).
+    /// An image turn must reach the provider in the SDK's WIRE shape:
+    /// `{type:"image_url", image_url:{url}}`. 0.7.4 sent the UI shape
+    /// (`{type:"file", url, mediaType}`), which the gateway rejects with
+    /// "file content parts are not supported here; send the image as an
+    /// image_url part" (live session, 2026-11-18). Reference:
+    /// @ai-sdk/openai-compatible@2.0.41 dist/index.js:152-163.
     #[test]
-    fn image_attachment_becomes_a_file_content_part() {
+    fn image_attachment_becomes_an_image_url_part() {
         let msgs = to_provider_messages_with(
             &hist(vec![
                 json!({"type": "text", "text": "what is this?"}),
@@ -5585,10 +5712,120 @@ mod media_encoding_tests {
             other => panic!("image turn must be a part array, got {other:?}"),
         };
         assert_eq!(parts[0], json!({"type": "text", "text": "what is this?"}));
-        assert_eq!(parts[1]["type"], "file");
-        assert_eq!(parts[1]["mediaType"], "image/webp");
-        assert_eq!(parts[1]["url"], "data:image/webp;base64,AAAA");
-        assert_eq!(parts[1]["filename"], "shot.webp");
+        assert_eq!(
+            parts[1],
+            json!({"type": "image_url",
+                   "image_url": {"url": "data:image/webp;base64,AAAA"}})
+        );
+    }
+
+    /// IMAGE-ONLY turn. The array/string predicate used to look for
+    /// `type == "file"`; after the wire fix that is `image_url`, so the
+    /// single-part message collapsed to `Text("")` and the image vanished.
+    #[test]
+    fn image_only_turn_is_an_array_not_an_empty_string() {
+        let msgs = to_provider_messages_with(
+            &hist(vec![json!({
+                "type": "file", "mime": "image/png", "filename": "dot.png",
+                "url": "data:image/png;base64,AAAA"
+            })]),
+            &["text".to_string(), "image".to_string()],
+        );
+        match &msgs[0].content {
+            ocserve_llm::Content::Parts(p) => {
+                assert_eq!(p.len(), 1);
+                assert_eq!(p[0]["type"], "image_url");
+            }
+            other => panic!("image-only turn must stay media, got {other:?}"),
+        }
+    }
+
+    /// PDF/audio/text map to the SDK's other branches; `image/*` becomes jpeg.
+    #[test]
+    fn other_media_types_follow_the_sdk_wire_shapes() {
+        let pdf = to_provider_messages_with(
+            &hist(vec![json!({
+                "type": "file", "mime": "application/pdf", "filename": "a.pdf",
+                "url": "data:application/pdf;base64,JVBERi0="
+            })]),
+            &["text".to_string(), "pdf".to_string()],
+        );
+        let p = match &pdf[0].content {
+            ocserve_llm::Content::Parts(p) => p[0].clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            p,
+            json!({"type": "file",
+                   "file": {"filename": "a.pdf",
+                            "file_data": "data:application/pdf;base64,JVBERi0="}})
+        );
+
+        let audio = to_provider_messages_with(
+            &hist(vec![json!({
+                "type": "file", "mime": "audio/mpeg", "url": "data:audio/mpeg;base64,SUQz"
+            })]),
+            &["text".to_string(), "audio".to_string()],
+        );
+        let a = match &audio[0].content {
+            ocserve_llm::Content::Parts(p) => p[0].clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            a,
+            json!({"type": "input_audio",
+                   "input_audio": {"data": "SUQz", "format": "mp3"}})
+        );
+
+        // text/csv was never expanded at ingest (only text/plain is); the SDK
+        // decodes any text/* part to a text part.
+        let csv = to_provider_messages_with(
+            &hist(vec![json!({
+                "type": "file", "mime": "text/csv", "url": "data:text/csv;base64,YSxiCg=="
+            })]),
+            &["text".to_string()],
+        );
+        let t = match &csv[0].content {
+            ocserve_llm::Content::Parts(p) => p[0].clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(t, json!({"type": "text", "text": "a,b\n"}));
+
+        // Wildcard image mime is sent as jpeg (SDK rule).
+        let wild = to_provider_messages_with(
+            &hist(vec![json!({
+                "type": "file", "mime": "image/*", "url": "data:image/*;base64,AAAA"
+            })]),
+            &["text".to_string(), "image".to_string()],
+        );
+        let w = match &wild[0].content {
+            ocserve_llm::Content::Parts(p) => p[0].clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            w,
+            json!({"type": "image_url",
+                   "image_url": {"url": "data:image/jpeg;base64,AAAA"}})
+        );
+    }
+
+    /// A media type the provider cannot encode becomes the explanatory text
+    /// rather than throwing. Recorded as D-MEDIA-UNSUPPORTED-TEXT: upstream's
+    /// SDK throws, which would brick the session because history is re-encoded
+    /// on every later turn.
+    #[test]
+    fn unencodable_media_type_becomes_text_not_a_failed_turn() {
+        let msgs = to_provider_messages_with(
+            &hist(vec![json!({
+                "type": "file", "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "filename": "notes.docx", "url": "data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,AAAA"
+            })]),
+            &["text".to_string()],
+        );
+        // Replaced at the transform level (like upstream `unsupportedParts`),
+        // so a lone part is TEXT and the SDK collapses it to a string.
+        assert!(matches!(msgs[0].content, ocserve_llm::Content::Text(_)));
+        assert!(msgs[0].content.as_text().contains("notes.docx"));
     }
 
     /// Upstream replaces an unreadable media part with an explanatory TEXT
@@ -5618,7 +5855,7 @@ mod media_encoding_tests {
             ocserve_llm::Content::Parts(p) => p.clone(),
             other => panic!("{other:?}"),
         };
-        assert_eq!(parts[1]["type"], "file");
+        assert_eq!(parts[1]["type"], "image_url");
     }
 
     /// Two TEXT parts stay two content entries. The pre-fix code merged them
@@ -5701,7 +5938,14 @@ mod media_encoding_tests {
         match &msgs[0].content {
             ocserve_llm::Content::Parts(p) => {
                 assert_eq!(p.len(), 1);
-                assert_eq!(p[0]["mediaType"], "application/pdf");
+                assert_eq!(p[0]["type"], "file");
+                assert_eq!(p[0]["file"]["filename"], "document.pdf");
+                assert!(
+                    p[0]["file"]["file_data"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("data:application/pdf;base64,")
+                );
             }
             other => panic!("media-only turn must be a part array: {other:?}"),
         }

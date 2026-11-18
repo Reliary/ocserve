@@ -117,21 +117,60 @@ fn every_file_part_in_a_real_db_encodes_to_a_provider_part() {
         // modalities the corpus actually contains, so every part must come out
         // as media. (The capability gate is proven separately by
         // `unreadable_media_becomes_an_explanatory_text_part`.)
-        let msgs = to_provider_messages_with(&[(info, vec![part])], &allowed);
+        let msgs = to_provider_messages_with(&[(info, vec![part.clone()])], &allowed);
         assert_eq!(msgs.len(), 1, "file part {id} produced no message");
         match &msgs[0].content {
             ocserve_llm::Content::Parts(parts) => {
-                let f = parts
+                // Assert the PROVIDER WIRE shape, not the UI shape. The old
+                // assertion checked `mediaType`/`url`, i.e. it encoded the very
+                // bug it was supposed to catch (0.7.4 sent the UI shape and the
+                // gateway rejected every image turn).
+                let mime = part["mime"].as_str().unwrap_or("");
+                let wire = parts
                     .iter()
-                    .find(|p| p["type"] == "file")
+                    .find(|p| {
+                        matches!(
+                            p["type"].as_str(),
+                            Some("image_url") | Some("input_audio") | Some("file")
+                        )
+                    })
                     .unwrap_or_else(|| panic!("file part {id} lost its media: {parts:?}"));
+                match wire["type"].as_str().unwrap() {
+                    "image_url" => {
+                        assert!(mime.starts_with("image/"), "part {id}: {mime} -> image_url");
+                        assert!(
+                            wire["image_url"]["url"]
+                                .as_str()
+                                .is_some_and(|u| u.starts_with("data:image/")),
+                            "part {id}: image_url.url must be a data URL"
+                        );
+                    }
+                    "input_audio" => {
+                        assert!(
+                            mime.starts_with("audio/"),
+                            "part {id}: {mime} -> input_audio"
+                        );
+                        assert!(
+                            wire["input_audio"]["data"]
+                                .as_str()
+                                .is_some_and(|d| !d.is_empty())
+                        );
+                    }
+                    "file" => {
+                        assert_eq!(mime, "application/pdf", "part {id}: {mime} -> file");
+                        assert!(
+                            wire["file"]["file_data"]
+                                .as_str()
+                                .is_some_and(|u| u.starts_with("data:application/pdf;base64,")),
+                            "part {id}: PDF must use file_data, not url"
+                        );
+                    }
+                    other => panic!("part {id}: unexpected wire type {other}"),
+                }
+                // The UI keys must NOT reach the wire.
                 assert!(
-                    f["url"].as_str().is_some_and(|u| !u.is_empty()),
-                    "file part {id} has no url"
-                );
-                assert!(
-                    f["mediaType"].as_str().is_some_and(|m| !m.is_empty()),
-                    "file part {id} has no mime"
+                    wire.get("mediaType").is_none() && wire.get("url").is_none(),
+                    "part {id}: UI-shaped keys leaked to the provider: {wire}"
                 );
                 media += 1;
             }

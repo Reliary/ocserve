@@ -23,6 +23,10 @@
 #   72. a shared operation's request body differs between the v1 and v2 pins
 #      and no declared handler covers both (v2 reply {reply}/{decision}, v2
 #      prompt nested/flat; both shipped as 400s in one review) [plant]
+#   73. provider content construction uses the AI SDK's UI part shape
+#      ({type:"file", url, mediaType}) instead of the wire shape the pinned
+#      @ai-sdk/openai-compatible emits (image_url / input_audio / file.file_data).
+#      Every image turn was rejected by the gateway, 2026-11-18 [plant]
 #   69. a built-in command's dispatch predicate tests `template.is_none()`
 #      (the advertised goal entry carries `template: ""`, which is Some("") —
 #      true only in an empty-list fixture, so `/goal` fell through to an empty
@@ -2274,5 +2278,34 @@ else
   echo "ok (planted unread query parameter detected)"
 fi
 rm -f "$_qp_plant"
+
+echo "== guard: no UI-shaped media parts in provider code (rule 73) =="
+# 0.7.4 sent the AI SDK's UI shape ({type:"file", url, mediaType}) straight to
+# the provider, so every image turn was rejected by the gateway ("file content
+# parts are not supported here; send the image as an image_url part").
+# `mediaType` is the UI-shape discriminator: the pinned SDK's PROVIDER wire
+# parts never carry it (image_url / input_audio / file.file_data), and neither
+# frozen wire contract declares it, so its presence in Rust source means a UI
+# part is being built where a wire part belongs.
+media_ui_hits() {
+  grep -rn '"mediaType"' crates/ --include='*.rs' 2>/dev/null \
+    | grep -v '^ *//' | grep -v '/tests/' | grep -v '#\[cfg(test)\]' || true
+}
+if [ -n "$(media_ui_hits)" ]; then
+  echo "FAIL: UI-shaped media part (mediaType) in provider construction (rule 73)"
+  media_ui_hits
+  fail=1
+else
+  echo "ok (no UI-shaped media parts in crates/)"
+fi
+_p73=/var/tmp/ocserve-rule73-planted
+mkdir -p "$_p73/crates/x"
+printf 'entries.push(json!({"type": "file", "url": u, "mediaType": m}));\n' > "$_p73/crates/x/lib.rs"
+if [ -z "$(cd "$_p73" && grep -rn '"mediaType"' crates/ --include='*.rs' | grep -v '^ *//' || true)" ]; then
+  echo "FAIL: rule 73 planted UI media shape not detected (vacuous)"; fail=1
+else
+  echo "ok (planted UI media shape detected)"
+fi
+rm -rf "$_p73"
 
 exit $fail

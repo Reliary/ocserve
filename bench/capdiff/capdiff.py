@@ -463,7 +463,14 @@ def write_fixture(home, sink_port):
                         "apiKey": "capture-key"},
             "models": {
                 "stub-1": {"name": "Stub One",
-                           "limit": {"context": 200000, "output": 8192}},
+                           "limit": {"context": 200000, "output": 8192},
+                           # Input capabilities decide whether an attachment
+                           # is forwarded as media or replaced with upstream's
+                           # explanatory text. Without these the media axis is
+                           # VACUOUS: both arms substitute the same text and
+                           # agree (the 2026-11-18 image_url bug hid here).
+                           "modalities": {"input": ["text", "image", "pdf", "audio"],
+                                          "output": ["text"]}},
                 "stub-tiny": {"name": "Stub Tiny",
                               "limit": {"context": 1200, "output": 256}},
             },
@@ -640,6 +647,32 @@ def selftest(arm_results, allow):
     fe = set(first["events"])
     planted_missing = sorted(fe - (fe - {"session.idle"})) if fe else ["session.idle"]
     checks.append(("events", bool(planted_missing)))
+    # media wire shape: replace an image_url part with the OLD UI shape. This
+    # is the dimension that was compared but never exercised, because the
+    # fixture declared no modalities (both arms substituted the same text);
+    # 0.7.4's image_url bug shipped green through it.
+    if fm:
+        planted = json.loads(json.dumps(fm))
+        hit = False
+        # `fm` is a list of REQUEST views (each with "messages"), not a list of
+        # messages. Mutating the wrong level made this plant report MISSED.
+        for req in planted:
+            for m in req.get("messages") or []:
+                if isinstance(m.get("content"), list):
+                    for i, part in enumerate(m["content"]):
+                        if isinstance(part, dict) and part.get("type") == "image_url":
+                            m["content"][i] = {
+                                "type": "file",
+                                "url": part["image_url"]["url"],
+                                "mediaType": "image/png",
+                            }
+                            hit = True
+                            break
+                if hit:
+                    break
+            if hit:
+                break
+        checks.append(("media_shape", bool(diff(fm, planted)) if hit else False))
     # cost: inflate bytes
     fc = first["cost"][0]["bytes"] if first["cost"] else 1
     checks.append(("cost", fc + 1 > fc))
@@ -680,7 +713,11 @@ def main():
     if args.full:
         scenarios = load_scenarios()
     else:
-        scenarios = load_scenarios([args.scenario])
+        # The selftest needs a scenario that actually carries an image, or its
+        # media-shape plant has nothing to mutate and reports MISSED (a
+        # vacuous selftest is worse than none — proven 2026-11-18).
+        name = "attachments" if args.selftest and args.scenario == "fresh" else args.scenario
+        scenarios = load_scenarios([name])
     if not scenarios:
         print(f"capdiff: no scenario '{args.scenario}'", file=sys.stderr); return 2
     if args.reverse:
