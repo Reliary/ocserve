@@ -3449,12 +3449,17 @@ pub async fn list_sessions(
     Ok(Json(json!({"data": window, "cursor": cursor_out})))
 }
 
-/// GET /api/session/active — `{data:{}}` (no per-request foreground drains
-/// are tracked on the v2 wire; ocserve's own prompt locks are v1 status).
-pub async fn active_sessions(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    // Sessions with a live execution claim are `running` (the claim table
-    // is the source of truth — no parallel busy-map to skew against).
-    let running = ocserve_store::claim::list_suspended(&st.db).unwrap_or_default();
+/// GET /api/session/active — `{data:{}}`
+///
+/// Process-local, exactly like upstream `SessionExecution.active`
+/// (opencode v2.2.5 `core/src/session/execution.ts:19,149`): the sessions
+/// THIS process has a live drain for. The durable `execution_claim` row is a
+/// crash-recovery marker, never a liveness signal — reading it here made a
+/// killed process report every in-flight session as `running` forever, and a
+/// v2 client that trusts this endpoint (Paseo's reconcile loop) then refuses
+/// new turns with "session already has an active turn".
+pub async fn active_sessions(State(st): State<Arc<AppState>>) -> Json<Value> {
+    let running: Vec<String> = st.v2_drain_tasks.lock().keys().cloned().collect();
     let data: serde_json::Map<String, Value> = running
         .into_iter()
         .map(|sid| (sid, json!({"type": "running"})))
@@ -4573,9 +4578,12 @@ async fn drain_session_inner(
         if let Err(e) = turn {
             tracing::warn!("v2 drain turn failed for {sid}: {e:#}");
             let message: String = format!("{e:#}").chars().take(2000).collect();
+            // Upstream `SessionError.Error` is FLAT: `{type, message, status?}`
+            // (packages/schema/src/session-error.ts). The v1 `{name,data:{…}}`
+            // shape decodes to an error with no `message` in a v2 client.
             failure = Some(json!({
                 "sessionID": sid,
-                "error": {"name": "UnknownError", "data": {"message": message}},
+                "error": {"type": "UnknownError", "message": message},
             }));
             break;
         }

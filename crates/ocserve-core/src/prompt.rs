@@ -3159,6 +3159,12 @@ pub async fn run_prompt_with(
                 }
 
                 let mut provider_tool_results = Vec::new();
+                // Upstream `ctx.blocked` (processor.ts:200-202): a denied
+                // permission or a declined loop-guard ask stops the turn AFTER
+                // this step — it never fails the turn. The step is persisted,
+                // the assistant message gets `finish: "stop"`, and the drain
+                // reports `session.execution.succeeded`.
+                let mut guard_stopped = false;
                 for call in &tool_calls {
                     let part_id = prt_id();
                     let mut running = json!({
@@ -3392,23 +3398,29 @@ pub async fn run_prompt_with(
                     }
                     if denied {
                         // upstream: a hard deny throws → the turn is blocked
-                        // (processor.ts ctx.blocked = shouldBreak).
+                        // (processor.ts ctx.blocked = shouldBreak). Blocked is
+                        // a controlled stop, not a turn failure: the denied
+                        // call is persisted as a tool error and the turn ends
+                        // after this step.
                         if crate::loop_guard::deny_blocks_turn() {
+                            let now = now_ms();
+                            running["state"] = json!({
+                                "status": "error",
+                                "input": input_value,
+                                "error": "Permission denied",
+                                "time": {"start": now, "end": now},
+                            });
                             emit_durable(
                                 ctx,
                                 writer,
                                 session_id,
                                 "message.part.updated",
-                                json!({"sessionID": session_id, "part": {
-                                    "type": "tool", "id": prt_id(),
-                                    "sessionID": session_id, "messageID": assistant_id,
-                                    "callID": call.id, "tool": call.name,
-                                    "state": {"status": "error", "input": input_value,
-                                        "error": "Permission denied", "time": {"start": now_ms(), "end": now_ms()}},
-                                }}),
+                                json!({"sessionID": session_id, "part": running}),
                                 &mut seq,
                             )?;
-                            anyhow::bail!("tool {} denied by permission rules", call.name);
+                            parts.push(running);
+                            guard_stopped = true;
+                            break;
                         }
                     }
 
@@ -3452,6 +3464,7 @@ pub async fn run_prompt_with(
                             );
                             if !ok {
                                 allowed = false;
+                                guard_stopped = true;
                             }
                         }
                     }
@@ -3858,8 +3871,9 @@ pub async fn run_prompt_with(
                     // rebuild => deterministic identical send both times (P1c)
                     let bound = crate::sift_boundary::maybe_sift(&call.name, &output);
                     provider_tool_results.push((call.id.clone(), bound.to_string()));
-                    // loop guard, post-exec (D1/P1b): spiral asks (declined →
-                    // prompt aborts, session self-heals like the stall path);
+                    // loop guard, post-exec (D1/P1b): spiral asks. A declined
+                    // ask stops the turn after this step (upstream's
+                    // ctx.blocked shape) — it never aborts the execution.
                     // error-storm is metric-only — iterating on a failing test
                     // is legitimate work and asking would be fatigue.
                     if let Some(class) = crate::loop_guard::check_post(&loop_win) {
@@ -3894,16 +3908,24 @@ pub async fn run_prompt_with(
                                 1,
                             );
                             if !ok {
-                                anyhow::bail!(
-                                    "loop guard: {} detected and declined by user (set OCSERVE_LOOP_GUARD=0 to disable asks)",
-                                    class.as_str()
-                                );
+                                // Upstream has no spiral detector, but the
+                                // closest permission semantics are exact: a
+                                // declined ask is a controlled stop, not a
+                                // failed execution. The tool result stays, the
+                                // step is persisted, the client sees a normal
+                                // turn end (and can keep working in the
+                                // session) instead of an UnknownError.
+                                guard_stopped = true;
                             }
                         }
+                    }
+                    if guard_stopped {
+                        break;
                     }
                 }
 
                 // persist the tool-step assistant message (parent = user message)
+                let step_finish = if guard_stopped { "stop" } else { "tool-calls" };
                 let step_info = json!({
                     "parentID": user_msg_id,
                     "role": "assistant",
@@ -3915,12 +3937,12 @@ pub async fn run_prompt_with(
                     "modelID": model,
                     "providerID": ctx.provider_id,
                     "time": {"created": t_done - elapsed_ms, "completed": t_done},
-                    "finish": "tool-calls",
+                    "finish": step_finish,
                     "id": assistant_id,
                     "sessionID": session_id,
                 });
                 parts.push(json!({
-                    "reason": "tool-calls", "type": "step-finish",
+                    "reason": step_finish, "type": "step-finish",
                     "tokens": step_info["tokens"], "cost": step_cost,
                     "id": prt_id(), "sessionID": session_id, "messageID": assistant_id,
                 }));
@@ -3952,7 +3974,7 @@ pub async fn run_prompt_with(
                     writer,
                     session_id,
                     "message.updated",
-                    json!({"sessionID": session_id, "info": step_info}),
+                    json!({"sessionID": session_id, "info": step_info.clone()}),
                     &mut seq,
                 )?;
                 emit_session_updated(
@@ -3966,6 +3988,15 @@ pub async fn run_prompt_with(
                     }),
                     &mut seq,
                 )?;
+
+                // Upstream `blocked`: the turn ends here, cleanly. The final
+                // `session.status idle` trio and the executor's success return
+                // come from the shared finalize path below, so the client sees
+                // `session.execution.succeeded` — never an UnknownError.
+                if guard_stopped {
+                    final_out = Some((step_info, parts.clone()));
+                    break 'outer;
+                }
 
                 // extend provider conversation for the next turn.
                 // v1 parity (K-CAPDIFF tool-turn): canonicalize the argument

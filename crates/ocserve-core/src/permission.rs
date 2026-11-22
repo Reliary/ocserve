@@ -1,14 +1,12 @@
 //! Permission rendezvous: ask → permission.asked event → await reply via
 //! POST /permission/{id}/reply (oc-remote contract: reply = once|always|reject).
-//! Bounded wait (300s) → deny (fail-closed, never hang a session).
+//! The wait is UNBOUNDED, matching upstream: `Permission.ask` awaits a
+//! `Deferred` with no timer (opencode v1.19.5 permission/index.ts:81-104).
+//! A dropped sender (interrupt settlement, session teardown) is a denial.
 
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
-
-/// How long an unanswered ask blocks the tool (then deny).
-pub const ASK_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// An "always"-granted rule (upstream `Permission.Rule`): a wildcard pattern
 /// per permission family. A grant on `bash` with pattern `git status *` covers
@@ -242,12 +240,16 @@ impl PermissionGate {
         true
     }
 
-    /// Await the reply with timeout; timeout → "reject" (fail closed) AND
-    /// cleanup (a stale pending entry would 404 every later reply — M2b finding).
+    /// Await the reply. Unbounded by design: upstream waits on a deferred with
+    /// no timeout, and a timeout that synthesises a denial turns an unanswered
+    /// card into a dead turn (the 300s ASK_TIMEOUT did exactly that). The
+    /// interrupt path settles pending asks (permission.replied: reject), which
+    /// drops the sender — that and session teardown are the only denials this
+    /// method invents.
     pub async fn wait(&self, id: &str, rx: tokio::sync::oneshot::Receiver<String>) -> String {
-        match tokio::time::timeout(ASK_TIMEOUT, rx).await {
-            Ok(Ok(reply)) => reply,
-            _ => {
+        match rx.await {
+            Ok(reply) => reply,
+            Err(_) => {
                 self.requests.lock().remove(id);
                 self.pending.lock().remove(id);
                 "reject".to_string()
