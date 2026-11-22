@@ -2409,21 +2409,36 @@ pub async fn plugin_update_api(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /api/vcs/init — real `git init` in the session directory
-/// (spawn_blocking; non-git → initialized; already-git → 204 idempotent).
+/// POST /api/vcs/init — real `git init` (spawn_blocking; non-git → initialized;
+/// already-git → 204 idempotent) in the directory the request names.
+///
+/// Resolution order: a body `directory` (the original contract, kept for
+/// existing clients — a named divergence from the spec, which scopes this
+/// route by query only and has no request body), then `location[directory]`,
+/// `directory`, the `x-opencode-directory` header, then the server cwd. The
+/// body is optional: empty or whitespace-only is treated as absent whatever
+/// the content type; malformed JSON is still a 400.
 pub async fn vcs_init_api(
     State(st): State<Arc<AppState>>,
-    Json(body): Json<Value>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+    raw: axum::body::Bytes,
 ) -> Result<StatusCode, HttpError> {
     // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
-    let dir = body
-        .get("directory")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| st.paths["directory"].as_str().unwrap_or("/").to_string());
+    let body = if raw.iter().all(u8::is_ascii_whitespace) {
+        Value::Null
+    } else {
+        serde_json::from_slice::<Value>(&raw)
+            .map_err(|e| bad_request(&format!("invalid JSON body: {e}")))?
+    };
+    let dir = match body.get("directory").and_then(|v| v.as_str()) {
+        Some(d) if d.starts_with('/') && d != "/" => d.to_string(),
+        Some(_) => return Err(bad_request("directory must be an absolute path")),
+        None => scoped_directory(&st, &headers, &q, None),
+    };
     let out = run_blocking(&st.db, move |_db| {
         ocserve_store::cgroup::command("git", "tools")
-            .args(["init", &dir])
+            .args(["init", "--", &dir])
             .output()
             .map(|o| {
                 (

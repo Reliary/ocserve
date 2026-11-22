@@ -166,3 +166,114 @@ async fn unscoped_requests_keep_answering_for_the_server_directory() {
         canon(server)
     );
 }
+
+#[tokio::test]
+async fn init_honours_the_location_query_the_header_and_the_body() {
+    let by_query = tempfile::tempdir().unwrap();
+    let by_header = tempfile::tempdir().unwrap();
+    let by_body = tempfile::tempdir().unwrap();
+    let q = by_query.path().to_str().unwrap();
+    let h = by_header.path().to_str().unwrap();
+    let b = by_body.path().to_str().unwrap();
+
+    let (st, v) = call(
+        &app(),
+        "POST",
+        &format!("/api/vcs/init?location[directory]={q}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{v}");
+    let (st, v) = call(
+        &app(),
+        "POST",
+        "/api/vcs/init",
+        &[("x-opencode-directory", h)],
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{v}");
+    let (st, v) = call(
+        &app(),
+        "POST",
+        "/api/vcs/init",
+        &[],
+        Some(serde_json::json!({"directory": b})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{v}");
+
+    for d in [&by_query, &by_header, &by_body] {
+        assert!(
+            d.path().join(".git").exists(),
+            "{} must have been initialised",
+            d.path().display()
+        );
+    }
+}
+
+#[tokio::test]
+async fn init_accepts_an_empty_json_body_and_rejects_malformed_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().to_str().unwrap();
+    // Empty body with a JSON content type (what SDKs send): scoped by query.
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/vcs/init?location[directory]={d}"))
+        .header("content-type", "application/json")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(dir.path().join(".git").exists());
+
+    // Malformed JSON must stay a 400, never fall through to the server cwd.
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/vcs/init?location[directory]={d}"))
+        .header("content-type", "application/json")
+        .body(Body::from("{not json"))
+        .unwrap();
+    let resp = app().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn init_refuses_a_relative_or_dash_body_directory() {
+    // A relative path would resolve against the server cwd, and a leading dash
+    // must never reach git as an option. Both are refused; nothing is created.
+    let before = std::env::current_dir().unwrap();
+    for d in ["--bare", "relative/dir"] {
+        let (st, v) = call(
+            &app(),
+            "POST",
+            "/api/vcs/init",
+            &[],
+            Some(serde_json::json!({"directory": d})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{d}: {v}");
+        assert!(!before.join(d).exists(), "{d} must not have been created");
+    }
+}
+
+#[tokio::test]
+async fn init_body_directory_wins_over_the_query() {
+    let by_body = tempfile::tempdir().unwrap();
+    let by_query = tempfile::tempdir().unwrap();
+    let (st, v) = call(
+        &app(),
+        "POST",
+        &format!(
+            "/api/vcs/init?location[directory]={}",
+            by_query.path().display()
+        ),
+        &[],
+        Some(serde_json::json!({"directory": by_body.path().to_str().unwrap()})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "{v}");
+    assert!(by_body.path().join(".git").exists());
+    assert!(!by_query.path().join(".git").exists());
+}

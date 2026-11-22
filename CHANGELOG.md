@@ -7,6 +7,10 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## Unreleased
 
 ### Fixed
+- `POST /api/vcs/init` now initialises the directory named by the
+  `location[directory]` query or `x-opencode-directory` header (a body
+  `directory` still wins) and no longer requires a request body. Previously a
+  scoped call ran `git init` in the server's working directory.
 - `GET /api/vcs`, `/api/vcs/status`, `/api/vcs/diff`, `/api/vcs/base` and
   `/api/vcs/branch` now answer for the directory the request names
   (`location[directory]`, `directory`, or `x-opencode-directory`) and echo it
