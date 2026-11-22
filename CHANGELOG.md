@@ -7,6 +7,11 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## Unreleased
 
 ### Fixed
+- `GET /api/vcs`, `/api/vcs/status`, `/api/vcs/diff`, `/api/vcs/base` and
+  `/api/vcs/branch` now answer for the directory the request names
+  (`location[directory]`, `directory`, or `x-opencode-directory`) and echo it
+  as `location.directory`, instead of always reporting the server's working
+  directory.
 - `POST`, `DELETE` and `GET /api/worktree` now act on the project the request
   names instead of the server's working directory. Previously a server started
   outside a git repository answered `WorktreeNotGitError` for every project,

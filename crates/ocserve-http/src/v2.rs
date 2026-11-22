@@ -5065,31 +5065,42 @@ pub async fn mcp_resource(State(st): State<Arc<AppState>>) -> impl IntoResponse 
 /// v2: `{current, default}` object, additionalProperties:false on both, so
 /// no union is possible). Same git queries, per-contract projection (the
 /// version-split made concrete; both decoders read only their shape).
-pub async fn vcs_get(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+pub async fn vcs_get(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let dir = scoped_directory(&st, &headers, &q, None);
+    let location = json!({"directory": dir});
     let info = run_blocking(&st.db, move |_db| {
         Ok::<_, anyhow::Error>(crate::vcs::info_v2(&dir))
     })
     .await
     .unwrap_or_else(|_| json!({"branch": {"current": Value::Null, "default": Value::Null}}));
-    Json(json!({"location": api_location_ref(&st), "data": info}))
+    Json(json!({"location": location, "data": info}))
 }
 
 /// GET /api/vcs/status — `{location, data: FileStatus[]}`.
-pub async fn vcs_status(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+pub async fn vcs_status(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let dir = scoped_directory(&st, &headers, &q, None);
+    let location = json!({"directory": dir});
     let status = run_blocking(&st.db, move |_db| {
         Ok::<_, anyhow::Error>(crate::vcs::status(&dir))
     })
     .await
     .unwrap_or_else(|_| Value::Array(vec![]));
-    Json(json!({"location": api_location_ref(&st), "data": status}))
+    Json(json!({"location": location, "data": status}))
 }
 
 /// GET /api/vcs/diff — `{location, data: FileDiff[]}` (same mode/context
 /// query contract as v1; missing mode → 400 via the v1 path).
 pub async fn vcs_diff(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -5102,7 +5113,8 @@ pub async fn vcs_diff(
         }
         .into_response();
     }
-    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let dir = scoped_directory(&st, &headers, &q, None);
+    let location = json!({"directory": dir});
     let context: Option<u32> = q.get("context").and_then(|c| c.parse().ok());
     // `base`: diff against a named ref instead of HEAD. The v2 TUI's diff
     // viewer sends `base: <branch>` for every non-HEAD mode, so ignoring it
@@ -5122,19 +5134,24 @@ pub async fn vcs_diff(
     })
     .await
     .unwrap_or_else(|_| Value::Array(vec![]));
-    Json(json!({"location": api_location_ref(&st), "data": diff})).into_response()
+    Json(json!({"location": location, "data": diff})).into_response()
 }
 
 /// GET /api/vcs/base + /api/vcs/branch — thin git queries (branch name +
 /// base ref). Honestly empty when not a git repo (never fabricated).
-pub async fn vcs_base(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+pub async fn vcs_base(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let dir = scoped_directory(&st, &headers, &q, None);
+    let location = json!({"directory": dir});
     let base = run_blocking(&st.db, move |_db| {
         Ok::<_, anyhow::Error>(crate::vcs::base(&dir))
     })
     .await
     .unwrap_or_else(|_| Value::Null);
-    Json(json!({"location": api_location_ref(&st), "data": base}))
+    Json(json!({"location": location, "data": base}))
 }
 
 /// GET /api/vcs/branch — `{location, data: string[]}` local branches.
@@ -5145,9 +5162,11 @@ pub async fn vcs_base(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 /// narrow and an ignored `limit` sends the whole list each time.
 pub async fn vcs_branch(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let dir = scoped_directory(&st, &headers, &q, None);
+    let location = json!({"directory": dir});
     let mut branches = run_blocking(&st.db, move |_db| {
         Ok::<_, anyhow::Error>(crate::vcs::branches(&dir))
     })
@@ -5167,7 +5186,7 @@ pub async fn vcs_branch(
     {
         arr.truncate(limit);
     }
-    Json(json!({"location": api_location_ref(&st), "data": branches}))
+    Json(json!({"location": location, "data": branches}))
 }
 
 // ---------------------------------------------------------------------------
