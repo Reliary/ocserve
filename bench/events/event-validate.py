@@ -48,6 +48,22 @@ ALLOW_TYPES = {
     "form.created",
     "form.replied",
     "form.cancelled",
+    # The 2.2.5 v2 turn lifecycle (`packages/schema/src/session-event.ts`
+    # `namespace Execution`). Absent from the 1.19.5 v1 union because v2 added
+    # the execution/claim model; emitted under OCSERVE_V2 only. Payloads are
+    # validated structurally by the v2 replay/`pair-v2` oracles.
+    "session.execution.started",
+    "session.execution.succeeded",
+    "session.execution.failed",
+    "session.execution.interrupted",
+    # v2-only projections/durability markers also absent from the v1 union:
+    # `session.view` (POST /api/session/{id}/view, D-V2-UNION), `session.background`
+    # (D-BACKGROUND-NOOP), `integration.wellknown` and `location.reload`
+    # (global-aggregate control events, emitted with sid "global").
+    "session.view",
+    "session.background",
+    "integration.wellknown",
+    "location.reload",
 }
 
 SUFFIX = re.compile(r"\.\d+$")

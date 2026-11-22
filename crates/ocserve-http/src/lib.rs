@@ -5967,7 +5967,14 @@ pub(crate) fn emit_durable_http(
     // the event. `session.execution.started/succeeded` shipped as `data:{}`,
     // which is why a live turn could only be observed through the 5s
     // reconciliation poll. Inject the aggregate once, at the wire choke.
-    if let Value::Object(map) = &mut props
+    //
+    // Session-scoped only: this choke also serves global events
+    // (`integration.wellknown`, `location.reload`) whose aggregate is the
+    // literal `"global"`. Injecting that would put `sessionID:"global"` on a
+    // field branded `^ses` (upstream `SessionID`), which the frozen contract
+    // rejects. Session ids start with `ses`.
+    if sid.starts_with("ses")
+        && let Value::Object(map) = &mut props
         && !map.contains_key("sessionID")
     {
         map.insert("sessionID".into(), json!(sid));
@@ -7813,6 +7820,33 @@ mod execution_wire_unit {
         assert_eq!(
             v["payload"]["properties"]["sessionID"], "ses_exec_wire",
             "frame={frame}"
+        );
+    }
+
+    /// The same choke serves global-aggregate events (`integration.wellknown`,
+    /// `location.reload`) whose id is the literal `"global"`. Injecting
+    /// `sessionID` there would put `"global"` on a field branded `^ses`
+    /// (upstream `SessionID`), violating the frozen contract.
+    ///
+    /// CONTROL: drop the `sid.starts_with("ses")` guard and this fails with
+    /// `properties.sessionID == "global"`.
+    #[tokio::test]
+    async fn global_aggregate_events_do_not_gain_a_session_id() {
+        let st = AppState::new();
+        let mut rx = st.bus.subscribe();
+        if let Err(e) = emit_durable_http(
+            &st,
+            "global",
+            "integration.wellknown",
+            json!({"url": "https://example.test"}),
+        ) {
+            panic!("emit: {} {}", e.name, e.message);
+        }
+        let frame = rx.recv().await.expect("bus frame");
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert!(
+            v["payload"]["properties"].get("sessionID").is_none(),
+            "global aggregate must not carry a sessionID: {frame}"
         );
     }
 
