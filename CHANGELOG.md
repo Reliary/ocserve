@@ -19,6 +19,12 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   dead process are closed at boot with a terminal event and released
   (`D-V2-BOOT-CLOSE`).
 
+### Credits
+- The v2 turn-lifecycle fixes are [@glanzel](https://github.com/glanzel)'s
+  (issue #58, PR #60). Review added the global-aggregate guard on the
+  `sessionID` injection, the v2 lifecycle allowlist for the event validator,
+  and the corrected `K-PERM` row.
+
 ## 0.7.5 - 2026-11-18
 
 ### Fixed
