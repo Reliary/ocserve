@@ -281,10 +281,16 @@ pub fn worktree_add(dir: &str, path: &str, branch: Option<&str>) -> Result<Strin
     if !is_git(dir) {
         return Err("not a git repository".to_string());
     }
+    // A branch/ref or path beginning with `-` would be parsed by git as an
+    // option; refuse the ref and pass the path after `--`.
+    if branch.is_some_and(|b| b.starts_with('-')) {
+        return Err("invalid branch name".to_string());
+    }
     let mut args = vec!["worktree", "add"];
     if branch.is_some() {
         args.push("--detach");
     }
+    args.push("--");
     args.push(path);
     if let Some(b) = branch {
         args.push(b);
@@ -305,6 +311,7 @@ pub fn worktree_remove(dir: &str, path: &str, force: bool) -> Result<(), String>
     if force {
         args.push("--force");
     }
+    args.push("--");
     args.push(path);
     match run_git(dir, &args) {
         Some((_, 0)) => Ok(()),

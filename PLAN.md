@@ -541,7 +541,6 @@ current anywhere.
 | `D-PTY-TICKET-QUERY` | The PTY `?ticket=` connect token is honoured from the marker header only; the query form is accepted and ignored. | open |
 | `D-PERSISTENT-PTY-PARAMS` | `role`/`attachment_id`/`takeover`/`input_protocol`/`ticket` on the persistent-PTY connect route are accepted and ignored (single local client). | open |
 | `D-CLIENT-MCP-TICKET` | `GET /api/experimental/client-mcp?ticket=` is accepted and ignored; the route serves the local client inventory. | open |
-| `D-WORKTREE-PROJECT-SCOPE` | `GET /api/worktree?projectID=` is accepted and ignored; worktrees are listed for the server's own worktree. | open |
 | `D-EXPERIMENTAL-SESSION-DIRECTORY` | `GET /experimental/session?directory=` is accepted and ignored; the listing is already scoped to the server's location. | open |
 | `D-VCS-BRANCH-PAGING` | `GET /api/vcs/branch?search=&limit=` filters and truncates the branch list in memory rather than in git; fine for local branch counts. | accepted |
 | `D-CONFIG-VAR` | A `{env:…}`/`{file:…}` that cannot be resolved degrades the load to defaults with a named warning; upstream aborts the config load with `InvalidError`. `{env:}` is honoured, literal keys pass through, `{file:}` resolves relative to the config dir and is JSON-escaped (issue #28). | accepted |

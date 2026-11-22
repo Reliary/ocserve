@@ -94,8 +94,6 @@ ALLOW.update({
     "GET /api/session/{sessionID}/diff context": "D-SESSION-DIFF-WINDOW",
     # Branch search/limit and diff base/untracked: the TUI sends them; our git
     # helpers return the full branch list and the HEAD-based diff.
-    # Worktree listing is not project-scoped in our store.
-    "GET /api/worktree projectID": "D-WORKTREE-PROJECT-SCOPE",
 })
 
 

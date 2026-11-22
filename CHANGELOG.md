@@ -7,6 +7,15 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## Unreleased
 
 ### Fixed
+- `POST`, `DELETE` and `GET /api/worktree` now act on the project the request
+  names instead of the server's working directory. Previously a server started
+  outside a git repository answered `WorktreeNotGitError` for every project,
+  and one started inside a repository cut worktrees of that repository. The
+  directory comes from `location[directory]`, `directory`, an absolute-path
+  `projectID`, or the percent-decoded `x-opencode-directory` header, in that
+  order; relative values are ignored. Git is also invoked with `--` before
+  the worktree path, and a branch starting with `-` is refused, so request
+  values cannot be parsed as git options. Closes `D-WORKTREE-PROJECT-SCOPE`.
 - A v2 turn now closes the way upstream does, so a loop-guard ask or a dead
   process cannot leave a session looking busy. `session.execution.*` frames
   carry `sessionID` inside `data` (v2 clients filter on it and dropped the

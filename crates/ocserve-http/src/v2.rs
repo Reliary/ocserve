@@ -756,9 +756,13 @@ pub async fn fs_read(
 // ---------------------------------------------------------------------------
 
 /// GET /api/worktree — `Worktree.List` from `git worktree list`.
-pub async fn worktree_list_api(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn worktree_list_api(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
     // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
-    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let dir = scoped_directory(&st, &headers, &q, q.get("projectID").map(String::as_str));
     let list = run_blocking(&st.db, move |_db| {
         Ok::<_, anyhow::Error>(crate::vcs::worktrees(&dir))
     })
@@ -772,6 +776,8 @@ pub async fn worktree_list_api(State(st): State<Arc<AppState>>) -> impl IntoResp
 /// fake success); git failure → 400 with stderr.
 pub async fn worktree_create_api(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
     Json(body): Json<Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -783,14 +789,14 @@ pub async fn worktree_create_api(
     {
         return bad_request(&format!("unknown key {bad}")).into_response();
     }
-    let (Some(_pid), Some(directory)) = (
+    let (Some(pid), Some(directory)) = (
         obj.get("projectID").and_then(|v| v.as_str()),
         obj.get("directory").and_then(|v| v.as_str()),
     ) else {
         return bad_request("Missing key\n  at [\"projectID\"] / [\"directory\"]").into_response();
     };
     let branch = obj.get("branch").and_then(|v| v.as_str());
-    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let dir = scoped_directory(&st, &headers, &q, Some(pid));
     let directory = directory.to_string();
     let branch = branch.map(str::to_string);
     match run_blocking(&st.db, move |_db| {
@@ -817,19 +823,21 @@ pub async fn worktree_create_api(
 /// projectID + directory + force.
 pub async fn worktree_remove_api(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
     Json(body): Json<Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let obj = body.as_object().cloned().unwrap_or_default();
-    let (Some(_pid), Some(directory), force) = (
+    let (Some(pid), Some(directory), force) = (
         obj.get("projectID").and_then(|v| v.as_str()),
         obj.get("directory").and_then(|v| v.as_str()),
         obj.get("force").and_then(|v| v.as_bool()).unwrap_or(false),
     ) else {
         return bad_request("Missing key\n  at [\"projectID\"] / [\"directory\"]").into_response();
     };
-    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let dir = scoped_directory(&st, &headers, &q, Some(pid));
     let directory = directory.to_string();
     match run_blocking(&st.db, move |_db| {
         Ok::<_, anyhow::Error>(crate::vcs::worktree_remove(&dir, &directory, force))
@@ -854,6 +862,61 @@ pub async fn worktree_refresh_api(
         return bad_request("Missing key\n  at [\"projectID\"]").into_response();
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// The directory a request is scoped to, in precedence order: the spec's
+/// `location[directory]` query, the v1 `directory` query, a `projectID` that is
+/// an absolute path (ocserve mints every non-global project id from the
+/// session directory, see `project_list_body`, so the id IS the directory and
+/// an explicit project outranks the ambient session header), the
+/// `x-opencode-directory` header (percent-decoded), then the server cwd.
+/// Only absolute paths count: a relative or empty value falls through rather
+/// than silently resolving against the server cwd, the bug this replaces.
+/// Git-backed routes used to read the server cwd unconditionally, so a server
+/// started outside a repository answered `not a git repository` for every
+/// project.
+pub(crate) fn scoped_directory(
+    st: &AppState,
+    headers: &axum::http::HeaderMap,
+    query: &HashMap<String, String>,
+    project_id: Option<&str>,
+) -> String {
+    let absolute = |s: &str| (s.starts_with('/') && s != "/").then(|| s.to_string());
+    query
+        .get("location[directory]")
+        .and_then(|s| absolute(s))
+        .or_else(|| query.get("directory").and_then(|s| absolute(s)))
+        .or_else(|| project_id.and_then(absolute))
+        .or_else(|| {
+            headers
+                .get("x-opencode-directory")
+                .and_then(|v| absolute(&percent_decode(&String::from_utf8_lossy(v.as_bytes()))))
+        })
+        .unwrap_or_else(|| st.paths["directory"].as_str().unwrap_or("/").to_string())
+}
+
+/// Minimal `%XX` decoder (the client percent-encodes non-ASCII directories in
+/// the header); malformed escapes pass through unchanged.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (
+                (b[i + 1] as char).to_digit(16),
+                (b[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn bad_request(msg: &str) -> HttpError {
