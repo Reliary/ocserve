@@ -152,7 +152,7 @@ fn setup(addr: std::net::SocketAddr, tag: &str) -> Arc<AppState> {
     ocserve_store::insert_session(
         &st.writer,
         &json!({
-            "id": format!("ses_{tag}"), "projectID": "global", "directory": "/w",
+            "id": format!("ses_{tag}"), "projectID": "global", "directory": dir.display().to_string(),
             "path": format!("ses_{tag}"), "slug": format!("ses_{tag}"),
             "title": "hooks", "version": "1",
             "time": {"created": 1, "updated": 2},
@@ -496,6 +496,183 @@ async fn tool_execute_before_mutates_execution() {
         !b2.contains("\"output\":\"hi\""),
         "original command must not be what executed:\n{b2}"
     );
+}
+
+#[tokio::test]
+async fn v1_tool_execute_after_replacement_lands_in_error_on_a_failed_call() {
+    require_node();
+    let (addr, rx) = spawn_provider_scripted(vec![
+        SSE_TOOL.replace("echo hi", "false"),
+        SSE_OK.to_string(),
+    ]);
+    let st = setup(addr, "v1after");
+    st.payloads.write().agent = vec![json!({
+        "name": "build",
+        "permission": [{"permission": "bash", "pattern": "*", "action": "allow"}],
+    })];
+    load_plugin(
+        &st,
+        "v1after",
+        r#"
+export const PluginModule = {
+  id: "v1-after",
+  server: async () => ({
+    "tool.execute.after": async (_i, output) => {
+      output.output = "V1_AFTER:" + output.output;
+    },
+  }),
+};
+"#,
+    )
+    .await;
+    run_prompt(
+        ocserve_http::router(st.clone()),
+        &st,
+        "v1after",
+        "run a failing tool",
+    )
+    .await;
+    let _ = rx.try_iter().count();
+    let messages = ocserve_store::load_messages(&st.db, "ses_v1after", None).unwrap();
+    let failed = messages
+        .iter()
+        .flat_map(|(_, parts)| parts.iter())
+        .find(|part| part["type"] == "tool" && part["state"]["status"] == "error")
+        .expect("nonzero shell exit must be an error state");
+    assert!(
+        failed["state"]["error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("V1_AFTER:")),
+        "the v1 hook replacement must land in error: {failed}"
+    );
+    assert!(
+        failed["state"].get("output").is_none(),
+        "a failed tool part must not carry the completed-only output: {failed}"
+    );
+}
+
+#[tokio::test]
+async fn v2_tool_execute_after_preserves_error_union_and_completed_control() {
+    require_node();
+    let failing_tool_response = SSE_TOOL.replace("echo hi", "false");
+    let (addr, rx) = spawn_provider_scripted(vec![
+        failing_tool_response,
+        SSE_OK.to_string(),
+        SSE_TOOL.to_string(),
+        SSE_OK.to_string(),
+    ]);
+    let st = setup(addr, "v2after");
+    st.payloads.write().agent = vec![json!({
+        "name": "build",
+        "permission": [{"permission": "bash", "pattern": "*", "action": "allow"}],
+    })];
+    load_plugin(
+        &st,
+        "v2after",
+        r#"
+export default {
+  id: "v2-after",
+  setup: async (ctx) => {
+    await ctx.tool.hook("execute.after", (event) => {
+      if (event.status === "error") {
+        event.error.message = "V2_ERROR_HOOK:" + event.error.message;
+      } else {
+        event.result = "V2_RESULT_HOOK:" + event.result;
+      }
+    });
+  },
+};
+"#,
+    )
+    .await;
+    run_prompt(
+        ocserve_http::router(st.clone()),
+        &st,
+        "v2after",
+        "run a failing tool",
+    )
+    .await;
+    let failed_requests: Vec<_> = rx.try_iter().collect();
+    assert_eq!(
+        failed_requests.len(),
+        2,
+        "failed prompt provider request count; messages: {:#?}",
+        ocserve_store::load_messages(&st.db, "ses_v2after", None).unwrap()
+    );
+    ocserve_store::insert_session(
+        &st.writer,
+        &json!({
+            "id": "ses_v2afterok", "projectID": "global",
+            "directory": st.db.parent().unwrap().display().to_string(),
+            "path": "ses_v2afterok", "slug": "ses_v2afterok",
+            "title": "hooks", "version": "1",
+            "time": {"created": 1, "updated": 2},
+        }),
+    )
+    .unwrap();
+    run_prompt(
+        ocserve_http::router(st.clone()),
+        &st,
+        "v2afterok",
+        "run the successful tool",
+    )
+    .await;
+    for _ in 0..2 {
+        let _ = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("successful tool prompt provider request");
+    }
+
+    let failed_messages = ocserve_store::load_messages(&st.db, "ses_v2after", None).unwrap();
+    let failed_parts: Vec<&serde_json::Value> = failed_messages
+        .iter()
+        .flat_map(|(_, parts)| parts.iter())
+        .filter(|part| part["type"] == "tool")
+        .collect();
+    assert_eq!(
+        failed_parts.len(),
+        1,
+        "the provider requested one failed tool"
+    );
+
+    let failed = failed_parts
+        .iter()
+        .find(|part| part["state"]["status"] == "error")
+        .expect("nonzero shell exit must be an error state");
+    assert!(
+        failed["state"]["error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("V2_ERROR_HOOK:")),
+        "the v2 hook must receive and mutate Tool.Error.message: {failed}"
+    );
+    assert!(
+        failed["state"].get("output").is_none(),
+        "a failed tool part must not carry the completed-only output: {failed}"
+    );
+
+    let successful_messages = ocserve_store::load_messages(&st.db, "ses_v2afterok", None).unwrap();
+    let successful_parts: Vec<&serde_json::Value> = successful_messages
+        .iter()
+        .flat_map(|(_, parts)| parts.iter())
+        .filter(|part| part["type"] == "tool")
+        .collect();
+    assert_eq!(successful_parts.len(), 1, "the provider requested one tool");
+    let completed = successful_parts
+        .iter()
+        .find(|part| part["state"]["status"] == "completed")
+        .unwrap_or_else(|| {
+            panic!(
+                "successful shell must remain completed: {}",
+                successful_parts[0]
+            )
+        });
+    assert!(
+        completed["state"]["output"]
+            .as_str()
+            .is_some_and(|output| output.starts_with("V2_RESULT_HOOK:")),
+        "the success control must keep using Tool.Result: {completed}"
+    );
+    assert!(completed["state"].get("error").is_none());
 }
 
 #[tokio::test]

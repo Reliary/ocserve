@@ -7,6 +7,13 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## Unreleased
 
 ### Fixed
+- A failed tool call now keeps its error state through hooks and reads. A v1
+  or v2 `tool.execute.after` hook that replaced the result wrote it to the
+  completed-only `output` field of a failed part; it now updates `error`, and
+  the v2 hook receives and can mutate `Tool.Error.message` for failed calls.
+  Older failed-tool rows that stored the message in `output` are normalized to
+  `error` on v1 reads and v2 projections without rewriting storage, and v2
+  completed output projects as `content[]` blocks.
 - A v2 turn now closes the way upstream does, so a loop-guard ask or a dead
   process cannot leave a session looking busy. `session.execution.*` frames
   carry `sessionID` inside `data` (v2 clients filter on it and dropped the

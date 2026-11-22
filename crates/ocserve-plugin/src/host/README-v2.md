@@ -27,7 +27,7 @@ identity, so this is exact.
 | `session.hook("context")` | **bridged** | mutates the system prefix immediately before provider dispatch (same site as v1 `experimental.chat.system.transform`, runs first) |
 | `session.hook("compaction")` | **bridged** | `result.summary` overrides the built summary prompt (same channel as v1 `experimental.session.compacting` `prompt`); `context[]` appends |
 | `tool.hook("execute.before")` | **bridged** | mutates tool `input`; runs before the widened-args guard so v2 mutations get the same re-evaluation as v1 |
-| `tool.hook("execute.after")` | **bridged** | mutates the tool `result` string (status union mapped: `completed`→result) |
+| `tool.hook("execute.after")` | **bridged** | mutates `result` when completed or `Tool.Error.message` when failed; the status union maps back to the persisted v1 output/error string |
 | `event.subscribe` | **bridged** | same bus → sidecar delivery as v1 `hooks["event"]` |
 | `session.hook("prompt")` | **bridged** | runs after decode and before admission; the returned `event.prompt` is what the inbox row carries (`v2.rs` prompt route). Never fires for v1 requests. |
 | `session.hook("model.request"/"http.request"/"http.response"/"retry"/"title"/"generate")` | **diverged** `D-V2-SESSION-LIFECYCLE` | the transport-level hooks bind to upstream's Effect HTTP/WebSocket driver, which ocserve does not have (a different, non-Effect client); retry/title/generate policy is internal. `generate` has its own row (`D-V2-SESSION-GENERATE`). |
