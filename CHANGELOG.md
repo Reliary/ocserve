@@ -38,6 +38,12 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   its endpoint through the same rule as every other provider; before this it
   listed its models while every prompt answered `no endpoint configured for
   provider …` (a bug that also exists in 0.7.5).
+- A plugin whose bundle tripped oxc's minifier loop was silently disabled:
+  the normalizer kept rolldown's default minification, whose internal
+  `debug_assert!` panics on such a bundle, so the plugin loaded with no hooks
+  (it loads fine raw). Minification is now off — it bought nothing for a
+  bundle that is never shipped over the wire. Reproduced with
+  `opencode-models-discovery@2.0.0`; present on rolldown 1.3.1 and 1.3.2.
 
 ### Credits
 - The v2 turn-lifecycle fixes are [@glanzel](https://github.com/glanzel)'s
