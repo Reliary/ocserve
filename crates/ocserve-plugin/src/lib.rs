@@ -25,6 +25,7 @@ use tokio::sync::oneshot;
 /// Host files (written next to the data dir once; content-addressed by embed).
 pub const HOST_FILES: &[(&str, &str)] = &[
     ("host.mjs", include_str!("host/host.mjs")),
+    ("native-assets.mjs", include_str!("host/native-assets.mjs")),
     ("v2.mjs", include_str!("host/v2.mjs")),
     (
         "bun-sqlite-loader.mjs",
@@ -1650,6 +1651,74 @@ export default PluginModule.server;
         assert_eq!(st["synthetic"]["ok"], true);
         assert_eq!(st["synthetic"]["hooks"][0], "tool.execute.after");
 
+        sc.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sidecar_resolves_bun_pty_library_from_original_package_tree() -> anyhow::Result<()> {
+        if !runtime_available() {
+            panic!(
+                "plugin-runtime binary ({}) required for plugin-host tests (M4b environment gate)",
+                crate::plugin_runtime().program()
+            );
+        }
+
+        #[cfg(target_os = "macos")]
+        let library_name = if cfg!(target_arch = "aarch64") {
+            "librust_pty_arm64.dylib"
+        } else {
+            "librust_pty.dylib"
+        };
+        #[cfg(target_os = "linux")]
+        let library_name = if cfg!(target_arch = "aarch64") {
+            "librust_pty_arm64.so"
+        } else {
+            "librust_pty.so"
+        };
+        #[cfg(target_os = "windows")]
+        let library_name = "rust_pty.dll";
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        let library_name = "librust_pty.so";
+
+        let dir = tempfile::tempdir()?;
+        let package = dir.path().join("opencode-pty");
+        let entry = package.join("index.mjs");
+        let library = package
+            .join("node_modules/bun-pty/rust-pty/target/release")
+            .join(library_name);
+        std::fs::create_dir_all(library.parent().expect("library has parent"))?;
+        std::fs::write(&library, b"synthetic native library path fixture")?;
+        let expected = serde_json::to_string(&library.to_string_lossy())?;
+        std::fs::write(
+            &entry,
+            format!(
+                r#"
+const expected = {expected};
+if (process.env.BUN_PTY_LIB !== expected) throw new Error("native library path was not resolved from plugin origin");
+export const PluginModule = {{
+  id: "native-asset-probe",
+  server: async () => ({{ "chat.message": async (_input, output) => {{ output.resolved = true; }} }}),
+}};
+export default PluginModule.server;
+"#
+            ),
+        )?;
+
+        let host = materialize_host(&dir.path().join("host"))?;
+        // The sidecar inherits this process's environment; an operator-set
+        // BUN_PTY_LIB would (correctly) win and mask the origin lookup.
+        assert!(
+            std::env::var_os("BUN_PTY_LIB").is_none(),
+            "unset BUN_PTY_LIB to run this test"
+        );
+        let mut sc = Sidecar::spawn(&host, "http://127.0.0.1:9", "/work").await?;
+        let hooks = sc
+            .load("opencode-pty", &entry, &json!({}), &Value::Null)
+            .await?;
+        assert_eq!(hooks, vec!["chat.message"]);
+        let output = sc.trigger("chat.message", json!({}), json!({})).await?;
+        assert_eq!(output["resolved"], true);
         sc.shutdown().await;
         Ok(())
     }

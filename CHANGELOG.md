@@ -7,6 +7,12 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## Unreleased
 
 ### Fixed
+- Plugins that load a native `bun-pty` library (such as `opencode-pty`) now
+  find it. The normalizer moves the plugin's ESM out of its package tree, so
+  the library's relative lookup missed; the plugin host now resolves the
+  matching library for the platform from the original package and sets
+  `BUN_PTY_LIB` per plugin unless the operator configured it at launch (musl
+  hosts prefer the `_musl` builds, as bun-pty does).
 - A v2 turn now closes the way upstream does, so a loop-guard ask or a dead
   process cannot leave a session looking busy. `session.execution.*` frames
   carry `sessionID` inside `data` (v2 clients filter on it and dropped the

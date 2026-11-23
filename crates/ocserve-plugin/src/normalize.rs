@@ -979,7 +979,9 @@ export default await import(pkg);"#,
         );
         let (p, o) = normalize_or_raw_sync(Some(&data), &e);
         assert!(matches!(o, Outcome::Built { beside: true, .. }), "{o:?}");
-        assert_eq!(p, base.join("dyn.normalized.mjs"), "K4: beside entry");
+        let expected = base.join("dyn.normalized.mjs").canonicalize().unwrap();
+        let actual = p.canonicalize().unwrap();
+        assert_eq!(actual, expected, "K4: beside the resolved entry");
         let _ = std::fs::remove_dir_all(&base);
     }
 

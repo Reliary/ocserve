@@ -10,6 +10,7 @@
  */
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { configureBunPtyLib } from "./native-assets.mjs";
 import {
   detectV2,
   v2Definition,
@@ -227,6 +228,10 @@ function resolveEffectFrom(pluginId, entry) {
 }
 
 async function loadPlugin({ spec, entry, origin, input, options }) {
+  // Some plugins, including opencode-pty, load a platform native library at
+  // module evaluation time. The normalized ESM lives outside the package tree,
+  // so give Bun FFI the matching asset from the original cached package.
+  if (origin) configureBunPtyLib(origin);
   const mod = await import(pathToFileURL(entry).href);
   // v2 detection FIRST (V2-EXECUTION-PLAN Phase 3): a v2 `Plugin.define`
   // module carries {id, setup|effect}; v1 modules never do. Both dialects
