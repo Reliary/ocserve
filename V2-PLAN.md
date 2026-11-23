@@ -141,7 +141,10 @@ requirement land here as edits, never silently in code.
   `_tag` errors mapped through the tagged machinery.
 - Dual-emit at the single choke: v1 grammar on `/event`+`/global/event`, v2
   grammar on `/api/event`; `log?after&follow` + `log.synced` exact.
-- Fill skeletal projections (`"content": []`, title-as-text) with real `content[]`.
+- Fill skeletal projections (`"content": []`, title-as-text) with real `content[]`;
+  v2-admitted user text is projected from its stored text part when the legacy
+  message-info `text` convenience field is absent, and assistant
+  `time.streamed`/`time.completed` survive the projection.
 - Interrupt settles every ask pending when the stop arrives: snapshot the ask
   ids, cancel the turn, then publish `permission.replied: reject`,
   `question.rejected`, and settle pending forms with `form.cancelled` (the

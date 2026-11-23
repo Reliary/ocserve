@@ -7,6 +7,11 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## Unreleased
 
 ### Fixed
+- The v2 message projection no longer drops data a v2 client needs: a prompt
+  admitted through `/api/session/{id}/prompt` shows its text (it was stored as
+  a part, so `text` came back empty), and assistant messages keep
+  `time.streamed` and `time.completed`, so a finished turn no longer looks
+  active.
 - A v2 turn now closes the way upstream does, so a loop-guard ask or a dead
   process cannot leave a session looking busy. `session.execution.*` frames
   carry `sessionID` inside `data` (v2 clients filter on it and dropped the
