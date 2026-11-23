@@ -1399,8 +1399,11 @@ async fn v2_phase_f_gap_closure() {
     let (s, _) = post(&app, "/api/plugin/update", json!({})).await;
     assert_eq!(s, StatusCode::NO_CONTENT);
 
-    // vcs init: real git init in a temp dir.
-    let dir = std::env::temp_dir().join(format!("ocserve-vcsinit-{}", std::process::id()));
+    // vcs init: real git init in a directory beneath the server cwd (the route
+    // refuses directories outside the cwd and home).
+    let dir = std::env::current_dir()
+        .unwrap()
+        .join(format!("ocserve-vcsinit-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let (s, _) = post(
         &app,

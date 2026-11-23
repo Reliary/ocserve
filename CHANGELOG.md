@@ -7,6 +7,9 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## Unreleased
 
 ### Fixed
+- `POST /api/vcs/init` now refuses a directory that does not exist or that
+  resolves outside the server working directory and home (400), and caps the
+  request body at 8 KiB. Previously it would `git init` any absolute path.
 - `POST /api/vcs/init` now initialises the directory named by the
   `location[directory]` query or `x-opencode-directory` header (a body
   `directory` still wins) and no longer requires a request body. Previously a

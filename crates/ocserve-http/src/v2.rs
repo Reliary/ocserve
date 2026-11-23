@@ -2442,18 +2442,40 @@ pub async fn vcs_init_api(
         Some(d) => d,
         None => scoped_directory(&st, &headers, &q, None),
     };
-    // Validate whichever source supplied it: absolute, not the root, no NUL,
-    // no `..` components (so the path names exactly what it says).
-    let path = std::path::Path::new(&dir);
-    if !path.is_absolute()
-        || dir == "/"
-        || dir.contains('\0')
-        || path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
+    // Containment: whichever source supplied the directory, it must exist and
+    // resolve (on the opened handle, via `containment::open_within`, the same
+    // primitive the file routes use) beneath the server's working directory or
+    // home. `git init` then runs on the verified real path.
+    if dir.len() > 4096 || !dir.starts_with('/') || dir == "/" {
         return Err(bad_request("directory must be an absolute path"));
     }
+    let roots: Vec<std::path::PathBuf> = ["directory", "home"]
+        .iter()
+        .filter_map(|k| st.paths[*k].as_str())
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .collect();
+    let dir_for_check = dir.clone();
+    let real = tokio::task::spawn_blocking(move || {
+        use crate::containment::{OpenError, OpenKind, open_within};
+        let mut last = OpenError::Escape;
+        for root in &roots {
+            match open_within(root, &dir_for_check, OpenKind::Dir) {
+                Ok(c) => return Ok(c.path().to_path_buf()),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    })
+    .await
+    .map_err(|e| crate::HttpError::Api(internal(anyhow::anyhow!("containment check failed: {e}"))))?
+    .map_err(|e| match e {
+        crate::containment::OpenError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            bad_request("directory does not exist")
+        }
+        crate::containment::OpenError::Io(io) => bad_request(&format!("directory: {io}")),
+        other => bad_request(&other.to_string()),
+    })?;
+    let dir = real.to_string_lossy().into_owned();
     let out = run_blocking(&st.db, move |_db| {
         ocserve_store::cgroup::command("git", "tools")
             .args(["init", "--", &dir])

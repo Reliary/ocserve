@@ -49,6 +49,15 @@ async fn call(
     (st, serde_json::from_slice(&b).unwrap_or(Value::Null))
 }
 
+/// A fresh directory beneath the server's working directory, which `vcs/init`
+/// accepts (the system temp dir is outside both allowed roots).
+fn inside_root() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("vcs-init-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap()
+}
+
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .arg("-C")
@@ -169,9 +178,9 @@ async fn unscoped_requests_keep_answering_for_the_server_directory() {
 
 #[tokio::test]
 async fn init_honours_the_location_query_the_header_and_the_body() {
-    let by_query = tempfile::tempdir().unwrap();
-    let by_header = tempfile::tempdir().unwrap();
-    let by_body = tempfile::tempdir().unwrap();
+    let by_query = inside_root();
+    let by_header = inside_root();
+    let by_body = inside_root();
     let q = by_query.path().to_str().unwrap();
     let h = by_header.path().to_str().unwrap();
     let b = by_body.path().to_str().unwrap();
@@ -215,7 +224,7 @@ async fn init_honours_the_location_query_the_header_and_the_body() {
 
 #[tokio::test]
 async fn init_accepts_an_empty_json_body_and_rejects_malformed_json() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = inside_root();
     let d = dir.path().to_str().unwrap();
     // Empty body with a JSON content type (what SDKs send): scoped by query.
     let req = Request::builder()
@@ -260,8 +269,8 @@ async fn init_refuses_a_relative_or_dash_body_directory() {
 
 #[tokio::test]
 async fn init_body_directory_wins_over_the_query() {
-    let by_body = tempfile::tempdir().unwrap();
-    let by_query = tempfile::tempdir().unwrap();
+    let by_body = inside_root();
+    let by_query = inside_root();
     let (st, v) = call(
         &app(),
         "POST",
@@ -289,4 +298,65 @@ async fn init_refuses_a_non_string_body_directory() {
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+}
+
+#[tokio::test]
+async fn init_refuses_directories_outside_the_allowed_roots() {
+    // The system temp dir is outside the server cwd and home: a real, existing
+    // directory the caller has no business initialising.
+    let outside = tempfile::tempdir().unwrap();
+    let (st, v) = call(
+        &app(),
+        "POST",
+        "/api/vcs/init",
+        &[],
+        Some(serde_json::json!({"directory": outside.path().to_str().unwrap()})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(!outside.path().join(".git").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn init_refuses_a_symlink_that_escapes_the_root() {
+    let outside = tempfile::tempdir().unwrap();
+    let inside = inside_root();
+    let link = inside.path().join("link");
+    std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+    let (st, v) = call(
+        &app(),
+        "POST",
+        "/api/vcs/init",
+        &[],
+        Some(serde_json::json!({"directory": link.to_str().unwrap()})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(!outside.path().join(".git").exists());
+}
+
+#[tokio::test]
+async fn init_refuses_a_missing_directory_and_an_oversized_body() {
+    let inside = inside_root();
+    let missing = inside.path().join("nope");
+    let (st, _) = call(
+        &app(),
+        "POST",
+        "/api/vcs/init",
+        &[],
+        Some(serde_json::json!({"directory": missing.to_str().unwrap()})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(!missing.exists());
+    let (st, _) = call(
+        &app(),
+        "POST",
+        "/api/vcs/init",
+        &[],
+        Some(serde_json::json!({"directory": "x".repeat(100_000)})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
 }
