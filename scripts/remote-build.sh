@@ -166,8 +166,13 @@ esac
 
 echo ">> $HOST: $VERB"
 # shellcheck disable=SC2029  # intentional: the command is expanded locally
-if ! timeout 7200 "${SSH[@]}" "bash -lc $(q "mkdir -p '$REMOTE_DIR' && cd '$REMOTE_DIR' && $RUN")"; then
-  rc=$?
+set +e
+timeout 7200 "${SSH[@]}" "bash -lc $(q "mkdir -p '$REMOTE_DIR' && cd '$REMOTE_DIR' && $RUN")"
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  # `if ! cmd; then rc=$?` reports 0 (the negation's status), which made a red
+  # remote run print "exited 0" and exit 0 — a silent green gate.
   echo ">> remote-build.sh: remote command exited $rc" >&2
   exit "$rc"
 fi

@@ -130,7 +130,14 @@ async fn first_data_after_stream_budget_within_ttfb_succeeds() {
     let addr = spawn_sse(std::time::Duration::from_millis(3000));
     let st = app_with(addr);
     assert_eq!(prompt(&st).await, StatusCode::NO_CONTENT);
-    let done = wait_assistant(&st, std::time::Duration::from_secs(20)).await;
+    // Observation window, not the assertion's budget: the budgets under test
+    // are the 1 s stream phase and the 6 s TTFB phase above. This window only
+    // decides how long we wait to SEE the outcome, and it flaked once under a
+    // 16-way parallel workspace run on a loaded box (2026-11-23) while passing
+    // standalone and in every later full run. A longer window keeps the
+    // discrimination intact: pre-fix the turn dies at the 1 s stream budget and
+    // NEVER completes, so any window catches it.
+    let done = wait_assistant(&st, std::time::Duration::from_secs(60)).await;
     assert!(
         done.is_some(),
         "turn must complete: first data at 3s is within the 6s TTFB budget \

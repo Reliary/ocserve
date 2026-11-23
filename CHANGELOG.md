@@ -19,15 +19,63 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   dead process are closed at boot with a terminal event and released
   (`D-V2-BOOT-CLOSE`).
 
+### Fixed (model catalog)
+- The models.dev catalog is now scoped to providers this server can actually
+  serve, which cuts resident memory for a typical catalog by roughly two
+  thirds to three quarters (`/api/provider` and `/api/model` are unchanged for
+  every usable provider; the rest keep a metadata stub so the connect UI still
+  lists them). `OCSERVE_MODEL_CATALOG=all` restores the full upstream catalog.
+  `D-CATALOG-SCOPE`.
+- Fixed two defects the scoping introduced: a provider with a wrong-typed
+  field (`"env": null`, a string `name`, an object `api`) used to abort the
+  whole document, and the self-heal then deleted the shared catalog — including
+  a file pinned with `OPENCODE_MODELS_PATH`. The stub parser is now as tolerant
+  as the full parse, a scoped failure falls back to it, and a pinned catalog is
+  never deleted.
+- Adding, activating or deleting a credential now reloads the provider
+  registry, so the provider becomes usable immediately instead of after a
+  restart. A provider known only through the credential table also resolves
+  its endpoint through the same rule as every other provider; before this it
+  listed its models while every prompt answered `no endpoint configured for
+  provider …` (a bug that also exists in 0.7.5).
+- A plugin whose bundle tripped oxc's minifier loop was silently disabled:
+  the normalizer kept rolldown's default minification, whose internal
+  `debug_assert!` panics on such a bundle, so the plugin loaded with no hooks
+  (it loads fine raw). Minification is now off — it bought nothing for a
+  bundle that is never shipped over the wire. Reproduced with
+  `opencode-models-discovery@2.0.0`; present on rolldown 1.3.1 and 1.3.2.
+
 ### Credits
 - The v2 turn-lifecycle fixes are [@glanzel](https://github.com/glanzel)'s
   (issue #58, PR #60). Review added the global-aggregate guard on the
   `sessionID` injection, the v2 lifecycle allowlist for the event validator,
   and the corrected `K-PERM` row.
+-
+- The catalog-scoping work is [@glanzel](https://github.com/glanzel)'s
+  (PR #62). Review added the tolerant stub, the fallback, the
+  no-delete-operator-file guard, the reconcile on credential writes, and the
+  credential-only endpoint resolution.
 
 ## 0.7.5 - 2026-11-18
 
 ### Fixed
+## Unreleased
+
+### Fixed
+- The served models catalog is scoped to usable providers by default. The
+  provider payload expanded every models.dev provider (324 on the stock
+  catalog) into `provider.all`/`/api/integration` and retained it in RAM,
+  although a provider without a key can never serve a model. Loading now keeps
+  full model bodies only for config, auth, credential-table and env-enabled
+  providers, the built-in `opencode` tier, and providers named by a model pin;
+  every other provider stays as a metadata stub with an empty model map, so the
+  connect/login UI still lists it. `OCSERVE_MODEL_CATALOG=all` restores the
+  full catalog (`D-CATALOG-SCOPE`). The boot/hourly models.dev refresh no
+  longer parses the download into a full `Value` just to validate it (syntax
+  check only) and writes the fetched bytes without a second copy; the
+  mtime-churn content check hashes in 64 KiB chunks instead of reading the
+  whole file.
+
 - Image attachments now reach the provider in the shape it accepts. The
   encoder emitted the AI SDK's UI file part (`{type:"file", url, mediaType}`)
   instead of the wire part the pinned openai-compatible SDK derives, so every

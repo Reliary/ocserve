@@ -23,6 +23,8 @@
 #   72. a shared operation's request body differs between the v1 and v2 pins
 #      and no declared handler covers both (v2 reply {reply}/{decision}, v2
 #      prompt nested/flat; both shipped as 400s in one review) [plant]
+#   74. a credential write (create/activate/delete) skips the reconcile, so the
+#      provider it makes usable stays stubbed until restart (PR #62 review) [plant]
 #   73. provider content construction uses the AI SDK's UI part shape
 #      ({type:"file", url, mediaType}) instead of the wire shape the pinned
 #      @ai-sdk/openai-compatible emits (image_url / input_audio / file.file_data).
@@ -240,7 +242,7 @@ uncontracted_reads() {
   # is narrow on purpose: if an allowlisted name ever appears on a line that
   # reads the environment (`env::var`/`var_os`), it is still a runtime knob and
   # the check below flags it.
-  local test_only=" OCSERVE_PTY_ENV_TEST OCSERVE_PTY_OK OCSERVE_PTY_OVERRIDE OCSERVE_UNIT_PROBE OCSERVE_PORTX OCSERVE_TEST_FAKE_KEY OCSERVE_TEST_ISSUE28 "
+  local test_only=" OCSERVE_PTY_ENV_TEST OCSERVE_PTY_OK OCSERVE_PTY_OVERRIDE OCSERVE_UNIT_PROBE OCSERVE_PORTX OCSERVE_TEST_FAKE_KEY OCSERVE_TEST_ISSUE28 OCSERVE_TEST_CATALOG_ENV "
   # `rg` is not installed on the GitHub macOS runner and is not guaranteed on
   # any dev box; a missing binary makes this predicate return EMPTY, which is
   # exactly what "no uncontracted reads" looks like — the guard then reported
@@ -2307,5 +2309,52 @@ else
   echo "ok (planted UI media shape detected)"
 fi
 rm -rf "$_p73"
+
+# 74. a credential WRITE (create/activate/delete) does not reconcile, so the
+#     provider it makes usable stays stubbed and unpromptable until restart
+#     (PR #62 review: create answered 200 while `/provider` still showed 0
+#     models; `PUT /auth/{pid}` has reloaded since W4, credentials did not).
+echo "== guard: credential writes reconcile (rule 74) =="
+_p74_bad=$(python3 - <<'PYEOF'
+import re, sys
+src = open('crates/ocserve-http/src/v2.rs').read()
+# Each credential mutation body must be followed (within its function) by a
+# reconcile call. Split on function signatures so a call in a NEIGHBOURING
+# handler cannot satisfy this one.
+fns = re.split(r'\npub async fn ', src)
+bad = []
+for f in fns:
+    name = f.split('(', 1)[0].removeprefix('pub async fn ').strip()
+    if name in ('credential_create_api', 'credential_activate_api', 'credential_remove'):
+        if 'reconcile_after_credential_change' in f.split('\n// ---', 1)[0][:2000]:
+            continue
+        bad.append(name)
+print(' '.join(bad))
+PYEOF
+)
+if [ -n "$_p74_bad" ]; then
+  echo "FAIL: credential writes without reconcile: $_p74_bad (rule 74)"
+  fail=1
+else
+  echo "ok (every credential write reconciles)"
+fi
+_p74=/var/tmp/ocserve-rule74-planted
+rm -rf "$_p74"; mkdir -p "$_p74/crates/ocserve-http/src"
+printf 'pub async fn credential_create_api(\n) -> u8 {\n    ocserve_store::credential_create();\n    Ok(1)\n}\n' > "$_p74/crates/ocserve-http/src/v2.rs"
+_p74_hit=$(cd "$_p74" && python3 - <<'PYEOF'
+import re
+src = open('crates/ocserve-http/src/v2.rs').read()
+fns = re.split(r'\npub async fn ', src)
+print(' '.join(f.split('(',1)[0].removeprefix('pub async fn ').strip() for f in fns
+               if f.split('(',1)[0].removeprefix('pub async fn ').strip() in ('credential_create_api','credential_activate_api','credential_remove')
+               and 'reconcile_after_credential_change' not in f.split('\n// ---',1)[0][:2000]))
+PYEOF
+)
+if [ -z "$_p74_hit" ]; then
+  echo "FAIL: rule 74 planted unreconciled write not detected (vacuous)"; fail=1
+else
+  echo "ok (planted unreconciled credential write detected)"
+fi
+rm -rf "$_p74"
 
 exit $fail
