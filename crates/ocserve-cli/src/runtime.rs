@@ -546,9 +546,7 @@ fn scope_with_fallback(
     match scoped(path, keep) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(
-                "scoped catalog parse failed ({e:#}) — falling back to the full parse"
-            );
+            tracing::warn!("scoped catalog parse failed ({e:#}) — falling back to the full parse");
             ocserve_metrics::counter("ocserve_catalog_scope_fallback_total", 1);
             read_catalog(path)
         }
@@ -2989,7 +2987,7 @@ mod registry_catalog_tests {
         .unwrap();
         let rt = Runtime {
             data_dir: dir.path().to_path_buf(),
-            config: json!({}),                    // no provider entry
+            config: json!({}), // no provider entry
             catalog: json!({                      // catalog carries the endpoint
                 "mistral": {"api": "https://api.mistral.ai/v1",
                             "npm": "@ai-sdk/mistral",
@@ -3325,7 +3323,10 @@ mod catalog_scope_tests {
         let got = load_catalog(&p, &cfg, &serde_json::json!({}), dir.path());
         assert!(got.get("keep").is_some(), "kept provider missing: {got}");
         assert!(got.get("odd").is_some(), "stub provider missing: {got}");
-        assert!(p.exists(), "a readable catalog must never be deleted: {got}");
+        assert!(
+            p.exists(),
+            "a readable catalog must never be deleted: {got}"
+        );
     }
 
     /// The self-heal must not delete a catalog the operator pinned.
@@ -3370,10 +3371,11 @@ mod catalog_scope_tests {
         )
         .unwrap();
         let keep: std::collections::HashSet<String> = ["keep".to_string()].into_iter().collect();
-        let got = scope_with_fallback(&p, &keep, |_, _| {
-            anyhow::bail!("injected scoped failure")
-        });
-        assert_eq!(got.get("keep").and_then(|v| v.get("name")), Some(&serde_json::json!("K")));
+        let got = scope_with_fallback(&p, &keep, |_, _| anyhow::bail!("injected scoped failure"));
+        assert_eq!(
+            got.get("keep").and_then(|v| v.get("name")),
+            Some(&serde_json::json!("K"))
+        );
         assert_eq!(
             got.get("other").and_then(|v| v.get("name")),
             Some(&serde_json::json!("O")),
@@ -3381,5 +3383,4 @@ mod catalog_scope_tests {
         );
         assert!(p.exists(), "a fallback must never delete the catalog");
     }
-
 }

@@ -1045,5 +1045,4 @@ export default await import(pkg);"#,
             "the normalizer must disable minification (oxc compressor loop panic)"
         );
     }
-
 }

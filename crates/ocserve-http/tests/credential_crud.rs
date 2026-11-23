@@ -211,7 +211,13 @@ async fn credential_writes_reconcile_so_the_provider_becomes_usable() {
     assert_eq!(n(), 1, "create must reconcile");
     let id = created["data"]["id"].as_str().unwrap().to_string();
 
-    let (s, _) = req(&app, "POST", &format!("/api/credential/{id}/activate"), None).await;
+    let (s, _) = req(
+        &app,
+        "POST",
+        &format!("/api/credential/{id}/activate"),
+        None,
+    )
+    .await;
     assert_eq!(s, 204);
     assert_eq!(n(), 2, "activate must reconcile");
 
@@ -243,4 +249,3 @@ async fn credential_writes_reconcile_so_the_provider_becomes_usable() {
     assert_eq!(s, 204);
     assert_eq!(n(), before, "a label-only PATCH must not reload");
 }
-
