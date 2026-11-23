@@ -5958,7 +5958,27 @@ pub(crate) fn emit_durable_http(
     event_type: &str,
     props: Value,
 ) -> Result<(), ApiError> {
-    let props = ocserve_core::event::normalize_props(event_type, props);
+    let mut props = ocserve_core::event::normalize_props(event_type, props);
+    // Every v2 durable SessionEvent carries `sessionID` inside `data`
+    // (`packages/schema/src/session-event.ts`: `const Base = { sessionID }`).
+    // The v1 grammar carries the session on the event envelope instead, so
+    // callers legitimately omit it — and a v2 client that filters on
+    // `data.sessionID` (Paseo's observeOwnEvent does exactly that) then DROPS
+    // the event. `session.execution.started/succeeded` shipped as `data:{}`,
+    // which is why a live turn could only be observed through the 5s
+    // reconciliation poll. Inject the aggregate once, at the wire choke.
+    //
+    // Session-scoped only: this choke also serves global events
+    // (`integration.wellknown`, `location.reload`) whose aggregate is the
+    // literal `"global"`. Injecting that would put `sessionID:"global"` on a
+    // field branded `^ses` (upstream `SessionID`), which the frozen contract
+    // rejects. Session ids start with `ses`.
+    if sid.starts_with("ses")
+        && let Value::Object(map) = &mut props
+        && !map.contains_key("sessionID")
+    {
+        map.insert("sessionID".into(), json!(sid));
+    }
     // Single choke (V2-PLAN.md P2): versioned durable type + stable id from
     // the allocated seq — the same path the prompt loop uses (D5).
     let (seq, _id) =
@@ -5976,6 +5996,66 @@ pub(crate) fn emit_durable_http(
         dir, event_type, props, seq as u64, sid,
     ));
     Ok(())
+}
+
+/// Close executions that a dead process left open (crash, SIGKILL, reboot).
+///
+/// Upstream resumes orphaned claims at boot
+/// (`SessionRestart.resumeSuspendedSessions`, v2.2.5
+/// `core/src/session/execution/restart.ts:222-258`). ocserve's executor cannot
+/// resume a half-finished step, so the honest equivalent is a terminal event
+/// plus the claim release: the v2 client releases its turn instead of trusting
+/// a phantom "running", and the session starts usable. Admitted inbox rows are
+/// left pending — the next wake promotes them, so no user prompt is lost.
+///
+/// Returns the number of executions closed. Boot only: a live drain is skipped
+/// defensively (the claim table is not a liveness signal).
+pub fn close_orphaned_executions(st: &Arc<AppState>) -> usize {
+    let suspended = match ocserve_store::claim::list_suspended(&st.db) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("boot recovery: claim scan failed: {e:#}");
+            return 0;
+        }
+    };
+    let mut closed = 0usize;
+    for sid in suspended {
+        if st.v2_drain_tasks.lock().contains_key(&sid) {
+            continue;
+        }
+        let error = json!({
+            "sessionID": sid,
+            "error": {
+                "type": "ExecutionAbortedError",
+                "message": "The server process ended while this execution was running. \
+                            The turn was closed so the session stays usable; \
+                            queued prompts run with the next turn."
+            },
+        });
+        if let Err(e) = emit_durable_http(st, &sid, "session.execution.failed", error) {
+            // Keep the claim: a terminal event that never reached the client
+            // is worse than retrying the closure on the next boot.
+            tracing::error!(
+                "boot recovery: failed to close execution for {sid}: {} {}",
+                e.name,
+                e.message
+            );
+            continue;
+        }
+        match ocserve_store::claim::release(&st.writer, &sid) {
+            Ok(_) => closed += 1,
+            Err(e) => tracing::error!("boot recovery: claim release failed for {sid}: {e:#}"),
+        }
+    }
+    if closed > 0 {
+        tracing::warn!("boot recovery: closed {closed} orphaned execution(s)");
+        ocserve_metrics::labeled_counter(
+            "ocserve_boot_recovery_total",
+            "result=\"closed\"",
+            closed as u64,
+        );
+    }
+    closed
 }
 
 /// Freeze-shaped event id: `evt_` + 26 hex chars (upstream ids are time+random
@@ -7696,6 +7776,138 @@ mod inbox_wake {
         assert!(
             drained,
             "wake did not drain queued v2 work after the v1 turn"
+        );
+    }
+}
+
+#[cfg(test)]
+mod execution_wire_unit {
+    use super::*;
+    use serde_json::json;
+
+    fn seed_session(st: &Arc<AppState>, sid: &str) {
+        ocserve_store::insert_session(
+            &st.writer,
+            &json!({
+                "id": sid, "projectID": "global", "directory": "/w",
+                "path": sid, "slug": sid, "title": sid, "version": "1",
+                "time": {"created": 1, "updated": 2},
+            }),
+        )
+        .unwrap();
+    }
+
+    /// v2 durability: every `session.execution.*` frame carries `sessionID`
+    /// inside `data` (schema `Base = { sessionID }`). Before the choke injected
+    /// it, `started`/`succeeded` shipped `data:{}` and a v2 client that filters
+    /// on `data.sessionID` (Paseo) dropped them, leaving the turn observable
+    /// only through its 5s polling fallback.
+    ///
+    /// CONTROL: remove the `sessionID` injection in `emit_durable_http` and
+    /// this assertion fails with `properties == {}`.
+    #[tokio::test]
+    async fn execution_events_carry_session_id_on_the_bus() {
+        let st = AppState::new();
+        seed_session(&st, "ses_exec_wire");
+        let mut rx = st.bus.subscribe();
+        if let Err(e) =
+            emit_durable_http(&st, "ses_exec_wire", "session.execution.started", json!({}))
+        {
+            panic!("emit: {} {}", e.name, e.message);
+        }
+        let frame = rx.recv().await.expect("bus frame");
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(
+            v["payload"]["properties"]["sessionID"], "ses_exec_wire",
+            "frame={frame}"
+        );
+    }
+
+    /// The same choke serves global-aggregate events (`integration.wellknown`,
+    /// `location.reload`) whose id is the literal `"global"`. Injecting
+    /// `sessionID` there would put `"global"` on a field branded `^ses`
+    /// (upstream `SessionID`), violating the frozen contract.
+    ///
+    /// CONTROL: drop the `sid.starts_with("ses")` guard and this fails with
+    /// `properties.sessionID == "global"`.
+    #[tokio::test]
+    async fn global_aggregate_events_do_not_gain_a_session_id() {
+        let st = AppState::new();
+        let mut rx = st.bus.subscribe();
+        if let Err(e) = emit_durable_http(
+            &st,
+            "global",
+            "integration.wellknown",
+            json!({"url": "https://example.test"}),
+        ) {
+            panic!("emit: {} {}", e.name, e.message);
+        }
+        let frame = rx.recv().await.expect("bus frame");
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert!(
+            v["payload"]["properties"].get("sessionID").is_none(),
+            "global aggregate must not carry a sessionID: {frame}"
+        );
+    }
+
+    /// A durable claim is a crash-recovery marker, NOT a liveness signal.
+    /// `/api/session/active` must be process-local (upstream
+    /// `SessionExecution.active`); a claim without a live drain is not running.
+    ///
+    /// CONTROL: restoring the claim-table read in `active_sessions` makes this
+    /// return `{ses_stale: running}` -> red.
+    #[tokio::test]
+    async fn active_ignores_claims_without_a_live_drain() {
+        let st = AppState::with_payloads_and_v2(None, Payloads::default(), true);
+        seed_session(&st, "ses_stale");
+        ocserve_store::claim::claim(&st.writer, "ses_stale", 1).unwrap();
+        let axum::Json(body) = crate::v2::active_sessions(axum::extract::State(st.clone())).await;
+        assert_eq!(
+            body,
+            json!({"data": {}}),
+            "stale claim must not read as running"
+        );
+        assert!(
+            ocserve_store::claim::held(&st.db, "ses_stale").unwrap(),
+            "the recovery marker itself is untouched by the read surface"
+        );
+    }
+
+    /// Boot recovery: a claim left by a process that died mid-turn is closed
+    /// with a terminal `session.execution.failed` (flat upstream error shape)
+    /// and released, so no client waits forever for a turn that cannot finish.
+    ///
+    /// CONTROL: skip `close_orphaned_executions` and the claim survives and no
+    /// terminal event exists — the exact phantom-busy state.
+    #[tokio::test]
+    async fn boot_closes_orphaned_executions_and_releases_the_claim() {
+        let st = AppState::new();
+        seed_session(&st, "ses_orphan");
+        assert!(
+            emit_durable_http(&st, "ses_orphan", "session.execution.started", json!({})).is_ok()
+        );
+        ocserve_store::claim::claim(&st.writer, "ses_orphan", 1).unwrap();
+
+        assert_eq!(close_orphaned_executions(&st), 1);
+        assert!(!ocserve_store::claim::held(&st.db, "ses_orphan").unwrap());
+
+        let conn = ocserve_store::pragma::open_reader(&st.db).unwrap();
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM event WHERE session_id='ses_orphan' \
+                 AND type LIKE 'session.execution.failed%' ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["sessionID"], "ses_orphan");
+        assert_eq!(v["error"]["type"], "ExecutionAbortedError");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .is_some_and(|m| !m.is_empty()),
+            "upstream SessionError.Error is flat {{type,message}}: {v}"
         );
     }
 }
