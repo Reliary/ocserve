@@ -48,7 +48,7 @@ for the normal behaviour.
 | `OCSERVE_ZEN_KEYLESS` | on | 0 disables | Install the keyless `Bearer public` endpoint for opencode free models. |
 | `OCSERVE_CONTINUE_ON_DENY` | off (a deny stops the turn) | 1 enables | Keep the turn going after a denied tool call. |
 | `OCSERVE_LOOP_GUARD` | on | 0 disables | Repeated/oscillating tool-call detection and its permission ask. |
-| `OCSERVE_MODEL_CATALOG` | configured | configured \| all | `configured` keeps the full model list only for providers that are usable here (config, auth, credential-table keys, env keys named by the catalog, and the built-in `opencode` tier); every other provider stays as a metadata stub with an empty model map, so the connect/login UI still lists it. `all` restores the full upstream catalog. |
+| `OCSERVE_MODEL_CATALOG` | configured | configured \| all (truthy aliases all/full/off/0/false/no also select all) | `configured` keeps the full model list only for providers that are usable here (config, auth, credential-table keys, env keys named by the catalog, and the built-in `opencode` tier); every other provider stays as a metadata stub with an empty model map, so the connect/login UI still lists it. `all` restores the full upstream catalog. |
 
 ## Plugins and MCP
 

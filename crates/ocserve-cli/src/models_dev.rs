@@ -94,6 +94,16 @@ pub fn read_path() -> PathBuf {
     }
 }
 
+/// True when the operator pinned the catalog via `OPENCODE_MODELS_PATH`.
+/// Upstream's self-heal only deletes the file it wrote (`models-dev.ts` checks
+/// the env before unlinking); we did not port that guard until PR #62 review.
+pub fn is_operator_pinned(path: &Path) -> bool {
+    match std::env::var("OPENCODE_MODELS_PATH") {
+        Ok(v) => !v.is_empty() && Path::new(&v) == path,
+        Err(_) => false,
+    }
+}
+
 /// Lock root (flock.ts `root()`): `{xdgState}/opencode/locks` — ocserve's
 /// HOME-based approximation = `~/.local/state/opencode/locks` (their state
 /// dir: leases are ephemeral + stale-swept, creating it is safe).
