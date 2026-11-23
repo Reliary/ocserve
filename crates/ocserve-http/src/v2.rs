@@ -2409,6 +2409,12 @@ pub async fn plugin_update_api(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Optional body of `POST /api/vcs/init` (a divergence from the spec; see the handler).
+#[derive(Default, serde::Deserialize)]
+struct VcsInitBody {
+    directory: Option<String>,
+}
+
 /// POST /api/vcs/init — real `git init` (spawn_blocking; non-git → initialized;
 /// already-git → 204 idempotent) in the directory the request names.
 ///
@@ -2425,17 +2431,29 @@ pub async fn vcs_init_api(
     raw: axum::body::Bytes,
 ) -> Result<StatusCode, HttpError> {
     // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
-    let body = if raw.iter().all(u8::is_ascii_whitespace) {
-        Value::Null
+    // Typed body: only `directory` (a string) is read; any other field is
+    // ignored. Empty or whitespace-only bodies are treated as absent.
+    let body: VcsInitBody = if raw.iter().all(u8::is_ascii_whitespace) {
+        VcsInitBody::default()
     } else {
-        serde_json::from_slice::<Value>(&raw)
-            .map_err(|e| bad_request(&format!("invalid JSON body: {e}")))?
+        serde_json::from_slice(&raw).map_err(|e| bad_request(&format!("invalid JSON body: {e}")))?
     };
-    let dir = match body.get("directory").and_then(|v| v.as_str()) {
-        Some(d) if d.starts_with('/') && d != "/" => d.to_string(),
-        Some(_) => return Err(bad_request("directory must be an absolute path")),
+    let dir = match body.directory {
+        Some(d) => d,
         None => scoped_directory(&st, &headers, &q, None),
     };
+    // Validate whichever source supplied it: absolute, not the root, no NUL,
+    // no `..` components (so the path names exactly what it says).
+    let path = std::path::Path::new(&dir);
+    if !path.is_absolute()
+        || dir == "/"
+        || dir.contains('\0')
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(bad_request("directory must be an absolute path"));
+    }
     let out = run_blocking(&st.db, move |_db| {
         ocserve_store::cgroup::command("git", "tools")
             .args(["init", "--", &dir])

@@ -244,7 +244,7 @@ async fn init_refuses_a_relative_or_dash_body_directory() {
     // A relative path would resolve against the server cwd, and a leading dash
     // must never reach git as an option. Both are refused; nothing is created.
     let before = std::env::current_dir().unwrap();
-    for d in ["--bare", "relative/dir"] {
+    for d in ["--bare", "relative/dir", "/tmp/a/../b", "/tmp/nul\u{0}x"] {
         let (st, v) = call(
             &app(),
             "POST",
@@ -276,4 +276,17 @@ async fn init_body_directory_wins_over_the_query() {
     assert_eq!(st, StatusCode::NO_CONTENT, "{v}");
     assert!(by_body.path().join(".git").exists());
     assert!(!by_query.path().join(".git").exists());
+}
+
+#[tokio::test]
+async fn init_refuses_a_non_string_body_directory() {
+    let (st, v) = call(
+        &app(),
+        "POST",
+        "/api/vcs/init",
+        &[],
+        Some(serde_json::json!({"directory": 5})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
 }
