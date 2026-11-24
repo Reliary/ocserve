@@ -302,17 +302,31 @@ pub fn create_within(base: &Path, raw: &str, body: &[u8]) -> Result<Contained, O
         return Err(OpenError::Invalid("cannot create the base itself".into()));
     }
     if Path::new(raw).is_absolute() {
-        // Absolute writes must still land beneath base; route them through the
-        // portable path, which verifies the handle after opening.
-        std::fs::create_dir_all(
-            Path::new(raw)
-                .parent()
-                .ok_or_else(|| OpenError::Invalid("no parent directory".into()))?,
-        )?;
-        let mut c = open_within(base, raw, OpenKind::Create)?;
-        use std::io::Write;
-        c.file.write_all(body).map_err(OpenError::Io)?;
-        return Ok(c);
+        #[cfg(unix)]
+        {
+            // Rebase onto the canonical root, then use the same dirfd walk as
+            // relative paths. Creating parents from the absolute string first
+            // would follow a symlink before containment could be checked.
+            let relative = absolute_relative_within(base, Path::new(raw))?;
+            let relative = relative
+                .to_str()
+                .ok_or_else(|| OpenError::Invalid("path is not valid UTF-8".into()))?;
+            return create_within(base, relative, body);
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows' handle-relative creation is implemented separately;
+            // its final object is still verified by open_within.
+            std::fs::create_dir_all(
+                Path::new(raw)
+                    .parent()
+                    .ok_or_else(|| OpenError::Invalid("no parent directory".into()))?,
+            )?;
+            let mut c = open_within(base, raw, OpenKind::Create)?;
+            use std::io::Write;
+            c.file.write_all(body).map_err(OpenError::Io)?;
+            return Ok(c);
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -369,7 +383,72 @@ pub fn create_within(base: &Path, raw: &str, body: &[u8]) -> Result<Contained, O
         unreachable!("loop returns on the last component")
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // Darwin has no openat2/RESOLVE_BENEATH. Keep traversal anchored to
+        // opened directory handles, and verify every resolved parent handle
+        // before creating anything below it. This prevents a symlinked path
+        // from redirecting mkdir/open to a location outside the project.
+        use rustix::fs::{Mode, OFlags, mkdirat, openat};
+        let canon_base = std::fs::canonicalize(base)?;
+        let mut dir = std::fs::File::open(&canon_base)?;
+        let comps: Vec<&str> = raw
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect();
+        if comps.is_empty() {
+            return Err(OpenError::Invalid("empty path".into()));
+        }
+        for (i, comp) in comps.iter().enumerate() {
+            if *comp == ".." {
+                return Err(OpenError::Escape);
+            }
+            let last = i + 1 == comps.len();
+            if last {
+                let fd = openat(
+                    &dir,
+                    *comp,
+                    OFlags::CREATE
+                        | OFlags::WRONLY
+                        | OFlags::TRUNC
+                        | OFlags::CLOEXEC
+                        | OFlags::NOFOLLOW,
+                    Mode::from_bits_truncate(0o666),
+                )
+                .map_err(map_errno)?;
+                let file = std::fs::File::from(fd);
+                use std::io::Write;
+                (&file).write_all(body).map_err(OpenError::Io)?;
+                let real = real_path_of(&file)?;
+                if !is_beneath(&real, &canon_base) {
+                    return Err(OpenError::Escape);
+                }
+                return Ok(Contained { file, real });
+            }
+
+            match mkdirat(&dir, *comp, Mode::from_bits_truncate(0o777)) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::EXIST) => {}
+                Err(e) => return Err(map_errno(e)),
+            }
+            let fd = openat(
+                &dir,
+                *comp,
+                OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(map_errno)?;
+            let next = std::fs::File::from(fd);
+            let real = real_path_of(&next)?;
+            if !is_beneath(&real, &canon_base) {
+                return Err(OpenError::Escape);
+            }
+            dir = next;
+        }
+        Err(OpenError::Invalid("empty path".into()))
+    }
+
+    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
     {
         // Portable: verify the deepest existing ancestor, create the rest, then
         // open the leaf without following a final-component symlink.
@@ -401,7 +480,54 @@ pub fn create_within(base: &Path, raw: &str, body: &[u8]) -> Result<Contained, O
     }
 }
 
-#[cfg(target_os = "linux")]
+/// Resolve an absolute target's existing parent and append any missing
+/// components only after proving that parent is beneath the canonical base.
+/// The final component is deliberately not canonicalized so a final symlink
+/// remains subject to the no-follow create rule.
+#[cfg(unix)]
+fn absolute_relative_within(base: &Path, target: &Path) -> Result<PathBuf, OpenError> {
+    let canon_base = std::fs::canonicalize(base)?;
+    if target
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(OpenError::Escape);
+    }
+    let leaf = target
+        .file_name()
+        .ok_or_else(|| OpenError::Invalid("no file name".into()))?;
+    let mut tail = vec![leaf.to_os_string()];
+    let mut probe = target
+        .parent()
+        .ok_or_else(|| OpenError::Invalid("no parent directory".into()))?;
+
+    loop {
+        match std::fs::canonicalize(probe) {
+            Ok(real_parent) => {
+                if !is_beneath(&real_parent, &canon_base) {
+                    return Err(OpenError::Escape);
+                }
+                let mut relative = real_parent
+                    .strip_prefix(&canon_base)
+                    .map_err(|_| OpenError::Escape)?
+                    .to_path_buf();
+                for component in tail.iter().rev() {
+                    relative.push(component);
+                }
+                return Ok(relative);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(OpenError::Io(error)),
+        }
+        let (Some(name), Some(parent)) = (probe.file_name(), probe.parent()) else {
+            return Err(OpenError::Escape);
+        };
+        tail.push(name.to_os_string());
+        probe = parent;
+    }
+}
+
+#[cfg(unix)]
 fn map_errno(e: rustix::io::Errno) -> OpenError {
     match e {
         rustix::io::Errno::XDEV | rustix::io::Errno::LOOP | rustix::io::Errno::ACCESS => {
@@ -650,6 +776,10 @@ mod tests {
             std::fs::read_to_string(base.join("a/b/c.txt")).unwrap(),
             "deep"
         );
+        let absolute = base.join("absolute/deep.txt");
+        create_within(&base, absolute.to_str().unwrap(), b"absolute")
+            .expect("absolute nested create");
+        assert_eq!(std::fs::read_to_string(absolute).unwrap(), "absolute");
     }
 
     #[cfg(unix)]
@@ -670,6 +800,82 @@ mod tests {
             !outside.join("sub").exists(),
             "created a directory outside the base"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_within_absolute_cannot_escape_through_symlinked_parent() {
+        let root = tmp();
+        let base = root.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("link")).unwrap();
+
+        let absolute_escape = base.join("link/sub/absolute-evil.txt");
+        assert!(create_within(&base, absolute_escape.to_str().unwrap(), b"x").is_err());
+        assert!(
+            !outside.join("sub").exists(),
+            "absolute write created a directory outside the base"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_within_absolute_outside_base_creates_nothing() {
+        let root = tmp();
+        let base = root.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        let target = root.path().join("outside/new/f.txt");
+        assert!(matches!(
+            create_within(&base, target.to_str().unwrap(), b"x"),
+            Err(OpenError::Escape)
+        ));
+        assert!(
+            !root.path().join("outside").exists(),
+            "absolute path outside the base created directories"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_within_absolute_through_inside_symlink_is_allowed() {
+        let root = tmp();
+        let base = root.path().join("base");
+        std::fs::create_dir_all(base.join("real")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("alias")).unwrap();
+        let target = base.join("alias/sub/f.txt");
+        create_within(&base, target.to_str().unwrap(), b"ok").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(base.join("real/sub/f.txt")).unwrap(),
+            "ok"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_within_refuses_dangling_symlink_parent() {
+        let root = tmp();
+        let base = root.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        let missing = root.path().join("missing");
+        std::os::unix::fs::symlink(&missing, base.join("dangling")).unwrap();
+        assert!(create_within(&base, "dangling/sub/f.txt", b"x").is_err());
+        assert!(!missing.exists(), "dangling symlink target was created");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_within_refuses_final_symlink_without_writing_through_it() {
+        let root = tmp();
+        let base = root.path().join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        let target = root.path().join("target.txt");
+        std::fs::write(&target, "orig").unwrap();
+        std::os::unix::fs::symlink(&target, base.join("leaf")).unwrap();
+
+        assert!(create_within(&base, "leaf", b"x").is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "orig");
     }
 
     #[test]

@@ -7,6 +7,14 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## Unreleased
 
 ### Fixed
+- On macOS, creating a file through a symlinked directory inside the project
+  (`<base>/link -> /elsewhere`, then `link/sub/f.txt`) made the missing parent
+  directories outside the base before refusing the write. `create_within` now
+  walks each component from an opened, verified directory handle on macOS, and
+  absolute targets on every Unix are rebased onto the canonical base instead of
+  running `create_dir_all` on the raw string first (`K-CONTAINMENT`).
+  Absolute targets outside the base, or containing `..`, are now refused as
+  an escape before anything is created.
 - A v2 turn now closes the way upstream does, so a loop-guard ask or a dead
   process cannot leave a session looking busy. `session.execution.*` frames
   carry `sessionID` inside `data` (v2 clients filter on it and dropped the
