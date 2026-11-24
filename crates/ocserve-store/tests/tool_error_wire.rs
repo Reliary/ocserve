@@ -96,3 +96,58 @@ fn legacy_failed_tool_state_is_normalized_on_single_and_streamed_reads() {
     let streamed: serde_json::Value = serde_json::from_str(&chunks[0]).unwrap();
     assert_normalized(streamed["parts"].as_array().unwrap());
 }
+
+/// PATCH round-trip (review of this PR): the read-boundary normalization must
+/// not leak into storage. `load_messages` stays raw, the walk is normalized,
+/// and `update_part` stores the client body verbatim — so a client that GETs a
+/// legacy part and PATCHes it back cannot migrate the row by reading it.
+#[test]
+fn legacy_normalization_is_not_written_back() {
+    let (dir, db, writer) = seeded_db();
+    let blobs =
+        std::sync::Arc::new(ocserve_store::BlobStore::new(dir.path().join("blobs")).unwrap());
+
+    let stored = ocserve_store::load_messages(&db, "ses_error", None).unwrap();
+    assert_eq!(
+        stored[0].1[0]["state"]["output"], "legacy failure",
+        "raw read must not normalize"
+    );
+    assert!(
+        stored[0].1[0]["state"].get("error").is_none(),
+        "raw read must not invent `error`"
+    );
+
+    let mut chunks = Vec::new();
+    ocserve_store::for_each_message_json(&db, "ses_error", MessageWalk::Seq { limit: None }, |c| {
+        chunks.push(c);
+        Ok(())
+    })
+    .unwrap();
+    let served: serde_json::Value = serde_json::from_str(&chunks[0]).unwrap();
+    assert_eq!(
+        served["parts"][0]["state"]["error"], "legacy failure",
+        "served is normalized"
+    );
+    assert!(
+        served["parts"][0]["state"].get("output").is_none(),
+        "served drops output"
+    );
+
+    let mut body = served["parts"][0].clone();
+    body["id"] = json!("prt_error01");
+    ocserve_store::update_part(
+        &writer,
+        &blobs,
+        "ses_error",
+        "msg_error",
+        "prt_error01",
+        &body,
+    )
+    .unwrap();
+    let after = ocserve_store::load_messages(&db, "ses_error", None).unwrap();
+    assert_eq!(
+        after[0].1[0]["state"]["error"], "legacy failure",
+        "storage takes the client body verbatim: {}",
+        after[0].1[0]
+    );
+}
