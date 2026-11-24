@@ -416,6 +416,17 @@ fn bundle(entry: &Path) -> Result<String> {
         platform: Some(Platform::Node),
         // D1-PLAN: side effects ARE the plugin registration contract.
         treeshake: TreeshakeOptions::Boolean(false),
+        // Rolldown's default is `DeadCodeEliminationOnly`, which still runs the
+        // oxc MINIFIER — and oxc's compressor carries
+        // `debug_assert!(false, "Ran loop more than 10 times.")`. A real plugin
+        // bundle trips it: the normalize task panicked and the plugin was
+        // silently disabled (`ok:false`), while the same plugin loads raw
+        // (`ok:true, hooks:["event"]`), reproduced with rolldown 1.3.1 AND
+        // 1.3.2 so it is not a dependency upgrade. In a `panic = "abort"`
+        // release that would kill the process. Minification of a bundled
+        // plugin buys nothing (it is not shipped over the wire), so turn it
+        // off entirely.
+        minify: Some(rolldown::RawMinifyOptions::Bool(false)),
         log_level: Some(LogLevel::Warn),
         ..Default::default()
     };
@@ -1009,5 +1020,31 @@ export default await import(pkg);"#,
             "stale beside-entry pair must be cleaned (spike-leftover class)"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+    /// The minifier must stay OFF. Rolldown's default (`DeadCodeEliminationOnly`)
+    /// still runs oxc's compressor, which carries
+    /// `debug_assert!(false, "Ran loop more than 10 times.")`; a real plugin
+    /// bundle trips it, the normalize task panics, and the plugin is silently
+    /// disabled — while the same plugin loads raw with its hooks intact.
+    ///
+    /// Reproduced 2026-11-23 with `opencode-models-discovery@2.0.0`:
+    ///   minify default -> `ok:false`, "normalize task: task 30 panicked with
+    ///   message \"Ran loop more than 10 times.\""
+    ///   minify false   -> `ok:true, hooks:["event"]`
+    /// The same panic occurs on rolldown 1.3.1, so it is not the #61 bump.
+    ///
+    /// Planted control: delete the `minify:` line and this fails.
+    #[test]
+    fn normalizer_never_minifies() {
+        let f = include_str!("normalize.rs");
+        let opts = f
+            .split("let opts = BundlerOptions {")
+            .nth(1)
+            .expect("bundler options block");
+        let block = &opts[..opts.find("};").expect("options end")];
+        assert!(
+            block.contains("minify: Some(rolldown::RawMinifyOptions::Bool(false))"),
+            "the normalizer must disable minification (oxc compressor loop panic)"
+        );
     }
 }

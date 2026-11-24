@@ -136,7 +136,11 @@ pub fn serialize(info: &Value, parts: &[Value]) -> String {
                         lines.push(call);
                         lines.push(format!(
                             "[Tool error]: {}",
-                            p["state"]["error"].as_str().unwrap_or("")
+                            // Older rows kept the message in `output`.
+                            p["state"]["error"]
+                                .as_str()
+                                .or_else(|| p["state"]["output"].as_str())
+                                .unwrap_or("")
                         ));
                     }
                     _ => lines.push(call),
