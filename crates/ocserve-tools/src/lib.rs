@@ -12,6 +12,8 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 pub mod bash_patterns;
+pub mod patch;
+pub mod websearch;
 // The bash tool's spawn/kill surface is the crate's contained unsafe opt-in:
 // `libc::killpg` on Unix and a Job Object here on Windows. Each site carries
 // its own safety notes; nothing else in the crate is unsafe.
@@ -128,6 +130,7 @@ pub fn evaluate(permission: &str, resource: &str, rules: &[Rule]) -> String {
 /// capdiff compared it against freeze's 50 KiB and could never pass.
 pub use truncate::{MAX_BYTES, MAX_LINES};
 
+#[derive(Debug)]
 pub struct ToolResult {
     pub output: String,
     pub truncated: bool,
@@ -200,6 +203,109 @@ pub const IMPLEMENTED: &[&str] = &[
     "write",
 ];
 
+/// OpenCode **v2** tool surface ocserve implements.
+///
+/// The v2 model-facing names differ from v1 (`bash`→`shell`, `task`→
+/// `subagent`), `patch` replaces `edit`+`write` on GPT-family models, and
+/// `websearch` is new. `execute` (Code Mode), `experimental_image_generate`
+/// and the flag-gated artifact/schedule/opencode-namespace tools are captured
+/// in the asset but deliberately not advertised: named divergences
+/// `D-V2-CODEMODE`, `D-V2-IMAGE-GEN`, `D-V2-FLAG-TOOLS` (PLAN §18).
+pub const IMPLEMENTED_V2: &[&str] = &[
+    "shell",
+    "read",
+    "write",
+    "edit",
+    "patch",
+    "glob",
+    "grep",
+    "question",
+    "skill",
+    "subagent",
+    "webfetch",
+    "websearch",
+];
+
+/// Frozen v2 provider schemas (live 2.2.6 capture, both model families).
+/// Regenerate with `scripts/capture-v2-provider-contract.sh` — never hand-edit.
+fn frozen_tools_v2() -> Vec<Value> {
+    let raw: Value = serde_json::from_str(include_str!("../assets/provider-tools-v2.json"))
+        .unwrap_or(Value::Null);
+    raw.as_array().cloned().unwrap_or_default()
+}
+
+/// Upstream `patch` replaces `edit`+`write` when the model id contains `gpt-`
+/// but is neither `oss` nor `gpt-4` (`tool/plugin/patch.ts` context hook).
+pub fn uses_patch_tool(model_id: &str) -> bool {
+    let m = model_id.to_ascii_lowercase();
+    m.contains("gpt-") && !m.contains("oss") && !m.contains("gpt-4")
+}
+
+/// v2 provider tool schemas for one model, filtered to what ocserve executes.
+///
+/// The captured `shell` description baked in the capture host's OS/shell; it
+/// is re-rendered for the running host like the v1 `bash` description.
+pub fn schemas_v2(model_id: &str) -> Vec<Value> {
+    let patch = uses_patch_tool(model_id);
+    let (shell, _tmp) = host_shell_and_tmp();
+    frozen_tools_v2()
+        .into_iter()
+        .filter(|t| {
+            t.pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .map(|n| {
+                    if !IMPLEMENTED_V2.contains(&n) {
+                        return false;
+                    }
+                    // Upstream removes websearch when no provider is usable
+                    // (`websearch.ts` context hook). Advertising a tool that
+                    // can only fail wastes the model's turn.
+                    if n == "websearch" && !websearch::configured() {
+                        return false;
+                    }
+                    // Only the model's editing family is offered.
+                    match n {
+                        "patch" => patch,
+                        "edit" | "write" => !patch,
+                        _ => true,
+                    }
+                })
+                .unwrap_or(false)
+        })
+        .map(|mut t| {
+            if t.pointer("/function/name").and_then(|n| n.as_str()) == Some("shell") {
+                t["function"]["description"] = Value::String(shell_description(&shell));
+            }
+            t
+        })
+        .collect()
+}
+
+/// v2 `shell` description, host-rendered (upstream `tool/plugin/shell.ts`
+/// builds the "Commands run on ${OS} using ${shell}." line at runtime).
+pub fn shell_description(shell: &str) -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "macOS".to_string(),
+        "windows" => "Windows".to_string(),
+        other => {
+            // Capitalise the platform name the way upstream prints it.
+            let mut c = other.chars();
+            match c.next() {
+                Some(first) => format!("{}{}", first.to_ascii_uppercase(), c.as_str()),
+                None => String::new(),
+            }
+        }
+    };
+    format!(
+        "Execute a shell command and return its output. Commands run on {os} using {shell}. \
+Quote file paths containing spaces or special characters. Prefer dedicated tools over shell \
+commands when possible. When output is large, the full result is saved to a file and a truncated \
+preview is returned. Rely on automatic truncation unless filtering the output is more useful. \
+Commands accept an optional timeout, background commands have no timeout by default. Background \
+commands return immediately, and you will be notified when they complete."
+    )
+}
+
 /// Frozen provider tool schemas, captured verbatim from the live 1.18.31
 /// provider request (bench/capdiff/frozen/TOOLS.json →
 /// scripts/capture-provider-contract.sh). Never hand-edit: a version bump
@@ -217,7 +323,19 @@ fn frozen_tools() -> Vec<Value> {
 /// The per-tool-call permission path used to call [`schemas`] (a 26 KB JSON
 /// parse per call) just to answer this. This is the same set, zero parse.
 pub fn is_builtin(name: &str) -> bool {
-    IMPLEMENTED.contains(&name)
+    IMPLEMENTED.contains(&name) || IMPLEMENTED_V2.contains(&name)
+}
+
+/// Model-facing tool name → the permission action ocserve evaluates. v2 names
+/// (`shell`, `subagent`, `patch`) fold onto the v1 actions the rule engine and
+/// config semantics use.
+pub fn permission_action(name: &str) -> &str {
+    match name {
+        "shell" => "bash",
+        "subagent" => "task",
+        "patch" => "edit",
+        other => other,
+    }
 }
 
 /// Provider tool schemas, filtered to IMPLEMENTED (deny filtering happens in
@@ -410,6 +528,31 @@ pub fn execute(
 ) -> Result<ToolResult> {
     match name {
         "bash" => bash(input, cwd, env),
+        // v2 name: same executor, plus the v2 `workdir` field. Backgrounded
+        // shell jobs need a notification loop ocserve does not have
+        // (D-V2-BACKGROUND-SHELL), so the call fails loudly instead of
+        // blocking the turn until the timeout.
+        "shell" => {
+            if input.get("background").and_then(Value::as_bool) == Some(true) {
+                bail!(
+                    "Background shell commands are not supported (D-V2-BACKGROUND-SHELL); \
+                     run the command in the foreground."
+                );
+            }
+            let dir = match input.get("workdir").and_then(Value::as_str) {
+                Some(w) if !w.is_empty() => {
+                    let p = resolve(cwd, w);
+                    if !p.is_dir() {
+                        bail!("shell.workdir is not a directory: {w}");
+                    }
+                    p
+                }
+                _ => cwd.to_path_buf(),
+            };
+            bash(input, &dir, env)
+        }
+        "patch" => patch::apply(input, cwd),
+        "websearch" => websearch::run(input),
         "read" => read(input, cwd),
         "write" => write(input, cwd),
         "edit" => edit(input, cwd),
@@ -418,6 +561,21 @@ pub fn execute(
         "todowrite" => todowrite(input),
         "webfetch" => webfetch(input),
         other => bail!("unknown tool: {other}"),
+    }
+}
+
+/// v2 variant of [`execute`]: same executors, plus the v2 `read` output format
+/// (1-based `<line>: ` prefixes) and the v2 directory listing.
+pub fn execute_v2(
+    name: &str,
+    input: &Value,
+    cwd: &Path,
+    env: &[(String, String)],
+) -> Result<ToolResult> {
+    if name == "read" {
+        read_mode(input, cwd, true)
+    } else {
+        execute(name, input, cwd, env)
     }
 }
 
@@ -591,27 +749,67 @@ fn shell_title(command: &str) -> String {
     command.lines().next().unwrap_or(command).to_string()
 }
 
+/// v1 spells the file argument `filePath`; v2 renamed it to `path`.
+fn input_path<'a>(input: &'a Value, tool: &str) -> Result<&'a str> {
+    input["filePath"]
+        .as_str()
+        .or_else(|| input["path"].as_str())
+        .with_context(|| format!("{tool}.path"))
+}
+
 fn read(input: &Value, cwd: &Path) -> Result<ToolResult> {
-    let fp = input["filePath"].as_str().context("read.filePath")?;
+    read_mode(input, cwd, false)
+}
+
+/// v2 `read` prefixes each line with its 1-based number (`read.txt`); v1 does
+/// not. Directory listings are numbered the same way.
+fn read_mode(input: &Value, cwd: &Path, numbered: bool) -> Result<ToolResult> {
+    let fp = input_path(input, "read")?;
     let path = resolve(cwd, fp);
-    let content =
-        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    // v2 `read` also accepts a directory and returns one entry per line
+    // ("Directory entries are returned one per line"). v1 callers passed files.
+    let content = if path.is_dir() {
+        let mut names: Vec<String> = std::fs::read_dir(&path)
+            .with_context(|| format!("read {}", path.display()))?
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names.join("\n")
+    } else {
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?
+    };
     let offset = input["offset"].as_u64().unwrap_or(0) as usize;
     let limit = input["limit"].as_u64().map(|l| l as usize);
     let lines: Vec<&str> = content.split('\n').collect();
-    let slice = if offset >= lines.len() {
-        ""
+    let end = if offset >= lines.len() {
+        offset
     } else {
-        let end = match limit {
+        match limit {
             // saturating: offset/limit come from the model as u64; a large
             // offset near usize::MAX would overflow `offset + l` (debug panic /
             // release wrap-to-huge then `.min(len)` — harmless but UB-adjacent).
             Some(l) => offset.saturating_add(l).min(lines.len()),
             None => lines.len(),
-        };
-        &lines[offset..end].join("\n")
+        }
     };
-    let t = truncate::truncate(slice, truncate::Direction::Head);
+    // v2 prefixes each line with its 1-based number (`read.txt`: "<line>:
+    // <content>"), and the prefix is not part of the file. v1 does not.
+    let slice = if numbered {
+        lines
+            .get(offset..end)
+            .unwrap_or(&[])
+            .iter()
+            .enumerate()
+            .map(|(i, line)| format!("{}: {line}", offset + i + 1))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else if offset >= lines.len() {
+        String::new()
+    } else {
+        lines[offset..end].join("\n")
+    };
+    let t = truncate::truncate(&slice, truncate::Direction::Head);
     let (output, truncated, output_path) = (
         t.text,
         t.truncated,
@@ -629,7 +827,7 @@ fn read(input: &Value, cwd: &Path) -> Result<ToolResult> {
 }
 
 fn write(input: &Value, cwd: &Path) -> Result<ToolResult> {
-    let fp = input["filePath"].as_str().context("write.filePath")?;
+    let fp = input_path(input, "write")?;
     let content = input["content"].as_str().context("write.content")?;
     let path = resolve(cwd, fp);
     if let Some(parent) = path.parent() {
@@ -648,7 +846,7 @@ fn write(input: &Value, cwd: &Path) -> Result<ToolResult> {
 }
 
 fn edit(input: &Value, cwd: &Path) -> Result<ToolResult> {
-    let fp = input["filePath"].as_str().context("edit.filePath")?;
+    let fp = input_path(input, "edit")?;
     // v1 parity (K-CAPDIFF): the model-facing param names are oldString /
     // newString / replaceAll, NOT oldText / newText. A model trained on
     // opencode emits the upstream names, so the old schema silently failed
@@ -699,6 +897,13 @@ fn glob(input: &Value, cwd: &Path) -> Result<ToolResult> {
     let mut matches = Vec::new();
     walk(&base, &base, pattern, &mut matches, 0)?;
     matches.sort();
+    // v2 `limit` (v1 had none; absent keeps the historical 10k walk bound).
+    if let Some(limit) = input["limit"].as_u64() {
+        matches.truncate(limit.min(10_000) as usize);
+    }
+    if let Some(limit) = input["limit"].as_u64() {
+        matches.truncate(limit as usize);
+    }
     let joined = matches.join("\n");
     let t = truncate::truncate(&joined, truncate::Direction::Head);
     let (output, truncated, output_path) = (
@@ -751,10 +956,23 @@ fn grep(input: &Value, cwd: &Path) -> Result<ToolResult> {
         None => cwd.to_path_buf(),
     };
     let include = input["include"].as_str().map(String::from);
-    let re = grep_matcher(pattern)?;
+    // v2 additions: `literal` and `caseSensitive` (default true). v1 callers
+    // send neither, so their regex path is unchanged byte for byte.
+    let mut effective = if input["literal"].as_bool().unwrap_or(false) {
+        regex::escape(pattern)
+    } else {
+        pattern.to_string()
+    };
+    if input["caseSensitive"].as_bool() == Some(false) {
+        effective = format!("(?i){effective}");
+    }
+    let re = grep_matcher(&effective)?;
     let mut hits: Vec<String> = Vec::new();
     grep_walk(&base, &base, &re, include.as_deref(), &mut hits, 0)?;
     hits.sort();
+    if let Some(limit) = input["limit"].as_u64() {
+        hits.truncate(limit.min(10_000) as usize);
+    }
     let t = truncate::truncate(&hits.join("\n"), truncate::Direction::Head);
     let (output, truncated, output_path) = (
         t.text,
@@ -1464,5 +1682,73 @@ mod drain_tests {
         assert_eq!(r.exit, Some(0));
         assert_eq!(r.output.trim(), "hello");
         assert!(!r.truncated);
+    }
+
+    /// K-V2-TOOLS: the v2 surface is the v2 capture filtered to what ocserve
+    /// executes, with the model-dependent editing family.
+    #[test]
+    fn v2_schemas_use_v2_names_and_model_family() {
+        let names = |model: &str| -> Vec<String> {
+            schemas_v2(model)
+                .iter()
+                .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let plain = names("deepseek-v4");
+        assert!(plain.contains(&"shell".to_string()));
+        assert!(plain.contains(&"subagent".to_string()));
+        assert!(plain.contains(&"edit".to_string()) && plain.contains(&"write".to_string()));
+        assert!(!plain.contains(&"patch".to_string()));
+        assert!(!plain.contains(&"bash".to_string()) && !plain.contains(&"task".to_string()));
+
+        let gpt = names("gpt-5.1-codex");
+        assert!(gpt.contains(&"patch".to_string()));
+        assert!(!gpt.contains(&"edit".to_string()) && !gpt.contains(&"write".to_string()));
+
+        // Deliberate named divergences are never advertised as if implemented.
+        for excluded in ["execute", "experimental_image_generate"] {
+            assert!(!plain.contains(&excluded.to_string()), "{excluded}");
+        }
+    }
+
+    #[test]
+    fn v2_shell_description_names_the_running_host() {
+        let d = shell_description("zsh");
+        assert!(d.contains("Commands run on"), "{d}");
+        assert!(d.contains("using zsh."), "{d}");
+        assert!(
+            !d.contains("Linux using bash."),
+            "host-baked capture leaked: {d}"
+        );
+    }
+
+    #[test]
+    fn permission_actions_fold_v2_names_onto_internal() {
+        assert_eq!(permission_action("shell"), "bash");
+        assert_eq!(permission_action("subagent"), "task");
+        assert_eq!(permission_action("patch"), "edit");
+        assert_eq!(permission_action("read"), "read");
+    }
+
+    #[test]
+    fn v2_shell_honours_workdir_and_rejects_background() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        let r = execute(
+            "shell",
+            &json!({"command": "pwd", "workdir": "sub"}),
+            tmp.path(),
+            &[],
+        )
+        .unwrap();
+        assert!(r.output.trim().ends_with("/sub"), "{}", r.output);
+        let err = execute(
+            "shell",
+            &json!({"command": "sleep 1", "background": true}),
+            tmp.path(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Background shell"), "{err}");
     }
 }
