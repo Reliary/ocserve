@@ -109,13 +109,25 @@ fn stat_one(p: &std::path::Path) -> Observed {
 
 /// Content hash for change detection (only computed when the fast
 /// (mtime,len) tuple already differs — never on the steady poll path).
+/// Content comparison for the mtime-churn case. Streams 64 KiB chunks: the
+/// models catalog is a 6.7 MB file and `fs::read` allocated the whole thing on
+/// every touched-mtime poll (the boot refresh triggers exactly one), memory
+/// glibc then keeps.
 fn content_hash(p: &std::path::Path) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let Ok(bytes) = std::fs::read(p) else {
+    use std::hash::Hasher;
+    use std::io::Read as _;
+    let Ok(mut f) = std::fs::File::open(p) else {
         return 0;
     };
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut h);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => h.write(&buf[..n]),
+            Err(_) => return 0,
+        }
+    }
     h.finish()
 }
 

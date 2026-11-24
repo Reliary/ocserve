@@ -94,6 +94,16 @@ pub fn read_path() -> PathBuf {
     }
 }
 
+/// True when the operator pinned the catalog via `OPENCODE_MODELS_PATH`.
+/// Upstream's self-heal only deletes the file it wrote (`models-dev.ts` checks
+/// the env before unlinking); we did not port that guard until PR #62 review.
+pub fn is_operator_pinned(path: &Path) -> bool {
+    match std::env::var("OPENCODE_MODELS_PATH") {
+        Ok(v) => !v.is_empty() && Path::new(&v) == path,
+        Err(_) => false,
+    }
+}
+
 /// Lock root (flock.ts `root()`): `{xdgState}/opencode/locks` — ocserve's
 /// HOME-based approximation = `~/.local/state/opencode/locks` (their state
 /// dir: leases are ephemeral + stale-swept, creating it is safe).
@@ -410,10 +420,22 @@ fn write_meta(path: &Path, token: &str) -> std::io::Result<()> {
     )
 }
 
+/// Syntax-only validation for the fetched catalog (D-MODELS-2). `IgnoredAny`
+/// walks the JSON without building maps/arrays/strings, so a 6.7 MB catalog
+/// costs no proportional heap. Trailing garbage is rejected (`end`) so the
+/// file can never contain two documents.
+fn validate_catalog_json(body: &[u8]) -> anyhow::Result<()> {
+    use serde::Deserialize as _;
+    let mut de = serde_json::Deserializer::from_slice(body);
+    serde::de::IgnoredAny::deserialize(&mut de).context("catalog payload is not valid JSON")?;
+    de.end().context("catalog payload has trailing data")?;
+    Ok(())
+}
+
 /// GET `{source}/api.json` with upstream's retry shape (2 retries =
 /// 3 attempts total, exponential 200ms base + jitter, 10s per-attempt
 /// timeout) and the mirrored UA.
-fn fetch_catalog(source: &str, timeout: Duration) -> anyhow::Result<String> {
+fn fetch_catalog(source: &str, timeout: Duration) -> anyhow::Result<Vec<u8>> {
     let url = format!("{}/api.json", source.trim_end_matches('/'));
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
@@ -428,11 +450,16 @@ fn fetch_catalog(source: &str, timeout: Duration) -> anyhow::Result<String> {
         match client.get(&url).header("User-Agent", user_agent()).send() {
             Ok(resp) if resp.status().is_success() => {
                 let body = resp.bytes().context("read body")?;
-                // D-MODELS-2: parse-validate before replace (upstream writes
-                // raw; we skip the corrupt-read window entirely).
-                serde_json::from_slice::<Value>(&body)
-                    .context("catalog payload is not valid JSON")?;
-                return Ok(String::from_utf8_lossy(&body).into_owned());
+                // D-MODELS-2: validate before replace (upstream writes raw; we
+                // skip the corrupt-read window entirely). SYNTAX-only: a full
+                // `Value` parse built the whole 324-provider tree just to drop
+                // it, and glibc kept the arena — the boot RSS spike was this
+                // validation, not the served catalog.
+                validate_catalog_json(&body)?;
+                // One copy: the validation walked the bytes in place and the
+                // writer takes a slice. `lossy().into_owned()` made a second
+                // 6.7 MB String (glibc keeps it) for no gain.
+                return Ok(body.to_vec());
             }
             Ok(resp) => {
                 last = format!("HTTP {}", resp.status());
@@ -443,7 +470,7 @@ fn fetch_catalog(source: &str, timeout: Duration) -> anyhow::Result<String> {
     anyhow::bail!("catalog fetch failed after 3 attempts: {last}")
 }
 
-fn atomic_write(path: &Path, bytes: &str) -> anyhow::Result<()> {
+fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).context("mkdir cache dir")?;
     }
@@ -460,7 +487,7 @@ fn atomic_write(path: &Path, bytes: &str) -> anyhow::Result<()> {
     ));
     let res = (|| -> anyhow::Result<()> {
         let mut f = std::fs::File::create(&tmp).context("create tmp")?;
-        f.write_all(bytes.as_bytes()).context("write tmp")?;
+        f.write_all(bytes).context("write tmp")?;
         f.sync_all().context("fsync tmp")?;
         std::fs::rename(&tmp, path).context("rename tmp")?;
         Ok(())
@@ -700,7 +727,7 @@ mod tests {
         });
         let body = fetch_catalog(&format!("http://{addr}"), Duration::from_secs(5))
             .expect("retry then succeed");
-        assert!(body.contains("deepseek"));
+        assert!(std::str::from_utf8(&body).unwrap().contains("deepseek"));
     }
 
     #[test]
@@ -729,7 +756,7 @@ mod tests {
     #[ignore = "live models.opencode.ai fetch (nightly)"]
     fn live_fetch_contains_big_pickle() {
         let body = fetch_catalog(DEFAULT_SOURCE, FETCH_TIMEOUT).expect("live catalog fetch");
-        let v: Value = serde_json::from_str(&body).expect("live catalog parses");
+        let v: Value = serde_json::from_slice(&body).expect("live catalog parses");
         assert!(
             v.pointer("/opencode/models/big-pickle").is_some(),
             "catalog must still carry opencode/big-pickle (zen default family)"
@@ -806,5 +833,19 @@ mod tests {
             Duration::from_secs(5),
         );
         assert_eq!(out3, Outcome::Fetched);
+    }
+
+    /// D-MODELS-2 validation must stay allocation-free: a syntactically valid
+    /// document passes, trailing data and malformed JSON fail.
+    ///
+    /// CONTROL: a `from_slice::<Value>` implementation still passes these
+    /// assertions; the RSS difference is measured separately (the whole point
+    /// is that the validator must not build the tree).
+    #[test]
+    fn catalog_validation_is_syntax_only() {
+        assert!(super::validate_catalog_json(br#"{"p":{"models":{"m":{"id":"m"}}}}"#).is_ok());
+        assert!(super::validate_catalog_json(b"{} trailing").is_err());
+        assert!(super::validate_catalog_json(b"{not json").is_err());
+        assert!(super::validate_catalog_json(b"").is_err());
     }
 }
