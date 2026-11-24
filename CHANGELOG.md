@@ -6,6 +6,22 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 
 ## Unreleased
 
+### Added (OpenCode v2 compatibility)
+- Config discovery now matches v2: `opencode.json` **and** `opencode.jsonc`
+  (JSONC commented/trailing-comma safe), the project tree
+  (`.opencode/opencode.json(c)` from the root down to the cwd), and the
+  canonical v2 keys `providers`, `agents`, `commands`, `permissions`,
+  `mcp.servers`, object-form `model` and `experimental.subagent_depth`.
+  `PATCH /config` writes an existing `.jsonc` instead of creating a
+  shadowed `.json`, and `/api/config` lists both files with their paths.
+  `D-V2-CONFIG`.
+- With `OCSERVE_V2=1` the model-facing tools are the v2 set: `shell`,
+  `subagent`, `patch` (GPT family instead of `edit`+`write`) and
+  `websearch`, with the live 2.2.6 schemas. v2 names fold onto the internal
+  permission actions. Code Mode, image generation and the flag-gated
+  artifact/schedule namespaces are named divergences (`D-V2-CODEMODE`,
+  `D-V2-IMAGE-GEN`, `D-V2-FLAG-TOOLS`).
+
 ### Fixed
 - The v2 message projection no longer drops data a v2 client needs: a prompt
   admitted through `/api/session/{id}/prompt` shows its text (it was stored as

@@ -301,6 +301,7 @@ fn default_data_dir() -> std::path::PathBuf {
     }
 }
 
+mod config_compat;
 mod gate_status;
 mod models_dev;
 // The platform seam lives in ocserve-core so every crate shares one copy.

@@ -15,6 +15,7 @@ pub mod event;
 pub mod form;
 pub mod goal;
 pub mod ids;
+pub mod jsonc;
 pub mod loop_guard;
 pub mod permission;
 pub mod prefix;

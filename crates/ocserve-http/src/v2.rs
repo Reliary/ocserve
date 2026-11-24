@@ -885,22 +885,50 @@ pub async fn config_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     // provisions plugins into; a hardcoded HOME path fails that check.
     let config_dir = ocserve_store::platform::opencode_config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from(format!("{home}/.config/opencode")));
+    // v2 discovery: global `opencode.json` + `opencode.jsonc`, then the
+    // project tree from the filesystem root down to the worktree. Each entry
+    // carries its own path — v2 clients compare it with the directory their
+    // launcher provisioned, and the old response omitted it entirely.
     let mut out = vec![json!({
         "type": "directory",
         "path": config_dir.display().to_string(),
     })];
-    for path in [
-        config_dir.join("opencode.json"),
-        std::path::PathBuf::from(&worktree).join("opencode.json"),
-    ] {
+    let mut paths: Vec<std::path::PathBuf> = ["opencode.json", "opencode.jsonc"]
+        .iter()
+        .map(|name| config_dir.join(name))
+        .collect();
+    paths.extend(project_config_paths(std::path::Path::new(&worktree)));
+    for path in paths {
         if let Ok(text) = std::fs::read_to_string(&path)
-            && let Ok(info) = serde_json::from_str::<Value>(&text)
-            && info.is_object()
+            && let Ok(info) = ocserve_core::jsonc::parse_object(&text)
         {
-            out.push(json!({"type": "document", "info": info}));
+            out.push(json!({
+                "type": "document",
+                "path": path.display().to_string(),
+                "info": info,
+            }));
         }
     }
     Json(Value::Array(out))
+}
+
+/// Project config candidates from the filesystem root down to `cwd`
+/// (`opencode.json(c)` plus `.opencode/opencode.json(c)` per directory),
+/// mirroring the loader's discovery order.
+fn project_config_paths(cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let start = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let mut dirs: Vec<std::path::PathBuf> = start.ancestors().map(|p| p.to_path_buf()).collect();
+    dirs.reverse();
+    let mut out = Vec::new();
+    for dir in dirs {
+        for name in ["opencode.json", "opencode.jsonc"] {
+            out.push(dir.join(name));
+        }
+        for name in ["opencode.json", "opencode.jsonc"] {
+            out.push(dir.join(".opencode").join(name));
+        }
+    }
+    out
 }
 
 /// GET /api/config/shell — `ConfigShell.Option[]` from `/etc/shells`

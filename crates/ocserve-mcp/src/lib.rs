@@ -72,7 +72,11 @@ pub fn parse_config(mcp: &Value) -> Vec<ServerCfg> {
     };
     obj.iter()
         .map(|(name, v)| {
-            let enabled = v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true);
+            // v1 spells the switch `enabled`; v2 spells it `disabled`.
+            let enabled = v
+                .get("enabled")
+                .and_then(|e| e.as_bool())
+                .unwrap_or_else(|| !v.get("disabled").and_then(|d| d.as_bool()).unwrap_or(false));
             let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("local");
             let kind = if ty == "remote" {
                 Kind::Remote {
