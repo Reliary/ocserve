@@ -7,6 +7,12 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## Unreleased
 
 ### Fixed
+- `GET /api/shell/{id}` (and the spawn response) reports the exit status as
+  `exit`, the field the upstream `Shell.Info` schema defines, and leaves it out
+  while the shell runs. It was emitted as `exitCode`, so a client that judges
+  a shell by `status == "exited" && exit == 0`, such as the opencode remote
+  dispatcher, treated every finished bootstrap as failed and rolled back its
+  worktree.
 - The v2 message projection no longer drops data a v2 client needs: a prompt
   admitted through `/api/session/{id}/prompt` shows its text (it was stored as
   a part, so `text` came back empty), and assistant messages keep

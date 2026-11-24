@@ -155,13 +155,20 @@ impl ShellRegistry {
                 }
             }
         }
-        Some(json!({
+        // Upstream `Shell.Info` names the exit status `exit` (a number, absent
+        // while running or when a signal ended the process); the schema is
+        // closed, so no other key carries it. Clients such as the opencode
+        // dispatcher judge a shell by `status == "exited" && exit == 0`.
+        let mut info = json!({
             "id": e.id,
             "status": e.status,
             "command": e.command,
             "cwd": e.cwd,
-            "exitCode": e.exit_code,
-        }))
+        });
+        if let Some(code) = e.exit_code {
+            info["exit"] = json!(code);
+        }
+        Some(info)
     }
 
     pub fn output(&self, id: &str) -> Option<Value> {
@@ -250,7 +257,11 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(info.unwrap()["status"], "exited");
+        let info = info.unwrap();
+        assert_eq!(info["status"], "exited");
+        // Spec field name is `exit`; the old `exitCode` key must be gone.
+        assert_eq!(info["exit"], 0);
+        assert!(info.get("exitCode").is_none());
         let out = reg.output(&id).unwrap();
         assert!(out["output"].as_str().unwrap().contains("hi"));
         assert!(reg.remove(&id));
@@ -275,5 +286,36 @@ mod tests {
         assert!(out["output"].as_str().unwrap().len() <= SHELL_OUTPUT_CAP);
         reg.remove(&id);
         // CONTROL: unbounded append → len exceeds cap, red.
+    }
+
+    fn wait_exited(reg: &ShellRegistry, id: &str) -> Value {
+        for _ in 0..200 {
+            let info = reg.poll(id).expect("known shell");
+            if info["status"] != "running" {
+                return info;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("shell did not exit");
+    }
+
+    #[test]
+    fn nonzero_exit_is_reported_as_exit() {
+        let reg = ShellRegistry::new();
+        let id = reg.spawn("exit 7", "/tmp").expect("spawn");
+        let info = wait_exited(&reg, &id);
+        assert_eq!(info["status"], "exited");
+        assert_eq!(info["exit"], 7);
+        reg.remove(&id);
+    }
+
+    #[test]
+    fn running_shell_has_no_exit_key() {
+        let reg = ShellRegistry::new();
+        let id = reg.spawn("sleep 5", "/tmp").expect("spawn");
+        let info = reg.poll(&id).unwrap();
+        assert_eq!(info["status"], "running");
+        assert!(info.get("exit").is_none(), "null/absent, never a fake 0");
+        reg.remove(&id);
     }
 }
