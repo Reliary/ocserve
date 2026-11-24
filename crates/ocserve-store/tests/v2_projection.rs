@@ -49,7 +49,7 @@ fn seeded_db() -> (tempfile::TempDir, std::path::PathBuf) {
         &[json!({"id": "prt_seed10", "type": "text", "text": "prompt from v2"})],
     )
     .unwrap();
-    // Assistant with text + reasoning + completed tool + error tool +
+    // Assistant with text + reasoning + completed tools + error tools +
     // running tool + envelope noise (step-start must not become content).
     ocserve_store::insert_message(
         &w,
@@ -64,12 +64,15 @@ fn seeded_db() -> (tempfile::TempDir, std::path::PathBuf) {
             json!({"id": "prt_seed05", "type": "reasoning", "text": "hmm"}),
             json!({"id": "prt_seed06", "type": "tool", "callID": "c1", "tool": "read",
                    "state": {"status": "completed", "input": {"path": "/a"},
-                             "output": [{"text": "x"}],
+                             "output": "x",
                              "time": {"start": 1, "end": 2}}}),
             json!({"id": "prt_seed07", "type": "tool", "callID": "c2", "tool": "bash",
                    "state": {"status": "error", "input": {"cmd": "y"},
-                             "error": "boom", "time": {"start": 3}}}),
-            json!({"id": "prt_seed08", "type": "tool", "callID": "c3", "tool": "grep",
+                             "output": "legacy boom", "time": {"start": 3}}}),
+            json!({"id": "prt_seed08", "type": "tool", "callID": "c3", "tool": "write",
+                   "state": {"status": "error", "input": {"path": "/a"},
+                             "error": "boom", "time": {"start": 4}}}),
+            json!({"id": "prt_seed11", "type": "tool", "callID": "c4", "tool": "grep",
                    "state": {"status": "running", "input": {"q": "z"}}}),
         ],
     )
@@ -94,9 +97,9 @@ fn content_projection_maps_all_part_kinds() {
     // V2 admission stores prompt text in a part, not info.text.
     assert_eq!(out[1]["type"], "user");
     assert_eq!(out[1]["text"], "prompt from v2");
-    // Assistant: envelope part excluded; 2 text-ish + 3 tools.
+    // Assistant: envelope part excluded; 2 text-ish + 4 tools.
     let content = out[2]["content"].as_array().unwrap();
-    assert_eq!(content.len(), 5, "text+reasoning+3 tools, no step-start");
+    assert_eq!(content.len(), 6, "text+reasoning+4 tools, no step-start");
     assert_eq!(
         (content[0]["type"].as_str(), content[0]["text"].as_str()),
         (Some("text"), Some("here"))
@@ -107,13 +110,25 @@ fn content_projection_maps_all_part_kinds() {
     );
     assert_eq!(content[2]["name"], "read");
     assert_eq!(content[2]["state"]["status"], "completed");
-    assert_eq!(content[2]["state"]["output"][0]["text"], "x");
+    assert_eq!(
+        content[2]["state"]["content"],
+        json!([{"type": "text", "text": "x"}])
+    );
+    assert!(content[2]["state"].get("output").is_none());
     assert_eq!(content[3]["state"]["status"], "error");
-    assert_eq!(content[3]["state"]["error"], "boom");
-    assert_eq!(content[4]["state"]["status"], "running");
+    assert_eq!(
+        content[3]["state"]["error"],
+        json!({"type": "unknown", "message": "legacy boom"})
+    );
+    assert!(content[3]["state"].get("output").is_none());
+    assert_eq!(
+        content[4]["state"]["error"],
+        json!({"type": "unknown", "message": "boom"})
+    );
+    assert_eq!(content[5]["state"]["status"], "running");
     assert_eq!(out[2]["model"]["providerID"], "fake");
-    // CONTROL: map step-start into content → len 6, red. Drop the running
-    // arm → len 4, red.
+    // CONTROL: map step-start into content → len 7, red. Drop the running
+    // arm → len 5, red.
 }
 
 #[test]

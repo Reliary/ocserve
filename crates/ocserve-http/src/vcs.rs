@@ -27,10 +27,38 @@ const MAX_TOTAL_PATCH_BYTES: usize = 10_000_000;
 /// the caller passes no `context`.
 const FULL_CONTEXT: &str = "2147483647";
 
+/// Repo config a *client-named* directory can use to run a program during a
+/// read-only-looking git command. `--no-ext-diff` covers `diff.external` on
+/// every diff call below, but two vectors remain and both are repo-controlled:
+///
+///   * `core.fsmonitor=<cmd>`: git spawns it for `status`/`diff` (measured on
+///     git 2.54: a hook script ran during `git status --porcelain`).
+///   * `diff.<driver>.textconv=<cmd>`: runs on a plain `git diff --patch`;
+///     `--no-ext-diff` does NOT disable it (measured: it ran on `git diff --`,
+///     and did not run with `--stat`).
+///
+/// Since #64/#65/#66 let the client choose the directory, git now runs in
+/// directories the caller names, so both are neutralised on every invocation.
+/// `-c` overrides repo config; the environment cannot re-enable them.
+const GIT_SAFETY: &[&str] = &[
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+];
+
+/// `--no-textconv` is a DIFF option, not a global flag: `git --no-textconv
+/// status` exits 129 and silently breaks every route (measured; the first
+/// version of this guard did exactly that). It therefore rides on the diff
+/// invocations, next to the `--no-ext-diff` that already neutralises
+/// `diff.external`.
+const DIFF_SAFETY: &[&str] = &["--no-ext-diff", "--no-textconv"];
+
 fn run_git(dir: &str, args: &[&str]) -> Option<(String, i32)> {
     // Containment: a vcs walk on a huge worktree is tool work, not server work.
     let out = ocserve_store::cgroup::command("git", "tools")
         .current_dir(dir)
+        .args(GIT_SAFETY)
         .args(args)
         .output()
         .ok()?;
@@ -73,7 +101,8 @@ fn numstat(dir: &str, ref_: &str) -> std::collections::HashMap<String, (i64, i64
         dir,
         &[
             "diff",
-            "--no-ext-diff",
+            DIFF_SAFETY[0],
+            DIFF_SAFETY[1],
             "--no-renames",
             "--numstat",
             "-z",
@@ -368,7 +397,8 @@ fn tracked_patches(
         &[
             "diff",
             "--patch",
-            "--no-ext-diff",
+            DIFF_SAFETY[0],
+            DIFF_SAFETY[1],
             "--no-renames",
             &format!("--unified={context}"),
             "--end-of-options",
@@ -420,7 +450,8 @@ pub fn diff_raw(dir: &str) -> String {
             &[
                 "diff",
                 "--patch",
-                "--no-ext-diff",
+                DIFF_SAFETY[0],
+                DIFF_SAFETY[1],
                 "--no-renames",
                 &format!("--unified={FULL_CONTEXT}"),
                 ref_,
@@ -439,7 +470,8 @@ pub fn diff_raw(dir: &str) -> String {
                     "diff",
                     "--no-index",
                     "--patch",
-                    "--no-ext-diff",
+                    DIFF_SAFETY[0],
+                    DIFF_SAFETY[1],
                     "--no-renames",
                     &format!("--unified={FULL_CONTEXT}"),
                     "--",
@@ -623,7 +655,8 @@ fn diff_body(dir: &str, ref_: &str, context: Option<u32>, untracked: bool) -> Va
                     "diff",
                     "--no-index",
                     "--patch",
-                    "--no-ext-diff",
+                    DIFF_SAFETY[0],
+                    DIFF_SAFETY[1],
                     "--no-renames",
                     &format!("--unified={ctx}"),
                     "--",
@@ -667,5 +700,120 @@ mod tests {
             Some("src/x.rs".into())
         );
         assert_eq!(parse_git_header("not a header"), None);
+    }
+    /// A client-named directory (#64/#65/#66) must not be able to run a
+    /// program through repo config. Two vectors, both measured on git 2.54:
+    /// `core.fsmonitor` runs during `git status --porcelain`, and
+    /// `diff.<driver>.textconv` runs on `git diff --patch` WITHOUT being
+    /// suppressed by `--no-ext-diff`.
+    ///
+    /// Each vector carries its own POSITIVE control (bare `git`, no safety
+    /// flags) so a "blocked" result cannot be a command that never ran.
+    /// Planted control for the guard: remove the entry from `GIT_SAFETY` and
+    /// the positive control passes while the guarded call creates the marker.
+    fn sh(cwd: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    fn arm_hook(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let marker = dir.join(name);
+        let hook = dir.join(format!("{name}.sh"));
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch {}\necho '{{}}'\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        hook
+    }
+
+    #[test]
+    fn git_safety_flags_block_repo_config_execution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        sh(&dir, &["init", "-q", "."]);
+
+        // ---- core.fsmonitor ----
+        let hook = arm_hook(&dir, "fsm");
+        sh(&dir, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+        // positive control: bare git must run it, or this fixture proves nothing
+        sh(&dir, &["status", "--porcelain"]);
+        let marker = dir.join("fsm");
+        assert!(
+            marker.exists(),
+            "fixture invalid: bare git did not run core.fsmonitor"
+        );
+        std::fs::remove_file(&marker).unwrap();
+        // guarded: our own path must not
+        let _ = status_entries(dir.to_str().unwrap());
+        assert!(
+            !marker.exists(),
+            "core.fsmonitor hook ran through run_git: a client-named directory can execute code"
+        );
+
+        // Isolate the next vector: a leftover fsmonitor hook reporting "no
+        // changes" makes `git diff` trust the stale index and print nothing,
+        // which read as "the textconv vector is absent". The positive control
+        // caught it.
+        sh(&dir, &["config", "--unset", "core.fsmonitor"]);
+
+        // ---- diff.<driver>.textconv ----
+        // The filter must CAT the file: a constant output makes both sides
+        // identical, `git diff` prints nothing, and the vector looks absent.
+        let cvt = dir.join("cvt.sh");
+        std::fs::write(
+            &cvt,
+            format!(
+                "#!/bin/sh\ntouch {}\ncat \"$1\"\n",
+                dir.join("cvt").display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cvt, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(dir.join("f.txt"), "a\n").unwrap();
+        std::fs::write(dir.join(".gitattributes"), "*.txt diff=up\n").unwrap();
+        for (k, v) in [
+            ("user.email", "t@example.com"),
+            ("user.name", "t"),
+            ("diff.up.textconv", cvt.to_str().unwrap()),
+        ] {
+            sh(&dir, &["config", k, v]);
+        }
+        sh(&dir, &["add", "-A"]);
+        sh(&dir, &["commit", "-qm", "init"]);
+        std::fs::write(dir.join("f.txt"), "b\n").unwrap();
+
+        // positive control: a bare patch diff runs the filter
+        let bare = std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(["diff", "--patch", "--", "."])
+            .output()
+            .unwrap();
+        assert!(!bare.stdout.is_empty(), "fixture invalid: bare diff empty");
+        let marker2 = dir.join("cvt");
+        assert!(
+            marker2.exists(),
+            "fixture invalid: bare git diff did not run the textconv filter"
+        );
+        std::fs::remove_file(&marker2).unwrap();
+
+        let _ = diff_with(dir.to_str().unwrap(), "unstaged", None, None, false);
+        let _ = diff_raw(dir.to_str().unwrap());
+        assert!(
+            !marker2.exists(),
+            "textconv filter ran through run_git: --no-ext-diff does not suppress it"
+        );
     }
 }

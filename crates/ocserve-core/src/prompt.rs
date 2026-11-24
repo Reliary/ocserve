@@ -3754,6 +3754,7 @@ pub async fn run_prompt_with(
                         )?;
                     }
 
+                    let output_before_hooks = output.clone();
                     // v1 hook: tool.execute.after (sequential in-host; failures are
                     // logged host-side, never block the tool result — M4b)
                     if let Some(plug) = &ctx.plugins {
@@ -3796,7 +3797,7 @@ pub async fn run_prompt_with(
                                 }
                                 if let Some(o) = out.get("output").and_then(|v| v.as_str()) {
                                     output = o.to_string();
-                                    running["state"]["output"] = json!(o);
+                                    set_tool_state_result(&mut running["state"], o);
                                 }
                                 if let Some(m) = out.get("metadata").and_then(|v| v.as_object())
                                     && !m.is_empty()
@@ -3816,15 +3817,13 @@ pub async fn run_prompt_with(
                             }
                         }
                     }
-                    // v2 Phase 3: tool.execute.after — the v2 tool-result shape
-                    // is a status union (promise/tool.ts): completed {result} or
-                    // error {error}. Map onto the same output string; a v2 hook
-                    // that replaces `result`/`error` mutates the tool output.
+                    // v2 Phase 3: tool.execute.after uses the upstream status
+                    // union: completed {result} or error {Tool.Error}. Map its
+                    // mutable result/message back onto the shared v1 result
+                    // string so either variant updates the persisted tool part.
                     {
-                        let v2_out = hook_v2(
-                            ctx.plugins.as_ref(),
-                            "tool",
-                            "execute.after",
+                        let is_error_state = running["state"]["status"] == "error";
+                        let v2_event = v2_tool_execute_after_event(
                             json!({
                                 "tool": call.name,
                                 "sessionID": session_id,
@@ -3833,14 +3832,24 @@ pub async fn run_prompt_with(
                                 "id": call.id,
                                 "input": serde_json::from_str::<Value>(&call.arguments)
                                     .unwrap_or_else(|_| json!({})),
-                                "status": "completed",
-                                "result": output,
                             }),
-                        )
-                        .await;
-                        if let Some(r) = v2_out.get("result").and_then(|v| v.as_str()) {
+                            is_error_state,
+                            &output,
+                        );
+                        let v2_out =
+                            hook_v2(ctx.plugins.as_ref(), "tool", "execute.after", v2_event).await;
+                        if let Some(r) = v2_tool_execute_after_result(&v2_out, is_error_state) {
                             output = r.to_string();
                         }
+                    }
+                    set_tool_state_result(&mut running["state"], &output);
+                    // The pre-hook mirror stands unless a hook replaced the
+                    // result; a hook-merged `metadata.output` is kept.
+                    if output != output_before_hooks
+                        && running["state"]["status"] == "completed"
+                        && running["state"]["metadata"].get("todos").is_none()
+                    {
+                        metadata_mut(&mut running["state"]).insert("output".into(), json!(output));
                     }
                     emit_durable(
                         ctx,
@@ -4509,6 +4518,53 @@ async fn question_tool_state(
             "time": {"start": ask_start, "end": now_ms()},
         }),
     ))
+}
+
+/// The tool result string lives in `error` for a failed call and in `output`
+/// for a completed one (frozen `ToolStateError` / `ToolStateCompleted`).
+fn set_tool_state_result(state: &mut Value, result: &str) {
+    let field = if state["status"] == "error" {
+        "error"
+    } else {
+        "output"
+    };
+    if let Some(object) = state.as_object_mut() {
+        object.insert(field.into(), Value::String(result.to_owned()));
+    }
+}
+
+/// Build the v2 `tool.execute.after` hook input: a status union, completed
+/// `{result}` or error `{error: {_tag: "Tool.Error", message}}`.
+fn v2_tool_execute_after_event(mut event: Value, is_error: bool, output: &str) -> Value {
+    if let Some(object) = event.as_object_mut() {
+        object.remove("result");
+        object.remove("error");
+        if is_error {
+            object.insert("status".into(), Value::String("error".into()));
+            object.insert(
+                "error".into(),
+                json!({"_tag": "Tool.Error", "message": output}),
+            );
+        } else {
+            object.insert("status".into(), Value::String("completed".into()));
+            object.insert("result".into(), Value::String(output.to_owned()));
+        }
+    }
+    event
+}
+
+/// Read the possibly hook-mutated result back from the v2 union arm that was
+/// sent; a hook that flips the arm is ignored.
+fn v2_tool_execute_after_result(event: &Value, is_error: bool) -> Option<&str> {
+    if is_error {
+        (event["status"] == "error")
+            .then(|| event.pointer("/error/message").and_then(Value::as_str))
+            .flatten()
+    } else {
+        (event["status"] == "completed")
+            .then(|| event.get("result").and_then(Value::as_str))
+            .flatten()
+    }
 }
 
 /// v2 form-service variant of the `question` tool: the frozen v2 question
