@@ -1548,7 +1548,15 @@ pub fn project_page_v2(
         let info: Value = serde_json::from_str(info_txt).unwrap_or(Value::Null);
         let role = info.get("role").and_then(|r| r.as_str()).unwrap_or("");
         let created = info.pointer("/time/created").cloned().unwrap_or(json!(0));
-        let time = json!({"created": created});
+        let mut time = json!({"created": created});
+        // v2 clients read an assistant's completion times to see a finished turn.
+        if role == "assistant" {
+            for key in ["streamed", "completed"] {
+                if let Some(v) = info.pointer(&format!("/time/{key}")) {
+                    time[key] = v.clone();
+                }
+            }
+        }
         let plist = parts.get(mid).map(|v| v.as_slice()).unwrap_or(&empty);
         let mut content = Vec::new();
         for (ptype, inline, blob) in plist {
@@ -1668,11 +1676,40 @@ pub fn project_page_v2(
                 }));
             }
             "user" => {
+                // V2 admission stores the prompt text as a part and leaves the
+                // legacy info `text` convenience field absent.
                 let text = info
                     .get("text")
                     .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                    .map(str::to_string)
+                    .or_else(|| {
+                        // Concatenate the prompt's own text parts (same rule as
+                        // the v1 prompt builder), skipping synthetic/ignored
+                        // parts, and decode blobbed parts like any other.
+                        let joined: String = plist
+                            .iter()
+                            .filter(|(t, _, _)| t == "text")
+                            .filter_map(|(_, inline, blob)| {
+                                let raw = match (inline, blob) {
+                                    (Some(t), _) => t.clone(),
+                                    (None, Some((sha, len))) => {
+                                        let bytes = blobs.get(sha, *len as u64).ok()?;
+                                        String::from_utf8_lossy(&bytes).into_owned()
+                                    }
+                                    _ => return None,
+                                };
+                                let b: Value = serde_json::from_str(&raw).ok()?;
+                                if b["synthetic"].as_bool() == Some(true)
+                                    || b["ignored"].as_bool() == Some(true)
+                                {
+                                    return None;
+                                }
+                                b["text"].as_str().map(str::to_string)
+                            })
+                            .collect();
+                        (!joined.is_empty()).then_some(joined)
+                    })
+                    .unwrap_or_default();
                 // file/agent attachments travel as parts; surface the file ones.
                 let mut files = Vec::new();
                 let mut agents = Vec::new();

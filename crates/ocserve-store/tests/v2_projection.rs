@@ -3,7 +3,8 @@
 //! `project_page_v2` maps the v1 part stream (text/reasoning/tool and
 //! envelope parts) to v2 `Session.Message` shapes. Proves text and reasoning,
 //! completed/error/running tool states, user files/agents, blobbed parts,
-//! envelope parts excluded, unknown roles dropped, one-IN-query batching.
+//! envelope parts excluded, v2 user text recovered from stored parts, unknown
+//! roles dropped, one-IN-query batching.
 //!
 //! Run: `cargo test -p ocserve-store --test v2_projection`.
 
@@ -36,6 +37,16 @@ fn seeded_db() -> (tempfile::TempDir, std::path::PathBuf) {
             json!({"id": "prt_seed01", "type": "text", "text": "do it"}),
             json!({"id": "prt_seed02", "type": "file", "file": {"uri": "file:///a.txt"}}),
         ],
+    )
+    .unwrap();
+    // V2 admission persists the prompt text as a part; its message info has
+    // no convenience `text` field.
+    ocserve_store::insert_message(
+        &w,
+        None,
+        "ses_p",
+        &json!({"id": "msg_v2u", "role": "user", "time": {"created": 15}}),
+        &[json!({"id": "prt_seed10", "type": "text", "text": "prompt from v2"})],
     )
     .unwrap();
     // Assistant with text + reasoning + completed tools + error tools +
@@ -74,16 +85,20 @@ fn content_projection_maps_all_part_kinds() {
     let (_dir, db) = seeded_db();
     let page = vec![
         ("msg_u".to_string(), "{\"id\":\"msg_u\",\"role\":\"user\",\"time\":{\"created\":10},\"text\":\"do it\"}".to_string()),
+        ("msg_v2u".to_string(), "{\"id\":\"msg_v2u\",\"role\":\"user\",\"time\":{\"created\":15}}".to_string()),
         ("msg_a".to_string(), "{\"id\":\"msg_a\",\"role\":\"assistant\",\"time\":{\"created\":20},\"agent\":\"build\",\"modelID\":\"m\",\"providerID\":\"fake\",\"cost\":0.1,\"tokens\":{\"input\":1}}".to_string()),
     ];
     let out = ocserve_store::project_page_v2(&db, &page).unwrap();
-    assert_eq!(out.len(), 2);
+    assert_eq!(out.len(), 3);
     // User: text passthrough + file part surfaced.
     assert_eq!(out[0]["type"], "user");
     assert_eq!(out[0]["text"], "do it");
     assert_eq!(out[0]["files"][0]["file"]["uri"], "file:///a.txt");
+    // V2 admission stores prompt text in a part, not info.text.
+    assert_eq!(out[1]["type"], "user");
+    assert_eq!(out[1]["text"], "prompt from v2");
     // Assistant: envelope part excluded; 2 text-ish + 4 tools.
-    let content = out[1]["content"].as_array().unwrap();
+    let content = out[2]["content"].as_array().unwrap();
     assert_eq!(content.len(), 6, "text+reasoning+4 tools, no step-start");
     assert_eq!(
         (content[0]["type"].as_str(), content[0]["text"].as_str()),
@@ -111,9 +126,31 @@ fn content_projection_maps_all_part_kinds() {
         json!({"type": "unknown", "message": "boom"})
     );
     assert_eq!(content[5]["state"]["status"], "running");
-    assert_eq!(out[1]["model"]["providerID"], "fake");
+    assert_eq!(out[2]["model"]["providerID"], "fake");
     // CONTROL: map step-start into content → len 7, red. Drop the running
     // arm → len 5, red.
+}
+
+#[test]
+fn assistant_completion_times_survive_v2_projection() {
+    let (_dir, db) = seeded_db();
+    let page = vec![(
+        "msg_a".to_string(),
+        json!({
+            "id": "msg_a", "role": "assistant",
+            "time": {"created": 20, "streamed": 30, "completed": 40},
+            "agent": "build", "modelID": "m", "providerID": "fake",
+        })
+        .to_string(),
+    )];
+    let out = ocserve_store::project_page_v2(&db, &page).unwrap();
+    assert_eq!(
+        out[0]["time"],
+        json!({"created": 20, "streamed": 30, "completed": 40}),
+        "v2 clients use assistant completion time to detect a finished turn"
+    );
+    // Negative control: dropping either optional timestamp leaves the v2 turn
+    // looking active after the assistant has already finished.
 }
 
 #[test]
@@ -151,6 +188,54 @@ fn blobbed_parts_decode_like_production() {
         big.len()
     );
     // CONTROL: skip blob decode (empty text) → len 0, red.
+}
+
+#[test]
+fn v2_user_text_skips_synthetic_and_ignored_and_decodes_blobs() {
+    use ocserve_store::blob::BlobStore;
+    let dir = tempfile::tempdir().unwrap();
+    let db = writer::db_path(dir.path());
+    let conn = ocserve_store::pragma::open_writer(&db).unwrap();
+    ocserve_store::schema::migrate(&conn).unwrap();
+    drop(conn);
+    let blobs = BlobStore::new(dir.path().join("blobs")).unwrap();
+    let big = "q".repeat(ocserve_store::INLINE_PART_MAX + 100);
+    let w = writer::Writer::spawn(db.clone()).unwrap();
+    ocserve_store::insert_session(
+        &w,
+        &json!({"id": "ses_t", "time": {"created": 1, "updated": 2}}),
+    )
+    .unwrap();
+    let info = json!({"id": "msg_t1", "role": "user", "time": {"created": 5}});
+    ocserve_store::insert_message(
+        &w,
+        Some(&blobs),
+        "ses_t",
+        &info,
+        &[
+            json!({"id": "prt_t01", "type": "text", "text": "Called the Read tool", "synthetic": true}),
+            json!({"id": "prt_t02", "type": "text", "text": "hidden", "ignored": true}),
+            json!({"id": "prt_t03", "type": "text", "text": "summarize "}),
+            json!({"id": "prt_t04", "type": "text", "text": "this"}),
+        ],
+    )
+    .unwrap();
+    let info2 = json!({"id": "msg_t2", "role": "user", "time": {"created": 6}});
+    ocserve_store::insert_message(
+        &w,
+        Some(&blobs),
+        "ses_t",
+        &info2,
+        &[json!({"id": "prt_t05", "type": "text", "text": big})],
+    )
+    .unwrap();
+    let page = vec![
+        ("msg_t1".to_string(), info.to_string()),
+        ("msg_t2".to_string(), info2.to_string()),
+    ];
+    let out = ocserve_store::project_page_v2(&db, &page).unwrap();
+    assert_eq!(out[0]["text"], "summarize this");
+    assert_eq!(out[1]["text"].as_str().unwrap().len(), big.len());
 }
 
 #[test]

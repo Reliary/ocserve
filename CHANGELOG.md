@@ -7,6 +7,11 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## Unreleased
 
 ### Fixed
+- The v2 message projection no longer drops data a v2 client needs: a prompt
+  admitted through `/api/session/{id}/prompt` shows its text (it was stored as
+  a part, so `text` came back empty), and assistant messages keep
+  `time.streamed` and `time.completed`, so a finished turn no longer looks
+  active.
 - A failed tool call now keeps its error state through hooks and reads. A v1
   or v2 `tool.execute.after` hook that replaced the result wrote it to the
   completed-only `output` field of a failed part; it now updates `error`, and
