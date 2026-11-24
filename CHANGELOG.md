@@ -52,6 +52,14 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   (it loads fine raw). Minification is now off — it bought nothing for a
   bundle that is never shipped over the wire. Reproduced with
   `opencode-models-discovery@2.0.0`; present on rolldown 1.3.1 and 1.3.2.
+- Git now runs in directories the client names (the `location`/`projectID`
+  scope), so a repository's own config could execute a program on a
+  read-only-looking route: `core.fsmonitor` runs during `git status`, and
+  `diff.<driver>.textconv` runs on `git diff --patch` without being suppressed
+  by `--no-ext-diff`. Every invocation now passes
+  `-c core.fsmonitor=false -c core.hooksPath=/dev/null`, and every diff also
+  `--no-textconv`. Both vectors were measured on git 2.54 and each carries a
+  planted control.
 
 ### Credits
 - The v2 turn-lifecycle fixes are [@glanzel](https://github.com/glanzel)'s
