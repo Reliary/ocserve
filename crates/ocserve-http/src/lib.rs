@@ -2170,9 +2170,9 @@ async fn metrics(State(_st): State<Arc<AppState>>) -> impl IntoResponse {
     // Read-path fast activity (L1 splice + F5/F7/F8 memos), published as
     // absolute cumulative gauges at scrape time — these counters live in
     // ocserve-store as atomics with no event stream of their own.
-    //  - splice_rows/fallbacks: the corpus gate proves 0 fallbacks on real
-    //    data, so a non-zero fallback gauge means stored bytes hit a shape
-    //    the splicer refuses — a signal, not a silent fallback (lib.rs L1).
+    //  - splice_rows/fallbacks: a fallback means either an unrecognized stored
+    //    shape or the known legacy failed-tool error adapter took the DOM path;
+    //    both are visible instead of silent (lib.rs L1).
     //  - memo hit/miss: the load report's cache-on/off variants must be
     //    observable in production, not just in a bench run.
     ocserve_metrics::gauge(
