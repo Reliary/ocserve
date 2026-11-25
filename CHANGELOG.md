@@ -113,32 +113,25 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   (issue #58, PR #60). Review added the global-aggregate guard on the
   `sessionID` injection, the v2 lifecycle allowlist for the event validator,
   and the corrected `K-PERM` row.
--
 - The catalog-scoping work is [@glanzel](https://github.com/glanzel)'s
   (PR #62). Review added the tolerant stub, the fallback, the
   no-delete-operator-file guard, the reconcile on credential writes, and the
   credential-only endpoint resolution.
+- The shadow-snapshot pipe deadlock is [@glanzel](https://github.com/glanzel)'s
+  (issue #77, PR #78). Review verified both negative controls by reverting to
+  write-then-read (the 15 s timeout reproduces) and re-ran the suite on the
+  build host.
+- The commit-attribution split is [@jrzmurray](https://github.com/jrzmurray)'s
+  (PR #69, landed as #79). Review added the epoch-cap overflow test, whose
+  first version was non-discriminating and was rewritten until the planted bug
+  reddened it.
+- The bun-pty resolver (PR #74) came from the same contributor; review found
+  two platform bugs by running it against the real package rather than the
+  synthetic fixture.
 
 ## 0.7.5 - 2026-11-18
 
 ### Fixed
-## Unreleased
-
-### Fixed
-- The served models catalog is scoped to usable providers by default. The
-  provider payload expanded every models.dev provider (324 on the stock
-  catalog) into `provider.all`/`/api/integration` and retained it in RAM,
-  although a provider without a key can never serve a model. Loading now keeps
-  full model bodies only for config, auth, credential-table and env-enabled
-  providers, the built-in `opencode` tier, and providers named by a model pin;
-  every other provider stays as a metadata stub with an empty model map, so the
-  connect/login UI still lists it. `OCSERVE_MODEL_CATALOG=all` restores the
-  full catalog (`D-CATALOG-SCOPE`). The boot/hourly models.dev refresh no
-  longer parses the download into a full `Value` just to validate it (syntax
-  check only) and writes the fetched bytes without a second copy; the
-  mtime-churn content check hashes in 64 KiB chunks instead of reading the
-  whole file.
-
 - Image attachments now reach the provider in the shape it accepts. The
   encoder emitted the AI SDK's UI file part (`{type:"file", url, mediaType}`)
   instead of the wire part the pinned openai-compatible SDK derives, so every
