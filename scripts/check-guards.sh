@@ -384,11 +384,20 @@ echo "== guard: child wrapper defined exactly once (rule 10) =="
 # ocserve-store::cgroup, because a third and fourth spawn class (tools, pty)
 # never had the wrapper at all — the duplication guard could only protect the
 # two that did.
-copies=$(grep -rl 'oom_score_adj 2>/dev/null; \[ -n "$OCSERVE_KIDS_CGROUP"' crates/*/src 2>/dev/null | wc -l)
+# The old form matched a byte-exact literal ('oom_score_adj 2>/dev/null; ...'),
+# which broke the guard the day the wrapper gained its `[ -w ]` write guard:
+# a rule about *how many* definitions exist must not depend on *what* the one
+# definition says. Match the invariant instead — one `pub const WRAPPER`, and
+# no second place that re-implements a wrapper body (the `OCSERVE_KIDS_CGROUP`
+# move plus `exec "$@"` are the two things a copy must contain).
 defs=$(grep -rn 'pub const WRAPPER' crates/*/src 2>/dev/null | wc -l)
-if [ "$copies" -ne 1 ] || [ "$defs" -ne 1 ]; then
+copies=$(grep -rl 'OCSERVE_KIDS_CGROUP.*exec "$@"' crates/*/src 2>/dev/null | wc -l)
+body=$(grep -rn 'pub const WRAPPER' crates/*/src 2>/dev/null | cut -d: -f1 | sort -u)
+has_oom=$(grep -c 'oom_score_adj' "$([ -n "$body" ] && echo "$body" || echo /dev/null)" 2>/dev/null || echo 0)
+has_move=$(grep -c 'OCSERVE_KIDS_CGROUP' "$([ -n "$body" ] && echo "$body" || echo /dev/null)" 2>/dev/null || echo 0)
+if [ "$defs" -ne 1 ] || [ "$copies" -ne 1 ] || [ "$has_oom" -eq 0 ] || [ "$has_move" -eq 0 ]; then
   grep -rn 'OCSERVE_KIDS_CGROUP' crates/*/src 2>/dev/null | head -8
-  echo "FAIL: child wrapper must exist exactly once, in ocserve-store/src/cgroup.rs (rule 10; found $copies copies, $defs constants)"; fail=1
+  echo "FAIL: child wrapper must exist exactly once, in ocserve-store/src/cgroup.rs (rule 10; found $defs constants, $copies wrapper bodies, oom=$has_oom move=$has_move)"; fail=1
 else
   echo "ok"
 fi

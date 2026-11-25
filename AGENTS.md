@@ -159,6 +159,10 @@ main ─────────────●────●──────
 ## 5. Working agreement for agents
 
 - Small diffs; one requirement at a time; never refactor + feature in one commit.
+- **Build off-host.** `cargo` work runs via `scripts/remote-build.sh`, never on the developer
+  laptop: a local `target/` has reached ~912 GB, and on btrfs the deleted extents stay pinned
+  by snapshots so the space never comes back and the machine crashes. Clean up after every
+  session (`--clean`); a run prints free space before and after and refuses below a floor.
 - Read the doc section for the area first; if the spec is wrong or silent, say so and update
   the doc in the same branch — don't invent silent behavior.
 - Run the narrow test first, then workspace gates, before declaring anything finished.
