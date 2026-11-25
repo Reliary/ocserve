@@ -7,6 +7,12 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## Unreleased
 
 ### Fixed
+- Snapshot capture no longer deadlocks when the candidate list and the source
+  repo's `git check-ignore` answer both exceed a pipe buffer. `run_git` writes
+  stdin on its own thread while `wait_with_output` drains stdout, so a large
+  shadow index cannot wedge `track()` (and with it the turn and every later
+  cancel attempt). A failed ignore filter is now fail-closed: the shadow index
+  is left untouched instead of treating the error as "nothing is ignored".
 - Plugins that load a native `bun-pty` library (such as `opencode-pty`) now
   find it. The normalizer moves the plugin's ESM out of its package tree, so
   the library's relative lookup missed; the plugin host now resolves the

@@ -217,7 +217,10 @@ impl Snapshots {
         if all.is_empty() {
             return;
         }
-        let ignored = self.ignore(worktree, &all);
+        let Some(ignored) = self.ignore(worktree, &all) else {
+            tracing::warn!("snapshot: ignore filter failed; leaving the shadow index untouched");
+            return;
+        };
         if !ignored.is_empty() {
             let files: Vec<String> = ignored.iter().cloned().collect();
             self.rm_cached(worktree, gs, &files);
@@ -235,9 +238,18 @@ impl Snapshots {
     }
 
     /// `git check-ignore --no-index` against the SOURCE repo (upstream `ignore`).
-    fn ignore(&self, worktree: &str, files: &[String]) -> std::collections::HashSet<String> {
+    ///
+    /// `None` means the filter could not run. Callers must then leave the
+    /// shadow index untouched: an empty set reads as "nothing is ignored" and
+    /// stages the ignored set — the fail-open path that lets build output into
+    /// a shadow index, where every later capture has to filter it out again.
+    fn ignore(
+        &self,
+        worktree: &str,
+        files: &[String],
+    ) -> Option<std::collections::HashSet<String>> {
         if files.is_empty() {
-            return std::collections::HashSet::new();
+            return Some(std::collections::HashSet::new());
         }
         let paths: Vec<String> = files
             .iter()
@@ -262,17 +274,24 @@ impl Snapshots {
         ]);
         let r = run_git(&args, Some(worktree), Some(&stdin), &[]);
         if r.code != 0 && r.code != 1 {
-            return std::collections::HashSet::new();
+            tracing::warn!(
+                code = r.code,
+                stderr = %r.stderr.trim(),
+                "snapshot: ignore filter failed"
+            );
+            return None;
         }
-        r.text
-            .split('\0')
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                s.strip_prefix("./:")
-                    .map(|x| format!(":{x}"))
-                    .unwrap_or_else(|| s.to_string())
-            })
-            .collect()
+        Some(
+            r.text
+                .split('\0')
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    s.strip_prefix("./:")
+                        .map(|x| format!(":{x}"))
+                        .unwrap_or_else(|| s.to_string())
+                })
+                .collect(),
+        )
     }
 
     fn rm_cached(&self, worktree: &str, gs: &str, files: &[String]) {
@@ -356,7 +375,13 @@ impl Snapshots {
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())
             .collect();
-        let ignored = self.ignore(&worktree, &rel);
+        let Some(ignored) = self.ignore(&worktree, &rel) else {
+            tracing::warn!("snapshot: ignore filter failed; reporting no changed files");
+            return Patch {
+                hash: hash.to_string(),
+                files: Vec::new(),
+            };
+        };
         let wt = worktree.trim_end_matches('/');
         let files = rel
             .into_iter()
@@ -529,13 +554,16 @@ impl Snapshots {
                 Some((file, binary, a, d))
             })
             .collect();
-        let ignored = self.ignore(
+        let Some(ignored) = self.ignore(
             &worktree,
             &rows
                 .iter()
                 .map(|(f, _, _, _)| f.clone())
                 .collect::<Vec<_>>(),
-        );
+        ) else {
+            tracing::warn!("snapshot: ignore filter failed; reporting no per-file diffs");
+            return Vec::new();
+        };
         let mut out = Vec::new();
         for (file, binary, additions, deletions) in rows {
             if ignored.contains(&file) {
@@ -717,13 +745,43 @@ fn run_git(
             stderr: "spawn failed".into(),
         };
     };
+    // The child answers while it consumes stdin (`git check-ignore` reports
+    // each match as it reads). Writing the whole input before reading stdout
+    // deadlocks as soon as both directions exceed the pipe buffer: the child
+    // blocks writing its answer, the writer blocks waiting for it to drain.
+    // The writer therefore runs on its own thread so `wait_with_output` can
+    // drain stdout concurrently. Bounded by construction: one writer per
+    // in-flight `run_git`, and callers are the fixed blocking pool (16) plus
+    // tests/CLI.
+    let mut writer = None;
+    let mut writer_spawn_error = None;
     if let Some(s) = stdin
         && let Some(mut si) = child.stdin.take()
     {
-        use std::io::Write;
-        let _ = si.write_all(s.as_bytes());
+        let bytes = s.as_bytes().to_vec();
+        match std::thread::Builder::new()
+            .name("ocserve-git-stdin".into())
+            .spawn(move || {
+                use std::io::Write;
+                // Drop closes the pipe: git needs EOF to finish.
+                let _ = si.write_all(&bytes);
+            }) {
+            Ok(handle) => writer = Some(handle),
+            Err(e) => writer_spawn_error = Some(e),
+        }
     }
-    let Ok(out) = child.wait_with_output() else {
+    let out = child.wait_with_output();
+    if let Some(handle) = writer {
+        let _ = handle.join();
+    }
+    if let Some(e) = writer_spawn_error {
+        return GitResult {
+            text: String::new(),
+            code: -1,
+            stderr: format!("stdin writer spawn failed: {e}"),
+        };
+    }
+    let Ok(out) = out else {
         return GitResult {
             text: String::new(),
             code: -1,
@@ -888,6 +946,25 @@ mod tests {
         );
     }
 
+    /// A failed `check-ignore` must not look like "nothing is ignored": that
+    /// fail-open path staged the ignored set into the shadow index.
+    #[test]
+    fn ignore_filter_failure_is_fail_closed() {
+        let r = Repo::new();
+        let s = r.snap();
+        let bogus = tempfile::tempdir().unwrap();
+        assert!(
+            s.ignore(&bogus.path().display().to_string(), &["kept.txt".into()])
+                .is_none(),
+            "a failed filter must not be reported as an empty ignore set"
+        );
+        assert_eq!(
+            s.ignore(&r.dir.display().to_string(), &[]).map(|h| h.len()),
+            Some(0),
+            "an empty candidate list is a successful no-op"
+        );
+    }
+
     #[test]
     fn large_untracked_file_is_excluded() {
         let r = Repo::new();
@@ -949,6 +1026,52 @@ mod tests {
         assert!(by["a.txt"]["additions"].as_i64().unwrap() >= 1);
         assert!(by.contains_key("new.txt"));
         assert_eq!(by["new.txt"]["status"], "added");
+    }
+
+    /// A candidate list large enough that `git check-ignore` emits more than
+    /// one pipe buffer while it is still consuming stdin. `run_git` must drain
+    /// stdout concurrently with writing stdin, or both sides block forever
+    /// (live 2026-11-25: a 4,999-entry shadow index wedged `track()` for
+    /// hours in two `check-ignore` children stuck in `pipe_write`, and the
+    /// turn could not be interrupted). Driven on a helper thread with a
+    /// timeout so a regression FAILS instead of hanging the suite.
+    #[test]
+    fn run_git_drains_stdout_while_writing_a_large_stdin() {
+        let r = Repo::new();
+        r.write(".gitignore", "target/\n");
+        // ~500 KiB stdin and stdout: both exceed the 64 KiB pipe. 4k short
+        // paths were not enough — the tail still fit in the stdin buffer
+        // after git blocked on stdout, so the writer finished and the test
+        // passed on the broken code.
+        let files: Vec<String> = (0..12000)
+            .map(|i| format!("target/build/deep/nested/dir/obj{i}.o"))
+            .collect();
+        let stdin = nul_terminated(&files);
+        let worktree = r.dir.display().to_string();
+        let args = quote(vec![
+            "--git-dir".into(),
+            format!("{worktree}/.git"),
+            "--work-tree".into(),
+            worktree.clone(),
+            "check-ignore".into(),
+            "--no-index".into(),
+            "--stdin".into(),
+            "-z".into(),
+        ]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = run_git(&args, Some(&worktree), Some(&stdin), &[]);
+            let _ = tx.send(out);
+        });
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("run_git deadlocked: stdout is not drained while stdin is written");
+        assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+        assert_eq!(
+            out.text.split('\0').filter(|s| !s.is_empty()).count(),
+            files.len(),
+            "every ignored path must be reported"
+        );
     }
 
     #[test]
