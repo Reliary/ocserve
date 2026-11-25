@@ -6887,7 +6887,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/plugin/update",
             axum::routing::post(v2::plugin_update_api),
         )
-        .route("/api/vcs/init", axum::routing::post(v2::vcs_init_api))
+        .route(
+            "/api/vcs/init",
+            axum::routing::post(v2::vcs_init_api).layer(axum::extract::DefaultBodyLimit::max(8192)),
+        )
         .route(
             "/api/experimental/session/{sessionID}/instructions/entries",
             get(v2::instruction_list),

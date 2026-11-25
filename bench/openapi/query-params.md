@@ -71,4 +71,4 @@
 | `/api/vcs/diff` | location | cited D-LOCATION-SINGLE-SERVER |
 | `/api/vcs/status` | location | cited D-LOCATION-SINGLE-SERVER |
 | `/api/websearch/provider` | location | cited D-LOCATION-SINGLE-SERVER |
-| `/api/worktree` | projectID | cited D-WORKTREE-PROJECT-SCOPE |
+| `/api/worktree` | projectID | read |

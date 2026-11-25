@@ -2,18 +2,37 @@
 
 ## Build
 
+**Build on the build host, never on your laptop.** A local `target/` grows into
+hundreds of gigabytes, and on a btrfs `/home` the deleted extents stay pinned by
+timeline snapshots, so the space is not reclaimed and the machine eventually
+crashes. `scripts/remote-build.sh` rsyncs the tree, runs the command there, and
+returns its exit status verbatim:
+
 ```bash
-cargo build --release        # binary at target/release/ocserve
+scripts/remote-build.sh build --release    # target/release/ocserve on the host
+scripts/remote-build.sh test --workspace
+scripts/remote-build.sh clippy --workspace --all-targets -- -D warnings
 ```
+
+Every run prints free space before and after and refuses to start below a floor
+(`OCSERVE_BUILD_MIN_FREE_GB`, default 60). Pass `--clean` to delete the remote
+`target/` when you are done, and `--prune` to drop incremental artefacts and
+stale scratch without a full wipe.
 
 ## Test
 
 ```bash
-cargo test --workspace       # unit + integration (offline)
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --check
-./scripts/check-guards.sh    # static bug-class rules
-./scripts/check-matrix.sh    # TRACEABILITY requirement rows exist
+scripts/remote-build.sh test --workspace    # unit + integration (offline)
+scripts/remote-build.sh clippy --workspace --all-targets -- -D warnings
+cargo fmt --check                           # cheap; fine locally
+./scripts/check-guards.sh                   # static bug-class rules
+./scripts/check-matrix.sh                   # TRACEABILITY requirement rows exist
+```
+
+Or all of the static gates at once, on the build host:
+
+```bash
+scripts/remote-build.sh gates
 ```
 
 Differential gates (need the vendored freeze binary; see `bench/pair/`):

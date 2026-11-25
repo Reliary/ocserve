@@ -87,7 +87,13 @@ D-REVERT-NOSNAP and D-VCS-NOAPPLY are **removed** by this work.
 - Default **on** (upstream default). Opt-out: config `"snapshot": false` (upstream key) or
   env `OCSERVE_SNAPSHOT=0`.
 - Untracked file cap 2 MiB; ignored-file filter on capture and revert; `diffFull` content
-  load batched (`cat-file --batch`).
+  load batched (`cat-file --batch`). A failed `check-ignore` is **fail-closed**: callers
+  leave the shadow index untouched instead of treating the error as "nothing is ignored"
+  (which can stage build output into the index).
+- `run_git` writes stdin on its own thread while `wait_with_output` drains stdout. Git
+  streams its answer as it consumes stdin, so a candidate list and answer larger than the
+  pipe buffer must never be serialized write-then-read (deadlock: both sides wait for the
+  other to drain).
 - Metric `ocserve_snapshot_ops_seconds{op}` (histogram) + `ocserve_snapshot_capture_total{result}`.
 - All git invocations run off the tokio workers (`spawn_blocking`); history/DB work obeys
   the standing storage/discipline rules (`AGENTS.md §2`).
