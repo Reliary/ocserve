@@ -7,6 +7,26 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## Unreleased
 
 ### Fixed
+- The v2 message projection no longer drops data a v2 client needs: a prompt
+  admitted through `/api/session/{id}/prompt` shows its text (it was stored as
+  a part, so `text` came back empty), and assistant messages keep
+  `time.streamed` and `time.completed`, so a finished turn no longer looks
+  active.
+- A failed tool call now keeps its error state through hooks and reads. A v1
+  or v2 `tool.execute.after` hook that replaced the result wrote it to the
+  completed-only `output` field of a failed part; it now updates `error`, and
+  the v2 hook receives and can mutate `Tool.Error.message` for failed calls.
+  Older failed-tool rows that stored the message in `output` are normalized to
+  `error` on v1 reads and v2 projections without rewriting storage, and v2
+  completed output projects as `content[]` blocks.
+- On macOS, creating a file through a symlinked directory inside the project
+  (`<base>/link -> /elsewhere`, then `link/sub/f.txt`) made the missing parent
+  directories outside the base before refusing the write. `create_within` now
+  walks each component from an opened, verified directory handle on macOS, and
+  absolute targets on every Unix are rebased onto the canonical base instead of
+  running `create_dir_all` on the raw string first (`K-CONTAINMENT`).
+  Absolute targets outside the base, or containing `..`, are now refused as
+  an escape before anything is created.
 - A v2 turn now closes the way upstream does, so a loop-guard ask or a dead
   process cannot leave a session looking busy. `session.execution.*` frames
   carry `sessionID` inside `data` (v2 clients filter on it and dropped the
@@ -19,15 +39,71 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   dead process are closed at boot with a terminal event and released
   (`D-V2-BOOT-CLOSE`).
 
+### Fixed (model catalog)
+- The models.dev catalog is now scoped to providers this server can actually
+  serve, which cuts resident memory for a typical catalog by roughly two
+  thirds to three quarters (`/api/provider` and `/api/model` are unchanged for
+  every usable provider; the rest keep a metadata stub so the connect UI still
+  lists them). `OCSERVE_MODEL_CATALOG=all` restores the full upstream catalog.
+  `D-CATALOG-SCOPE`.
+- Fixed two defects the scoping introduced: a provider with a wrong-typed
+  field (`"env": null`, a string `name`, an object `api`) used to abort the
+  whole document, and the self-heal then deleted the shared catalog — including
+  a file pinned with `OPENCODE_MODELS_PATH`. The stub parser is now as tolerant
+  as the full parse, a scoped failure falls back to it, and a pinned catalog is
+  never deleted.
+- Adding, activating or deleting a credential now reloads the provider
+  registry, so the provider becomes usable immediately instead of after a
+  restart. A provider known only through the credential table also resolves
+  its endpoint through the same rule as every other provider; before this it
+  listed its models while every prompt answered `no endpoint configured for
+  provider …` (a bug that also exists in 0.7.5).
+- A plugin whose bundle tripped oxc's minifier loop was silently disabled:
+  the normalizer kept rolldown's default minification, whose internal
+  `debug_assert!` panics on such a bundle, so the plugin loaded with no hooks
+  (it loads fine raw). Minification is now off — it bought nothing for a
+  bundle that is never shipped over the wire. Reproduced with
+  `opencode-models-discovery@2.0.0`; present on rolldown 1.3.1 and 1.3.2.
+- Git now runs in directories the client names (the `location`/`projectID`
+  scope), so a repository's own config could execute a program on a
+  read-only-looking route: `core.fsmonitor` runs during `git status`, and
+  `diff.<driver>.textconv` runs on `git diff --patch` without being suppressed
+  by `--no-ext-diff`. Every invocation now passes
+  `-c core.fsmonitor=false -c core.hooksPath=/dev/null`, and every diff also
+  `--no-textconv`. Both vectors were measured on git 2.54 and each carries a
+  planted control.
+
 ### Credits
 - The v2 turn-lifecycle fixes are [@glanzel](https://github.com/glanzel)'s
   (issue #58, PR #60). Review added the global-aggregate guard on the
   `sessionID` injection, the v2 lifecycle allowlist for the event validator,
   and the corrected `K-PERM` row.
+-
+- The catalog-scoping work is [@glanzel](https://github.com/glanzel)'s
+  (PR #62). Review added the tolerant stub, the fallback, the
+  no-delete-operator-file guard, the reconcile on credential writes, and the
+  credential-only endpoint resolution.
 
 ## 0.7.5 - 2026-11-18
 
 ### Fixed
+## Unreleased
+
+### Fixed
+- The served models catalog is scoped to usable providers by default. The
+  provider payload expanded every models.dev provider (324 on the stock
+  catalog) into `provider.all`/`/api/integration` and retained it in RAM,
+  although a provider without a key can never serve a model. Loading now keeps
+  full model bodies only for config, auth, credential-table and env-enabled
+  providers, the built-in `opencode` tier, and providers named by a model pin;
+  every other provider stays as a metadata stub with an empty model map, so the
+  connect/login UI still lists it. `OCSERVE_MODEL_CATALOG=all` restores the
+  full catalog (`D-CATALOG-SCOPE`). The boot/hourly models.dev refresh no
+  longer parses the download into a full `Value` just to validate it (syntax
+  check only) and writes the fetched bytes without a second copy; the
+  mtime-churn content check hashes in 64 KiB chunks instead of reading the
+  whole file.
+
 - Image attachments now reach the provider in the shape it accepts. The
   encoder emitted the AI SDK's UI file part (`{type:"file", url, mediaType}`)
   instead of the wire part the pinned openai-compatible SDK derives, so every

@@ -58,7 +58,7 @@ tower = "0.5"
 bytes = "1"
 
 # storage
-rusqlite = { version = "0.41", features = ["bundled", "blob", "column_decltype"] }
+rusqlite = { version = "0.43", features = ["bundled", "blob", "column_decltype"] }
 zstd = "0.14"
 
 # serialization
