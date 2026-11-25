@@ -1,0 +1,4 @@
+source: live OpenCode 2.2.6 provider request (two captures: openai-compatible stub model, and a gpt-5 model so the patch/edit family is exercised)
+tools: 14 (shell, read, write, edit, patch, glob, grep, question, skill, subagent, webfetch, websearch, experimental_image_generate, execute)
+rebuild: ./scripts/capture-v2-provider-contract.sh — never hand-edit
+note: `todowrite`, artifact, schedule and opencode-namespace tools are flag-gated and off in the release channel, so they do not appear in a default capture.

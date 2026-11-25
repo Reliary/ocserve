@@ -27,6 +27,9 @@ pub struct Runtime {
     /// Data dir (auth-overlay lives here) — kept so llm_registry layers the
     /// same auth as load_for (W5 read-precedence rule).
     pub data_dir: std::path::PathBuf,
+    /// The merged document. A v2 config is normalized in place (canonical
+    /// keys gain v1-shaped mirrors; the v2 keys stay), so every consumer sees
+    /// one document and `/config` shows both vocabularies.
     pub config: Value,
     /// Parsed models catalog — read ONCE in load_for and reused by
     /// llm_registry (A1: the old re-read double-parsed the 5.3 MB file per
@@ -133,53 +136,53 @@ fn expand_config_vars(
     Ok(out)
 }
 
-/// Read + expand + parse one config file. `{file:…}` failure is loud and
-/// degrades to defaults (same contract as a corrupt config — the drop-in must
-/// still boot; the bad reference is named in the log). Upstream aborts the
-/// load with InvalidError; named divergence `D-CONFIG-VAR` (PLAN §18).
-fn read_config_resolved(path: &Path) -> Value {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!("no global config at {} — using defaults", path.display());
-            return json!({});
-        }
-        Err(e) => {
-            tracing::warn!(
-                "global config unreadable ({}), using defaults: {e}",
-                path.display()
-            );
-            return json!({});
-        }
-    };
-    let base = path.parent().unwrap_or_else(|| Path::new("."));
-    let text = match expand_config_vars(&raw, base, &|n| std::env::var(n).ok()) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!("global config {}: {e}; using defaults", path.display());
-            return json!({});
-        }
-    };
-    match serde_json::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                "global config unreadable ({}), using defaults: {e}",
-                path.display()
-            );
-            json!({})
-        }
-    }
-}
-
 /// Global config read with upstream parity (config.ts: missing file → empty,
 /// unreadable/corrupt → "using defaults" + continue). Found by CI 2026-10-08:
 /// `serve` on a bare machine (no `~/.config/opencode/opencode.json`) died at
 /// boot — a fresh install of the drop-in server must start with defaults, and
 /// upstream treats both cases as defaults, never as fatal. Per-user errors
 /// stay loud: the missing/corrupt file is logged with its path.
+///
+/// Production reads the full discovery stack through [`read_config_stack`];
+/// this single-file probe is kept for the boot-contract tests.
+#[cfg(test)]
 fn read_global_config(path: &Path) -> Value {
-    read_config_resolved(path)
+    read_config_stack(&[path.to_path_buf()])
+}
+
+/// Read every config document in load order and merge it. Missing files are
+/// skipped; an unreadable/corrupt file is logged and skipped (upstream "using
+/// defaults" semantics), never fatal. `{env:}`/`{file:}` substitution runs
+/// before the JSONC parse, exactly like the single-file path always did.
+fn read_config_stack(paths: &[std::path::PathBuf]) -> Value {
+    let mut acc = json!({});
+    for path in paths {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!("config unreadable ({}), skipping: {e}", path.display());
+                continue;
+            }
+        };
+        let base = path.parent().unwrap_or_else(|| Path::new("."));
+        let text = match expand_config_vars(&raw, base, &|n| std::env::var(n).ok()) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("config {}: {e}; skipping", path.display());
+                continue;
+            }
+        };
+        let doc = match crate::config_compat::parse_document(&text) {
+            Ok(doc) => doc,
+            Err(e) => {
+                tracing::warn!("config unreadable ({}), skipping: {e:#}", path.display());
+                continue;
+            }
+        };
+        crate::config_compat::merge_documents(&mut acc, doc);
+    }
+    acc
 }
 
 /// Layer the two explicit config channels upstream reads on top of the
@@ -207,7 +210,7 @@ fn layer_env_config(
                 let base = path.parent().unwrap_or(base_dir);
                 let text = expand_config_vars(&raw, base, &|n| std::env::var(n).ok())
                     .map_err(|e| anyhow!("OPENCODE_CONFIG {}: {e}", path.display()))?;
-                let v: Value = serde_json::from_str(&text)
+                let v: Value = crate::config_compat::parse_document(&text)
                     .with_context(|| format!("parse OPENCODE_CONFIG {}", path.display()))?;
                 if !v.is_object() {
                     anyhow::bail!("OPENCODE_CONFIG {}: expected a JSON object", path.display());
@@ -232,7 +235,7 @@ fn layer_env_config(
     if let Some(raw) = content.map(str::trim).filter(|s| !s.is_empty()) {
         let text = expand_config_vars(raw, base_dir, &|n| std::env::var(n).ok())
             .map_err(|e| anyhow!("OPENCODE_CONFIG_CONTENT: {e}"))?;
-        let v: Value = serde_json::from_str(&text)
+        let v: Value = crate::config_compat::parse_document(&text)
             .context("parse OPENCODE_CONFIG_CONTENT (invalid JSON; value is not logged)")?;
         if !v.is_object() {
             anyhow::bail!("OPENCODE_CONFIG_CONTENT: expected a JSON object");
@@ -612,23 +615,28 @@ pub fn watch_paths(data_dir: &Path) -> Vec<std::path::PathBuf> {
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from);
     let home = std::env::var("HOME").unwrap_or_default();
-    let config_json = ocserve_store::platform::opencode_config_dir()
-        .map(|d| d.join("opencode.json"))
-        .unwrap_or_else(|| Path::new(&home).join(".config/opencode/opencode.json"));
-    watch_paths_with(data_dir, explicit, config_json)
+    let config_dir = ocserve_store::platform::opencode_config_dir()
+        .unwrap_or_else(|| Path::new(&home).join(".config/opencode"));
+    watch_paths_with(data_dir, explicit, config_dir)
 }
 
 /// Env-free variant so the watch-set test never depends on the ambient shell.
 fn watch_paths_with(
     data_dir: &Path,
     opencode_config: Option<std::path::PathBuf>,
-    config_json: std::path::PathBuf,
+    config_dir: std::path::PathBuf,
 ) -> Vec<std::path::PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     let h = Path::new(&home);
     let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from);
-    let mut paths = vec![
-        config_json,
+    // Every file the loader reads must reload on change: both global names plus
+    // the project tree (v2 discovery).
+    let mut paths = crate::config_compat::global_config_paths(&config_dir).to_vec();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").into());
+    if !crate::config_compat::project_config_disabled() {
+        paths.extend(crate::config_compat::project_config_paths(&cwd));
+    }
+    paths.extend([
         h.join(".config/ocserve/config.json"),
         ocserve_store::platform::opencode_data_dir_for(h, xdg_data_home.as_deref())
             .join("auth.json"),
@@ -636,7 +644,7 @@ fn watch_paths_with(
         // K-MODELS: the catalog ocserve READS (source-aware + fixture flag)
         crate::models_dev::read_path(),
         h.join(".local/state/opencode/model.json"),
-    ];
+    ]);
     if let Some(p) = opencode_config {
         paths.push(p);
     }
@@ -829,6 +837,44 @@ fn sort_json_keys(m: &serde_json::Map<String, Value>) -> BTreeMap<String, Value>
 /// Flatten Permission.fromConfig: string → single rule; object → per-pattern rules.
 pub fn perm_from_config(cfg: &Value) -> Vec<Value> {
     let mut out = Vec::new();
+    // v2 canonical ruleset (`permissions` / an agent's `permissions`): already
+    // in the internal {permission, pattern, action} shape, so pass through.
+    if let Some(items) = cfg.as_array() {
+        out.extend(items.iter().filter_map(|item| {
+            let obj = item.as_object()?;
+            let permission = match obj.get("permission").and_then(Value::as_str) {
+                Some(p) => p,
+                // Raw v2 rule: `action` is the permission and must be folded
+                // onto the internal vocabulary (shell→bash, subagent→task).
+                None => crate::config_compat::internal_action(
+                    obj.get("action").and_then(Value::as_str)?,
+                ),
+            };
+            let pattern = obj
+                .get("pattern")
+                .or_else(|| obj.get("resource"))
+                .and_then(Value::as_str)
+                .unwrap_or("*");
+            let action = obj
+                .get("action")
+                .or_else(|| obj.get("effect"))
+                .and_then(Value::as_str)?;
+            // A normalized rule's `action` is the effect; a raw v2 rule's
+            // `action` is the permission. Distinguish by the presence of the
+            // internal `permission` key.
+            let effect = if obj.contains_key("permission") {
+                action
+            } else {
+                obj.get("effect").and_then(Value::as_str)?
+            };
+            Some(json!({
+                "permission": permission,
+                "pattern": pattern,
+                "action": effect,
+            }))
+        }));
+        return out;
+    }
     let Some(obj) = cfg.as_object() else {
         return out;
     };
@@ -1187,14 +1233,20 @@ impl Runtime {
         // the SAME directory, so pointing the seam at a temp dir also isolates
         // the `~/.config/ocserve/config.json` overlay (previously ambient, which
         // a review flagged as a masked dependency).
-        let config_path = config_dir
-            .as_ref()
-            .map(|d| d.join("opencode.json"))
-            .unwrap_or_else(|| Path::new(&home).join(".config/opencode/opencode.json"));
+        // OpenCode v2 discovery: both names in the global directory (JSONC
+        // wins), then the project tree (cwd → root, nearest last). A stock v2
+        // install keeps its config in `opencode.jsonc`, which the old
+        // single-name read never opened.
+        let config_dir = config_dir.unwrap_or_else(|| Path::new(&home).join(".config/opencode"));
+        let base_dir = std::env::current_dir().unwrap_or_else(|_| Path::new(".").into());
+        let mut config_paths = crate::config_compat::global_config_paths(&config_dir).to_vec();
+        if !crate::config_compat::project_config_disabled() {
+            config_paths.extend(crate::config_compat::project_config_paths(&base_dir));
+        }
         // K-MODELS: OPENCODE_MODELS_URL/_PATH aware (upstream read precedence)
         let cache_path = crate::models_dev::read_path();
 
-        let mut raw_config = read_global_config(&config_path);
+        let mut raw_config = read_config_stack(&config_paths);
         // W4 overlay: a ocserve-owned patch file (OCSERVE_CONFIG_WRITE=overlay
         // writes it) deep-merges OVER the shared opencode.json on every load —
         // never mutates the user's other server's config unless told to.
@@ -1208,13 +1260,18 @@ impl Runtime {
             let overlay = read_json(&overlay_path)?;
             ocserve_http::deep_merge(&mut raw_config, overlay);
         }
-        let base_dir = std::env::current_dir().unwrap_or_else(|_| Path::new(".").into());
         raw_config = layer_env_config(
             raw_config,
             env_config_path,
             env_content.as_deref(),
             &base_dir,
         )?;
+        // The catalog scope must see the normalized providers: a v2 config's
+        // providers live under `providers`, and scoping by the raw `provider`
+        // key would drop every configured provider's models. `from_parts` does
+        // the one authoritative normalization of the served document.
+        let mut catalog_cfg = raw_config.clone();
+        crate::config_compat::normalize(&mut catalog_cfg);
         // `config_dir` is a REAL input (resolved from OPENCODE_CONFIG_DIR /
         // XDG_CONFIG_HOME in production), so it must not double as the test
         // seam — the legacy auth file lives under `~/.local/share/opencode`,
@@ -1222,7 +1279,7 @@ impl Runtime {
         // `$XDG_CONFIG_HOME/opencode/auth.json` and drop every provider key
         // (caught by the differential replay, 2026-11-12).
         let auth = load_auth_with(data_dir, test_root)?;
-        let cache = load_catalog(&cache_path, &raw_config, &auth, data_dir);
+        let cache = load_catalog(&cache_path, &catalog_cfg, &auth, data_dir);
         Self::from_parts(data_dir, raw_config, auth, cache)
     }
 
@@ -1230,8 +1287,15 @@ impl Runtime {
     /// Auth + the model catalog are re-read — the same cost as a normal
     /// reload, and it keeps ONE derivation path for both.
     pub fn from_config(data_dir: &std::path::Path, config: Value) -> Result<Self> {
+        let mut catalog_cfg = config.clone();
+        crate::config_compat::normalize(&mut catalog_cfg);
         let auth = load_auth(data_dir)?;
-        let cache = load_catalog(&crate::models_dev::read_path(), &config, &auth, data_dir);
+        let cache = load_catalog(
+            &crate::models_dev::read_path(),
+            &catalog_cfg,
+            &auth,
+            data_dir,
+        );
         Self::from_parts(data_dir, config, auth, cache)
     }
 
@@ -1241,12 +1305,6 @@ impl Runtime {
         auth: Value,
         cache: Value,
     ) -> Result<Self> {
-        let (agent, api_agent) = build_agents(&raw_config);
-        let command = build_commands(&raw_config)?;
-        let (config_providers, provider) = build_providers(&raw_config, &auth, &cache);
-        // Pair gate (2026-10-06): freeze's config loader ALWAYS answers
-        // agent/command/mode ({} when unset) + username. Applied to the SERVED
-        // config only; derivations above use the raw value (unchanged order).
         let mut config = raw_config;
         // `plugin_origins` exists ONLY in the config handed to the plugin
         // (upstream derives it for the hook). It must never become a served
@@ -1266,6 +1324,14 @@ impl Runtime {
                 obj.insert("username".into(), json!(u));
             }
         }
+
+        // One normalization point for every constructor (file load and the
+        // plugin `config` hook): v2 canonical keys gain their internal mirrors
+        // before any derivation reads the document.
+        crate::config_compat::normalize(&mut config);
+        let (agent, api_agent) = build_agents(&config);
+        let command = build_commands(&config)?;
+        let (config_providers, provider) = build_providers(&config, &auth, &cache);
 
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
@@ -1501,6 +1567,10 @@ fn build_agents(cfg: &Value) -> (Vec<Value>, Vec<Value>) {
         "read": {"*": "allow", "*.env": "ask", "*.env.*": "ask", "*.env.example": "allow"},
     });
     let user = cfg.get("permission").cloned().unwrap_or(json!({}));
+    // v2 `permissions` is an ordered ruleset whose last match wins, so it is
+    // appended AFTER the deprecated `permission` map (upstream `normalize.ts`
+    // builds `[...tools, ...legacy, ...native]`).
+    let native = cfg.get("permissions").cloned().unwrap_or(json!([]));
 
     let flat = |extra: Value| -> Vec<Value> {
         let mut rules = perm_from_config(&defaults);
@@ -1508,6 +1578,7 @@ fn build_agents(cfg: &Value) -> (Vec<Value>, Vec<Value>) {
             rules.extend(perm_from_config(&extra));
         }
         rules.extend(perm_from_config(&user));
+        rules.extend(perm_from_config(&native));
         rules
     };
 
@@ -2406,29 +2477,32 @@ mod tests {
     fn watch_paths_cover_every_runtime_read() {
         let dp = std::path::Path::new("/tmp/ocserve-data");
         // A neutral root, not a literal home path (the repo gate rejects those).
-        let cfg = std::path::PathBuf::from("/srv/root/.config/opencode/opencode.json");
-        let paths = watch_paths_with(dp, None, cfg.clone());
+        let cfg_dir = std::path::PathBuf::from("/srv/root/.config/opencode");
+        let paths = watch_paths_with(dp, None, cfg_dir.clone());
         assert_eq!(
-            paths.len(),
-            6,
-            "opencode.json, overlay, auth, auth-overlay, models cache, state model"
-        );
-        assert_eq!(
-            paths[0], cfg,
+            paths[0],
+            cfg_dir.join("opencode.json"),
             "shared config first (OPENCODE_CONFIG_DIR-aware): {:?}",
             paths[0]
         );
-        assert_eq!(paths[3], dp.join("auth-overlay.json"), "data-dir overlay");
         assert!(
-            paths[5].ends_with(".local/state/opencode/model.json"),
-            "state model (default-model hot-swap): {:?}",
-            paths[5]
+            paths.contains(&cfg_dir.join("opencode.jsonc")),
+            "the v2 JSONC file is a read input and must be watched: {paths:?}"
+        );
+        assert!(
+            paths.contains(&dp.join("auth-overlay.json")),
+            "data-dir overlay"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.ends_with(".local/state/opencode/model.json")),
+            "state model (default-model hot-swap): {paths:?}"
         );
         // An explicit OPENCODE_CONFIG is a read input and must be watched.
         let explicit = std::path::PathBuf::from("/tmp/explicit-opencode.json");
-        let with_env = watch_paths_with(dp, Some(explicit.clone()), cfg);
-        assert_eq!(with_env.len(), 7);
-        assert_eq!(with_env[6], explicit);
+        let with_env = watch_paths_with(dp, Some(explicit.clone()), cfg_dir);
+        assert!(with_env.contains(&explicit));
     }
 
     #[test]
@@ -2587,6 +2661,76 @@ mod b2_public_tier_tests {
 #[cfg(test)]
 mod bare_machine_tests {
     use super::*;
+
+    /// K-V2-CONFIG: upstream loads `opencode.json` and then
+    /// `opencode.jsonc`, so the JSONC file wins on scalars and both
+    /// contribute providers/plugins.
+    #[test]
+    fn jsonc_wins_over_json_and_both_layers_contribute() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("opencode.json"),
+            r#"{"model":"a/b","plugin":["from-json"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("opencode.jsonc"),
+            r#"{
+                // v2 file
+                "model": "c/d",
+                "plugin": ["from-jsonc"],
+            }"#,
+        )
+        .unwrap();
+        let paths = crate::config_compat::global_config_paths(dir.path());
+        let cfg = read_config_stack(&paths);
+        assert_eq!(cfg["model"], "c/d", "jsonc loads second and wins");
+        assert_eq!(
+            cfg["plugin"],
+            json!(["from-json", "from-jsonc"]),
+            "plugin lists accumulate across layers"
+        );
+    }
+
+    /// K-V2-CONFIG: a canonical v2 document reaches every derivation, and the
+    /// v1-shaped mirrors are what the builders read.
+    #[test]
+    fn v2_config_shapes_reach_agents_and_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = Runtime::from_parts(
+            dir.path(),
+            json!({
+                "providers": {"p": {"name": "P", "package": "@ai-sdk/openai-compatible",
+                    "settings": {"baseURL": "http://x/v1"}, "models": {"m": {"name": "M"}}}},
+                "permissions": [{"action": "shell", "resource": "rm -rf *", "effect": "deny"}],
+                "agents": {"reviewer": {"description": "R", "mode": "subagent"}},
+                "mcp": {"servers": {"s": {"type": "local", "command": ["x"], "disabled": true}}}
+            }),
+            json!({}),
+            json!({}),
+        )
+        .unwrap();
+        assert!(rt.config["provider"]["p"].is_object(), "providers mirror");
+        assert!(rt.config["agent"]["reviewer"].is_object(), "agents mirror");
+        assert_eq!(rt.config["mcp"]["s"]["enabled"], false);
+        // The build agent carries the normalized v2 rule as an internal one.
+        let build = rt
+            .agent
+            .iter()
+            .find(|a| a["name"] == "build")
+            .expect("build agent");
+        assert!(
+            build["permission"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["permission"] == "bash"
+                    && r["pattern"] == "rm -rf *"
+                    && r["action"] == "deny"),
+            "v2 permission rule missing: {}",
+            build["permission"]
+        );
+    }
 
     /// CI 2026-10-08: `serve` on a bare machine (no ~/.config/opencode) died
     /// at boot with "load runtime config" — a fresh install must start with

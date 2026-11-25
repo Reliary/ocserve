@@ -60,7 +60,27 @@ const PATH_COMMANDS: &[&str] = &[
 /// `args` is the parsed tool input.
 pub fn asks_for(tool: &str, args: &Value, cwd: &Path) -> Vec<Ask> {
     match tool {
-        "bash" => bash_asks(args, cwd),
+        // v2 names map back onto the internal permission vocabulary, so a
+        // config written in either era evaluates against one rule set.
+        "bash" | "shell" => bash_asks(args, cwd),
+        // v2 `patch`: the paths live inside `patchText`, and a malformed patch
+        // is rejected by the executor before it can touch a file. Ask on the
+        // whole `edit` action (`*`) rather than fabricating a per-file rule.
+        "patch" => vec![Ask {
+            permission: "edit".to_string(),
+            patterns: vec!["*".to_string()],
+            always: vec!["*".to_string()],
+            metadata: json!({"filepath": "*", "patch": args.get("patchText").cloned().unwrap_or(Value::Null)}),
+        }],
+        "subagent" => vec![Ask {
+            permission: "task".to_string(),
+            patterns: vec![str_arg(args, "agent")],
+            always: vec!["*".to_string()],
+            metadata: json!({
+                "description": args.get("description").cloned().unwrap_or(Value::Null),
+                "subagent_type": args.get("agent").cloned().unwrap_or(Value::Null),
+            }),
+        }],
         "read" => fs_asks("read", args, cwd, "filePath"),
         "write" | "apply_patch" => fs_asks("edit", args, cwd, "filePath"),
         "edit" => fs_asks("edit", args, cwd, "filePath"),

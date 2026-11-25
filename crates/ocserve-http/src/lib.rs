@@ -221,9 +221,19 @@ pub fn config_write_path() -> std::path::PathBuf {
         .map(|v| v == "overlay")
         .unwrap_or(false)
     {
-        std::path::PathBuf::from(home).join(".config/ocserve/config.json")
+        return std::path::PathBuf::from(home).join(".config/ocserve/config.json");
+    }
+    // OpenCode v2 keeps the effective global file as `opencode.jsonc` when one
+    // exists (config.update picks the last existing candidate). Writing to a
+    // fresh `opencode.json` next to a `.jsonc` would be shadowed by the JSONC
+    // on the next load — the PATCH would look successful and change nothing.
+    let dir = ocserve_store::platform::opencode_config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from(&home).join(".config/opencode"));
+    let jsonc = dir.join("opencode.jsonc");
+    if jsonc.exists() {
+        jsonc
     } else {
-        std::path::PathBuf::from(home).join(".config/opencode/opencode.json")
+        dir.join("opencode.json")
     }
 }
 
@@ -2827,10 +2837,12 @@ pub(crate) async fn patch_config(
             name: "InternalError",
             message: format!("read {}: {e}", path.display()),
         })?;
-        serde_json::from_str(&raw).map_err(|e| ApiError {
+        // The target may be `opencode.jsonc`; parse it with the JSONC reader,
+        // then write canonical JSON back (a PATCH cannot preserve comments).
+        ocserve_core::jsonc::parse_object(&raw).map_err(|e| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             name: "InternalError",
-            message: format!("parse {}: {e}", path.display()),
+            message: format!("parse {}: {e:#}", path.display()),
         })?
     } else {
         json!({})
@@ -4036,6 +4048,7 @@ pub(crate) fn build_prompt_context(
             api_key,
             pricing,
         },
+        v2_tools: v2_flag(),
         modalities: st
             .llm
             .read()

@@ -54,6 +54,11 @@ pub struct PromptContext {
     pub variant_options: serde_json::Value,
     /// Agent permission rules (v1 {permission, pattern, action}, last wins).
     pub rules: Vec<ocserve_tools::Rule>,
+    /// Advertise the OpenCode v2 tool surface (`shell`, `subagent`, `patch`,
+    /// `websearch`) instead of the v1 one (`bash`, `task`). Set from the same
+    /// `OCSERVE_V2` flag that turns on the v2 API, so a v2 client gets the tool
+    /// names it knows.
+    pub v2_tools: bool,
     /// Permission rendezvous (ask → event → reply).
     pub gate: Arc<PermissionGate>,
     /// MCP hub (M4a): namespaced tools merged into the provider tool list.
@@ -1514,7 +1519,11 @@ fn skill_exec(
     skills: &[(String, String, String, String)],
     input: &Value,
 ) -> Result<ocserve_tools::ToolResult> {
-    let name = input["name"].as_str().context("skill.name")?;
+    // v1 arg is `name`; v2 renamed it to `id`.
+    let name = input["name"]
+        .as_str()
+        .or_else(|| input["id"].as_str())
+        .context("skill.name")?;
     let (_, _, location, content) = skills
         .iter()
         .find(|(n, _, _, _)| n == name)
@@ -1909,12 +1918,17 @@ async fn spawn_tool(
     input: Value,
     directory: &str,
     env: &[(String, String)],
+    v2: bool,
 ) -> Result<ocserve_tools::ToolResult> {
     let name = name.to_string();
     let dir = directory.to_string();
     let env = env.to_vec();
     tokio::task::spawn_blocking(move || {
-        ocserve_tools::execute(&name, &input, Path::new(&dir), &env)
+        if v2 {
+            ocserve_tools::execute_v2(&name, &input, Path::new(&dir), &env)
+        } else {
+            ocserve_tools::execute(&name, &input, Path::new(&dir), &env)
+        }
     })
     .await
     .map_err(|e| anyhow::anyhow!("tool join: {e}"))?
@@ -2507,7 +2521,11 @@ pub async fn run_prompt_with(
         // are the exception: their allow-list is empty when schemas are off,
         // so a plugin tool cannot execute in a tools-disabled run.
         let mut tools = if opts.tools_enabled {
-            ocserve_tools::schemas()
+            if ctx.v2_tools {
+                ocserve_tools::schemas_v2(&ctx.model_id)
+            } else {
+                ocserve_tools::schemas()
+            }
         } else {
             Vec::new()
         };
@@ -2592,7 +2610,12 @@ pub async fn run_prompt_with(
         tools.retain(|spec| {
             spec.pointer("/function/name")
                 .and_then(|n| n.as_str())
-                .map(|n| ocserve_tools::evaluate(n, "*", &ctx.rules) != "deny")
+                // v2 names fold onto the internal permission actions, or a
+                // config rule written as `bash: deny` would not hide `shell`.
+                .map(|n| {
+                    ocserve_tools::evaluate(ocserve_tools::permission_action(n), "*", &ctx.rules)
+                        != "deny"
+                })
                 .unwrap_or(true)
         });
         // The advertised set IS the execution allow-list. `retain` can drop a
@@ -3568,13 +3591,30 @@ pub async fn run_prompt_with(
                             // by name, emit the <skill_content> block. Missing
                             // name → error (upstream Effect.die).
                             skill_exec(&ctx.skills, &input)
-                        } else if call.name == "task" {
+                        } else if call.name == "task" || call.name == "subagent" {
                             // K-TASK: spawn a subagent on its OWN child session
                             // and run the SHARED executor on it (no second
                             // loop). Depth-bounded by `subagent_depth` (default
                             // 1); child permission derived like upstream
                             // (subagent-permissions.ts, RCM framing).
-                            task_exec(ctx, writer, session_id, &input).await
+                            //
+                            // v2 renamed `task`→`subagent` and its input is
+                            // `{agent, description, prompt, model?}`; translate
+                            // to the internal launcher shape. `model` is
+                            // advisory (the child runs its own agent model).
+                            let task_input = if call.name == "subagent" {
+                                json!({
+                                    "subagent_type": input.get("agent").cloned().unwrap_or(Value::Null),
+                                    "description": input.get("description").cloned().unwrap_or(Value::Null),
+                                    "prompt": input.get("prompt").cloned().unwrap_or(Value::Null),
+                                    // v2 names the continuation handle `sessionID`.
+                                    "task_id": input.get("sessionID").cloned().unwrap_or(Value::Null),
+                                    "background": input.get("background").cloned().unwrap_or(json!(false)),
+                                })
+                            } else {
+                                input.clone()
+                            };
+                            task_exec(ctx, writer, session_id, &task_input).await
                         } else if builtin {
                             {
                                 // shell.env (SDK): plugin-injected vars are merged
@@ -3589,7 +3629,8 @@ pub async fn run_prompt_with(
                                     )
                                     .await,
                                 );
-                                spawn_tool(&call.name, input, &ctx.directory, &env).await
+                                spawn_tool(&call.name, input, &ctx.directory, &env, ctx.v2_tools)
+                                    .await
                             }
                         } else if plugin_tool_names.contains(&call.name) {
                             plugin_tool_exec(ctx, session_id, &assistant_id, &call.name, input)
@@ -3617,7 +3658,14 @@ pub async fn run_prompt_with(
                                         )
                                         .await,
                                     );
-                                    spawn_tool(&call.name, input, &ctx.directory, &env).await
+                                    spawn_tool(
+                                        &call.name,
+                                        input,
+                                        &ctx.directory,
+                                        &env,
+                                        ctx.v2_tools,
+                                    )
+                                    .await
                                 }
                             }
                         } else {
@@ -3632,7 +3680,8 @@ pub async fn run_prompt_with(
                                     )
                                     .await,
                                 );
-                                spawn_tool(&call.name, input, &ctx.directory, &env).await
+                                spawn_tool(&call.name, input, &ctx.directory, &env, ctx.v2_tools)
+                                    .await
                             }
                         };
                         match exec {
