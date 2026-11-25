@@ -6,11 +6,19 @@
 //! `1048576` bytes while freeze advertised `51200`, and the provider-boundary
 //! differential could never pass.
 //!
-//! Two values are HOST-templated upstream and therefore legitimately differ
-//! from the capture: `${shell}` (the user's shell) and `${tmp}` (`TMPDIR`).
-//! They are normalized here; everything else must be byte-identical.
+//! Three values are HOST-templated upstream and therefore legitimately differ
+//! from the capture: `${os}`, `${shell}` (the user's shell), and `${tmp}`
+//! (`TMPDIR`). They are normalized here; everything else must be byte-identical.
 
 fn normalize(mut s: String, tmp: &str) -> String {
+    // `provider-tools.json` was captured on Linux. The host OS label is part
+    // of the rendered prompt, but it is not a contract difference.
+    for os in ["linux", "macos", "windows"] {
+        s = s.replace(
+            &format!("Be aware: OS: {os}, Shell:"),
+            "Be aware: OS: <os>, Shell:",
+        );
+    }
     // Both sides may have baked a different temp root: the capture recorded
     // whatever TMPDIR the capture run used, and this test runs under whatever
     // TMPDIR the suite has. Replace the KNOWN literal roots longest-first and
@@ -43,9 +51,14 @@ fn description_matches_frozen_capture() {
         .into_owned();
     let got = ocserve_tools::shell_prompt::bash_description(&shell, &tmp);
 
-    // The capture was recorded on linux/zsh; on any other host the shell name
-    // is a legitimate difference, so compare with that line normalized too.
+    // The capture was recorded on Linux/zsh; all three host values are
+    // normalized so the assertion covers only invariant prompt bytes.
     let want = normalize(want.replace("Shell: zsh", "Shell: <shell>"), &tmp);
+    let host_os = format!("Be aware: OS: {}, Shell:", std::env::consts::OS);
+    assert!(
+        got.contains(&host_os),
+        "rendered prompt must report the host OS ({host_os})"
+    );
     let got = normalize(
         got.replace(&format!("Shell: {shell}"), "Shell: <shell>"),
         &tmp,

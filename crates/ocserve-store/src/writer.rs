@@ -131,9 +131,10 @@ impl Writer {
         // The pre-migration snapshot happens inside `migrate` now (it must run
         // for every caller, including the boot checks that migrate first).
         crate::schema::migrate(&conn)?;
+        let writer_path = path.clone();
         let handle = std::thread::Builder::new()
             .name("ocserve-writer".into())
-            .spawn(move || run_loop(&conn, rx))?;
+            .spawn(move || run_loop(&conn, rx, writer_path))?;
         Ok(Self {
             tx: Some(tx),
             handle: Some(handle),
@@ -235,7 +236,7 @@ fn bind(conn: &Connection, sql: &str, params: &[serde_json::Value]) -> Result<us
     Ok(stmt.execute(refs.as_slice())?)
 }
 
-fn run_loop(conn: &Connection, rx: mpsc::Receiver<Batch>) {
+fn run_loop(conn: &Connection, rx: mpsc::Receiver<Batch>, db_path: PathBuf) {
     loop {
         let first = match rx.recv() {
             Ok(b) => b,
@@ -287,13 +288,17 @@ fn run_loop(conn: &Connection, rx: mpsc::Receiver<Batch>) {
             }
             match &failure {
                 None => {
+                    // Keep the watcher from sampling data_version after the
+                    // SQLite commit but before its local-attribution epoch is
+                    // published. The barrier spans only COMMIT and the bump.
+                    let _commit_barrier = crate::local_commit_barrier().write();
                     if let Err(e) = conn.execute_batch("COMMIT") {
                         failure = Some(format!("commit: {e:#}"));
                         let _ = conn.execute_batch("ROLLBACK");
                     } else {
                         // F7/F8: committed => epoch bump + eager memo clear
                         // (exact invalidation for the single-writer caches)
-                        crate::bump_write_epoch();
+                        crate::bump_local_write_epoch(&db_path);
                     }
                 }
                 Some(_) => {
@@ -423,7 +428,9 @@ pub fn apply_ops(conn: &Connection, ops: &[WriteOp]) -> Result<usize> {
         exec_op(conn, op, &mut affected, &mut captured)?;
     }
     if !ops.is_empty() {
-        // F7/F8: caller-owned batches (importer/fork/tests) invalidate too
+        // F7/F8: caller-owned batches invalidate too, but their caller owns
+        // the transaction boundary. Do not claim a local Writer commit here;
+        // the watcher classifies the eventual commit from data_version.
         crate::bump_write_epoch();
     }
     Ok(affected)

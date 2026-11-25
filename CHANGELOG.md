@@ -13,6 +13,35 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   shadow index cannot wedge `track()` (and with it the turn and every later
   cancel attempt). A failed ignore filter is now fail-closed: the shadow index
   is left untouched instead of treating the error as "nothing is ignored".
+- Plugins that load a native `bun-pty` library (such as `opencode-pty`) now
+  find it. The normalizer moves the plugin's ESM out of its package tree, so
+  the library's relative lookup missed; the plugin host now resolves the
+  matching library for the platform from the original package and sets
+  `BUN_PTY_LIB` per plugin unless the operator configured it at launch (musl
+  hosts prefer the `_musl` builds, as bun-pty does; musl is detected from
+  `/proc/self/maps` because the `process.report` check answers "musl" on a
+  glibc host under bun 1.3.14, and Windows arm64 uses `rust_pty_arm64.dll`).
+- `POST /api/vcs/init` now refuses a directory that does not exist or that
+  resolves outside the server working directory and home (400), and caps the
+  request body at 8 KiB. Previously it would `git init` any absolute path.
+- `POST /api/vcs/init` now initialises the directory named by the
+  `location[directory]` query or `x-opencode-directory` header (a body
+  `directory` still wins) and no longer requires a request body. Previously a
+  scoped call ran `git init` in the server's working directory.
+- `GET /api/vcs`, `/api/vcs/status`, `/api/vcs/diff`, `/api/vcs/base` and
+  `/api/vcs/branch` now answer for the directory the request names
+  (`location[directory]`, `directory`, or `x-opencode-directory`) and echo it
+  as `location.directory`, instead of always reporting the server's working
+  directory.
+- `POST`, `DELETE` and `GET /api/worktree` now act on the project the request
+  names instead of the server's working directory. Previously a server started
+  outside a git repository answered `WorktreeNotGitError` for every project,
+  and one started inside a repository cut worktrees of that repository. The
+  directory comes from `location[directory]`, `directory`, an absolute-path
+  `projectID`, or the percent-decoded `x-opencode-directory` header, in that
+  order; relative values are ignored. Git is also invoked with `--` before
+  the worktree path, and a branch starting with `-` is refused, so request
+  values cannot be parsed as git options. Closes `D-WORKTREE-PROJECT-SCOPE`.
 - The v2 message projection no longer drops data a v2 client needs: a prompt
   admitted through `/api/session/{id}/prompt` shows its text (it was stored as
   a part, so `text` came back empty), and assistant messages keep

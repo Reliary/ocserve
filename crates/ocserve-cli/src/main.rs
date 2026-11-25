@@ -847,47 +847,58 @@ async fn serve(
             loop {
                 tick.tick().await;
                 n += 1;
-                // Cross-process commits (the importer writing into this data
-                // dir) must invalidate the epoch-keyed caches even though OUR
-                // writer never ran. `PRAGMA data_version` on one long-lived
-                // reader sees exactly those commits.
+                // Any commit made through another SQLite connection changes
+                // data_version, including our own Writer. Invalidate caches
+                // for every observed change, but attribute/log a non-writer
+                // commit only when the local writer epoch did not also move.
                 // File I/O + SQLite on the blocking pool: this runs on the
                 // async sampler and a slow disk/lock must not park a worker.
                 let poll_db = st.db.clone();
-                match tokio::task::spawn_blocking(move || {
-                    ocserve_store::poll_external_commits(&poll_db)
-                })
-                .await
+                match tokio::task::spawn_blocking(move || ocserve_store::poll_db_commits(&poll_db))
+                    .await
                 {
-                    Ok(Ok(true)) => {
-                        ocserve_store::bump_write_epoch();
-                        ocserve_metrics::labeled_counter(
-                            "ocserve_external_commit_total",
-                            "source=\"sampler\"",
-                            1,
-                        );
-                        tracing::info!(
-                            "external commit observed on the data dir — caches invalidated"
-                        );
+                    Ok(Ok(observation)) => {
+                        if observation != ocserve_store::DbCommitObservation::Unchanged {
+                            ocserve_store::bump_write_epoch();
+                        }
+                        match observation {
+                            ocserve_store::DbCommitObservation::Unchanged => {}
+                            ocserve_store::DbCommitObservation::LocalOrMixed => {
+                                ocserve_metrics::labeled_counter(
+                                    "ocserve_db_commit_observed_total",
+                                    "source=\"local_or_mixed\"",
+                                    1,
+                                );
+                            }
+                            ocserve_store::DbCommitObservation::OtherConnectionOnly => {
+                                ocserve_metrics::labeled_counter(
+                                    "ocserve_db_commit_observed_total",
+                                    "source=\"other_connection_only\"",
+                                    1,
+                                );
+                                tracing::info!(
+                                    "other SQLite connection commit observed — caches invalidated"
+                                );
+                            }
+                        }
                     }
-                    Ok(Ok(false)) => {}
                     // A broken watcher is a real observability failure (the
                     // caches silently stop invalidating), not debug noise.
                     Ok(Err(e)) => {
                         ocserve_metrics::labeled_counter(
-                            "ocserve_external_commit_poll_errors_total",
+                            "ocserve_db_commit_poll_errors_total",
                             "source=\"sampler\"",
                             1,
                         );
-                        tracing::warn!("external-commit poll failed: {e:#}");
+                        tracing::warn!("database-commit poll failed: {e:#}");
                     }
                     Err(e) => {
                         ocserve_metrics::labeled_counter(
-                            "ocserve_external_commit_poll_errors_total",
+                            "ocserve_db_commit_poll_errors_total",
                             "source=\"sampler\"",
                             1,
                         );
-                        tracing::warn!("external-commit poll join failed: {e}");
+                        tracing::warn!("database-commit poll join failed: {e}");
                     }
                 }
                 ocserve_metrics::sample_rss();
