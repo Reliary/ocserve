@@ -317,34 +317,94 @@ fn newest_anchor_wins_even_when_a_late_summary_lands_on_an_older_anchor() {
     );
 }
 
-/// Cross-process visibility: a commit from ANOTHER connection must be
-/// observable through one long-lived read-only connection, because that is how
-/// the server notices an importer writing into its data dir.
+/// A same-process Writer commit changes PRAGMA data_version because it uses a
+/// different SQLite connection from the watch reader. It must not be reported
+/// as an external commit.
 #[test]
-fn external_commit_is_observable_through_a_long_lived_reader() {
+fn local_writer_commit_is_classified_local_or_mixed() {
     let fx = fixture("ext_commit");
     msg(&fx, "msg_a", "user", "before");
 
     // First poll establishes the baseline.
     assert!(
-        !ocserve_store::poll_external_commits(&fx.db).unwrap(),
+        ocserve_store::poll_db_commits(&fx.db).unwrap()
+            == ocserve_store::DbCommitObservation::Unchanged,
         "baseline poll must not report a change"
     );
     assert!(
-        !ocserve_store::poll_external_commits(&fx.db).unwrap(),
+        ocserve_store::poll_db_commits(&fx.db).unwrap()
+            == ocserve_store::DbCommitObservation::Unchanged,
         "an idle database must not report a change"
     );
 
-    // A different connection writes (this is the importer process).
-    msg(&fx, "msg_b", "user", "written by another process");
+    // The local Writer commits through its own connection, exactly like
+    // normal server traffic.
+    msg(&fx, "msg_b", "user", "written by the local writer");
 
     assert!(
-        ocserve_store::poll_external_commits(&fx.db).unwrap(),
-        "another connection's commit must be visible"
+        ocserve_store::poll_db_commits(&fx.db).unwrap()
+            == ocserve_store::DbCommitObservation::LocalOrMixed,
+        "a local writer commit must not be labeled external"
     );
     assert!(
-        !ocserve_store::poll_external_commits(&fx.db).unwrap(),
+        ocserve_store::poll_db_commits(&fx.db).unwrap()
+            == ocserve_store::DbCommitObservation::Unchanged,
         "the same change must not be reported twice"
+    );
+}
+
+/// A commit from a connection that did not go through the local Writer still
+/// needs to be attributed and must invalidate the server's memoized reads.
+#[test]
+fn other_connection_commit_is_observable_through_a_long_lived_reader() {
+    let fx = fixture("other_conn_commit");
+    msg(&fx, "msg_a", "user", "before");
+    assert_eq!(
+        ocserve_store::poll_db_commits(&fx.db).unwrap(),
+        ocserve_store::DbCommitObservation::Unchanged
+    );
+
+    let conn = ocserve_store::pragma::open_writer(&fx.db).unwrap();
+    conn.execute(
+        "UPDATE session SET title = 'updated elsewhere' WHERE id = ?1",
+        [&fx.sid],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_eq!(
+        ocserve_store::poll_db_commits(&fx.db).unwrap(),
+        ocserve_store::DbCommitObservation::OtherConnectionOnly,
+        "a commit outside the local Writer must remain observable"
+    );
+    assert_eq!(
+        ocserve_store::poll_db_commits(&fx.db).unwrap(),
+        ocserve_store::DbCommitObservation::Unchanged
+    );
+}
+
+#[test]
+fn mixed_local_and_other_connection_commits_are_not_claimed_external() {
+    let fx = fixture("mixed_conn_commit");
+    msg(&fx, "msg_a", "user", "before");
+    assert_eq!(
+        ocserve_store::poll_db_commits(&fx.db).unwrap(),
+        ocserve_store::DbCommitObservation::Unchanged
+    );
+
+    msg(&fx, "msg_b", "user", "local writer commit");
+    let conn = ocserve_store::pragma::open_writer(&fx.db).unwrap();
+    conn.execute(
+        "UPDATE session SET title = 'updated elsewhere' WHERE id = ?1",
+        [&fx.sid],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert_eq!(
+        ocserve_store::poll_db_commits(&fx.db).unwrap(),
+        ocserve_store::DbCommitObservation::LocalOrMixed,
+        "mixed traffic still invalidates caches without claiming a source"
     );
 }
 
@@ -352,10 +412,13 @@ fn external_commit_is_observable_through_a_long_lived_reader() {
 /// connection keeps reading the unlinked inode, whose `data_version` never
 /// changes, so the server would serve stale caches until restart.
 #[test]
-fn replaced_database_file_is_detected_as_external_change() {
+fn replaced_database_file_is_detected_as_db_change() {
     let fx = fixture("replace");
     msg(&fx, "msg_a", "user", "before");
-    assert!(!ocserve_store::poll_external_commits(&fx.db).unwrap());
+    assert_eq!(
+        ocserve_store::poll_db_commits(&fx.db).unwrap(),
+        ocserve_store::DbCommitObservation::Unchanged
+    );
 
     // Simulate the restore drill: write a replacement file, then rename it
     // over the live path (atomic replace; same path, new inode).
@@ -368,9 +431,10 @@ fn replaced_database_file_is_detected_as_external_change() {
     drop(src);
     std::fs::rename(&tmp, &fx.db).unwrap();
 
-    assert!(
-        ocserve_store::poll_external_commits(&fx.db).unwrap(),
-        "a replaced database file must be treated as an external change"
+    assert_eq!(
+        ocserve_store::poll_db_commits(&fx.db).unwrap(),
+        ocserve_store::DbCommitObservation::OtherConnectionOnly,
+        "a replaced database file must be treated as an other-connection change"
     );
 }
 

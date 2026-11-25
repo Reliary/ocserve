@@ -13,6 +13,41 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   a shell by `status == "exited" && exit == 0`, such as the opencode remote
   dispatcher, treated every finished bootstrap as failed and rolled back its
   worktree.
+- Snapshot capture no longer deadlocks when the candidate list and the source
+  repo's `git check-ignore` answer both exceed a pipe buffer. `run_git` writes
+  stdin on its own thread while `wait_with_output` drains stdout, so a large
+  shadow index cannot wedge `track()` (and with it the turn and every later
+  cancel attempt). A failed ignore filter is now fail-closed: the shadow index
+  is left untouched instead of treating the error as "nothing is ignored".
+- Plugins that load a native `bun-pty` library (such as `opencode-pty`) now
+  find it. The normalizer moves the plugin's ESM out of its package tree, so
+  the library's relative lookup missed; the plugin host now resolves the
+  matching library for the platform from the original package and sets
+  `BUN_PTY_LIB` per plugin unless the operator configured it at launch (musl
+  hosts prefer the `_musl` builds, as bun-pty does; musl is detected from
+  `/proc/self/maps` because the `process.report` check answers "musl" on a
+  glibc host under bun 1.3.14, and Windows arm64 uses `rust_pty_arm64.dll`).
+- `POST /api/vcs/init` now refuses a directory that does not exist or that
+  resolves outside the server working directory and home (400), and caps the
+  request body at 8 KiB. Previously it would `git init` any absolute path.
+- `POST /api/vcs/init` now initialises the directory named by the
+  `location[directory]` query or `x-opencode-directory` header (a body
+  `directory` still wins) and no longer requires a request body. Previously a
+  scoped call ran `git init` in the server's working directory.
+- `GET /api/vcs`, `/api/vcs/status`, `/api/vcs/diff`, `/api/vcs/base` and
+  `/api/vcs/branch` now answer for the directory the request names
+  (`location[directory]`, `directory`, or `x-opencode-directory`) and echo it
+  as `location.directory`, instead of always reporting the server's working
+  directory.
+- `POST`, `DELETE` and `GET /api/worktree` now act on the project the request
+  names instead of the server's working directory. Previously a server started
+  outside a git repository answered `WorktreeNotGitError` for every project,
+  and one started inside a repository cut worktrees of that repository. The
+  directory comes from `location[directory]`, `directory`, an absolute-path
+  `projectID`, or the percent-decoded `x-opencode-directory` header, in that
+  order; relative values are ignored. Git is also invoked with `--` before
+  the worktree path, and a branch starting with `-` is refused, so request
+  values cannot be parsed as git options. Closes `D-WORKTREE-PROJECT-SCOPE`.
 - The v2 message projection no longer drops data a v2 client needs: a prompt
   admitted through `/api/session/{id}/prompt` shows its text (it was stored as
   a part, so `text` came back empty), and assistant messages keep
@@ -84,32 +119,25 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   (issue #58, PR #60). Review added the global-aggregate guard on the
   `sessionID` injection, the v2 lifecycle allowlist for the event validator,
   and the corrected `K-PERM` row.
--
 - The catalog-scoping work is [@glanzel](https://github.com/glanzel)'s
   (PR #62). Review added the tolerant stub, the fallback, the
   no-delete-operator-file guard, the reconcile on credential writes, and the
   credential-only endpoint resolution.
+- The shadow-snapshot pipe deadlock is [@glanzel](https://github.com/glanzel)'s
+  (issue #77, PR #78). Review verified both negative controls by reverting to
+  write-then-read (the 15 s timeout reproduces) and re-ran the suite on the
+  build host.
+- The commit-attribution split is [@jrzmurray](https://github.com/jrzmurray)'s
+  (PR #69, landed as #79). Review added the epoch-cap overflow test, whose
+  first version was non-discriminating and was rewritten until the planted bug
+  reddened it.
+- The bun-pty resolver (PR #74) came from the same contributor; review found
+  two platform bugs by running it against the real package rather than the
+  synthetic fixture.
 
 ## 0.7.5 - 2026-11-18
 
 ### Fixed
-## Unreleased
-
-### Fixed
-- The served models catalog is scoped to usable providers by default. The
-  provider payload expanded every models.dev provider (324 on the stock
-  catalog) into `provider.all`/`/api/integration` and retained it in RAM,
-  although a provider without a key can never serve a model. Loading now keeps
-  full model bodies only for config, auth, credential-table and env-enabled
-  providers, the built-in `opencode` tier, and providers named by a model pin;
-  every other provider stays as a metadata stub with an empty model map, so the
-  connect/login UI still lists it. `OCSERVE_MODEL_CATALOG=all` restores the
-  full catalog (`D-CATALOG-SCOPE`). The boot/hourly models.dev refresh no
-  longer parses the download into a full `Value` just to validate it (syntax
-  check only) and writes the fetched bytes without a second copy; the
-  mtime-churn content check hashes in 64 KiB chunks instead of reading the
-  whole file.
-
 - Image attachments now reach the provider in the shape it accepts. The
   encoder emitted the AI SDK's UI file part (`{type:"file", url, mediaType}`)
   instead of the wire part the pinned openai-compatible SDK derives, so every

@@ -81,23 +81,42 @@ fn regex_crate_matches_the_corpus() {
 /// engines disagree, GNU grep must still disagree. If a future grep release
 /// grew `\d`, this test tells us the "bug we fixed" narrative is stale.
 ///
-/// Skipped when `grep` is absent (Windows), which is itself the point.
+/// Use GNU grep explicitly (`ggrep` on Homebrew systems). BSD grep is a
+/// different engine and cannot validate this recorded GNU-grep behavior.
+/// The legacy-engine comparison is skipped when GNU grep is unavailable; the
+/// regex-crate corpus test above still runs on every host.
 #[test]
 fn gnu_grep_still_disagrees_where_the_corpus_says_it_did() {
-    if std::process::Command::new("grep")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("skipping: no grep on this host (that is why the engine moved in-process)");
+    let gnu_grep = ["ggrep", "grep"].into_iter().find(|program| {
+        let Ok(output) = std::process::Command::new(program)
+            .arg("--version")
+            .output()
+        else {
+            return false;
+        };
+        let version = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.status.success() && version.contains("GNU grep")
+    });
+    let Some(gnu_grep) = gnu_grep else {
+        // Linux CI always ships GNU grep; a silent skip there would hide a
+        // broken runner. Only non-Linux hosts (BSD grep) may skip.
+        assert!(
+            !(std::env::var_os("CI").is_some() && cfg!(target_os = "linux")),
+            "GNU grep is required on Linux CI"
+        );
+        eprintln!("skipping: GNU grep is unavailable; BSD grep is a different engine");
         return;
-    }
+    };
     let c = corpus();
     for case in &c.cases {
         if case.regex == case.gnu_grep {
             continue; // engines agree; nothing to prove
         }
-        let out = std::process::Command::new("grep")
+        let out = std::process::Command::new(gnu_grep)
             .arg("-E")
             .arg("-q")
             .arg(&case.pattern)
