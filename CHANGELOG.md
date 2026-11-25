@@ -7,6 +7,12 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## Unreleased
 
 ### Fixed
+- Snapshot capture no longer deadlocks when the candidate list and the source
+  repo's `git check-ignore` answer both exceed a pipe buffer. `run_git` writes
+  stdin on its own thread while `wait_with_output` drains stdout, so a large
+  shadow index cannot wedge `track()` (and with it the turn and every later
+  cancel attempt). A failed ignore filter is now fail-closed: the shadow index
+  is left untouched instead of treating the error as "nothing is ignored".
 - The v2 message projection no longer drops data a v2 client needs: a prompt
   admitted through `/api/session/{id}/prompt` shows its text (it was stored as
   a part, so `text` came back empty), and assistant messages keep
