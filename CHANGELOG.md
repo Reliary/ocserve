@@ -7,6 +7,14 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## Unreleased
 
 ### Fixed
+- Plugins that load a native `bun-pty` library (such as `opencode-pty`) now
+  find it. The normalizer moves the plugin's ESM out of its package tree, so
+  the library's relative lookup missed; the plugin host now resolves the
+  matching library for the platform from the original package and sets
+  `BUN_PTY_LIB` per plugin unless the operator configured it at launch (musl
+  hosts prefer the `_musl` builds, as bun-pty does; musl is detected from
+  `/proc/self/maps` because the `process.report` check answers "musl" on a
+  glibc host under bun 1.3.14, and Windows arm64 uses `rust_pty_arm64.dll`).
 - `POST /api/vcs/init` now refuses a directory that does not exist or that
   resolves outside the server working directory and home (400), and caps the
   request body at 8 KiB. Previously it would `git init` any absolute path.
