@@ -40,8 +40,16 @@ fn run(cmd: &str) -> String {
 
 /// `$0` basename, lowercased, exactly the identity the description uses.
 fn reported_shell() -> String {
-    let raw = run("printf '%s' \"$0\"");
-    let base = raw.rsplit('/').next().unwrap_or(&raw).to_lowercase();
+    // Shell startup warnings share the captured output stream with stdout on
+    // some platforms. Delimit the identity so stderr cannot become part of it.
+    let raw = run("printf '__OCSERVE_SHELL__%s__END__\\n' \"$0\"");
+    let raw = raw
+        .split_once("__OCSERVE_SHELL__")
+        .and_then(|(_, rest)| rest.split_once("__END__"))
+        .map(|(id, _)| id.to_string())
+        .unwrap_or_else(|| panic!("shell identity marker missing from output: {raw}"));
+    let raw = raw.trim();
+    let base = raw.rsplit('/').next().unwrap_or(raw).to_lowercase();
     // Some shells report `-bash`/`sh`; strip the login marker.
     base.trim_start_matches('-').to_string()
 }
