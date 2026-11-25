@@ -359,4 +359,15 @@ async fn init_refuses_a_missing_directory_and_an_oversized_body() {
     )
     .await;
     assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
+    // The handler also refuses an oversized body on its own, so the bound holds
+    // even if the route is exercised without the route-level body layer. Call
+    // the handler directly (there it sees the raw bytes, no DefaultBodyLimit).
+    assert!(
+        ocserve_http::v2::vcs_init_body_guard(8193).is_err(),
+        "8193 bytes must be refused by the handler"
+    );
+    assert!(
+        ocserve_http::v2::vcs_init_body_guard(8192).is_ok(),
+        "8192 bytes is the inclusive cap"
+    );
 }

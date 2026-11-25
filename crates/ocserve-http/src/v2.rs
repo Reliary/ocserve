@@ -2424,6 +2424,17 @@ pub async fn plugin_update_api(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Inclusive body-size cap for `POST /api/vcs/init`, enforced in the handler as
+/// well as by the route layer's `DefaultBodyLimit` (see the call site for why).
+#[doc(hidden)]
+pub fn vcs_init_body_guard(len: usize) -> Result<(), crate::HttpError> {
+    const MAX: usize = 8192;
+    if len > MAX {
+        return Err(bad_request(&format!("request body exceeds {MAX} bytes")));
+    }
+    Ok(())
+}
+
 /// Optional body of `POST /api/vcs/init` (a divergence from the spec; see the handler).
 #[derive(Default, serde::Deserialize)]
 struct VcsInitBody {
@@ -2448,6 +2459,14 @@ pub async fn vcs_init_api(
     // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     // Typed body: only `directory` (a string) is read; any other field is
     // ignored. Empty or whitespace-only bodies are treated as absent.
+    //
+    // The size cap is enforced HERE and not only by the route layer's
+    // `DefaultBodyLimit` (crates/ocserve-http/src/lib.rs). CodeQL flags a
+    // user-controlled `serde_json::from_slice` as unsafe-deserialization
+    // because the extractor that produced the bytes is not visible to it; a
+    // check in the same function makes the bound provable at the call site and
+    // keeps the handler safe if it is ever mounted without the layer.
+    vcs_init_body_guard(raw.len())?;
     let body: VcsInitBody = if raw.iter().all(u8::is_ascii_whitespace) {
         VcsInitBody::default()
     } else {
