@@ -335,9 +335,11 @@ pub fn normalize(cfg: &mut Value) {
         obj.insert("command".into(), Value::Object(target));
     }
 
-    // `tools` (deprecated boolean map) and `permissions` (v2 array) become the
-    // internal ordered rule list. The legacy `permission` object is left as it
-    // is; `perm_from_config` reads both surfaces.
+    // `tools` (deprecated boolean map), the legacy `permission` map and the v2
+    // `permissions` array become ONE ordered ruleset in upstream's order
+    // (`normalize.ts`: `[...tools, ...legacy, ...native]`, last match wins).
+    // Collapsing the order here means the rule engine cannot accidentally give
+    // a deprecated `permission` entry precedence over a v2 one.
     let mut rules: Vec<Value> = Vec::new();
     if let Some(tools) = obj.get("tools").and_then(Value::as_object) {
         for (name, enabled) in tools {
@@ -350,6 +352,9 @@ pub fn normalize(cfg: &mut Value) {
                 "action": if enabled { "allow" } else { "deny" },
             }));
         }
+    }
+    if let Some(legacy) = obj.get("permission") {
+        rules.extend(permission_rules(legacy));
     }
     if let Some(perms) = obj.get("permissions") {
         rules.extend(permission_rules(perms));
@@ -546,6 +551,31 @@ mod tests {
         // would make parse_config register a server literally named "servers".
         assert!(cfg["mcp"].get("servers").is_none());
         assert!(cfg["mcp"]["off"].is_object());
+    }
+
+    #[test]
+    fn normalize_orders_tools_legacy_then_native_rules() {
+        let mut cfg = json!({
+            "tools": {"shell": false},
+            "permission": {"bash": "ask"},
+            "permissions": [{"action": "shell", "resource": "*", "effect": "allow"}]
+        });
+        normalize(&mut cfg);
+        let rules = cfg["permissions"].as_array().unwrap();
+        let effects: Vec<_> = rules
+            .iter()
+            .map(|r| {
+                (
+                    r["permission"].as_str().unwrap(),
+                    r["action"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            effects,
+            vec![("bash", "deny"), ("bash", "ask"), ("bash", "allow")],
+            "upstream order is tools, legacy permission, native permissions"
+        );
     }
 
     #[test]

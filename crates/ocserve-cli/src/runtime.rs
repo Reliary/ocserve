@@ -842,10 +842,14 @@ pub fn perm_from_config(cfg: &Value) -> Vec<Value> {
     if let Some(items) = cfg.as_array() {
         out.extend(items.iter().filter_map(|item| {
             let obj = item.as_object()?;
-            let permission = obj
-                .get("permission")
-                .or_else(|| obj.get("action"))
-                .and_then(Value::as_str)?;
+            let permission = match obj.get("permission").and_then(Value::as_str) {
+                Some(p) => p,
+                // Raw v2 rule: `action` is the permission and must be folded
+                // onto the internal vocabulary (shell→bash, subagent→task).
+                None => crate::config_compat::internal_action(
+                    obj.get("action").and_then(Value::as_str)?,
+                ),
+            };
             let pattern = obj
                 .get("pattern")
                 .or_else(|| obj.get("resource"))

@@ -897,8 +897,24 @@ pub async fn config_list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         .iter()
         .map(|name| config_dir.join(name))
         .collect();
-    paths.extend(project_config_paths(std::path::Path::new(&worktree)));
+    let project_off = matches!(
+        std::env::var("OPENCODE_DISABLE_PROJECT_CONFIG")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    );
+    if !project_off {
+        paths.extend(project_config_paths(std::path::Path::new(&worktree)));
+    }
+    let mut seen = std::collections::HashSet::new();
     for path in paths {
+        // The global directory can reappear in the project walk when the
+        // worktree sits below it; list each document once.
+        if !seen.insert(path.clone()) {
+            continue;
+        }
         if let Ok(text) = std::fs::read_to_string(&path)
             && let Ok(info) = ocserve_core::jsonc::parse_object(&text)
         {
