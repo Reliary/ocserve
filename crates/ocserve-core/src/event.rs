@@ -5,9 +5,11 @@
 //! - durable types (session.updated, message.updated, message.part.updated)
 //!   also get a sync twin {payload:{type:"sync", syncEvent:{id,type:"<t>.1",
 //!   seq, aggregateID, data}}}; seq is per-session monotonic
-//! - overflow policy: slow subscribers are disconnected (bounded by
-//!   construction — no unbounded queues, AGENTS §2.3); clients recover via
-//!   REST snapshot on reconnect (PLAN §4 divergence note)
+//! - overflow policy: a receiver is told how many frames were evicted and its
+//!   cursor advances to the oldest resident frame; stream clients disconnect
+//!   and recover via REST snapshot, while fire-and-forget consumers may resume
+//!   from the retained ring (bounded by construction — no unbounded queues,
+//!   AGENTS §2.3; PLAN §4 divergence note)
 //!
 //! Why not `tokio::sync::broadcast` (the obvious choice): broadcast is
 //! **count**-bounded only. Every `message.part.updated` carries the full part
@@ -22,9 +24,10 @@
 //! publish = lock + push + evict + watch notify.
 //!
 //! Per-connection memory stays O(1 frame in flight): the SSE task holds at
-//! most one frame while writing to a stalled TCP socket; when the receiver
-//! falls behind the ring, it sees `Lagged` and the stream disconnects
-//! (existing captured behavior — clients reconnect and REST-snapshot).
+//! most one frame while writing to a stalled TCP socket; when a receiver
+//! falls behind the ring, it sees `Lagged` and may disconnect. SSE clients
+//! keep the captured disconnect behavior and REST-snapshot on reconnect;
+//! fire-and-forget consumers can resume at the oldest retained frame.
 
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -152,7 +155,7 @@ impl EventBus {
 
     /// Publish a fully-encoded global-event frame (payload already wrapped).
     /// Never blocks on subscribers: evicts OLDEST frames when the ring
-    /// exceeds count or byte bounds (lagging receivers get `Lagged` and
+    /// exceeds count or byte bounds (lagging receivers get `Lagged` and may
     /// disconnect — backpressure → disconnect, not stall, not growth).
     pub fn publish(&self, frame: Value) {
         self.publish_str(frame.to_string());
@@ -226,11 +229,18 @@ impl EventBusReceiver {
                     .map(|(s, a)| (*s, a.clone())),
             )
         };
-        // gap between my cursor and the oldest resident frame = I lagged
+        // A gap between the cursor and oldest resident frame means frames
+        // were evicted. Report that loss once and move the cursor just before
+        // the oldest retained frame, matching broadcast receiver semantics.
+        // A caller may disconnect (SSE) or call recv again to resume (plugin
+        // event pump); leaving the cursor unchanged makes retrying callers
+        // spin on the same Lagged error indefinitely.
         if let Some(front) = front
             && front > self.last_seq + 1
         {
-            return Err(RecvError::Lagged(front - self.last_seq - 1));
+            let skipped = front - self.last_seq - 1;
+            self.last_seq = front - 1;
+            return Err(RecvError::Lagged(skipped));
         }
         match next {
             Some((s, frame)) => {
@@ -779,7 +789,8 @@ mod tests {
         let got = rx.recv().await.unwrap();
         let v: Value = serde_json::from_str(&got).unwrap();
         assert_eq!(v["payload"]["type"], "session.idle");
-        // overflow → Lagged error (not a stall); receiver side disconnects
+        // Overflow is reported, and retrying consumers resume from the oldest
+        // retained frame; SSE callers still choose to disconnect.
         for _ in 0..2000 {
             bus.publish(frame("/x", "session.status", json!({})));
         }
@@ -787,6 +798,25 @@ mod tests {
             Ok(_) | Err(RecvError::Lagged(_)) => {}
             e => panic!("unexpected bus result: {e:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn lagged_receiver_advances_to_oldest_retained_frame() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let burst = BUS_CAPACITY + 64;
+        for index in 0..burst {
+            bus.publish(frame("/x", "session.status", json!({"index": index})));
+        }
+
+        assert_eq!(rx.recv().await, Err(RecvError::Lagged(64)));
+
+        let oldest = rx
+            .recv()
+            .await
+            .expect("receiver should resume at the oldest retained frame");
+        let oldest: Value = serde_json::from_str(&oldest).expect("frame JSON");
+        assert_eq!(oldest["payload"]["properties"]["index"], json!(64));
     }
 
     /// NEGATIVE-CONTROL pair for the byte bound: publishing frames that

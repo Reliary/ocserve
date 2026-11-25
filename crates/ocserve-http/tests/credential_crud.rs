@@ -160,3 +160,92 @@ async fn connect_key_splits_known_and_unknown_integrations() {
     assert_eq!(body["_tag"], "IntegrationNotFoundError");
     assert_eq!(body["integrationID"], "definitely-not-an-integration");
 }
+
+/// B (PR #62 review): every credential WRITE reconciles, because a credential
+/// is both a catalog-scope input and a registry endpoint source. Without the
+/// reconcile the provider stayed stubbed and unpromptable until restart.
+/// Planted control: remove `reconcile_after_credential_change` from any of the
+/// three handlers and the corresponding counter stops incrementing.
+#[tokio::test]
+async fn credential_writes_reconcile_so_the_provider_becomes_usable() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let db = ocserve_store::writer::db_path(dir.path());
+    let writer = std::sync::Arc::new(ocserve_store::Writer::spawn(db.clone()).unwrap());
+    let blobs =
+        std::sync::Arc::new(ocserve_store::BlobStore::new(dir.path().join("blobs")).unwrap());
+    let st = ocserve_http::AppState::with_wiring_and_v2(
+        None,
+        ocserve_http::Payloads::default(),
+        ocserve_http::Wires {
+            db,
+            blobs,
+            writer,
+            llm: ocserve_http::LlmRegistry::default(),
+        },
+        true,
+    );
+    let hits = std::sync::Arc::new(AtomicU32::new(0));
+    let h = hits.clone();
+    *st.reloader.write() = Some(std::sync::Arc::new(move || {
+        h.fetch_add(1, Ordering::Relaxed);
+        Ok((
+            ocserve_http::Payloads::default(),
+            ocserve_http::LlmRegistry::default(),
+        ))
+    }));
+    let app = ocserve_http::router(st.clone());
+    let n = || hits.load(Ordering::Relaxed);
+
+    let (s, created) = req(
+        &app,
+        "POST",
+        "/api/credential",
+        Some(serde_json::json!({
+            "integrationID": "mistral",
+            "value": {"type": "key", "key": "sk-m"}
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{created}");
+    assert_eq!(n(), 1, "create must reconcile");
+    let id = created["data"]["id"].as_str().unwrap().to_string();
+
+    let (s, _) = req(
+        &app,
+        "POST",
+        &format!("/api/credential/{id}/activate"),
+        None,
+    )
+    .await;
+    assert_eq!(s, 204);
+    assert_eq!(n(), 2, "activate must reconcile");
+
+    let (s, _) = req(&app, "DELETE", &format!("/api/credential/{id}"), None).await;
+    assert_eq!(s, 204);
+    assert_eq!(n(), 3, "delete must reconcile");
+
+    // A label-only PATCH changes no auth input: it must NOT spend a reload.
+    let (st2, created2) = req(
+        &app,
+        "POST",
+        "/api/credential",
+        Some(serde_json::json!({
+            "integrationID": "mistral",
+            "value": {"type": "key", "key": "sk-m2"}
+        })),
+    )
+    .await;
+    assert_eq!(st2, 200);
+    let id2 = created2["data"]["id"].as_str().unwrap().to_string();
+    let before = n();
+    let (s, _) = req(
+        &app,
+        "PATCH",
+        &format!("/api/credential/{id2}"),
+        Some(serde_json::json!({"label": "renamed"})),
+    )
+    .await;
+    assert_eq!(s, 204);
+    assert_eq!(n(), before, "a label-only PATCH must not reload");
+}

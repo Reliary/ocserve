@@ -2189,6 +2189,16 @@ pub async fn credential_list_api(State(st): State<Arc<AppState>>) -> impl IntoRe
 /// single-actives same-integration siblings (verified live). Value union
 /// validated structurally (key/oauth/external + required fields); unknown
 /// integrationIDs accepted (verified live — no registry check).
+/// One reconcile rule for every auth-source mutation. `PUT /auth/{pid}`
+/// already reloads (lib.rs); a credential write is the other way a provider
+/// becomes usable, so it takes the same path. Failure only warns: the write
+/// is already durable and a later config reload picks it up.
+async fn reconcile_after_credential_change(st: &Arc<AppState>) {
+    if let Err(e) = crate::watch::reconcile(st).await {
+        tracing::warn!("credential change: reconcile failed (restart to apply): {e:#}");
+    }
+}
+
 pub async fn credential_create_api(
     State(st): State<Arc<AppState>>,
     Json(body): Json<Value>,
@@ -2229,6 +2239,10 @@ pub async fn credential_create_api(
         .into_iter()
         .find(|c| c.id == id)
         .ok_or_else(|| internal(anyhow::anyhow!("created credential missing")))?;
+    // A credential is a catalog-scope input (`catalog_keep_set`) AND a registry
+    // endpoint source; without a reconcile the provider stays stubbed and
+    // unpromptable until restart (PR #62 review: create 200, still 0 models).
+    reconcile_after_credential_change(&st).await;
     Ok(Json(json!({"data": entry.to_wire()})))
 }
 
@@ -2265,6 +2279,7 @@ pub async fn credential_activate_api(
 ) -> Result<StatusCode, HttpError> {
     // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     ocserve_store::credential_activate(&st.writer, &st.db, &id, now_ms()).map_err(internal)?;
+    reconcile_after_credential_change(&st).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -6662,6 +6677,7 @@ pub async fn credential_remove(
 ) -> Result<StatusCode, HttpError> {
     // In BOTH frozen contracts: no handler self-gate.
     ocserve_store::credential_delete(&st.writer, &id).map_err(internal)?;
+    reconcile_after_credential_change(&st).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

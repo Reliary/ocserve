@@ -747,8 +747,72 @@ pub fn message_by_id_conn(
     };
     let info: serde_json::Value = serde_json::from_str(&info_txt)?;
     let info = merge_columns(info, message_id, session_id, None);
-    let parts = load_parts_for_message(conn, message_id, session_id, blobs_root)?;
+    let mut parts = load_parts_for_message(conn, message_id, session_id, blobs_root)?;
+    normalize_legacy_tool_errors(&mut parts);
     Ok(Some(serde_json::json!({"info": info, "parts": parts})))
+}
+
+/// Older ocserve rows could persist a failed tool's message in the
+/// completed-only `output` field: either with no `error` at all, or (a v1
+/// `tool.execute.after` hook replaced the result) next to the original
+/// `error`. Repair both at the response boundary so existing sessions stay
+/// readable and schema-valid; the stored row is left untouched. A structured
+/// (non-string) `error` is already the v2 shape and is never overwritten.
+/// Returns true when the part was changed.
+fn normalize_legacy_tool_error(part: &mut serde_json::Value) -> bool {
+    use serde_json::Value;
+
+    if part.get("type").and_then(Value::as_str) != Some("tool") {
+        return false;
+    }
+    let Some(state) = part.get_mut("state") else {
+        return false;
+    };
+    if state.get("status").and_then(Value::as_str) != Some("error") {
+        return false;
+    }
+    let has_error = match state.get("error") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(_)) => true,
+        Some(_) => return false,
+    };
+    // The latest write wins: `output` (a hook's replacement) over the stored
+    // `error`, then `metadata.output` only when there is no error at all.
+    let result = state
+        .get("output")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            if has_error {
+                None
+            } else {
+                state
+                    .get("metadata")
+                    .and_then(|m| m.get("output"))
+                    .and_then(Value::as_str)
+            }
+        })
+        .map(str::to_owned);
+    let Some(object) = state.as_object_mut() else {
+        return false;
+    };
+    let stray = object.contains_key("output") || object.contains_key("title");
+    match result {
+        Some(result) => {
+            object.insert("error".into(), Value::String(result));
+        }
+        None if !has_error => return false,
+        None => {}
+    }
+    // The v1 error variant does not carry the completed-only fields.
+    object.remove("output");
+    object.remove("title");
+    stray || !has_error
+}
+
+fn normalize_legacy_tool_errors(parts: &mut [serde_json::Value]) {
+    for part in parts {
+        normalize_legacy_tool_error(part);
+    }
 }
 
 /// Parts for one message (inline read; blob spilled parts decompressed) —
@@ -1423,7 +1487,7 @@ pub fn page_messages(
 /// - `reasoning` → `{type:"reasoning", text, state:"completed"}`
 /// - `tool` → `{type:"tool", id, name, state, time}` from the stored state
 ///   envelope (`{status,input,output,error,time}` → v2
-///   `completed{input,output}|error{input,error}|running{input}`)
+///   `completed{input,content}|error{input,error}|running{input}`)
 /// - `step-start`/`step-finish`/`patch`/`idle`/`busy`/`function` →
 ///   folded into the assistant envelope (`snapshot`, `cost`, `finish`), never
 ///   content elements (upstream has no message.part.* in v2 either)
@@ -1484,7 +1548,15 @@ pub fn project_page_v2(
         let info: Value = serde_json::from_str(info_txt).unwrap_or(Value::Null);
         let role = info.get("role").and_then(|r| r.as_str()).unwrap_or("");
         let created = info.pointer("/time/created").cloned().unwrap_or(json!(0));
-        let time = json!({"created": created});
+        let mut time = json!({"created": created});
+        // v2 clients read an assistant's completion times to see a finished turn.
+        if role == "assistant" {
+            for key in ["streamed", "completed"] {
+                if let Some(v) = info.pointer(&format!("/time/{key}")) {
+                    time[key] = v.clone();
+                }
+            }
+        }
         let plist = parts.get(mid).map(|v| v.as_slice()).unwrap_or(&empty);
         let mut content = Vec::new();
         for (ptype, inline, blob) in plist {
@@ -1528,16 +1600,32 @@ pub fn project_page_v2(
                         .unwrap_or("running");
                     let input = state.get("input").cloned().unwrap_or(json!({}));
                     let v2state = match status {
-                        "completed" => json!({
-                            "status": "completed",
-                            "input": input,
-                            "output": state.get("output").cloned().unwrap_or(json!([])),
-                        }),
-                        "error" => json!({
-                            "status": "error",
-                            "input": input,
-                            "error": state.get("error").cloned().unwrap_or(json!("")),
-                        }),
+                        "completed" => {
+                            let mut projected = json!({
+                                "status": "completed",
+                                "input": input,
+                                "content": v2_tool_content(
+                                    state.get("output").unwrap_or(&Value::Null),
+                                ),
+                            });
+                            if let Some(metadata) = state.get("metadata").filter(|v| v.is_object())
+                            {
+                                projected["metadata"] = metadata.clone();
+                            }
+                            projected
+                        }
+                        "error" => {
+                            let mut projected = json!({
+                                "status": "error",
+                                "input": input,
+                                "error": v2_tool_error(&state),
+                            });
+                            if let Some(metadata) = state.get("metadata").filter(|v| v.is_object())
+                            {
+                                projected["metadata"] = metadata.clone();
+                            }
+                            projected
+                        }
                         _ => json!({"status": "running", "input": input}),
                     };
                     content.push(json!({
@@ -1588,11 +1676,40 @@ pub fn project_page_v2(
                 }));
             }
             "user" => {
+                // V2 admission stores the prompt text as a part and leaves the
+                // legacy info `text` convenience field absent.
                 let text = info
                     .get("text")
                     .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                    .map(str::to_string)
+                    .or_else(|| {
+                        // Concatenate the prompt's own text parts (same rule as
+                        // the v1 prompt builder), skipping synthetic/ignored
+                        // parts, and decode blobbed parts like any other.
+                        let joined: String = plist
+                            .iter()
+                            .filter(|(t, _, _)| t == "text")
+                            .filter_map(|(_, inline, blob)| {
+                                let raw = match (inline, blob) {
+                                    (Some(t), _) => t.clone(),
+                                    (None, Some((sha, len))) => {
+                                        let bytes = blobs.get(sha, *len as u64).ok()?;
+                                        String::from_utf8_lossy(&bytes).into_owned()
+                                    }
+                                    _ => return None,
+                                };
+                                let b: Value = serde_json::from_str(&raw).ok()?;
+                                if b["synthetic"].as_bool() == Some(true)
+                                    || b["ignored"].as_bool() == Some(true)
+                                {
+                                    return None;
+                                }
+                                b["text"].as_str().map(str::to_string)
+                            })
+                            .collect();
+                        (!joined.is_empty()).then_some(joined)
+                    })
+                    .unwrap_or_default();
                 // file/agent attachments travel as parts; surface the file ones.
                 let mut files = Vec::new();
                 let mut agents = Vec::new();
@@ -1631,6 +1748,77 @@ pub fn project_page_v2(
         }
     }
     Ok(out)
+}
+
+/// The v1 tool state stores completed output as a string, while v2 represents
+/// that output as typed content blocks. Accept old content-shaped values too,
+/// but ensure every emitted item conforms to `Tool.Content`.
+fn v2_tool_content(output: &serde_json::Value) -> Vec<serde_json::Value> {
+    use serde_json::{Value, json};
+
+    let mut content = Vec::new();
+    match output {
+        Value::String(text) => content.push(json!({"type": "text", "text": text})),
+        Value::Array(items) => {
+            for item in items {
+                match item.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            content.push(json!({"type": "text", "text": text}));
+                        }
+                    }
+                    Some("file") => {
+                        if let (Some(uri), Some(mime)) = (
+                            item.get("uri").and_then(Value::as_str),
+                            item.get("mime").and_then(Value::as_str),
+                        ) {
+                            let mut file = json!({"type": "file", "uri": uri, "mime": mime});
+                            if let Some(name) = item.get("name").filter(|v| v.is_string()) {
+                                file["name"] = name.clone();
+                            }
+                            content.push(file);
+                        }
+                    }
+                    _ => {
+                        if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            content.push(json!({"type": "text", "text": text}));
+                        }
+                    }
+                }
+            }
+        }
+        Value::Null => {}
+        other => content.push(json!({"type": "text", "text": other.to_string()})),
+    }
+    if content.is_empty() {
+        content.push(json!({"type": "text", "text": ""}));
+    }
+    content
+}
+
+/// V2 tool errors are structured. Older persisted rows may only have the
+/// failure text in `output`; normalize both forms without losing that text.
+fn v2_tool_error(state: &serde_json::Value) -> serde_json::Value {
+    use serde_json::{Value, json};
+
+    let error = state.get("error").unwrap_or(&Value::Null);
+    match error {
+        Value::Object(object)
+            if object.get("type").is_some_and(Value::is_string)
+                && object.get("message").is_some_and(Value::is_string) =>
+        {
+            error.clone()
+        }
+        Value::String(message) => json!({"type": "unknown", "message": message}),
+        _ => {
+            let message = state
+                .get("output")
+                .and_then(Value::as_str)
+                .or_else(|| error.as_str())
+                .unwrap_or_default();
+            json!({"type": "unknown", "message": message})
+        }
+    }
 }
 /// Walk a session's messages one at a time, yielding each message's FULL
 /// response JSON object (`{"info":…,"parts":[…]}`) to `visit`. Bounded by
@@ -1848,11 +2036,31 @@ pub fn for_each_message_json(
                     &mut ser,
                     &mut scratch,
                 ) {
-                    SPLICE_ROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let spliced = std::str::from_utf8(&ser)?;
+                    if spliced.contains("\"type\":\"tool\"")
+                        && spliced.contains("\"status\":\"error\"")
+                    {
+                        // Parse only this candidate shape so legacy
+                        // output-only failures can be normalized without
+                        // giving up the zero-parse path for ordinary parts.
+                        // Only a part that actually needed repair counts as
+                        // a fallback; a valid failed-tool part is a row.
+                        let mut part: serde_json::Value = serde_json::from_slice(&ser)?;
+                        if normalize_legacy_tool_error(&mut part) {
+                            ser.clear();
+                            serde_json::to_writer(&mut ser, &part)?;
+                            SPLICE_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            SPLICE_ROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    } else {
+                        SPLICE_ROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     chunk.push_str(std::str::from_utf8(&ser)?);
                 } else {
-                    let v: serde_json::Value = serde_json::from_str(&text)?;
-                    let merged = merge_columns(v, &prow.id, session_id, Some(mid));
+                    let value: serde_json::Value = serde_json::from_str(&text)?;
+                    let mut merged = merge_columns(value, &prow.id, session_id, Some(mid));
+                    normalize_legacy_tool_error(&mut merged);
                     ser.clear();
                     serde_json::to_writer(&mut ser, &merged)?;
                     chunk.push_str(std::str::from_utf8(&ser)?);
