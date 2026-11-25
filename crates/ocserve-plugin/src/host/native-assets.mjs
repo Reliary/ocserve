@@ -3,7 +3,7 @@
  * package tree. The normalizer moves ESM outside node_modules; Bun FFI assets
  * remain beside the cached package and cannot be bundled into JavaScript.
  */
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 // A plugin entry can be nested under dist/ or src/. Keep the upward search
@@ -12,10 +12,21 @@ import { dirname, join, resolve } from "node:path";
 const MAX_ORIGIN_PARENTS = 12;
 
 // bun-pty prefers the `_musl` builds on musl libc (Alpine); the glibc names are
-// its fallback. Detect musl the way Node reports it: no glibc runtime version.
+// its fallback.
+//
+// Detect musl the way bun-pty ITSELF does (`src/terminal.ts: isMusl`) — by
+// grepping /proc/self/maps for `ld-musl` — and not via
+// `process.report.getReport()`. Measured under bun 1.3.14 on glibc: the report
+// object exists but `header.glibcVersionRuntime` is undefined, so the
+// report-based heuristic answers "musl" on a glibc host and would hand FFI the
+// musl build. If /proc is unreadable, assume glibc: picking the glibc library
+// on a musl host fails loudly at dlopen, while picking musl on glibc fails the
+// same way, so the tie-break does not matter — but the common case must be
+// right.
 function isMusl() {
+  if (process.platform !== "linux") return false;
   try {
-    return !process.report?.getReport?.().header?.glibcVersionRuntime;
+    return readFileSync("/proc/self/maps", "utf8").includes("ld-musl");
   } catch {
     return false;
   }
@@ -27,7 +38,14 @@ function libraryNames(platform, arch, musl = false) {
       ? ["librust_pty_arm64.dylib", "librust_pty.dylib"]
       : ["librust_pty.dylib"];
   }
-  if (platform === "win32") return ["rust_pty.dll"];
+  if (platform === "win32") {
+    // bun-pty ships BOTH windows builds (rust_pty_arm64.dll exists in
+    // 0.4.11's rust-pty/target/release); listing only the x64 name made an
+    // arm64 Windows host resolve a library with the wrong architecture.
+    return arch === "arm64"
+      ? ["rust_pty_arm64.dll", "rust_pty.dll"]
+      : ["rust_pty.dll"];
+  }
   if (platform === "linux") {
     const glibc =
       arch === "arm64"

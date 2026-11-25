@@ -11,7 +11,10 @@ such as `bun:ffi` (`opencode-pty` is one example). For plugins that load a
 native `bun-pty` library, the host resolves the matching library from the
 original package tree before importing the normalized entry and sets
 `BUN_PTY_LIB` per plugin; a value the operator set at launch always wins.
-Musl hosts try the `_musl` library names first.
+Musl hosts try the `_musl` library names first, detected by grepping
+`/proc/self/maps` for `ld-musl` exactly as `bun-pty` itself does (the
+`process.report` heuristic answers "musl" on glibc under bun 1.3.14). Windows
+arm64 resolves `rust_pty_arm64.dll`, which the package ships.
 
 Plugin compatibility targets opencode v1 (frozen at 1.19.5); v2 plugin
 entrypoints are out of scope by policy (`PLAN.md` §8).

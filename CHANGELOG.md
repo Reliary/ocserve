@@ -12,7 +12,9 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   the library's relative lookup missed; the plugin host now resolves the
   matching library for the platform from the original package and sets
   `BUN_PTY_LIB` per plugin unless the operator configured it at launch (musl
-  hosts prefer the `_musl` builds, as bun-pty does).
+  hosts prefer the `_musl` builds, as bun-pty does; musl is detected from
+  `/proc/self/maps` because the `process.report` check answers "musl" on a
+  glibc host under bun 1.3.14, and Windows arm64 uses `rust_pty_arm64.dll`).
 - The v2 message projection no longer drops data a v2 client needs: a prompt
   admitted through `/api/session/{id}/prompt` shows its text (it was stored as
   a part, so `text` came back empty), and assistant messages keep
