@@ -223,8 +223,25 @@ for path in "${PULL[@]+"${PULL[@]}"}"; do
 done
 
 if [ "$CLEAN" = 1 ]; then
-  timeout 600 "${SSH[@]}" "rm -rf '$REMOTE_DIR/target' '$REMOTE_DIR'/mutants.out*" 2>/dev/null || true
-  echo ">> cleaned remote target/"
+  # VERIFY, do not announce. `rm -rf ... || true` printed "cleaned" even when
+  # the timeout killed it and 42 GB was still there (measured 2026-11-25) —
+  # the swallowed-result class this repo bans. A 40 GB btrfs tree can exceed
+  # any fixed timeout, so this runs with a generous budget, then asserts the
+  # directory is GONE and reports the real free-space delta.
+  # MUST go through bash: the remote login shell is fish, and fish ABORTS the
+  # whole command line when a glob matches nothing. `rm -rf target mutants.out*`
+  # therefore never ran `rm` at all when there was no mutants dir, and the old
+  # `2>/dev/null || true` reported success over a 42 GB tree (measured
+  # 2026-11-25). No glob at all now: find with -exec.
+  timeout 1800 "${SSH[@]}" "bash -lc 'rm -rf \"\$1\"/target; find \"\$1\" -maxdepth 1 -name \"mutants.out*\" -exec rm -rf {} +'" _ "$REMOTE_DIR" >/dev/null 2>&1 || true
+  if timeout 20 "${SSH[@]}" "bash -lc 'test -e \"\$1\"/target'" _ "$REMOTE_DIR" 2>/dev/null; then
+    echo "remote-build.sh: --clean FAILED, '$REMOTE_DIR/target' still exists (deletion timed out or was refused)" >&2
+    exit 6
+  fi
+  # Our own scratch dirs (the test suite creates thousands per workspace run).
+  timeout 600 "${SSH[@]}" "bash -lc 'find /var/tmp -maxdepth 1 -user \"\$(id -un)\" -name \"ocserve-*\" ! -name \"ocserve-build\" -exec rm -rf {} + 2>/dev/null || true'" >/dev/null 2>&1 || true
+  leftover=$(timeout 30 "${SSH[@]}" "bash -lc 'find /var/tmp -maxdepth 1 -user \"\$(id -un)\" -name \"ocserve-*\" ! -name \"ocserve-build\" | wc -l'" 2>/dev/null | tr -dc '0-9' || echo 0)
+  echo ">> cleaned remote target/ and scratch dirs (${leftover:-0} scratch dirs left)"
 elif [ "$KEEP" = 0 ]; then
   size=$(timeout 30 "${SSH[@]}" "du -sh '$REMOTE_DIR/target' 2>/dev/null | cut -f1" 2>/dev/null || true)
   [ -n "$size" ] && echo ">> remote target/ is $size (kept for incremental reuse; --clean to remove)"
