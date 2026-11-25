@@ -7,6 +7,12 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 ## Unreleased
 
 ### Fixed
+- `GET /api/shell/{id}` (and the spawn response) reports the exit status as
+  `exit`, the field the upstream `Shell.Info` schema defines, and leaves it out
+  while the shell runs. It was emitted as `exitCode`, so a client that judges
+  a shell by `status == "exited" && exit == 0`, such as the opencode remote
+  dispatcher, treated every finished bootstrap as failed and rolled back its
+  worktree.
 - Snapshot capture no longer deadlocks when the candidate list and the source
   repo's `git check-ignore` answer both exceed a pipe buffer. `run_git` writes
   stdin on its own thread while `wait_with_output` drains stdout, so a large
