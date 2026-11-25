@@ -756,9 +756,13 @@ pub async fn fs_read(
 // ---------------------------------------------------------------------------
 
 /// GET /api/worktree — `Worktree.List` from `git worktree list`.
-pub async fn worktree_list_api(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn worktree_list_api(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
     // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
-    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let dir = scoped_directory(&st, &headers, &q, q.get("projectID").map(String::as_str));
     let list = run_blocking(&st.db, move |_db| {
         Ok::<_, anyhow::Error>(crate::vcs::worktrees(&dir))
     })
@@ -772,6 +776,8 @@ pub async fn worktree_list_api(State(st): State<Arc<AppState>>) -> impl IntoResp
 /// fake success); git failure → 400 with stderr.
 pub async fn worktree_create_api(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
     Json(body): Json<Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -783,14 +789,14 @@ pub async fn worktree_create_api(
     {
         return bad_request(&format!("unknown key {bad}")).into_response();
     }
-    let (Some(_pid), Some(directory)) = (
+    let (Some(pid), Some(directory)) = (
         obj.get("projectID").and_then(|v| v.as_str()),
         obj.get("directory").and_then(|v| v.as_str()),
     ) else {
         return bad_request("Missing key\n  at [\"projectID\"] / [\"directory\"]").into_response();
     };
     let branch = obj.get("branch").and_then(|v| v.as_str());
-    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let dir = scoped_directory(&st, &headers, &q, Some(pid));
     let directory = directory.to_string();
     let branch = branch.map(str::to_string);
     match run_blocking(&st.db, move |_db| {
@@ -817,19 +823,21 @@ pub async fn worktree_create_api(
 /// projectID + directory + force.
 pub async fn worktree_remove_api(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
     Json(body): Json<Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
     let obj = body.as_object().cloned().unwrap_or_default();
-    let (Some(_pid), Some(directory), force) = (
+    let (Some(pid), Some(directory), force) = (
         obj.get("projectID").and_then(|v| v.as_str()),
         obj.get("directory").and_then(|v| v.as_str()),
         obj.get("force").and_then(|v| v.as_bool()).unwrap_or(false),
     ) else {
         return bad_request("Missing key\n  at [\"projectID\"] / [\"directory\"]").into_response();
     };
-    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let dir = scoped_directory(&st, &headers, &q, Some(pid));
     let directory = directory.to_string();
     match run_blocking(&st.db, move |_db| {
         Ok::<_, anyhow::Error>(crate::vcs::worktree_remove(&dir, &directory, force))
@@ -854,6 +862,61 @@ pub async fn worktree_refresh_api(
         return bad_request("Missing key\n  at [\"projectID\"]").into_response();
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// The directory a request is scoped to, in precedence order: the spec's
+/// `location[directory]` query, the v1 `directory` query, a `projectID` that is
+/// an absolute path (ocserve mints every non-global project id from the
+/// session directory, see `project_list_body`, so the id IS the directory and
+/// an explicit project outranks the ambient session header), the
+/// `x-opencode-directory` header (percent-decoded), then the server cwd.
+/// Only absolute paths count: a relative or empty value falls through rather
+/// than silently resolving against the server cwd, the bug this replaces.
+/// Git-backed routes used to read the server cwd unconditionally, so a server
+/// started outside a repository answered `not a git repository` for every
+/// project.
+pub(crate) fn scoped_directory(
+    st: &AppState,
+    headers: &axum::http::HeaderMap,
+    query: &HashMap<String, String>,
+    project_id: Option<&str>,
+) -> String {
+    let absolute = |s: &str| (s.starts_with('/') && s != "/").then(|| s.to_string());
+    query
+        .get("location[directory]")
+        .and_then(|s| absolute(s))
+        .or_else(|| query.get("directory").and_then(|s| absolute(s)))
+        .or_else(|| project_id.and_then(absolute))
+        .or_else(|| {
+            headers
+                .get("x-opencode-directory")
+                .and_then(|v| absolute(&percent_decode(&String::from_utf8_lossy(v.as_bytes()))))
+        })
+        .unwrap_or_else(|| st.paths["directory"].as_str().unwrap_or("/").to_string())
+}
+
+/// Minimal `%XX` decoder (the client percent-encodes non-ASCII directories in
+/// the header); malformed escapes pass through unchanged.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (
+                (b[i + 1] as char).to_digit(16),
+                (b[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn bad_request(msg: &str) -> HttpError {
@@ -2361,21 +2424,95 @@ pub async fn plugin_update_api(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /api/vcs/init — real `git init` in the session directory
-/// (spawn_blocking; non-git → initialized; already-git → 204 idempotent).
+/// Inclusive body-size cap for `POST /api/vcs/init`, enforced in the handler as
+/// well as by the route layer's `DefaultBodyLimit` (see the call site for why).
+#[doc(hidden)]
+pub fn vcs_init_body_guard(len: usize) -> Result<(), crate::HttpError> {
+    const MAX: usize = 8192;
+    if len > MAX {
+        return Err(bad_request(&format!("request body exceeds {MAX} bytes")));
+    }
+    Ok(())
+}
+
+/// Optional body of `POST /api/vcs/init` (a divergence from the spec; see the handler).
+#[derive(Default, serde::Deserialize)]
+struct VcsInitBody {
+    directory: Option<String>,
+}
+
+/// POST /api/vcs/init — real `git init` (spawn_blocking; non-git → initialized;
+/// already-git → 204 idempotent) in the directory the request names.
+///
+/// Resolution order: a body `directory` (the original contract, kept for
+/// existing clients — a named divergence from the spec, which scopes this
+/// route by query only and has no request body), then `location[directory]`,
+/// `directory`, the `x-opencode-directory` header, then the server cwd. The
+/// body is optional: empty or whitespace-only is treated as absent whatever
+/// the content type; malformed JSON is still a 400.
 pub async fn vcs_init_api(
     State(st): State<Arc<AppState>>,
-    Json(body): Json<Value>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+    raw: axum::body::Bytes,
 ) -> Result<StatusCode, HttpError> {
     // Flag authority is `v2_gate` (generated v2-only table); no handler self-gate.
-    let dir = body
-        .get("directory")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| st.paths["directory"].as_str().unwrap_or("/").to_string());
+    // Typed body: only `directory` (a string) is read; any other field is
+    // ignored. Empty or whitespace-only bodies are treated as absent.
+    //
+    // The size cap is enforced HERE and not only by the route layer's
+    // `DefaultBodyLimit` (crates/ocserve-http/src/lib.rs). CodeQL flags a
+    // user-controlled `serde_json::from_slice` as unsafe-deserialization
+    // because the extractor that produced the bytes is not visible to it; a
+    // check in the same function makes the bound provable at the call site and
+    // keeps the handler safe if it is ever mounted without the layer.
+    vcs_init_body_guard(raw.len())?;
+    let body: VcsInitBody = if raw.iter().all(u8::is_ascii_whitespace) {
+        VcsInitBody::default()
+    } else {
+        serde_json::from_slice(&raw).map_err(|e| bad_request(&format!("invalid JSON body: {e}")))?
+    };
+    let dir = match body.directory {
+        Some(d) => d,
+        None => scoped_directory(&st, &headers, &q, None),
+    };
+    // Containment: whichever source supplied the directory, it must exist and
+    // resolve (on the opened handle, via `containment::open_within`, the same
+    // primitive the file routes use) beneath the server's working directory or
+    // home. `git init` then runs on the verified real path.
+    if dir.len() > 4096 || !dir.starts_with('/') || dir == "/" {
+        return Err(bad_request("directory must be an absolute path"));
+    }
+    let roots: Vec<std::path::PathBuf> = ["directory", "home"]
+        .iter()
+        .filter_map(|k| st.paths[*k].as_str())
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .collect();
+    let dir_for_check = dir.clone();
+    let real = tokio::task::spawn_blocking(move || {
+        use crate::containment::{OpenError, OpenKind, open_within};
+        let mut last = OpenError::Escape;
+        for root in &roots {
+            match open_within(root, &dir_for_check, OpenKind::Dir) {
+                Ok(c) => return Ok(c.path().to_path_buf()),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    })
+    .await
+    .map_err(|e| crate::HttpError::Api(internal(anyhow::anyhow!("containment check failed: {e}"))))?
+    .map_err(|e| match e {
+        crate::containment::OpenError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            bad_request("directory does not exist")
+        }
+        crate::containment::OpenError::Io(io) => bad_request(&format!("directory: {io}")),
+        other => bad_request(&other.to_string()),
+    })?;
+    let dir = real.to_string_lossy().into_owned();
     let out = run_blocking(&st.db, move |_db| {
         ocserve_store::cgroup::command("git", "tools")
-            .args(["init", &dir])
+            .args(["init", "--", &dir])
             .output()
             .map(|o| {
                 (
@@ -5017,31 +5154,42 @@ pub async fn mcp_resource(State(st): State<Arc<AppState>>) -> impl IntoResponse 
 /// v2: `{current, default}` object, additionalProperties:false on both, so
 /// no union is possible). Same git queries, per-contract projection (the
 /// version-split made concrete; both decoders read only their shape).
-pub async fn vcs_get(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+pub async fn vcs_get(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let dir = scoped_directory(&st, &headers, &q, None);
+    let location = json!({"directory": dir});
     let info = run_blocking(&st.db, move |_db| {
         Ok::<_, anyhow::Error>(crate::vcs::info_v2(&dir))
     })
     .await
     .unwrap_or_else(|_| json!({"branch": {"current": Value::Null, "default": Value::Null}}));
-    Json(json!({"location": api_location_ref(&st), "data": info}))
+    Json(json!({"location": location, "data": info}))
 }
 
 /// GET /api/vcs/status — `{location, data: FileStatus[]}`.
-pub async fn vcs_status(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+pub async fn vcs_status(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let dir = scoped_directory(&st, &headers, &q, None);
+    let location = json!({"directory": dir});
     let status = run_blocking(&st.db, move |_db| {
         Ok::<_, anyhow::Error>(crate::vcs::status(&dir))
     })
     .await
     .unwrap_or_else(|_| Value::Array(vec![]));
-    Json(json!({"location": api_location_ref(&st), "data": status}))
+    Json(json!({"location": location, "data": status}))
 }
 
 /// GET /api/vcs/diff — `{location, data: FileDiff[]}` (same mode/context
 /// query contract as v1; missing mode → 400 via the v1 path).
 pub async fn vcs_diff(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -5054,7 +5202,8 @@ pub async fn vcs_diff(
         }
         .into_response();
     }
-    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let dir = scoped_directory(&st, &headers, &q, None);
+    let location = json!({"directory": dir});
     let context: Option<u32> = q.get("context").and_then(|c| c.parse().ok());
     // `base`: diff against a named ref instead of HEAD. The v2 TUI's diff
     // viewer sends `base: <branch>` for every non-HEAD mode, so ignoring it
@@ -5074,19 +5223,24 @@ pub async fn vcs_diff(
     })
     .await
     .unwrap_or_else(|_| Value::Array(vec![]));
-    Json(json!({"location": api_location_ref(&st), "data": diff})).into_response()
+    Json(json!({"location": location, "data": diff})).into_response()
 }
 
 /// GET /api/vcs/base + /api/vcs/branch — thin git queries (branch name +
 /// base ref). Honestly empty when not a git repo (never fabricated).
-pub async fn vcs_base(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+pub async fn vcs_base(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let dir = scoped_directory(&st, &headers, &q, None);
+    let location = json!({"directory": dir});
     let base = run_blocking(&st.db, move |_db| {
         Ok::<_, anyhow::Error>(crate::vcs::base(&dir))
     })
     .await
     .unwrap_or_else(|_| Value::Null);
-    Json(json!({"location": api_location_ref(&st), "data": base}))
+    Json(json!({"location": location, "data": base}))
 }
 
 /// GET /api/vcs/branch — `{location, data: string[]}` local branches.
@@ -5097,9 +5251,11 @@ pub async fn vcs_base(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 /// narrow and an ignored `limit` sends the whole list each time.
 pub async fn vcs_branch(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let dir = st.paths["directory"].as_str().unwrap_or("/").to_string();
+    let dir = scoped_directory(&st, &headers, &q, None);
+    let location = json!({"directory": dir});
     let mut branches = run_blocking(&st.db, move |_db| {
         Ok::<_, anyhow::Error>(crate::vcs::branches(&dir))
     })
@@ -5119,7 +5275,7 @@ pub async fn vcs_branch(
     {
         arr.truncate(limit);
     }
-    Json(json!({"location": api_location_ref(&st), "data": branches}))
+    Json(json!({"location": location, "data": branches}))
 }
 
 // ---------------------------------------------------------------------------

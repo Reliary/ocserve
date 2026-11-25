@@ -50,6 +50,11 @@ ALLOW = {
 # and the parameter never changes the answer. Every ocserve process is
 # single-location for the same reason an upstream instance is, so ignoring the
 # parameter IS parity. A per-route list would be a second thing to maintain.
+# Exception: the git-backed routes (`/api/worktree*`, `/api/vcs*`) resolve the
+# request directory through `scoped_directory` in v2.rs and DO honour it,
+# because a client driving several projects through one server needs the
+# answer for the project it named. That is a deliberate departure from the
+# single-location reference; the structural check below does not flag it.
 LOCATION_PARAM = "location"
 # Remaining declared-but-unimplemented parameters, each with a recorded reason.
 # These are the honest "we accept the request but the value does not change the
@@ -94,8 +99,6 @@ ALLOW.update({
     "GET /api/session/{sessionID}/diff context": "D-SESSION-DIFF-WINDOW",
     # Branch search/limit and diff base/untracked: the TUI sends them; our git
     # helpers return the full branch list and the HEAD-based diff.
-    # Worktree listing is not project-scoped in our store.
-    "GET /api/worktree projectID": "D-WORKTREE-PROJECT-SCOPE",
 })
 
 

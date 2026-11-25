@@ -33,9 +33,15 @@
 #   --jobs N           cargo -j (default: 16 on a 32-thread box)
 #   --no-sync          skip rsync (iterate on the same tree)
 #   --pull PATH...     copy result paths back after a successful run
-#   --keep             leave the remote tree in place (default: it stays
-#                      anyway; this flag only suppresses the size report)
+#   --clean            delete the remote target/ after a successful run
+#   --prune            prune incremental/scratch before running, then continue
+#   --keep             suppress the target-size line (the tree still stays)
 #   --print-host       print the resolved host and exit (for other scripts)
+#
+# Disk discipline (standing rule, 2026-11-24): this box is the ONLY build
+# host. A local `target/` reached ~912 GB here and btrfs snapshots pinned the
+# deleted extents, so deleting it freed nothing and the machine crashed. Every
+# run therefore reports free space, and refuses to start without headroom.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -50,6 +56,12 @@ JOBS="${OCSERVE_BUILD_JOBS:-16}"
 SYNC=1
 PULL=()
 KEEP=0
+CLEAN=0
+PRUNE=0
+# Refuse to start below this much free space on the build host. A release
+# build needs ~8 GB and the test suite ~12 GB of scratch; 60 GB leaves room for
+# the co-tenant workload (llama-server) without ever risking its disk.
+MIN_FREE_GB="${OCSERVE_BUILD_MIN_FREE_GB:-60}"
 
 _need_arg() { # $1 = flag, $2 = remaining count
   [ "$2" -ge 2 ] || {
@@ -63,6 +75,8 @@ while [ $# -gt 0 ]; do
     --host) _need_arg "$1" "$#"; HOST="$2"; shift 2 ;;
     --jobs) _need_arg "$1" "$#"; JOBS="$2"; shift 2 ;;
     --no-sync) SYNC=0; shift ;;
+    --clean) CLEAN=1; shift ;;
+    --prune) PRUNE=1; shift ;;
     --keep) KEEP=1; shift ;;
     --pull)
       shift
@@ -87,6 +101,31 @@ SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15 "$HOST")
 if ! timeout 20 "${SSH[@]}" true 2>/dev/null; then
   echo "remote-build.sh: cannot reach $HOST over ssh" >&2
   exit 3
+fi
+
+# Disk preflight: never start a build that could fill the host. Reported on
+# every run so a slow leak is visible before it becomes a crash.
+#
+# Parsed with awk on the DATA line, not `tr -dc 0-9` over the output: the
+# remote login shell is fish and a multi-line df made the digit-strip concatenate
+# header and row numbers into a bogus value (measured: "01295469625574G").
+free_gb=$(timeout 20 "${SSH[@]}" "df -Pk '$REMOTE_DIR' 2>/dev/null | awk 'NR==2{print int(\$4/1048576)}'" 2>/dev/null | tr -dc '0-9' || true)
+if [ -z "$free_gb" ]; then
+  free_gb=$(timeout 20 "${SSH[@]}" "df -Pk /var/tmp 2>/dev/null | awk 'NR==2{print int(\$4/1048576)}'" 2>/dev/null | tr -dc '0-9' || true)
+fi
+if [ -n "$free_gb" ] && [ "$free_gb" -lt "$MIN_FREE_GB" ]; then
+  echo "remote-build.sh: $HOST has only ${free_gb}G free (need ${MIN_FREE_GB}G)." >&2
+  echo "  free space with: scripts/remote-build.sh --clean <same command>" >&2
+  echo "  or raise the floor: OCSERVE_BUILD_MIN_FREE_GB=<n>" >&2
+  exit 5
+fi
+echo ">> $HOST free: ${free_gb:-?}G (floor ${MIN_FREE_GB}G)"
+
+# Scratch prune: incremental artefacts are pure rebuild cost, and the test
+# suite leaves temp trees in /var/tmp. Both are regenerable by definition.
+if [ "$PRUNE" = 1 ] || [ "$CLEAN" = 1 ]; then
+  timeout 600 "${SSH[@]}" "bash -lc 'rm -rf \"$REMOTE_DIR\"/target/*/incremental; find /var/tmp -maxdepth 1 -user \"\$(id -un)\" -mmin +120 -name \"ocserve*\" -exec rm -rf {} + '" 2>/dev/null || true
+  echo ">> pruned remote incremental + stale scratch"
 fi
 
 # The gates need tools the remote may lack; check the verbs that use them.
@@ -183,7 +222,13 @@ for path in "${PULL[@]+"${PULL[@]}"}"; do
   echo ">> pulled $path"
 done
 
-if [ "$KEEP" = 0 ]; then
+if [ "$CLEAN" = 1 ]; then
+  timeout 600 "${SSH[@]}" "rm -rf '$REMOTE_DIR/target' '$REMOTE_DIR'/mutants.out*" 2>/dev/null || true
+  echo ">> cleaned remote target/"
+elif [ "$KEEP" = 0 ]; then
   size=$(timeout 30 "${SSH[@]}" "du -sh '$REMOTE_DIR/target' 2>/dev/null | cut -f1" 2>/dev/null || true)
-  [ -n "$size" ] && echo ">> remote target/ is $size (left in place for incremental reuse)"
+  [ -n "$size" ] && echo ">> remote target/ is $size (kept for incremental reuse; --clean to remove)"
 fi
+
+free_after=$(timeout 20 "${SSH[@]}" "df -Pk '$REMOTE_DIR' 2>/dev/null | awk 'NR==2{print int(\$4/1048576)}'" 2>/dev/null | tr -dc '0-9' || true)
+[ -n "$free_after" ] && echo ">> $HOST free after: ${free_after}G"
