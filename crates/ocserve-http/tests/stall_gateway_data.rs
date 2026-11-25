@@ -141,6 +141,52 @@ async fn first_data_after_stream_budget_within_ttfb_succeeds() {
     assert!(
         done.is_some(),
         "turn must complete: first data at 3s is within the 6s TTFB budget \
-         (pre-fix it died at the 1s stream budget)"
+         (pre-fix it died at the 1s stream budget). {}",
+        db_diagnosis(&st)
     );
+}
+
+/// Issue #80: the assertion above says only "must complete", so a flake is a
+/// blind rerun. Report what actually reached the database, which separates the
+/// two candidate causes: (1) the watchdog applied the 1 s STREAM budget to the
+/// first-data phase (a real regression — a `session.error` naming "stalled"),
+/// or (2) the turn died some other way (an error with a different message, or
+/// an assistant row with no `time.completed`).
+fn db_diagnosis(st: &std::sync::Arc<AppState>) -> String {
+    let Ok(conn) = ocserve_store::pragma::open_reader(&st.db) else {
+        return "diagnosis: reader open failed".into();
+    };
+    let assistant: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM msg WHERE session_id='ses_tgd' AND role='assistant'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1);
+    let completed: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM msg WHERE session_id='ses_tgd' AND role='assistant' \
+             AND json_extract(info,'$.time.completed') IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1);
+    let errors: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM event WHERE session_id='ses_tgd' AND type='session.error'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1);
+    let last: String = conn
+        .query_row(
+            "SELECT payload FROM event WHERE session_id='ses_tgd' AND type='session.error' \
+             ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| "<none>".into());
+    format!(
+        "diagnosis: assistant_rows={assistant} completed={completed} session_errors={errors} last_error={last}"
+    )
 }
