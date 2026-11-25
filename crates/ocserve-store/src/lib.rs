@@ -6210,6 +6210,69 @@ mod commit_attribution_tests {
         );
     }
 
+    /// The 64-database cap in `bump_local_write_epoch` clears the epoch map and
+    /// bumps the GENERATION. The dangerous consequence is that a database whose
+    /// watcher baseline is taken AFTER the clear records `(gen, None)`, so a
+    /// later external commit also reads `(gen, None)` — the epochs compare equal
+    /// and the commit is reported `OtherConnectionOnly`. Correct, but only while
+    /// "both sides None" is NOT mistaken for "no change": that confusion would
+    /// report a real external commit as `Unchanged` and skip invalidation.
+    ///
+    /// So the test deliberately takes the baseline AFTER overflowing the map,
+    /// then commits from another connection. Ordering matters: taken before the
+    /// overflow the watcher holds `Some(n)` and the epochs differ regardless, so
+    /// the test would pass without the rule it claims to pin (measured: the
+    /// first version of this test stayed green under the planted bug).
+    #[test]
+    fn epoch_cap_overflow_still_observes_an_external_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = writer::db_path(dir.path());
+        {
+            let conn = pragma::create_new(&db).unwrap();
+            conn.execute_batch("CREATE TABLE sample (value INTEGER NOT NULL);")
+                .unwrap();
+        }
+
+        // Overflow the map (cap 64) BEFORE the baseline, so this database's
+        // watcher records no local epoch.
+        let filler = tempfile::tempdir().unwrap();
+        for i in 0..70 {
+            bump_local_write_epoch(&filler.path().join(format!("other-{i}.db")));
+        }
+        assert_eq!(
+            poll_db_commits(&db).unwrap(),
+            DbCommitObservation::Unchanged,
+            "baseline after the overflow"
+        );
+
+        // External commit: another connection, no epoch bump.
+        {
+            let outer = pragma::open_writer(&db).unwrap();
+            outer
+                .execute("INSERT INTO sample (value) VALUES (1)", [])
+                .unwrap();
+        }
+        assert_ne!(
+            poll_db_commits(&db).unwrap(),
+            DbCommitObservation::Unchanged,
+            "an external commit must invalidate even when no local epoch is tracked"
+        );
+
+        // And a local commit is still attributed local rather than external.
+        {
+            let _g = local_commit_barrier().write();
+            let conn = pragma::open_writer(&db).unwrap();
+            conn.execute("INSERT INTO sample (value) VALUES (2)", [])
+                .unwrap();
+        }
+        bump_local_write_epoch(&db);
+        assert_eq!(
+            poll_db_commits(&db).unwrap(),
+            DbCommitObservation::LocalOrMixed,
+            "a local commit after the overflow is not mislabelled external"
+        );
+    }
+
     /// The Writer half of the pairing: a real `Writer` commits while a sampler
     /// polls concurrently. Removing the barrier in `Writer::run_loop` lets the
     /// sampler see the new `data_version` before the epoch bump and report a
