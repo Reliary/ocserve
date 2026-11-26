@@ -64,6 +64,10 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# Issue #80: the stall tests assert on durable rows, but the code logs its
+# reason through `tracing`, which is a no-op without a subscriber. A failure
+# was therefore indistinguishable from a hang.
+tracing-subscriber = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 tempfile = "3"

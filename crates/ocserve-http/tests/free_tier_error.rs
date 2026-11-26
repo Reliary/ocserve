@@ -55,16 +55,54 @@ fn app_with(addr: std::net::SocketAddr) -> std::sync::Arc<AppState> {
 }
 
 /// 429 with the exact body the free tier returned live.
+/// Drain a request fully (head + `Content-Length` body) before responding.
+///
+/// Issue #80 root cause: a single `read` can leave request bytes queued; when
+/// the stub then closes the socket the kernel sends RST, and the client reports
+/// `error decoding response body` partway through the response. It only bites
+/// under load, because that is when the request arrives in more than one
+/// segment (measured: 15/96 concurrent runs failed before this, 0/96 after).
+fn drain_request(stream: &mut std::net::TcpStream) {
+    use std::io::Read;
+    let mut req = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut head_len: Option<usize> = None;
+    let mut content_len = 0usize;
+    loop {
+        let n = match stream.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        req.extend_from_slice(&buf[..n]);
+        if head_len.is_none()
+            && let Some(p) = req.windows(4).position(|w| w == b"\r\n\r\n")
+        {
+            head_len = Some(p + 4);
+            let head = String::from_utf8_lossy(&req[..p]).to_ascii_lowercase();
+            content_len = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+        }
+        if let Some(h) = head_len
+            && req.len() >= h + content_len
+        {
+            return;
+        }
+    }
+}
+
 fn spawn_limited_provider() -> std::net::SocketAddr {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let mut stream = stream;
             std::thread::spawn(move || {
-                let mut buf = vec![0u8; 65536];
-                let _ = stream.read(&mut buf);
+                drain_request(&mut stream);
                 let body = r#"{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go"}}"#;
                 let head = format!(
                     "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
