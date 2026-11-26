@@ -103,7 +103,7 @@ fn drain_request(stream: &mut std::net::TcpStream) {
 }
 
 fn spawn_sse_server(first_data_after: Option<std::time::Duration>) -> std::net::SocketAddr {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
