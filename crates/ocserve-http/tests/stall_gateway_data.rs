@@ -53,6 +53,45 @@ fn app_with(addr: std::net::SocketAddr) -> std::sync::Arc<AppState> {
     st
 }
 
+/// Drain a request fully (head + `Content-Length` body) before responding.
+///
+/// Issue #80 root cause: a single `read` can leave request bytes queued; when
+/// the stub then closes the socket the kernel sends RST, and the client reports
+/// `error decoding response body` partway through the response. It only bites
+/// under load, because that is when the request arrives in more than one
+/// segment (measured: 15/96 concurrent runs failed before this, 0/96 after).
+fn drain_request(stream: &mut std::net::TcpStream) {
+    use std::io::Read;
+    let mut req = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut head_len: Option<usize> = None;
+    let mut content_len = 0usize;
+    loop {
+        let n = match stream.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        req.extend_from_slice(&buf[..n]);
+        if head_len.is_none()
+            && let Some(p) = req.windows(4).position(|w| w == b"\r\n\r\n")
+        {
+            head_len = Some(p + 4);
+            let head = String::from_utf8_lossy(&req[..p]).to_ascii_lowercase();
+            content_len = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+        }
+        if let Some(h) = head_len
+            && req.len() >= h + content_len
+        {
+            return;
+        }
+    }
+}
+
 fn spawn_sse(first_data_after: std::time::Duration) -> std::net::SocketAddr {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -61,8 +100,7 @@ fn spawn_sse(first_data_after: std::time::Duration) -> std::net::SocketAddr {
         for stream in listener.incoming().flatten() {
             let mut stream = stream;
             std::thread::spawn(move || {
-                let mut buf = vec![0u8; 65536];
-                let _ = stream.read(&mut buf);
+                drain_request(&mut stream);
                 let _ =
                     stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n");
                 let t0 = std::time::Instant::now();
@@ -123,6 +161,16 @@ async fn wait_assistant(st: &std::sync::Arc<AppState>, budget: std::time::Durati
 
 #[tokio::test]
 async fn first_data_after_stream_budget_within_ttfb_succeeds() {
+    // Issue #80: capture the code's own reason. Without a subscriber every
+    // `tracing::error!` on the failure path is invisible, so a failed turn and
+    // a hung one looked identical in the DB.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_test_writer()
+        .try_init();
     // SAFETY: single test in this binary (own process env).
     unsafe { std::env::set_var("OCSERVE_PROVIDER_STALL_SECS", "1") }; // stream phase: 1s
     unsafe { std::env::set_var("OCSERVE_PROVIDER_TTFB_SECS", "6") }; // first-data phase: 6s
@@ -132,18 +180,20 @@ async fn first_data_after_stream_budget_within_ttfb_succeeds() {
     assert_eq!(prompt(&st).await, StatusCode::NO_CONTENT);
     // Observation window, not the assertion's budget: the budgets under test
     // are the 1 s stream phase and the 6 s TTFB phase above. This window only
-    // decides how long we wait to SEE the outcome, and it flaked once under a
-    // 16-way parallel workspace run on a loaded box (2026-11-23) while passing
-    // standalone and in every later full run. A longer window keeps the
-    // discrimination intact: pre-fix the turn dies at the 1 s stream budget and
-    // NEVER completes, so any window catches it.
+    // decides how long we wait to SEE the outcome. The old flake (~30% under
+    // load, issue #80) was never this window: the stub closed the socket with
+    // request bytes still queued, the kernel answered with RST, and the turn
+    // failed with `error decoding response body` — see `drain_request`.
     let done = wait_assistant(&st, std::time::Duration::from_secs(60)).await;
-    assert!(
-        done.is_some(),
-        "turn must complete: first data at 3s is within the 6s TTFB budget \
-         (pre-fix it died at the 1s stream budget). {}",
-        db_diagnosis(&st)
-    );
+    if done.is_none() {
+        let task = task_diagnosis(&st).await;
+        panic!(
+            "turn must complete: first data at 3s is within the 6s TTFB budget \
+             (pre-fix it died at the 1s stream budget). {} | {}",
+            db_diagnosis(&st),
+            task
+        );
+    }
 }
 
 /// Issue #80: the assertion above says only "must complete", so a flake is a
@@ -156,6 +206,13 @@ fn db_diagnosis(st: &std::sync::Arc<AppState>) -> String {
     let Ok(conn) = ocserve_store::pragma::open_reader(&st.db) else {
         return "diagnosis: reader open failed".into();
     };
+    let user: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM msg WHERE session_id='ses_tgd' AND role='user'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1);
     let assistant: i64 = conn
         .query_row(
             "SELECT count(*) FROM msg WHERE session_id='ses_tgd' AND role='assistant'",
@@ -171,22 +228,77 @@ fn db_diagnosis(st: &std::sync::Arc<AppState>) -> String {
             |r| r.get(0),
         )
         .unwrap_or(-1);
+    let all_events: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM event WHERE session_id='ses_tgd'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1);
+    let types: String = conn
+        .query_row(
+            "SELECT COALESCE(group_concat(t||':'||n), '') FROM (SELECT type AS t, count(*) AS n \
+             FROM event WHERE session_id='ses_tgd' GROUP BY type)",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| "<none>".into());
+    // Event types are stored with a `@vN` grammar suffix (e.g.
+    // `session.error@v1`), so an exact-type query reports 0 errors on a turn
+    // that DID fail — which is what made this diagnostic misleading when it
+    // was added (issue #80).
     let errors: i64 = conn
         .query_row(
-            "SELECT count(*) FROM event WHERE session_id='ses_tgd' AND type='session.error'",
+            "SELECT count(*) FROM event WHERE session_id='ses_tgd' AND type LIKE 'session.error%'",
             [],
             |r| r.get(0),
         )
         .unwrap_or(-1);
     let last: String = conn
         .query_row(
-            "SELECT payload FROM event WHERE session_id='ses_tgd' AND type='session.error' \
+            "SELECT payload FROM event WHERE session_id='ses_tgd' AND type LIKE 'session.error%' \
              ORDER BY seq DESC LIMIT 1",
             [],
             |r| r.get::<_, String>(0),
         )
         .unwrap_or_else(|_| "<none>".into());
     format!(
-        "diagnosis: assistant_rows={assistant} completed={completed} session_errors={errors} last_error={last}"
+        "diagnosis: user_rows={user} assistant_rows={assistant} completed={completed} \
+         session_errors={errors} last_error={last} all_events={all_events} types=[{types}]"
     )
+}
+
+/// Issue #80: decide whether the background prompt task (a) never started,
+/// (b) panicked, (c) finished without writing an assistant row, or (d) is
+/// still running. This is the difference between a product bug and a test
+/// harness bug, so it must be observable rather than inferred.
+async fn task_diagnosis(st: &std::sync::Arc<AppState>) -> String {
+    let handle = {
+        let mut tasks = st.prompt_tasks.lock();
+        tasks.remove("ses_tgd").map(|(_, h)| h)
+    };
+    let Some(handle) = handle else {
+        // Removed on completion; the DB rows already tell the story.
+        return "task=absent(already completed or never registered)".into();
+    };
+    if !handle.is_finished() {
+        handle.abort();
+        return "task=still-running-after-window (aborted)".into();
+    }
+    match handle.await {
+        Ok(()) => {
+            "task=finished-ok-but-no-rows (the turn returned without persisting an assistant row)"
+                .into()
+        }
+        Err(e) if e.is_panic() => {
+            let p = e.into_panic();
+            let msg = p
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "<non-string panic payload>".into());
+            format!("task=PANICKED: {msg}")
+        }
+        Err(e) => format!("task=join-error: {e}"),
+    }
 }
