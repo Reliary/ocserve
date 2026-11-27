@@ -17,6 +17,12 @@ pub const SHELL_OUTPUT_CAP: usize = 64 * 1024;
 /// Registry cap (bulkhead: fail-closed over cap after exited-eviction).
 pub const SHELL_REGISTRY_CAP: usize = 128;
 
+/// Directory named in `Shell.Info.file`. ocserve keeps shell output in memory
+/// (bounded by `SHELL_OUTPUT_CAP`) rather than spilling to a file, but the
+/// frozen v2 schema REQUIRES a `file` string, so we emit the path upstream
+/// would have written to. Divergence: `D-SHELL-NO-FILE`.
+pub const SHELL_OUTPUT_DIR: &str = "shell";
+
 pub struct ShellEntry {
     pub id: String,
     pub command: String,
@@ -31,6 +37,17 @@ pub struct ShellEntry {
     pub output: Vec<u8>,
     pub exit_code: Option<i32>,
     pub child: Option<std::process::Child>,
+    /// Resolved shell program (`bash`, `/bin/zsh`, ...) — `Shell.Info.shell`.
+    pub shell: String,
+    /// Upstream writes combined output to a file and names it in
+    /// `Shell.Info.file`; ocserve keeps it in memory, so this is the
+    /// spill path the operator would find the output at if it were written.
+    /// Emitted because the frozen schema REQUIRES the key.
+    pub file: String,
+    /// Epoch millis; `Shell.Info.time` is `{started, completed?}` and the
+    /// schema requires `started`.
+    pub started_ms: i64,
+    pub completed_ms: Option<i64>,
 }
 
 pub struct ShellRegistry {
@@ -80,6 +97,10 @@ impl ShellRegistry {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| format!("spawn failed: {e}"))?;
+        let started_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
         inner.insert(
             id.clone(),
             ShellEntry {
@@ -91,6 +112,10 @@ impl ShellRegistry {
                 output: Vec::new(),
                 exit_code: None,
                 child: Some(child),
+                shell: program.clone(),
+                file: format!("{}/{}.log", SHELL_OUTPUT_DIR, id),
+                started_ms,
+                completed_ms: None,
             },
         );
         Ok(id)
@@ -106,6 +131,12 @@ impl ShellRegistry {
                 Ok(Some(status)) => {
                     e.exit_code = status.code();
                     e.status = "exited".to_string();
+                    e.completed_ms = Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0),
+                    );
                     // Drain remaining pipes (bounded by the cap).
                     // Nonblocking is set on the CONCRETE pipe types (the
                     // Read trait has no set_nonblocking), then boxed for
@@ -152,6 +183,12 @@ impl ShellRegistry {
                 Err(_) => {
                     e.status = "killed".to_string();
                     e.child = None;
+                    e.completed_ms = Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0),
+                    );
                 }
             }
         }
@@ -159,11 +196,24 @@ impl ShellRegistry {
         // while running or when a signal ended the process); the schema is
         // closed, so no other key carries it. Clients such as the opencode
         // dispatcher judge a shell by `status == "exited" && exit == 0`.
+        // Full `Shell.Info`. The schema is closed and REQUIRES id/status/
+        // command/cwd/shell/file/metadata/time, so emitting only a subset
+        // (the state after #75) still failed validation on every response —
+        // the class the PR set out to fix. `sessionID` is NOT part of the
+        // schema: it lives on `Shell.Entry` in a separate projection.
+        let mut time = json!({ "started": e.started_ms });
+        if let Some(c) = e.completed_ms {
+            time["completed"] = json!(c);
+        }
         let mut info = json!({
             "id": e.id,
             "status": e.status,
             "command": e.command,
             "cwd": e.cwd,
+            "shell": e.shell,
+            "file": e.file,
+            "metadata": {},
+            "time": time,
         });
         if let Some(code) = e.exit_code {
             info["exit"] = json!(code);
@@ -182,17 +232,38 @@ impl ShellRegistry {
 
     pub fn list(&self) -> Vec<Value> {
         // Poll-everything would take + release per entry; list is a cheap
-        // status snapshot (freshness comes from get/output polls).
+        // status snapshot (freshness comes from get/output polls). Shape is
+        // `Shell.Info` (closed schema — `sessionID` here failed validation).
         self.inner
             .lock()
             .values()
             .map(|e| {
-                json!({
+                let mut t = json!({ "started": e.started_ms });
+                if let Some(c) = e.completed_ms {
+                    t["completed"] = json!(c);
+                }
+                let mut info = json!({
                     "id": e.id, "status": e.status,
                     "command": e.command, "cwd": e.cwd,
-                    "sessionID": e.session_id,
-                })
+                    "shell": e.shell, "file": e.file,
+                    "metadata": {}, "time": t,
+                });
+                if let Some(code) = e.exit_code {
+                    info["exit"] = json!(code);
+                }
+                info
             })
+            .collect()
+    }
+
+    /// `(shell_id, owning session)` pairs. The goal loop's "does this session
+    /// have background work" query reads the session id, which the closed
+    /// `Shell.Info` schema does not carry.
+    pub fn session_owners(&self) -> Vec<(String, String)> {
+        self.inner
+            .lock()
+            .values()
+            .filter_map(|e| e.session_id.clone().map(|s| (e.id.clone(), s)))
             .collect()
     }
 
@@ -262,6 +333,31 @@ mod tests {
         // Spec field name is `exit`; the old `exitCode` key must be gone.
         assert_eq!(info["exit"], 0);
         assert!(info.get("exitCode").is_none());
+        // The frozen `Shell.Info` schema is CLOSED and requires every one of
+        // these keys; emitting a subset validated fine in tests and failed on
+        // a strict client. Assert the whole required set plus the absence of
+        // anything the schema forbids (`sessionID` belongs to `Shell.Entry`).
+        for key in [
+            "id", "status", "command", "cwd", "shell", "file", "metadata", "time",
+        ] {
+            assert!(info.get(key).is_some(), "missing required `{key}`: {info}");
+        }
+        assert!(
+            info["time"].get("started").is_some(),
+            "time.started: {info}"
+        );
+        assert!(
+            info["time"].get("completed").is_some(),
+            "time.completed: {info}"
+        );
+        assert!(
+            info.get("sessionID").is_none(),
+            "sessionID is not in Shell.Info: {info}"
+        );
+        assert!(
+            reg.list()[0].get("sessionID").is_none(),
+            "list() must be schema-clean"
+        );
         let out = reg.output(&id).unwrap();
         assert!(out["output"].as_str().unwrap().contains("hi"));
         assert!(reg.remove(&id));

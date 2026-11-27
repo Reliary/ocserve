@@ -833,7 +833,9 @@ fn write(input: &Value, cwd: &Path) -> Result<ToolResult> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
     }
-    std::fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
+    // `write` takes an `edit` permission ask (external_directory included) and
+    // matches upstream: containment is the ASK, not the path.
+    std::fs::write(&path, content).with_context(|| format!("write {}", path.display()))?; // allow:raw-write
     Ok(ToolResult {
         output: format!("Wrote {} bytes to {}", content.len(), fp),
         truncated: false,
@@ -876,7 +878,7 @@ fn edit(input: &Value, cwd: &Path) -> Result<ToolResult> {
     } else {
         content.replacen(old, new, 1)
     };
-    std::fs::write(&path, &updated).with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(&path, &updated).with_context(|| format!("write {}", path.display()))?; // allow:raw-write (edit is permission-asked, upstream parity)
     Ok(ToolResult {
         output: format!("Edited {fp}"),
         truncated: false,

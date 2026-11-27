@@ -54,14 +54,124 @@ const GIT_SAFETY: &[&str] = &[
 /// `diff.external`.
 const DIFF_SAFETY: &[&str] = &["--no-ext-diff", "--no-textconv"];
 
-fn run_git(dir: &str, args: &[&str]) -> Option<(String, i32)> {
-    // Containment: a vcs walk on a huge worktree is tool work, not server work.
-    let out = ocserve_store::cgroup::command("git", "tools")
-        .current_dir(dir)
+/// `run_git` for a call that needs bytes on stdin (only `git apply`).
+///
+/// Same `GIT_SAFETY` flags and the same deadline as `run_git`; the difference
+/// is the stdin pipe, which is written on its own thread so the child cannot
+/// block on a full stdin while we block reading its stdout (issue #80's pipe
+/// lesson, applied here).
+fn run_git_with_stdin(dir: &str, args: &[&str], stdin: &[u8]) -> Option<bool> {
+    use std::io::Write;
+    let mut cmd = ocserve_store::cgroup::command("git", "tools");
+    cmd.current_dir(dir)
         .args(GIT_SAFETY)
         .args(args)
-        .output()
-        .ok()?;
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let label = format!("git {}", args.first().copied().unwrap_or(""));
+    // `run_with_deadline` pipes stdout/stderr and drains them; it does not
+    // touch stdin, so hand it a child whose stdin we feed ourselves.
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("{label} failed to spawn: {e}");
+            return None;
+        }
+    };
+    let payload = stdin.to_vec();
+    let writer = child.stdin.take().map(|mut si| {
+        std::thread::spawn(move || {
+            let _ = si.write_all(&payload);
+            // Drop closes the pipe: git needs EOF to finish the patch.
+        })
+    });
+    let mut out = child.stdout.take();
+    let mut err = child.stderr.take();
+    let out_t = out.take().map(|mut p| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut v = Vec::new();
+            let _ = p.read_to_end(&mut v);
+            v
+        })
+    });
+    let err_t = err.take().map(|mut p| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut v = Vec::new();
+            let _ = p.read_to_end(&mut v);
+            v
+        })
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("{label} wait failed: {e}");
+                return None;
+            }
+        }
+        if start.elapsed() >= GIT_DEADLINE {
+            let _ = child.kill();
+            let _ = child.wait();
+            ocserve_metrics::labeled_counter("ocserve_vcs_git_errors_total", "op=\"apply\"", 1);
+            tracing::warn!(
+                "{label} exceeded {}s and was killed",
+                GIT_DEADLINE.as_secs()
+            );
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
+    let _ = out_t.and_then(|t| t.join().ok());
+    let _ = err_t.and_then(|t| t.join().ok());
+    if !status.success() {
+        ocserve_metrics::labeled_counter("ocserve_vcs_git_errors_total", "op=\"apply\"", 1);
+    }
+    Some(status.success())
+}
+
+/// Wall-clock cap for one git call. Generous for a real repository (a cold
+/// `git status` on a large tree is seconds, not minutes) but finite, because
+/// the blocking pool is shared with every store route: an unbounded `git`
+/// against a huge or network-mounted repo would starve the whole server.
+const GIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn run_git(dir: &str, args: &[&str]) -> Option<(String, i32)> {
+    // Containment: a vcs walk on a huge worktree is tool work, not server work.
+    let mut cmd = ocserve_store::cgroup::command("git", "tools");
+    cmd.current_dir(dir)
+        .args(GIT_SAFETY)
+        .args(args)
+        .stdin(std::process::Stdio::null());
+    let label = format!("git {}", args.first().copied().unwrap_or(""));
+    let out = match ocserve_store::platform::run_with_deadline(cmd, GIT_DEADLINE, &label) {
+        Ok(o) => o,
+        Err(e) => {
+            // Silent-vs-failed class: an absent/unreadable git produced "clean"
+            // results indistinguishable from a real empty one. Count it.
+            ocserve_metrics::labeled_counter(
+                "ocserve_vcs_git_errors_total",
+                &format!("op=\"{}\"", args.first().copied().unwrap_or("")),
+                1,
+            );
+            tracing::warn!("{label} failed: {e}");
+            return None;
+        }
+    };
+    if !out.status.success() {
+        ocserve_metrics::labeled_counter(
+            "ocserve_vcs_git_errors_total",
+            &format!("op=\"{}\"", args.first().copied().unwrap_or("")),
+            1,
+        );
+    }
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     Some((text, out.status.code().unwrap_or(-1)))
 }
@@ -154,20 +264,11 @@ pub fn apply(dir: &str, patch: &str) -> Option<bool> {
     if !is_git(dir) {
         return None;
     }
-    let mut child = ocserve_store::cgroup::command("git", "tools")
-        .current_dir(dir)
-        .args(["apply", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .ok()?;
-    if let Some(mut si) = child.stdin.take() {
-        use std::io::Write;
-        let _ = si.write_all(patch.as_bytes());
-    }
-    let out = child.wait_with_output().ok()?;
-    Some(out.status.success())
+    // Hardened the same way as every other git call (reviews 2026-11-26):
+    // repo-config execution is neutralised AND the call is deadline-bounded.
+    // `git apply` takes its patch on stdin, so it uses the streaming variant.
+    let out = run_git_with_stdin(dir, &["apply", "-"], patch.as_bytes())?;
+    Some(out)
 }
 
 fn has_head(dir: &str) -> bool {

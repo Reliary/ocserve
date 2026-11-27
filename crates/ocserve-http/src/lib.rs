@@ -10,7 +10,10 @@ use axum::{Json, Router};
 use futures_util::StreamExt;
 use futures_util::stream;
 use serde_json::{Value, json};
-pub mod containment;
+// Containment lives in `ocserve-store` so the tools crate can use it too (the
+// v2 `patch` tool wrote files with no containment at all). Re-exported under
+// the old path so existing `crate::containment::…` call sites are unchanged.
+pub use ocserve_store::containment;
 
 use std::collections::HashMap;
 use std::sync::Arc;

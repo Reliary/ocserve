@@ -1907,13 +1907,16 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "hex",
+ "libc",
  "parking_lot",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "tracing",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 

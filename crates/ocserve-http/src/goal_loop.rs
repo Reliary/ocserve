@@ -142,11 +142,20 @@ pub async fn after_turn(st: &Arc<AppState>, sid: &str) -> bool {
     // is kept (and unit-tested against an attributed entry) so the mechanism
     // starts working the day a route attributes its spawns; the previous
     // comment claimed the registry already did, which was false.
+    // `Shell.Info` is a closed schema with no `sessionID`, so ownership comes
+    // from the registry accessor and the status/command from the projection.
+    let owned: std::collections::HashSet<String> = st
+        .shells
+        .session_owners()
+        .into_iter()
+        .filter(|(_, owner)| owner == sid)
+        .map(|(id, _)| id)
+        .collect();
     let shells: Vec<String> = st
         .shells
         .list()
         .into_iter()
-        .filter(|s| s["sessionID"].as_str() == Some(sid))
+        .filter(|s| s["id"].as_str().is_some_and(|id| owned.contains(id)))
         .filter(|s| s["status"].as_str() == Some("running"))
         .filter_map(|s| s["command"].as_str().map(str::to_string))
         .collect();
