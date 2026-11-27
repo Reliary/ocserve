@@ -4,7 +4,7 @@ All notable changes to ocserve. The wire contract targets the frozen opencode
 1.19.5 release and the v2 surface the 2.2.5 client; anything that differs is a
 named `D-*` row in the ledger at `PLAN.md` section 18.
 
-## Unreleased
+## 0.7.6 - 2026-11-27
 
 ### Added (OpenCode v2 compatibility)
 - Config discovery now matches v2: `opencode.json` **and** `opencode.jsonc`
@@ -140,14 +140,36 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 - The v2 `patch` tool is contained. It wrote with `cwd.join(path)` and no
   verification at all, so `../x`, an absolute path, or a `*** Move to:`
   escaped the project, and `.git/hooks/pre-commit` was writable. Every path now
-  goes through the handle-verified `containment` primitive (moved into
-  `ocserve-store` so the tools crate shares it), with `.git` refused outright
-  (`D-PATCH-NO-GIT-DIR`).
+  goes through the handle-verified containment primitive (now the
+  `ocserve-containment` crate, so the tools crate shares the same one as the
+  file routes), with `.git` refused outright (`D-PATCH-NO-GIT-DIR`).
 - `Shell.Info` now carries the full required shape. #75 renamed `exitCode` to
   `exit` but still omitted `shell`, `file`, `metadata` and `time`, and `list()`
   added `sessionID`, which the closed schema forbids — so a strict client still
   rejected every response. All required keys are emitted and `sessionID` moved
   to a separate accessor the goal loop uses (`D-SHELL-NO-FILE`).
+- The tool wrapper no longer prints a spurious error on hosts without
+  `/proc`. The guard script wrote `/proc/self/oom_score_adj` under
+  `2>/dev/null`, but a shell sets redirections up left to right, so when the
+  open itself failed the message was emitted before `2>/dev/null` applied. On
+  macOS every tool result therefore began with
+  `sh: /proc/self/oom_score_adj: No such file or directory`. The write is now
+  guarded by a writability test, which also covers containers that mount
+  `/proc` read-only.
+- A commit made by another process is now noticed even when this process holds
+  no write history. In-memory caches (session bodies, page and list wire
+  bytes, search) were keyed by a write epoch that only advanced on our own
+  writes, so an import or a second server writing the same database left
+  ocserve serving stale reads until restart. A long-lived reader now polls
+  `PRAGMA data_version` and advances the epoch on an external commit
+  (`ocserve_external_commit_total`).
+
+### Dependencies
+- Bumped `boring`/`boring-sys` 5.5.1 -> 5.6.0 (the zen free-tier TLS lane),
+  `sha2`, `tokio`, `clap`, `base64`, `hyper`, `serde_json` and the pinned
+  GitHub Actions (CodeQL 4.39.4 as one unit, scorecard 2.6.0,
+  dependency-review 5.0.1). `url` 2.5.9 carries RUSTSEC-2026-0592.
+
 
 ### Credits
 - The v2 turn-lifecycle fixes are [@glanzel](https://github.com/glanzel)'s
@@ -169,6 +191,17 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
 - The bun-pty resolver (PR #74) came from the same contributor; review found
   two platform bugs by running it against the real package rather than the
   synthetic fixture.
+
+- The macOS portability work is [@jrzmurray](https://github.com/jrzmurray)'s
+  (PR #71). Their note on the redirect order was right and review fixed it at
+  the source: the wrapper guards the `oom_score_adj` write with a writability
+  test instead of relying on `2>/dev/null`. The `url` RUSTSEC bump is theirs
+  too.
+- The directory-scoped VCS and worktree routes are
+  [@jrzmurray](https://github.com/jrzmurray)'s (PRs #64/#65/#66). Review added
+  the git repo-config hardening those routes make reachable
+  (`core.fsmonitor`, `core.hooksPath`, `--no-textconv`) and bounded the
+  `vcs/init` body.
 
 ## 0.7.5 - 2026-11-18
 
