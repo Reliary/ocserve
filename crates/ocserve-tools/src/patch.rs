@@ -141,13 +141,81 @@ fn parse(text: &str) -> Result<Vec<Change>> {
     Ok(changes)
 }
 
-fn resolve(cwd: &Path, path: &str) -> PathBuf {
-    let p = Path::new(path);
-    if p.is_absolute() {
-        p.to_path_buf()
+/// Containment for every path the patch touches.
+///
+/// The v2 `patch` tool was added with no containment at all (`cwd.join` then
+/// `fs::write`), so a `*** Add File: ../../etc/x` or an absolute path wrote
+/// anywhere the process could. It now uses the same handle-verified primitive
+/// as the file routes: every component is resolved beneath `cwd` with the
+/// kernel's `RESOLVE_BENEATH`, and a symlink leaving the tree is rejected.
+///
+/// Returns the verified real path, which is what gets written, so there is no
+/// TOCTOU window between the check and the write.
+fn contained_path(cwd: &Path, path: &str) -> Result<PathBuf> {
+    use ocserve_containment::{OpenError, OpenKind, open_within};
+    // A directory open proves containment for the target's parent; the leaf
+    // itself may not exist yet (Add File), so verify the parent.
+    let leaf = Path::new(path);
+    let parent = leaf.parent().unwrap_or_else(|| Path::new("."));
+    let parent_str = parent.to_string_lossy();
+    let handle = if parent_str.is_empty() || parent_str == "." {
+        open_within(cwd, ".", OpenKind::Dir)
     } else {
-        cwd.join(p)
+        open_within(cwd, &parent_str, OpenKind::Dir)
     }
+    .map_err(|e: OpenError| {
+        anyhow::anyhow!("patch path {path:?} is not inside the project: {e}")
+    })?;
+    let name = leaf
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("patch path {path:?} has no file name"))?;
+    Ok(handle.path().join(name))
+}
+
+/// Remove a path already proven contained.
+fn remove_contained(target: &Path) -> Result<()> {
+    // Callers pass a path already returned by `contained_path`, i.e. the
+    // kernel-verified real path.
+    std::fs::remove_file(target).with_context(|| format!("delete {}", target.display())) // allow:raw-write
+}
+
+/// Refuse any path whose first component is `.git`.
+///
+/// Containment alone allows this (`.git/` is inside the project), but writing
+/// `.git/hooks/pre-commit` is a code-execution primitive that fires on the
+/// user's next commit, and no legitimate patch does it. Named divergence
+/// `D-PATCH-NO-GIT-DIR`.
+fn refuse_git_dir(path: &str) -> Result<()> {
+    let first = Path::new(path)
+        .components()
+        .find_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if first == ".git" {
+        bail!("patch may not write inside .git (D-PATCH-NO-GIT-DIR): {path}");
+    }
+    Ok(())
+}
+
+/// Write `body` to a path already proven contained, refusing to follow a
+/// symlink at the leaf (writing through one is the escape class).
+fn write_contained(target: &Path, body: &[u8]) -> Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    use std::io::Write;
+    let mut f = opts
+        .open(target)
+        .with_context(|| format!("write {}", target.display()))?;
+    f.write_all(body)
+        .with_context(|| format!("write {}", target.display()))?;
+    Ok(())
 }
 
 /// Apply `ops` to `before`, returning the new content.
@@ -204,40 +272,52 @@ pub fn apply(input: &Value, cwd: &Path) -> Result<ToolResult> {
     for change in changes {
         match change {
             Change::Add { path, content } => {
-                let target = resolve(cwd, &path);
-                if target.exists() {
+                refuse_git_dir(&path)?;
+                // Existence is checked LEXICALLY first (a metadata read cannot
+                // write anything), because `create_within` creates the leaf as
+                // part of proving containment — checking after would see our
+                // own new file.
+                if cwd.join(&path).symlink_metadata().is_ok() {
                     bail!("Add File {path}: file already exists");
                 }
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("create {}", parent.display()))?;
-                }
-                std::fs::write(&target, content.as_bytes())
-                    .with_context(|| format!("write {}", target.display()))?;
+                // Then create it through the kernel-verified primitive, which
+                // builds missing parents one component at a time so
+                // `*** Add File: new/dir/x.txt` works in-tree while a
+                // symlinked component out of the tree is refused.
+                use ocserve_containment::{OpenError, create_within};
+                create_within(cwd, &path, content.as_bytes()).map_err(|e: OpenError| {
+                    anyhow::anyhow!("Add File {path}: not inside the project: {e}")
+                })?;
                 summary.push(format!("A {path}"));
                 files.push(json!({"path": path, "status": "added"}));
             }
             Change::Delete { path } => {
-                let target = resolve(cwd, &path);
-                std::fs::remove_file(&target)
-                    .with_context(|| format!("delete {}", target.display()))?;
+                refuse_git_dir(&path)?;
+                let target = contained_path(cwd, &path)?;
+                // A directory is never a valid patch target.
+                if target.is_dir() {
+                    bail!("Delete File {path}: is a directory");
+                }
+                remove_contained(&target)?;
                 summary.push(format!("D {path}"));
                 files.push(json!({"path": path, "status": "deleted"}));
             }
             Change::Update { path, move_to, ops } => {
-                let target = resolve(cwd, &path);
+                refuse_git_dir(&path)?;
+                if let Some(to) = &move_to {
+                    refuse_git_dir(to)?;
+                }
+                let target = contained_path(cwd, &path)?;
                 let before = std::fs::read_to_string(&target)
                     .with_context(|| format!("read {}", target.display()))?;
                 let after = apply_ops(&path, &before, &ops)?;
                 let dest = match &move_to {
-                    Some(to) => resolve(cwd, to),
+                    Some(to) => contained_path(cwd, to)?,
                     None => target.clone(),
                 };
-                std::fs::write(&dest, after.as_bytes())
-                    .with_context(|| format!("write {}", dest.display()))?;
+                write_contained(&dest, after.as_bytes())?;
                 if dest != target {
-                    std::fs::remove_file(&target)
-                        .with_context(|| format!("remove {}", target.display()))?;
+                    remove_contained(&target)?;
                 }
                 let shown = move_to.unwrap_or(path);
                 summary.push(format!("M {shown}"));
@@ -315,5 +395,42 @@ mod tests {
     fn missing_envelope_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(apply(&json!({"patchText": "nope"}), tmp.path()).is_err());
+    }
+    /// Security review H1 (2026-11-26): the v2 `patch` tool wrote with
+    /// `cwd.join(path)` and no containment, so `..` or an absolute path
+    /// escaped the project. Each case below must be REFUSED, and the control
+    /// proves an in-tree path still works.
+    #[test]
+    fn patch_refuses_to_escape_the_project_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("proj");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("in.txt"), "x\n").unwrap();
+
+        // CONTROL: a legal in-tree add still works.
+        let ok = apply(
+            &json!({"patchText": "*** Begin Patch\n*** Add File: ok.txt\n+hi\n*** End Patch\n"}),
+            &base,
+        );
+        assert!(ok.is_ok(), "in-tree add must succeed: {ok:?}");
+        assert!(base.join("ok.txt").exists());
+
+        for (label, path) in [
+            ("dotdot", "../escape.txt"),
+            ("nested dotdot", "sub/../../escape.txt"),
+            ("absolute", "/tmp/ocserve-patch-escape.txt"),
+            ("git hooks", ".git/hooks/pre-commit"),
+        ] {
+            let text = format!("*** Begin Patch\n*** Add File: {path}\n+pwned\n*** End Patch\n");
+            let r = apply(&json!({ "patchText": text }), &base);
+            assert!(r.is_err(), "{label}: patch must refuse {path:?}, got {r:?}");
+        }
+        // The absolute target must not exist as a side effect of the attempt.
+        assert!(!std::path::Path::new("/tmp/ocserve-patch-escape.txt").exists());
+
+        // Update + Move to must be contained too.
+        let mv = "*** Begin Patch\n*** Update File: in.txt\n*** Move to: ../moved.txt\n-x\n+y\n*** End Patch\n";
+        assert!(apply(&json!({ "patchText": mv }), &base).is_err());
+        assert!(!dir.path().join("moved.txt").exists());
     }
 }

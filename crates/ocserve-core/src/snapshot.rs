@@ -770,7 +770,45 @@ fn run_git(
             Err(e) => writer_spawn_error = Some(e),
         }
     }
-    let out = child.wait_with_output();
+    // Deadline: these run on the prompt path (step snapshots) and on the same
+    // shared blocking pool as every store read, so an unbounded `git` against
+    // a huge or network-mounted repo would stall turns, not just one route.
+    // stdout/stderr drain on their own threads so a full pipe cannot deadlock
+    // the wait loop (the same lesson as issue #80's stub).
+    let err_drain = child.stderr.take().map(|mut p| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut v = Vec::new();
+            let _ = p.read_to_end(&mut v);
+            v
+        })
+    });
+    let out_drain = child.stdout.take().map(|mut p| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut v = Vec::new();
+            let _ = p.read_to_end(&mut v);
+            v
+        })
+    });
+    let start = std::time::Instant::now();
+    let deadline = std::time::Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Ok(st),
+            Ok(None) => {}
+            Err(e) => break Err(e),
+        }
+        if start.elapsed() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "git exceeded 30s and was killed",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
     if let Some(handle) = writer {
         let _ = handle.join();
     }
@@ -781,12 +819,26 @@ fn run_git(
             stderr: format!("stdin writer spawn failed: {e}"),
         };
     }
-    let Ok(out) = out else {
-        return GitResult {
-            text: String::new(),
-            code: -1,
-            stderr: "wait failed".into(),
-        };
+    let stdout = out_drain.and_then(|t| t.join().ok()).unwrap_or_default();
+    let stderr = err_drain.and_then(|t| t.join().ok()).unwrap_or_default();
+    let out = match status {
+        Ok(status) => std::process::Output {
+            status,
+            stdout,
+            stderr,
+        },
+        Err(e) => {
+            ocserve_metrics::labeled_counter(
+                "ocserve_snapshot_git_timeouts_total",
+                "op=\"git\"",
+                1,
+            );
+            return GitResult {
+                text: String::new(),
+                code: -1,
+                stderr: format!("{e}"),
+            };
+        }
     };
     GitResult {
         text: String::from_utf8_lossy(&out.stdout).into_owned(),

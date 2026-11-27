@@ -129,6 +129,25 @@ named `D-*` row in the ledger at `PLAN.md` section 18.
   `-c core.fsmonitor=false -c core.hooksPath=/dev/null`, and every diff also
   `--no-textconv`. Both vectors were measured on git 2.54 and each carries a
   planted control.
+- Every `git` invocation on the VCS and snapshot routes now has a 30 s
+  deadline. The calls share the 16-thread blocking pool, so one `git status`
+  against a huge, network-mounted or hostile repository could block a thread
+  forever; enough of those removed the pool and stalled every store-backed
+  route. A timeout increments `ocserve_vcs_git_errors_total{op}` and returns,
+  rather than hanging. `POST /vcs/apply` also gets the repo-config hardening
+  (`core.fsmonitor`, `core.hooksPath`, `--no-ext-diff`, `--no-textconv`) it was
+  missing.
+- The v2 `patch` tool is contained. It wrote with `cwd.join(path)` and no
+  verification at all, so `../x`, an absolute path, or a `*** Move to:`
+  escaped the project, and `.git/hooks/pre-commit` was writable. Every path now
+  goes through the handle-verified `containment` primitive (moved into
+  `ocserve-store` so the tools crate shares it), with `.git` refused outright
+  (`D-PATCH-NO-GIT-DIR`).
+- `Shell.Info` now carries the full required shape. #75 renamed `exitCode` to
+  `exit` but still omitted `shell`, `file`, `metadata` and `time`, and `list()`
+  added `sessionID`, which the closed schema forbids — so a strict client still
+  rejected every response. All required keys are emitted and `sessionID` moved
+  to a separate accessor the goal loop uses (`D-SHELL-NO-FILE`).
 
 ### Credits
 - The v2 turn-lifecycle fixes are [@glanzel](https://github.com/glanzel)'s

@@ -17,6 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 ocserve-store = { workspace = true }
+ocserve-containment = { workspace = true }
 regex = "1"
 similar = "3"
 libc.workspace = true

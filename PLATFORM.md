@@ -180,7 +180,7 @@ fallback), `v2.rs::resolve_within` (deepest-existing-ancestor), and
 strings, so all three had the check/use gap: a component could be swapped for a
 symlink between canonicalize and open.
 
-Now there is one: `crates/ocserve-http/src/containment.rs`.
+Now there is one: `crates/ocserve-containment/src/lib.rs`.
 
 | Platform | Mechanism |
 |---|---|

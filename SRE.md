@@ -203,7 +203,11 @@ encode, JSON part encode, blob zstd, FTS insert, tool-output chunking. Optimizat
 only with a before/after number on the bench gate.
 
 
-### 5.x Blocking filesystem I/O (M3, PERF-10X Phase II)
+#### Runtime dependency: `git`
+
+The directory-scoped VCS routes (`/api/vcs*`, `/api/worktree`, `/api/vcs/init`) and the snapshot engine shell out to `git`, which must be on the service PATH. `POST /api/vcs/init` additionally needs WRITE access to the named directory, so under the shipped unit (`ProtectSystem=strict`) it only works inside `ReadWritePaths`; outside those paths it fails with EROFS. Every git call is deadline-bounded (`GIT_DEADLINE` = 30 s, `ocserve-store::platform::run_with_deadline`) because the calls share the 16-thread blocking pool: an unbounded `git` against a huge or network-mounted repo would starve every store-backed route, not just that request. Timeouts and non-zero exits increment `ocserve_vcs_git_errors_total{op}`.
+
+## 5.x Blocking filesystem I/O (M3, PERF-10X Phase II)
 
 `GET /find/file` and `GET /file` walk the filesystem. Both bodies now run via
 `tokio::task::spawn_blocking`; the walk itself is unchanged (same bounds:

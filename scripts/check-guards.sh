@@ -402,6 +402,41 @@ else
   echo "ok"
 fi
 
+echo "== guard: tools crate cannot write files outside containment (rule 75) =="
+# 2026-11-26: the v2 `patch` tool shipped with `cwd.join(path)` + `fs::write`,
+# so `../x`, absolute paths and `.git/hooks/*` were writable. Every write in
+# PRODUCTION tool code must either go through the verified helper or carry a
+# reviewed `allow:raw-write` marker (with the reason on the same line) — that
+# keeps `write`/`edit` (permission-asked, upstream parity) legal and visible
+# while making a new unmarked write a build failure. Test code is excluded: it
+# writes its own tempdirs.
+check_tools_writes() {
+  local f="$1"
+  # Scan only before the first `#[cfg(test)]` in the file.
+  awk '/#\[cfg\(test\)\]/{exit} {print FNR": "$0}' "$f" 2>/dev/null \
+    | grep -E 'fs::write\(|fs::remove_file\(|fs::remove_dir_all\(' \
+    | grep -v 'write_contained' \
+    | grep -v 'allow:raw-write' || true
+}
+planted=/var/tmp/ocserve-rule75-planted.rs
+if ! printf 'fn bad(p: &std::path::Path) { let _ = std::fs::write(p, b"x"); }\n' > "$planted"; then
+  echo "FAIL: rule 75 could not write its planted control"; fail=1
+elif [ -z "$(check_tools_writes "$planted")" ]; then
+  echo "FAIL: rule 75 planted uncontained write not detected (vacuous predicate)"; fail=1
+else
+  leaked=""
+  for f in crates/ocserve-tools/src/*.rs; do
+    hits=$(check_tools_writes "$f")
+    [ -n "$hits" ] && leaked="$leaked\n$f: $hits"
+  done
+  if [ -n "$leaked" ]; then
+    printf '%b\n' "$leaked"
+    echo "FAIL: ocserve-tools writes a file without containment or a reviewed allow:raw-write marker (rule 75)"; fail=1
+  else
+    echo "ok (planted uncontained write detected)"
+  fi
+fi
+
 echo "== guard: install/uninstall never delete shared opencode state =="
 # rm targets may sit next to "opencode" ONLY for the derived normalized
 # artifacts (basename-gated in remove_derived); anything else (config/auth/

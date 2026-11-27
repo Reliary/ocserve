@@ -191,6 +191,72 @@ impl ShellKind {
     }
 }
 
+/// Run a `Command` to completion with a wall-clock deadline, killing it and
+/// its process group on expiry.
+///
+/// Why this exists: every `git` invocation in the VCS/snapshot routes runs on
+/// the shared 16-thread blocking pool. A `git status` against a huge,
+/// network-mounted, or hostile repository can block forever, and ~16 such
+/// calls remove the whole pool — so *every* store-backed route stalls, not
+/// just the one request. A deadline converts that into a bounded error.
+///
+/// `label` names the operation in the timeout message so a client sees
+/// "git status timed out" rather than a bare failure.
+///
+/// The child is killed (SIGKILL) on expiry and then reaped, so the caller does
+/// not leak a zombie. `stdout`/`stderr` are piped by the caller; this drains
+/// them on a thread so a chatty child cannot deadlock on a full pipe.
+pub fn run_with_deadline(
+    mut cmd: std::process::Command,
+    deadline: std::time::Duration,
+    label: &str,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let mut out = child.stdout.take();
+    let mut err = child.stderr.take();
+    // Drain both pipes on their own threads: `wait()` alone deadlocks when a
+    // child fills a 64 KiB pipe buffer.
+    let out_t = out.take().map(|mut p| {
+        std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = p.read_to_end(&mut v);
+            v
+        })
+    });
+    let err_t = err.take().map(|mut p| {
+        std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = p.read_to_end(&mut v);
+            v
+        })
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if start.elapsed() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("{label} exceeded {}s and was killed", deadline.as_secs()),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let stdout = out_t.and_then(|t| t.join().ok()).unwrap_or_default();
+    let stderr = err_t.and_then(|t| t.join().ok()).unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// A resolved shell: the family (how to pass a command string), the program
 /// to launch, and the name the model is told about.
 ///
