@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/ocserve-core",
     "crates/ocserve-store",
+    "crates/ocserve-containment",
     "crates/ocserve-http",
     "crates/ocserve-llm",
     "crates/ocserve-tools",
@@ -36,6 +37,7 @@ categories = ["web-programming::http-server", "database-implementations", "devel
 # internal
 ocserve-core = { path = "crates/ocserve-core", version = "0.7.3" }
 ocserve-store = { path = "crates/ocserve-store", version = "0.7.3" }
+ocserve-containment = { path = "crates/ocserve-containment", version = "0.7.3" }
 ocserve-http = { path = "crates/ocserve-http", version = "0.7.3" }
 ocserve-llm = { path = "crates/ocserve-llm", version = "0.7.3" }
 ocserve-tools = { path = "crates/ocserve-tools", version = "0.7.3" }

@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 //! Path containment, enforced on the **opened object** rather than on a string.
 //!
 //! ## Why this exists

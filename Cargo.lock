@@ -1747,6 +1747,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ocserve-containment"
+version = "0.7.5"
+dependencies = [
+ "libc",
+ "rustix",
+ "tempfile",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "ocserve-core"
 version = "0.7.5"
 dependencies = [
@@ -1783,6 +1793,7 @@ dependencies = [
  "http-body-util",
  "libc",
  "libmimalloc-sys",
+ "ocserve-containment",
  "ocserve-core",
  "ocserve-llm",
  "ocserve-mcp",
@@ -1801,7 +1812,6 @@ dependencies = [
  "regex",
  "reqwest",
  "rusqlite",
- "rustix",
  "serde",
  "serde_json",
  "sha2",
@@ -1810,7 +1820,6 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
- "windows-sys 0.61.2",
  "zstd",
 ]
 
@@ -1907,16 +1916,13 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "hex",
- "libc",
  "parking_lot",
  "rusqlite",
- "rustix",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "tracing",
- "windows-sys 0.61.2",
  "zstd",
 ]
 
@@ -1926,6 +1932,7 @@ version = "0.7.5"
 dependencies = [
  "anyhow",
  "libc",
+ "ocserve-containment",
  "ocserve-store",
  "regex",
  "reqwest",

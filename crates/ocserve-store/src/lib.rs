@@ -11,7 +11,6 @@ use std::path::Path;
 
 pub mod blob;
 pub mod cgroup;
-pub mod containment;
 pub mod fork;
 pub mod platform;
 pub mod pragma;

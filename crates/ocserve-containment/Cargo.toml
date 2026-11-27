@@ -1,0 +1,30 @@
+[package]
+name = "ocserve-containment"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+description = "Handle-verified path containment: openat2 RESOLVE_BENEATH, F_GETPATH, GetFinalPathNameByHandleW"
+
+[dependencies]
+
+# Kernel-enforced containment (openat2 RESOLVE_BENEATH) and directory iteration
+# from a verified fd.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+libc.workspace = true
+
+# Handle -> real-path verification and the kernel's own string collation.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Globalization",
+] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -152,7 +152,7 @@ fn parse(text: &str) -> Result<Vec<Change>> {
 /// Returns the verified real path, which is what gets written, so there is no
 /// TOCTOU window between the check and the write.
 fn contained_path(cwd: &Path, path: &str) -> Result<PathBuf> {
-    use ocserve_store::containment::{OpenError, OpenKind, open_within};
+    use ocserve_containment::{OpenError, OpenKind, open_within};
     // A directory open proves containment for the target's parent; the leaf
     // itself may not exist yet (Add File), so verify the parent.
     let leaf = Path::new(path);
@@ -284,7 +284,7 @@ pub fn apply(input: &Value, cwd: &Path) -> Result<ToolResult> {
                 // builds missing parents one component at a time so
                 // `*** Add File: new/dir/x.txt` works in-tree while a
                 // symlinked component out of the tree is refused.
-                use ocserve_store::containment::{OpenError, create_within};
+                use ocserve_containment::{OpenError, create_within};
                 create_within(cwd, &path, content.as_bytes()).map_err(|e: OpenError| {
                     anyhow::anyhow!("Add File {path}: not inside the project: {e}")
                 })?;

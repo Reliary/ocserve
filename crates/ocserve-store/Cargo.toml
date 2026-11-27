@@ -26,18 +26,3 @@ parking_lot.workspace = true
 [dev-dependencies]
 tempfile = "3"
 
-# Kernel-enforced containment (openat2 RESOLVE_BENEATH) — moved here from
-# ocserve-http so the tools crate (v2 `patch`) can share one implementation.
-# Unix-only by design; Windows uses handle verification instead.
-[target.'cfg(unix)'.dependencies]
-rustix.workspace = true
-libc.workspace = true
-
-# Handle -> real-path verification and the kernel's string collation, needed
-# by the Windows containment branch.
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_Storage_FileSystem",
-    "Win32_Globalization",
-] }
